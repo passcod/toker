@@ -28,6 +28,20 @@ struct LocalAccount {
     token: String,
 }
 
+/// The local multi-account store: `WORKHORSE_HOME` when set, otherwise the
+/// default directory under the user's home.
+pub fn local_account_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("WORKHORSE_HOME")
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|path| !path.is_empty())
+                .map(|home| std::path::PathBuf::from(home).join(".workhorse"))
+        })
+        .map(|dir| dir.join("claude-accounts.json"))
+}
+
 /// The identity facts a local multi-account file names. Malformed entries are
 /// skipped individually; a missing, unreadable or malformed file answers no
 /// identities, never an empty destructive replacement.

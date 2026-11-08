@@ -168,13 +168,10 @@ impl ReadyAttempt {
         };
         if let Some(ctx) = record.as_mut() {
             ctx.credential_digest = upstream.credential_digest.clone();
-            ctx.account_number = upstream.credential_digest.as_ref().and_then(|digest| {
-                server
-                    .store
-                    .observe_credential(self.backend.id(), digest, super::record::now_ms(), None)
-                    .ok()
-                    .flatten()
-            });
+            ctx.account_number = upstream
+                .credential_digest
+                .as_ref()
+                .and_then(|digest| server.observe_credential(self.backend.id(), digest));
         }
         super::anthropic::note_meters(server, self.backend.as_ref(), upstream.response.headers());
         let response_status = upstream.response.status();

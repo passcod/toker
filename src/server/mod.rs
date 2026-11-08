@@ -83,6 +83,7 @@ use axum::Router;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
 use axum::routing::{any, get, post};
 
+use crate::accounts::local_account_identities;
 use crate::catalog::fetched::{self, FetchedCatalog, FetchedCatalogs};
 use crate::catalog::offers;
 use crate::config::Config;
@@ -96,10 +97,10 @@ use crate::providers::{AnthropicApi, AnthropicSub, CodexSub, OpenAiApi, OpenRout
 use crate::routing::{FrontendProfile, ModelTarget, ProtocolId, RouteRegistry};
 use crate::secrets::{self, KEYRING_READ_TIMEOUT, OsKeyring, SecretStore};
 use crate::store::{
-    ActivatePolicyRevision, ActivatedPolicyRevision, BindingLearning, DraftCasResult,
-    PolicyCompilerOrigin, PolicyRevision, PolicyRevisionSource, PublicationCasResult,
-    PublicationKey, PublicationResultUpdate, PublicationState, RoutingPolicyState,
-    RoutingPublication, Store,
+    AccountIdentity, ActivatePolicyRevision, ActivatedPolicyRevision, BindingLearning,
+    CredentialDigest, DraftCasResult, PolicyCompilerOrigin, PolicyRevision, PolicyRevisionSource,
+    PublicationCasResult, PublicationKey, PublicationResultUpdate, PublicationState,
+    RoutingPolicyState, RoutingPublication, Store,
 };
 
 use record::now_ms;
@@ -412,6 +413,10 @@ pub struct Server {
     /// timeouts only — no overall deadline, so a stream lives as long as
     /// its upstream keeps talking (see [`UPSTREAM_IDLE_TIMEOUT`]).
     pub(crate) http: reqwest::Client,
+    /// The local multi-account identities known at startup, keyed only by
+    /// credential digest. The source's token values do not survive this map.
+    pub(crate) local_account_identities:
+        Arc<std::collections::BTreeMap<CredentialDigest, AccountIdentity>>,
     /// The enabled provider bindings and implemented frontend-to-backend
     /// routes. Policy picks the binding; handlers turn it into a concrete
     /// model target here.
@@ -486,6 +491,15 @@ impl Server {
         // one, which validates them itself.
         config.validate_retained()?;
         let http = upstream_client(UPSTREAM_IDLE_TIMEOUT)?;
+        let local_account_identities = crate::accounts::local_account_path()
+            .map(|path| match local_account_identities(&path) {
+                Ok(identities) => identities,
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "local account identities unavailable");
+                    Default::default()
+                }
+            })
+            .unwrap_or_default();
         let openrouter = config.openrouter.as_ref().map(|openrouter| {
             Arc::new(OpenRouter::new(
                 openrouter.upstream.clone(),
@@ -617,6 +631,7 @@ impl Server {
             store,
             config: Arc::new(ConfigCell::new(config)),
             http,
+            local_account_identities: Arc::new(local_account_identities),
             registry,
             codex_turn,
             binding_learning,
@@ -638,6 +653,28 @@ impl Server {
 
     /// Mark one selected binding and effective target immediately before an
     /// actual inference transport starts.
+    /// Resolve an outbound credential from the startup's local account facts,
+    /// then record and backfill the durable digest binding. A failure loses
+    /// attribution only: requests are already in flight and must continue.
+    pub(crate) fn observe_credential(
+        &self,
+        provider: &str,
+        digest: &CredentialDigest,
+    ) -> Option<i64> {
+        match self.store.observe_credential(
+            provider,
+            digest,
+            now_ms(),
+            self.local_account_identities.get(digest),
+        ) {
+            Ok(account_number) => account_number,
+            Err(error) => {
+                tracing::error!(%error, "credential account observation failed");
+                None
+            }
+        }
+    }
+
     pub(crate) fn note_binding_sent(
         &self,
         binding_id: &crate::policy::BindingId,
