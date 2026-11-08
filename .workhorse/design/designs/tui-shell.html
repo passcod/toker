@@ -1,0 +1,164 @@
+<!-- spec: tui/dashboard.md -->
+<!-- The shell every toker TUI mockup starts from. Copy this file, replace
+     the frame's contents, keep the CSS. See ../mockups.md. -->
+<!DOCTYPE html>
+<html lang="en-NZ">
+<head>
+<meta charset="utf-8">
+<title>TUI mockup shell</title>
+<style>
+  /* Ghostty's stock palette, the reference ground toker is developed
+     against. The TUI sets no RGB anywhere: it names the ANSI sixteen, so
+     these are the reference theme's answer, not values from the code. */
+  :root {
+    --bg: #282c34;  /* background      */  --fg: #ffffff;  /* foreground   */
+    --c0: #1d1f21;  /* black           */  --c8: #666666;  /* dark gray    */
+    --c1: #cc6666;  /* red             */  --c9: #d54e53;  /* bright red   */
+    --c2: #b5bd68;  /* green           */  --c10:#b9ca4a;  /* bright green */
+    --c3: #f0c674;  /* yellow          */  --c11:#e7c547;  /* bright yellow*/
+    --c4: #81a2be;  /* blue            */  --c12:#7aa6da;  /* bright blue  */
+    --c5: #b294bb;  /* magenta         */  --c13:#c397d8;  /* bright mag.  */
+    --c6: #8abeb7;  /* cyan            */  --c14:#70c0b1;  /* bright cyan  */
+    --c7: #c5c8c6;  /* white           */  --c15:#eaeaea;  /* bright white */
+  }
+
+  body {
+    background: #14161a;
+    color: var(--c7);
+    font-family: system-ui, sans-serif;
+    margin: 0;
+    padding: 2rem;
+  }
+
+  /* One terminal frame. Width is set in ch so it resolves against
+     Iosevka's own advance rather than a guessed cell size: naming the
+     font matters, because Iosevka is narrower per cell than most
+     monospace faces and a frame set in a generic monospace comes out
+     wider than it ever renders. */
+  .frame {
+    font-family: Iosevka, "Iosevka Term", "Iosevka Fixed", monospace;
+    font-size: 15px;
+    line-height: 1.2;
+    background: var(--bg);
+    color: var(--fg);
+    padding: 0.6rem 1rem;
+    margin: 0 0 0.5rem;
+    white-space: pre;
+    overflow-x: auto;
+    width: max-content;
+    /* The terminal runs Iosevka with calt on, but every arrow and
+       comparison the TUI emits is a precomposed character rather than an
+       ASCII sequence, so there is nothing here for a ligature to join.
+       Off, because a browser ligature need not stay cell-aligned and the
+       grid matters more than a feature nothing triggers. */
+    font-variant-ligatures: none;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Foreground colours. Each sets --now as well, so .r can swap them. */
+  .black   { color: var(--c0); --now: var(--c0); }
+  .red     { color: var(--c1); --now: var(--c1); }
+  .green   { color: var(--c2); --now: var(--c2); }
+  .yellow  { color: var(--c3); --now: var(--c3); }
+  .blue    { color: var(--c4); --now: var(--c4); }
+  .cyan    { color: var(--c6); --now: var(--c6); }
+  .gray    { color: var(--c8); --now: var(--c8); }
+
+  /* Modifiers. Compose them: class="green b", class="cyan d". */
+
+  /* BOLD is the emphasis channel, since colour is not. It keeps its
+     colour: the reference terminal leaves bold-color unset, so bold does
+     not remap onto the bright palette. */
+  .b { font-weight: 700; }
+
+  /* DIM at exactly the terminal's faint-opacity, so it keeps the colour
+     underneath rather than flattening to grey. A dim green mark is still
+     a green mark. */
+  .d { opacity: 0.5; }
+
+  /* REVERSED swaps foreground and background. --now carries whatever
+     colour class came before; plain text falls back to the foreground. */
+  .r { color: var(--bg); background-color: var(--now, var(--fg)); }
+
+  /* The one explicit pair in the TUI: an armed burn control. */
+  .on-yellow { color: var(--c0); background-color: var(--c3); }
+
+  /* A key rather than a screen, so its rows are deliberately ragged.
+     Anything claiming to be a frame has rows of equal width. */
+  .swatch { width: auto; }
+
+  /* Annotation outside the frame. Never inside it: a terminal has no
+     room for a note, and a mockup that puts one there is not a frame. */
+  .note {
+    font-size: 0.85rem;
+    color: #8b8f96;
+    margin: 0 0 1.5rem;
+    max-width: 70ch;
+    line-height: 1.5;
+  }
+  .note strong { color: var(--c7); font-weight: 600; }
+  h1 { font-size: 1.1rem; font-weight: 600; color: var(--fg); margin: 0 0 0.25rem; }
+  h2 { font-size: 0.95rem; font-weight: 600; color: var(--c7); margin: 2rem 0 0.5rem; }
+</style>
+</head>
+<body>
+
+<h1>TUI mockup shell</h1>
+<p class="note">
+  Copy this file, replace the frame below, keep the CSS. Every row in a
+  frame must be the same number of cells, and that number must be the
+  width you are claiming. See <strong>mockups.md</strong> for how to work
+  from a pinned snapshot, and <strong>design-system.md</strong> for what
+  each colour means.
+</p>
+
+<h2>Frame</h2>
+<pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>last 30m · 2 sessions · 12 requests                         last req <span class="green">8s ago</span> · 12:34:56
+┌SESSIONS────────────────────────────────────────────────────────────────────────────────┐
+│session                          ctx model          reqs prompt now    peak msgs ↺      │
+│ses-free                          <span class="green b">1M</span> sonnet-5 <span class="yellow">$</span>        3      2,500   2,500    <span class="d">-</span> <span class="d">-</span>      │
+│ses-hot                           <span class="green b">1M</span> opus-5 <span class="green b">↑</span>          3    470,893 472,000   77 1      │
+│ses-myst                           <span class="d">?</span> gpt-5.6-terra     3      3,132   3,132    <span class="d">-</span> <span class="d">-</span>      │
+│ses-crow                        <span class="yellow">200k</span> haiku-4-5 <span class="red b">!</span>       3    170,000 170,000    <span class="d">-</span> <span class="d">-</span>      │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+┌CONTEXT─────────────────────────────────────────────────────────────────────────────────┐
+│ses-free          <span class="cyan">░░░░░░░░░░░░░░░░░░░░░░░░</span>         2,500 / <span class="green b">1M</span>     0%                    │
+│ses-crow          <span class="red">█████████████████████░░░</span>       170,000 / <span class="yellow">200k</span>  85%  <span class="red">← compacts soon</span>   │
+│ses-myst                  3,132 / <span class="d">?</span>                              <span class="d">idle 10m</span>               │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+┌RATE &amp; QUOTA────────────────────────────────────────────────────────────────────────────┐
+│  requests <span class="d">·········</span>▁▂▃<span class="d">···</span>▄▅<span class="red b">█</span>▇█ 0.4/min  <span class="red">1 error</span>                                        │
+│  5-hour   <span class="green">███░░░░░░░░░░░░░░░░░░░</span> <span class="green">12%</span>  <span class="d">resets 14:53</span>  <span class="green">on track</span>                           │
+│  7-day    <span class="yellow">████████████████░░░░░░</span> <span class="yellow">74%</span>  <span class="d">resets Mon 05:00</span>  <span class="yellow">stops ~Thu 08:49</span>               │
+│  overage  <span class="red">█████████████████████░</span> <span class="red">96%</span>  <span class="d">resets 1 Oct</span>  <span class="red">out ~19:20</span>                         │
+│  <span class="d">binding</span>  five_hour                                                                    │
+└────────────────────────────────────────────────────────────────────────────────────────┘</pre>
+<p class="note">
+  Every style in the TUI appears above: the header chips reversed, the
+  four marks, the three bar kinds, the meter bands, the absence
+  vocabulary, and dim for idle and for a subordinate clock.
+</p>
+
+<h2>Palette reference</h2>
+<pre class="frame swatch"><span class="green">green    a reading that is fine, or better than asked for</span>
+<span class="yellow">yellow   worth noticing, or a release that spends</span>
+<span class="red">red      exhausted, failed, or about to be</span>
+<span class="cyan">cyan     identity rather than judgement</span>
+<span class="blue">blue     the page-switch chip, and nothing else</span>
+<span class="gray">gray     chrome that is not content</span>
+plain    everything else, which is most of the screen
+
+<span class="green b">bold     emphasis, since colour is not</span>
+<span class="green d">dim      absent, inactive or subordinate</span>
+<span class="green r">reversed</span> <span class="r">a handle to press, or a row in focus</span>
+<span class="on-yellow">[b] burn</span> an armed control</pre>
+<p class="note">
+  Plain white text is the most prominent thing on the screen at 14:1,
+  while red sits at 3.77:1 and yellow at 8.69:1. Colour here is a
+  de-emphasis channel: a meter at 96% reads softer than one at 85%.
+  Reaching for a saturated red produces a warning panel where the real
+  screen is a calm readout.
+</p>
+
+</body>
+</html>
