@@ -216,9 +216,9 @@ pub fn picker_sync(dry_run: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `tui`: the ratatui dashboard over the ledger. `--db`
-/// overrides the path; otherwise `TOKER_DB` and the config default apply
-/// (Config::load already layered env over file).
+/// `tui`: the ratatui dashboard over the ledger. `--db` overrides which
+/// ledger is read; otherwise it is the one `TOKER_DB` or the user data
+/// directory resolves, which is also where the configuration came from.
 pub fn tui(window_mins: u64, db: Option<PathBuf>) -> anyhow::Result<()> {
     let config = Config::load()?;
     // Without a resolvable home the routing page still edits and activates;
@@ -242,8 +242,8 @@ pub fn tui(window_mins: u64, db: Option<PathBuf>) -> anyhow::Result<()> {
 
 /// `import`: ingest the predecessor proxy's usage.jsonl into the ledger
 /// .
-/// `--db` overrides the path; otherwise `TOKER_DB` and the config default
-/// apply (Config::load already layered env over file).
+/// `--db` overrides the path; otherwise it is the one `TOKER_DB` or the
+/// user data directory resolves.
 pub fn import(
     from: PathBuf,
     db: Option<PathBuf>,

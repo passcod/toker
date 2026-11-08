@@ -1953,6 +1953,13 @@ pub fn config_path() -> anyhow::Result<PathBuf> {
     config_path_with_env(&ProcessEnvironment)
 }
 
+/// The store this process will open (spec: DCONF#before-the-store), for
+/// setup, which has to write the store every other process reads rather
+/// than one of its own choosing.
+pub fn store_path() -> anyhow::Result<PathBuf> {
+    resolve_db_path(&ProcessEnvironment)
+}
+
 fn config_path_with_env(environment: &impl Environment) -> anyhow::Result<PathBuf> {
     if let Some(path) = environment.var_os("TOKER_CONFIG") {
         return Ok(PathBuf::from(path));

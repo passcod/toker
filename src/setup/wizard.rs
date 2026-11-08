@@ -382,6 +382,9 @@ pub struct Paths {
     pub codex_auth: PathBuf,
     /// The codex CLI's user configuration.
     pub codex_config: PathBuf,
+    /// The store, resolved the way every other process resolves it, so
+    /// setup writes the one they will read.
+    pub store: PathBuf,
     /// The state dir (the ledger's parent): the only path the
     /// hardened service unit may write.
     pub state_dir: PathBuf,
@@ -405,6 +408,10 @@ impl Paths {
         let home = PathBuf::from(home);
         let config_home = xdg_dir("XDG_CONFIG_HOME", &home, ".config");
         let data_home = xdg_dir("XDG_DATA_HOME", &home, ".local/share");
+        // Resolved, not derived from XDG here: `TOKER_DB` moves the store
+        // for every other process, and a setup that wrote the XDG one
+        // anyway would leave its rows where nothing reads them.
+        let store = crate::config::store_path()?;
         Ok(Paths {
             config_toml: crate::config::config_path()?,
             units_dir: config_home.join("systemd").join("user"),
@@ -415,7 +422,11 @@ impl Paths {
             ctp_usage: data_home.join("claude-token-proxy").join("usage.jsonl"),
             codex_auth: home.join(".codex").join("auth.json"),
             codex_config: home.join(".codex").join("config.toml"),
-            state_dir: data_home.join("toker"),
+            state_dir: store
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from(".")),
+            store,
             opencode_plugins_dir: config_home.join("opencode").join("plugins"),
             catalog_cache: crate::catalog::fetched::cache_dir().ok(),
         })
@@ -434,15 +445,17 @@ impl Paths {
             ctp_usage: root.join(".local/share/claude-token-proxy/usage.jsonl"),
             codex_auth: root.join(".codex/auth.json"),
             codex_config: root.join(".codex/config.toml"),
+            store: root.join(".local/share/toker/toker.db"),
             state_dir: root.join(".local/share/toker"),
             opencode_plugins_dir: root.join(".config/opencode/plugins"),
             catalog_cache: None,
         }
     }
 
-    /// The ledger path under the state dir.
+    /// The ledger path. The wizard opens no other store: this is the
+    /// one place it decides which one it is working on.
     pub fn db_path(&self) -> PathBuf {
-        self.state_dir.join("toker.db")
+        self.store.clone()
     }
 }
 
@@ -484,9 +497,9 @@ WantedBy=sockets.target
 /// established), with
 /// `ExecStart` a function of the binary that ran the wizard
 /// (`std::env::current_exe`, resolved by the caller) rather than a
-/// hardcoded path, and `ReadWritePaths` the configured state dir
-/// rather than `%h` (the state dir follows `$XDG_DATA_HOME`, which
-/// `%h` cannot express).
+/// hardcoded path, and `ReadWritePaths` the `store`'s own directory
+/// rather than `%h` (it follows `$XDG_DATA_HOME` or `TOKER_DB`, neither
+/// of which `%h` can express).
 ///
 /// `extra_writable` are directories outside the state dir the service
 /// must write: the codex login's, when codex_sub is enabled, because a
@@ -495,11 +508,21 @@ WantedBy=sockets.target
 /// was lost and the next start refreshed again from the stale token.
 /// Each is `-`-prefixed: a missing one is skipped, where a missing state
 /// dir must fail the start (it is where the ledger lives).
-pub fn service_unit(exe: &Path, state_dir: &Path, extra_writable: &[PathBuf]) -> String {
+///
+/// A `store` that is not the default one carries `TOKER_DB` into the
+/// unit (spec: DCONF#before-the-store): the service does not share the
+/// shell setup ran in, so without it the service resolves the default
+/// and reads a store setup never wrote.
+pub fn service_unit(exe: &Path, store: &Path, extra_writable: &[PathBuf]) -> String {
+    let state_dir = store.parent().unwrap_or(store);
     let extra: String = extra_writable
         .iter()
         .map(|dir| format!("ReadWritePaths=-{}\n", dir.display()))
         .collect();
+    let store_env = match crate::store::default_db_path() {
+        Ok(default) if default == store => String::new(),
+        _ => format!("Environment=\"TOKER_DB={}\"\n", store.display()),
+    };
     format!(
         r#"[Unit]
 Description=toker proxy service (socket-activated)
@@ -513,7 +536,7 @@ After=toker.socket
 # inode until restarted.
 Type=exec
 ExecStart="{exe}" serve
-Restart=always
+{store_env}Restart=always
 # A refusal over a configuration file still being here cannot resolve
 # itself: only `toker setup` moves the machine off it, so retrying
 # only fills the journal (spec: DLIFE#starting).
@@ -986,10 +1009,6 @@ struct Detected {
     /// changing anything rather than run over a file it does not
     /// understand (the config writer's own refusal rule).
     config_error: Option<String>,
-    /// Whether the existing file carried an explicit `db_path` — the
-    /// wizard only writes its own default when it did not, so an
-    /// operator's custom db path is never stomped.
-    db_explicit: bool,
     /// `toker.socket`'s is-active verdict; `None` when the query
     /// itself failed (non-fatal — the summary says "unknown").
     socket_active: Option<bool>,
@@ -1316,37 +1335,34 @@ impl<'a> Wizard<'a> {
             Err(error) => socket_error = Some(format!("{error:#}")),
         }
 
-        let (config, config_error, db_explicit) =
-            match std::fs::read_to_string(&self.paths.config_toml) {
-                Ok(text) => match Config::load_from(&self.paths.config_toml) {
-                    Ok(config) => (Some(config), None, toml_has_db_path(&text)),
-                    Err(error) => (None, Some(format!("{error:#}")), false),
+        let (config, config_error) = match std::fs::read_to_string(&self.paths.config_toml) {
+            Ok(text) => match Config::load_from(&self.paths.config_toml) {
+                Ok(config) => match self.refuse_a_file_naming_another_store(&config, &text) {
+                    Ok(()) => (Some(config), None),
+                    Err(error) => (None, Some(error)),
                 },
-                // No file: the machine is already across, so what it is
-                // configured with is in the store. A machine with no
-                // provider rows has never been configured at all, and is
-                // asked everything.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    match stored_configuration(self.paths) {
-                        Ok(config) => (config, None, false),
-                        Err(error) => (None, Some(format!("{error:#}")), false),
-                    }
+                Err(error) => (None, Some(format!("{error:#}"))),
+            },
+            // No file: the machine is already across, so what it is
+            // configured with is in the store. A machine with no
+            // provider rows has never been configured at all, and is
+            // asked everything.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match stored_configuration(self.paths) {
+                    Ok(config) => (config, None),
+                    Err(error) => (None, Some(format!("{error:#}"))),
                 }
-                Err(error) => (
-                    None,
-                    Some(format!(
-                        "reading {}: {error}",
-                        self.paths.config_toml.display()
-                    )),
-                    false,
-                ),
-            };
-
-        let db_path = match &config {
-            Some(config) if db_explicit => config.db_path.clone(),
-            _ => self.paths.db_path(),
+            }
+            Err(error) => (
+                None,
+                Some(format!(
+                    "reading {}: {error}",
+                    self.paths.config_toml.display()
+                )),
+            ),
         };
-        let routing = self.read_routing(&db_path).context(
+
+        let routing = self.read_routing().context(
             "the wizard stopped without changing anything: \
              reading the routing state from the ledger",
         )?;
@@ -1405,7 +1421,6 @@ impl<'a> Wizard<'a> {
         let detected = Detected {
             config,
             config_error,
-            db_explicit,
             socket_active,
             socket_error,
             frontends,
@@ -1421,8 +1436,8 @@ impl<'a> Wizard<'a> {
     /// ledger from before the policy tables, is not owned; a ledger that
     /// cannot be read is an error, because writing a config over a
     /// database in an unknown state could strand the machine.
-    fn read_routing(&self, db_path: &Path) -> Result<Option<OwnedRouting>> {
-        let store = match Store::open_read_only(db_path) {
+    fn read_routing(&self) -> Result<Option<OwnedRouting>> {
+        let store = match Store::open_read_only(self.paths.db_path()) {
             Ok(store) => store,
             Err(crate::store::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(None);
@@ -1442,6 +1457,31 @@ impl<'a> Wizard<'a> {
             revision_id,
             source: revision.source,
         }))
+    }
+
+    /// Stop when the file's `db_path` is not the store setup will write
+    /// (spec: DCONF#moving-a-machine-off-the-file). The store's path is
+    /// resolved now, not configured, so a file carrying a different one
+    /// cannot be imported: the rows would go to the store the file names
+    /// and every later command would read the resolved one. A file
+    /// carrying no `db_path` at all says nothing and is fine.
+    fn refuse_a_file_naming_another_store(
+        &self,
+        config: &Config,
+        text: &str,
+    ) -> Result<(), String> {
+        let store = self.paths.db_path();
+        if !toml_has_db_path(text) || config.db_path == store {
+            return Ok(());
+        }
+        Err(format!(
+            "{} names the store {}, but toker reads {}. \
+             Move that store into place, or export TOKER_DB={} and run setup again.",
+            self.paths.config_toml.display(),
+            config.db_path.display(),
+            store.display(),
+            config.db_path.display(),
+        ))
     }
 
     /// The state summary print (from [`Wizard::detect_state`], before
@@ -1996,13 +2036,11 @@ impl<'a> Wizard<'a> {
             None => Config::load_from(&file)
                 .context("the defaults for a machine with no configuration")?,
         };
-        // The store this run writes is the one the wizard manages, not
-        // whatever a resolved default points at. Without this a scratch run
-        // writes into the real machine's store, and a keep run — which never
-        // reaches `apply_choices` — would do it on every path.
-        if !detected.db_explicit {
-            config.db_path = paths.db_path();
-        }
+        // The store this run writes is the one the wizard was given, never
+        // whatever the config's own default resolved to: a scratch run that
+        // follows the latter writes into the real machine's store. Set here,
+        // before any branch, because one of the branches returns early.
+        config.db_path = paths.db_path();
         match choices {
             None if !had_file => {
                 // Already across, and nothing to change: writing the same
@@ -2022,7 +2060,7 @@ impl<'a> Wizard<'a> {
             Some(choices) => {
                 let mut choices = choices.clone();
                 self.place_keys(&mut choices)?;
-                apply_choices(&mut config, &choices, paths, detected.db_explicit)?;
+                apply_choices(&mut config, &choices, paths)?;
             }
         }
         config
@@ -2058,7 +2096,7 @@ impl<'a> Wizard<'a> {
                 ))?;
             }
             (None, None) => {
-                report.routing_owned = active_revision_id(&config.db_path);
+                report.routing_owned = active_revision_id(paths);
             }
         }
 
@@ -2116,7 +2154,7 @@ impl<'a> Wizard<'a> {
             (SOCKET_UNIT, socket_unit(port)),
             (
                 SERVICE_UNIT,
-                service_unit(&exe, &self.paths.state_dir, &extra_writable(current)),
+                service_unit(&exe, &self.paths.db_path(), &extra_writable(current)),
             ),
         ];
 
@@ -3162,8 +3200,8 @@ fn installed_socket_port(paths: &Paths) -> Option<u16> {
 
 /// The revision a store is on, where it can be read at all. Only for the
 /// report: a failure here must not fail a run that already committed.
-fn active_revision_id(db_path: &std::path::Path) -> Option<i64> {
-    Store::open(db_path)
+fn active_revision_id(paths: &Paths) -> Option<i64> {
+    Store::open(paths.db_path())
         .ok()?
         .load_routing_policy_state()
         .ok()?
@@ -3173,8 +3211,13 @@ fn active_revision_id(db_path: &std::path::Path) -> Option<i64> {
 fn commit_configuration(config: &Config, paths: &Paths) -> Result<Option<i64>> {
     use crate::catalog::{fetched, offers};
 
-    let store = Store::open(&config.db_path)
-        .with_context(|| format!("opening the store at {}", config.db_path.display()))?;
+    // The paths' store, never the config's own `db_path`: a config loaded
+    // from a file or from defaults carries whatever the user data
+    // directory resolved to, and following that is how a scratch run
+    // reached the real machine's store.
+    let db_path = paths.db_path();
+    let store = Store::open(&db_path)
+        .with_context(|| format!("opening the store at {}", db_path.display()))?;
     let configuration = config.to_configuration();
 
     // A machine whose routing already moved keeps its revision, and the
@@ -3212,21 +3255,14 @@ fn commit_configuration(config: &Config, paths: &Paths) -> Result<Option<i64>> {
     Ok(Some(revision.revision_id))
 }
 
-/// Apply the wizard's choices to the config the config writer read
-/// (its read-merge-rewrite preserves everything not changed here). A
-/// chosen key source REPLACES the old one (picking the env var drops
-/// a stale literal; picking a literal stores the given key), so the
-/// file ends up saying exactly what was just answered. The db path is
-/// written from the wizard's own paths only when the file did not
-/// carry one — an operator's explicit db path is never stomped, and a
-/// scratch-rooted run never pins the real machine's db into its
-/// config.
-fn apply_choices(
-    config: &mut Config,
-    choices: &Choices,
-    paths: &Paths,
-    db_explicit: bool,
-) -> Result<()> {
+/// Apply the wizard's choices to the config read from the file or the
+/// store, leaving everything not answered here as it was. A chosen key
+/// source REPLACES the old one (picking the env var drops a stale
+/// literal; picking a literal stores the given key), so the
+/// configuration ends up saying exactly what was just answered. The
+/// store's path is not among the choices: [`Wizard::write_step`] pins
+/// it for every path through the run.
+fn apply_choices(config: &mut Config, choices: &Choices, paths: &Paths) -> Result<()> {
     config.port = choices.port;
     // The ticked set is exactly the enabled set: a ticked backend gets
     // its block (an existing block keeps its hand edits), an unticked one
@@ -3281,9 +3317,6 @@ fn apply_choices(
         if !config.transcript_roots.contains(&root) {
             config.transcript_roots.push(root);
         }
-    }
-    if !db_explicit {
-        config.db_path = paths.db_path();
     }
     Ok(())
 }
@@ -4056,7 +4089,7 @@ default_backend_anthropic = "codex_sub"
         );
         let unit = service_unit(
             Path::new("/opt/toker/toker"),
-            Path::new("/srv/state/toker"),
+            Path::new("/srv/state/toker/toker.db"),
             &extra_writable(&config),
         );
         assert!(unit.contains("ReadWritePaths=/srv/state/toker\n"));
@@ -4084,7 +4117,7 @@ default_backend_anthropic = "codex_sub"
         // every hardening line from the hand-installed unit survives.
         let service = service_unit(
             Path::new("/opt/toker/toker"),
-            Path::new("/srv/state/toker"),
+            Path::new("/srv/state/toker/toker.db"),
             &[],
         );
         assert!(service.contains("ExecStart=\"/opt/toker/toker\" serve"));
@@ -4117,6 +4150,17 @@ default_backend_anthropic = "codex_sub"
         assert!(
             !service.contains("18082") && !service.contains("18123"),
             "no hardcoded port in the service unit"
+        );
+        // A store that is not the default one has to reach the service,
+        // which does not share the shell setup ran in.
+        assert!(
+            service.contains("Environment=\"TOKER_DB=/srv/state/toker/toker.db\"\n"),
+            "the overridden store reaches the service:\n{service}"
+        );
+        let default = crate::store::default_db_path().expect("the default store path");
+        assert!(
+            !service_unit(Path::new("/opt/toker/toker"), &default, &[]).contains("TOKER_DB"),
+            "the default store needs no override"
         );
     }
 
@@ -4292,7 +4336,7 @@ default_backend_anthropic = "codex_sub"
             (SOCKET_UNIT.to_owned(), socket_unit(port)),
             (
                 SERVICE_UNIT.to_owned(),
-                service_unit(&exe, &rig.paths().state_dir, &[]),
+                service_unit(&exe, &rig.paths().db_path(), &[]),
             ),
         ];
         units.extend(picker_installed(&rig, &exe));
@@ -4773,8 +4817,7 @@ default_backend_anthropic = "codex_sub"
         std::fs::write(rig.toml_path(), text).expect("seed the toml");
         // The seed is the FILE: this stands in for a machine whose routing
         // moved before its configuration did, so the store starts empty.
-        let mut config = Config::load_from(&rig.toml_path()).expect("the seed loads");
-        config.db_path = rig.paths().db_path();
+        let config = Config::load_from(&rig.toml_path()).expect("the seed loads");
         commit_configuration(&config, &rig.paths()).expect("commit the configuration");
         active_revision(&rig.paths()).expect("revision one is active")
     }
@@ -5499,6 +5542,66 @@ default_backend_anthropic = "codex_sub"
         assert!(!rig.root.join(".claude").exists());
     }
 
+    /// The store's path is resolved rather than configured, so a file
+    /// naming a different one is refused rather than imported into the
+    /// store it names (spec: DCONF#moving-a-machine-off-the-file).
+    #[tokio::test]
+    async fn a_file_naming_another_store_stops_the_wizard_before_any_change() {
+        let mut rig = Rig::new("elsewhere-db", vec![], vec![inactive()]);
+        std::fs::create_dir_all(rig.toml_path().parent().expect("the config dir"))
+            .expect("create the config dir");
+        let seeded = "db_path = \"/var/lib/toker/elsewhere.db\"\n[providers.anthropic_sub]\n";
+        std::fs::write(rig.toml_path(), seeded).expect("seed the toml");
+
+        let error = rig
+            .run(VERIFY_TIMEOUT)
+            .await
+            .expect_err("importing into one store while toker reads another is refused");
+
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("stopped without changing anything"),
+            "{chain}"
+        );
+        assert!(
+            chain.contains("/var/lib/toker/elsewhere.db")
+                && chain.contains(&rig.paths().db_path().display().to_string())
+                && chain.contains("TOKER_DB"),
+            "the refusal names both stores and the way out: {chain}"
+        );
+        assert_eq!(
+            std::fs::read(rig.toml_path()).expect("read back"),
+            seeded.as_bytes(),
+            "the file is left as it was"
+        );
+        assert!(!rig.paths().db_path().exists(), "no store was written");
+        assert!(rig.prompt.asked().is_empty(), "no question was asked");
+    }
+
+    /// A file whose `db_path` is already the store setup will write says
+    /// nothing the resolution does not, so it imports like any other.
+    /// Files written by setup carry one, so this is the usual case rather
+    /// than the corner.
+    #[tokio::test]
+    async fn a_file_naming_the_same_store_imports_as_usual() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "same-db",
+            vec![select(0), confirm(false)], // keep it as is; no timers
+            vec![inactive(), ok_empty(), ok_empty()],
+        );
+        let seeded = format!(
+            "db_path = \"{}\"\nport = {port}\n{EXISTING_TOML}",
+            rig.paths().db_path().display()
+        );
+        seed_owned(&rig, &seeded);
+
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+
+        assert!(report.config_written && report.config_file_removed);
+        assert!(!rig.toml_path().exists());
+    }
+
     #[tokio::test]
     async fn the_opencode_plugin_is_offered_with_an_opt_out() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
@@ -5626,7 +5729,7 @@ default_backend_anthropic = "codex_sub"
                 (SOCKET_UNIT.to_owned(), socket_unit(port)),
                 (
                     SERVICE_UNIT.to_owned(),
-                    service_unit(&exe, &rig.paths().state_dir, &[])
+                    service_unit(&exe, &rig.paths().db_path(), &[])
                 ),
                 (HOLD_TIMER_UNIT.to_owned(), hold_timer),
                 (HOLD_SERVICE_UNIT.to_owned(), hold_service),

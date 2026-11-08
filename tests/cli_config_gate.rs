@@ -87,7 +87,7 @@ fn the_refusal_is_a_status_of_its_own_so_the_supervisor_can_stop_retrying() {
     assert!(
         toker::setup::wizard::service_unit(
             std::path::Path::new("/opt/toker/toker"),
-            std::path::Path::new("/state"),
+            std::path::Path::new("/state/toker.db"),
             &[],
         )
         .contains(&format!(

@@ -66,6 +66,13 @@ Each phase compiles and keeps the suite green.
 - [x] `claude_credentials_path` and codex `auth_path` become discovery
 - [x] Prune what `config.rs` no longer needs
 
+### 8. The store setup writes
+
+- [x] One store path in the wizard: `Paths::store`, resolved as every other process resolves it (`TOKER_DB`, else the user data directory)
+- [x] No wizard function takes a store path, so none can be handed a different one
+- [x] A non-default store reaches the service through `Environment="TOKER_DB=…"` in the unit
+- [x] A file naming a different store stops the run before anything changes
+
 ## Decisions worth keeping
 
 A configuration error degrades rather than refusing a start, because the dashboard reaches configuration through the service: a service that will not start over a setting leaves no way to fix that setting.
@@ -76,6 +83,10 @@ Every command except setup refusing while it exists means no row can be edited b
 
 Endpoints stay configurable, subscription providers included, because Toker is itself a proxy and another may reasonably sit in front of it.
 Values that identify Toker to a provider do not, being facts about the provider rather than preferences.
+
+A file's `db_path` is not an override the store can hold, so a file naming a store other than the resolved one stops setup rather than importing.
+Importing it would write the rows into the store the file names and leave every later command reading the resolved one.
+The way across is `TOKER_DB`, which setup carries into the unit so the service agrees with the shell it was run from.
 
 
 ## Known gap

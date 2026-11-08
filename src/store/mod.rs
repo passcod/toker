@@ -528,6 +528,9 @@ impl Store {
         // Immediate, not deferred: a deferred transaction that upgrades to a
         // write can come back BUSY without waiting out the busy timeout,
         // because SQLite will not retry an upgrade that could deadlock.
+        // The long waits that first showed this up were a scratch setup run
+        // opening the real machine's store, not a holder inside the wizard:
+        // with each run on its own store the lock is taken in microseconds.
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         config::write_configuration(&tx, configuration)?;
         tx.commit()?;

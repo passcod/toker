@@ -7,6 +7,7 @@ Scenarios that verify configuration lives in the store, is edited live from the 
 - [x] The store path defaults under the user data directory, and `TOKER_DB` overrides it (verifies spec: DCONF)
 - [x] The listener port defaults, and `PORT` overrides it (verifies spec: DCONF)
 - [ ] The service, a command and the dashboard resolve the same port and store path from the same environment (verifies spec: DCONF)
+- [x] Setup writes the store the environment resolves, and carries a non-default one into the service's unit (verifies spec: DCONF)
 - [ ] A command that cannot reach the service names the port it tried (verifies spec: DCONF)
 
 ## Reading configuration from the store
@@ -37,6 +38,8 @@ Scenarios that verify configuration lives in the store, is edited live from the 
 - [ ] An import interrupted before the removal is repaired by running setup again, to the same rows (verifies spec: RMIG, DCONF)
 - [ ] An import whose routing fields do not validate writes nothing and removes nothing (verifies spec: RMIG)
 - [x] The file's routing fields are not stored as configuration (verifies spec: RMIG)
+- [x] A file naming a store other than the resolved one stops setup before anything changes, naming both and `TOKER_DB` (verifies spec: DCONF)
+- [x] A file naming the store setup will write imports like any other (verifies spec: DCONF)
 - [ ] Setup reports what it read from the file before importing it (verifies spec: USETUP)
 
 ## Editing live
