@@ -787,6 +787,104 @@ impl Store {
         state::load_meters(&*self.conn()?, provider_id)
     }
 
+    /// Overwrite one account's last snapshot on a provider. A reading from
+    /// an unresolved credential names no account and so reaches no slot
+    /// here, which is what keeps it out of every account's reading and fit
+    /// (spec: ACCT#an-account-not-yet-known).
+    pub fn save_account_meters(
+        &self,
+        provider_id: &str,
+        account_number: i64,
+        snapshot: &MetersSnapshot,
+    ) -> Result<()> {
+        state::save_account_meters(&*self.conn()?, provider_id, account_number, snapshot)
+    }
+
+    /// One account's last meter snapshot on a provider.
+    pub fn load_account_meters(
+        &self,
+        provider_id: &str,
+        account_number: i64,
+    ) -> Result<Option<MetersSnapshot>> {
+        state::load_account_meters(&*self.conn()?, provider_id, account_number)
+    }
+
+    /// Every account's last snapshot on a provider, by account number.
+    pub fn load_meters_by_account(&self, provider_id: &str) -> Result<Vec<(i64, MetersSnapshot)>> {
+        state::load_meters_by_account(&*self.conn()?, provider_id)
+    }
+
+    /// The account a request on this provider is about: the one the
+    /// session is already being served on, and for a session with no row
+    /// yet the one the provider served last.
+    ///
+    /// Every quota read takes its account from here, so the gate, a
+    /// release and a revoke all agree about whose window is in question.
+    /// `None` is the answer when nothing has been served yet or no source
+    /// has named the credential — an absence each caller handles, rather
+    /// than a zero it could spend against (spec: ACCT#an-account-not-yet-known).
+    ///
+    /// A machine with one account answers both ways the same. A machine
+    /// with several can answer a session's very first request with the
+    /// wrong one; that request writes the row that settles it, so the
+    /// window of error is one request and it does not recur.
+    pub fn account_for(&self, provider_id: &str, session_id: Option<&str>) -> Result<Option<i64>> {
+        if let Some(session_id) = session_id
+            && let Some(account) = self.session_account(provider_id, session_id)?
+        {
+            return Ok(Some(account));
+        }
+        if let Some(account) = self.provider_account(provider_id)? {
+            return Ok(Some(account));
+        }
+        // Nothing served yet. One account known is not a guess, so take it;
+        // several, and which one a request is on is exactly what nothing
+        // has said yet, so answer none rather than pick the nearest.
+        self.sole_account(provider_id)
+    }
+
+    /// The provider's only known account, or `None` where it holds none or
+    /// holds more than one.
+    pub fn sole_account(&self, provider_id: &str) -> Result<Option<i64>> {
+        // Two is enough to know it is not one.
+        let mut numbers: Vec<i64> = rows_of(
+            &*self.conn()?,
+            "SELECT number FROM accounts WHERE provider = ?1 ORDER BY number LIMIT 2",
+            [provider_id],
+            |row| Ok(row.get("number")?),
+        )?;
+        Ok(if numbers.len() == 1 {
+            numbers.pop()
+        } else {
+            None
+        })
+    }
+
+    /// The account a provider most recently served, whatever the session.
+    pub fn provider_account(&self, provider_id: &str) -> Result<Option<i64>> {
+        row_of(
+            &*self.conn()?,
+            "SELECT account_number FROM requests
+             WHERE provider = ?1 AND account_number IS NOT NULL
+             ORDER BY ts_ms DESC, id DESC LIMIT 1",
+            [provider_id],
+            |row| Ok(row.get("account_number")?),
+        )
+    }
+
+    /// The account a session is being served on: the newest row of that
+    /// session that names one.
+    pub fn session_account(&self, provider_id: &str, session_id: &str) -> Result<Option<i64>> {
+        row_of(
+            &*self.conn()?,
+            "SELECT account_number FROM requests
+             WHERE provider = ?1 AND session_id = ?2 AND account_number IS NOT NULL
+             ORDER BY ts_ms DESC, id DESC LIMIT 1",
+            (provider_id, session_id),
+            |row| Ok(row.get("account_number")?),
+        )
+    }
+
     /// Set a meta key/value.
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         state::set_meta(&*self.conn()?, key, value)
@@ -2630,8 +2728,10 @@ mod tests {
         assert_eq!(store.load_model("unknown/model").expect("missing"), None);
 
         // Allowances: idempotent per (session, meter, reset).
+        let account = crate::test_support::account(&store, "anthropic_sub", "one@example.test");
         let five_h = Allowance {
             session_id: "ses-1".to_string(),
+            account_number: account,
             meter: "5h".to_string(),
             reset_value: 1_769_100_000_000,
             release: Release::Overage,
@@ -2640,6 +2740,7 @@ mod tests {
         store.record_allowance(&five_h).expect("record again");
         let seven_d = Allowance {
             session_id: "ses-1".to_string(),
+            account_number: account,
             meter: "7d".to_string(),
             reset_value: 1_769_700_000_000,
             release: Release::Plan,
@@ -2917,8 +3018,10 @@ mod tests {
         // Epoch milliseconds now; resets are epoch seconds.
         let now = 1_790_000_000_500;
         let now_s = now / 1000;
+        let account = crate::test_support::account(&store, "anthropic_sub", "one@example.test");
         let allowance = |session: &str, meter: &str, reset_value: i64| Allowance {
             session_id: session.to_owned(),
+            account_number: account,
             meter: meter.to_owned(),
             reset_value,
             release: Release::Overage,
@@ -5330,3 +5433,4 @@ mod tests {
         }
     }
 }
+

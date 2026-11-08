@@ -1424,8 +1424,9 @@ mod tests {
         row.provider = Some("anthropic_sub".to_owned());
         store.record_request(&row).expect("record");
         store
-            .save_meters(
+            .save_account_meters(
                 "anthropic_sub",
+                crate::test_support::account(&store, "anthropic_sub", "one@example.test"),
                 &MetersSnapshot {
                     updated_ms: now.as_millisecond(),
                     snapshot: serde_json::json!({

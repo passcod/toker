@@ -297,7 +297,13 @@ impl ReadyMessagesAttempt {
                 .as_ref()
                 .and_then(|digest| server.observe_credential(self.backend.id(), digest));
         }
-        super::anthropic::note_meters(server, self.backend.as_ref(), upstream.response.headers());
+        let account_number = self.record.as_ref().and_then(|ctx| ctx.account_number);
+        super::anthropic::note_meters(
+            server,
+            self.backend.as_ref(),
+            account_number,
+            upstream.response.headers(),
+        );
         let retry = match super::anthropic::retry_thinking_off(
             server,
             self.backend.as_ref(),
@@ -343,7 +349,12 @@ impl ReadyMessagesAttempt {
                 )
             }
             super::anthropic::ThinkingRetry::Retried(upstream) => {
-                super::anthropic::note_meters(server, self.backend.as_ref(), upstream.headers());
+                super::anthropic::note_meters(
+                    server,
+                    self.backend.as_ref(),
+                    account_number,
+                    upstream.headers(),
+                );
                 let status = upstream.status();
                 let rate_limits = parse_rate_limits(upstream.headers());
                 (

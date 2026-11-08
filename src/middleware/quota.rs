@@ -613,6 +613,7 @@ mod tests {
     fn allowance(meter: &str, reset: i64) -> Allowance {
         Allowance {
             session_id: "ses-test".to_owned(),
+            account_number: 1,
             meter: meter.to_owned(),
             reset_value: reset,
             release: Release::Overage,

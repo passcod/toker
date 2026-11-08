@@ -24,6 +24,7 @@ pub const GATED_BACKEND: &str = "anthropic_sub";
 pub fn record_grant(
     store: &Store,
     session_id: &str,
+    account_number: i64,
     release: Release,
     fresh: &Grant,
 ) -> anyhow::Result<()> {
@@ -34,6 +35,7 @@ pub fn record_grant(
         if let Some(reset) = reset {
             store.record_allowance(&Allowance {
                 session_id: session_id.to_owned(),
+                account_number,
                 meter: meter.as_str().to_owned(),
                 reset_value: reset,
                 release,
@@ -47,24 +49,37 @@ pub fn record_grant(
 /// granted, the live allowance already held for the rest. The merge never
 /// replaces: a release while only the 5-hour window is spent must not
 /// read as wiping an existing 7-day allowance.
-pub fn merged(store: &Store, session_id: &str, fresh: &Grant, now_ms: i64) -> Grant {
+pub fn merged(
+    store: &Store,
+    session_id: &str,
+    account_number: i64,
+    fresh: &Grant,
+    now_ms: i64,
+) -> Grant {
     Grant {
         five_hour: fresh
             .five_hour
-            .or_else(|| prior_live(store, session_id, "5h", now_ms)),
+            .or_else(|| prior_live(store, session_id, account_number, "5h", now_ms)),
         seven_day: fresh
             .seven_day
-            .or_else(|| prior_live(store, session_id, "7d", now_ms)),
+            .or_else(|| prior_live(store, session_id, account_number, "7d", now_ms)),
     }
 }
 
 /// The live prior allowance a session holds for one meter. A store error
 /// reads as nothing held: this only shapes the record, never the gate.
-fn prior_live(store: &Store, session_id: &str, meter: &str, now_ms: i64) -> Option<i64> {
+fn prior_live(
+    store: &Store,
+    session_id: &str,
+    account_number: i64,
+    meter: &str,
+    now_ms: i64,
+) -> Option<i64> {
     store
         .load_session_allowances(session_id)
         .ok()?
         .into_iter()
+        .filter(|allowance| allowance.account_number == account_number)
         .filter(|allowance| allowance.meter == meter)
         .map(|allowance| allowance.reset_value)
         .filter(|reset| reset.saturating_mul(1000) > now_ms)
@@ -84,15 +99,20 @@ pub fn grant_from_tui(
     gates: &GatesConfig,
     now_ms: i64,
 ) -> anyhow::Result<Grant> {
+    // A release spends one account's window, so there is nothing to grant
+    // until Toker knows whose window this session is on.
+    let Some(account_number) = store.account_for(GATED_BACKEND, Some(session_id))? else {
+        bail!("no account is known for this session yet");
+    };
     let meters = store
-        .load_meters(GATED_BACKEND)?
+        .load_account_meters(GATED_BACKEND, account_number)?
         .map(|meters| meters.snapshot);
     let fresh = grant_ahead(meters.as_ref().map(Meters::over), now_ms);
     if fresh.five_hour.is_none() && fresh.seven_day.is_none() {
         bail!("no meter reading names a window to release yet");
     }
-    record_grant(store, session_id, release, &fresh)?;
-    let merged = merged(store, session_id, &fresh, now_ms);
+    record_grant(store, session_id, account_number, release, &fresh)?;
+    let merged = merged(store, session_id, account_number, &fresh, now_ms);
     let mut row = released_row(
         session_id,
         GATED_BACKEND,
@@ -120,9 +140,14 @@ pub fn revoke_from_tui(
     if gone == 0 {
         return Ok(0);
     }
-    let meters = store
-        .load_meters(GATED_BACKEND)?
-        .map(|meters| meters.snapshot);
+    // The revoke itself needs no account — it closes the session's gate
+    // whatever it was released against. The row beside it carries the
+    // reading it was revoked against, where one is known.
+    let meters = match store.account_for(GATED_BACKEND, Some(session_id))? {
+        Some(account_number) => store.load_account_meters(GATED_BACKEND, account_number)?,
+        None => None,
+    }
+    .map(|meters| meters.snapshot);
     let mut row = gate_row(
         RowKind::Revoked,
         session_id,
@@ -278,9 +303,13 @@ mod tests {
 
     fn store_with(util5h: f64, util7d: f64) -> Store {
         let store = Store::open(":memory:").expect("store");
+        // The only account on this provider, so it is the one every
+        // session here is served on.
+        let account = crate::test_support::account(&store, GATED_BACKEND, "one@example.test");
         store
-            .save_meters(
+            .save_account_meters(
                 GATED_BACKEND,
+                account,
                 &MetersSnapshot {
                     updated_ms: NOW,
                     snapshot: json!({
@@ -313,6 +342,7 @@ mod tests {
             store.load_session_allowances("ses-a").expect("allowances"),
             vec![Allowance {
                 session_id: "ses-a".to_owned(),
+                account_number: 1,
                 meter: "5h".to_owned(),
                 reset_value: RESET5H,
                 release: Release::Plan,

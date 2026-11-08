@@ -173,7 +173,12 @@ impl ReadyAttempt {
                 .as_ref()
                 .and_then(|digest| server.observe_credential(self.backend.id(), digest));
         }
-        super::anthropic::note_meters(server, self.backend.as_ref(), upstream.response.headers());
+        super::anthropic::note_meters(
+            server,
+            self.backend.as_ref(),
+            record.as_ref().and_then(|ctx| ctx.account_number),
+            upstream.response.headers(),
+        );
         let response_status = upstream.response.status();
         match super::attempt::precommit_anthropic(upstream.response).await {
             Ok(super::attempt::PrecommitOutcome::Accepted { response, .. }) => {

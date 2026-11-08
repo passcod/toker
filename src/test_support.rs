@@ -40,3 +40,24 @@ mod tests {
         assert!(!path.exists(), "tempfile removed the tree");
     }
 }
+
+/// An account in the store, for fixtures that need one to hang quota state
+/// off. Accounts are learned rather than created, so this learns one the
+/// way the proxy does: a credential digest, named by a local identity.
+#[cfg(test)]
+pub(crate) fn account(store: &crate::store::Store, provider: &str, email: &str) -> i64 {
+    let digest = crate::providers::credential_digest(email);
+    store
+        .observe_credential(
+            provider,
+            &digest,
+            0,
+            Some(&crate::store::AccountIdentity {
+                upstream_id: None,
+                email: Some(email.to_owned()),
+                named_by: crate::store::AccountNameSource::Local,
+            }),
+        )
+        .expect("observe the fixture credential")
+        .expect("the identity names an account")
+}

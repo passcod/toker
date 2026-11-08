@@ -422,6 +422,9 @@ pub struct ModelEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Allowance {
     pub session_id: String,
+    /// The account whose window this releases. A release spends one
+    /// account's quota and never another's (spec: ACCT#what-is-attributed-to-an-account).
+    pub account_number: i64,
     pub meter: String,
     pub reset_value: i64,
     /// What the release covers: overage, or only the plan's own room.
@@ -1892,13 +1895,14 @@ pub(super) fn prune_lanes(
 /// overage was fine for this window.
 pub(super) fn record_allowance(conn: &Connection, allowance: &Allowance) -> Result<()> {
     conn.execute(
-        "INSERT INTO allowances (session_id, meter, reset_value, release)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT (session_id, meter, reset_value) DO UPDATE SET
+        "INSERT INTO allowances (session_id, account_number, meter, reset_value, release)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (session_id, account_number, meter, reset_value) DO UPDATE SET
            release = CASE WHEN excluded.release = 'overage' THEN 'overage'
                           ELSE allowances.release END",
         (
             &allowance.session_id,
+            allowance.account_number,
             &allowance.meter,
             allowance.reset_value,
             release_name(allowance.release),
@@ -1910,8 +1914,8 @@ pub(super) fn record_allowance(conn: &Connection, allowance: &Allowance) -> Resu
 pub(super) fn load_allowances(conn: &Connection) -> Result<Vec<Allowance>> {
     rows_of(
         conn,
-        "SELECT session_id, meter, reset_value, release FROM allowances
-         ORDER BY session_id, meter, reset_value",
+        "SELECT session_id, account_number, meter, reset_value, release FROM allowances
+         ORDER BY session_id, account_number, meter, reset_value",
         [],
         read_allowance,
     )
@@ -1927,9 +1931,9 @@ pub(super) fn load_session_allowances(
 ) -> Result<Vec<Allowance>> {
     rows_of(
         conn,
-        "SELECT session_id, meter, reset_value, release FROM allowances
+        "SELECT session_id, account_number, meter, reset_value, release FROM allowances
          WHERE session_id = ?1
-         ORDER BY meter, reset_value",
+         ORDER BY account_number, meter, reset_value",
         [session_id],
         read_allowance,
     )
@@ -1969,6 +1973,7 @@ fn read_allowance(row: &rusqlite::Row<'_>) -> Result<Allowance> {
     let release: String = row.get("release")?;
     Ok(Allowance {
         session_id: row.get("session_id")?,
+        account_number: row.get("account_number")?,
         meter: row.get("meter")?,
         reset_value: row.get("reset_value")?,
         // A spelling this binary does not know reads as the narrower
@@ -2058,6 +2063,61 @@ pub(super) fn load_meters(conn: &Connection, provider_id: &str) -> Result<Option
         "SELECT updated_ms, snapshot FROM meters_by_provider WHERE provider_id = ?1",
         [provider_id],
         read_meters,
+    )
+}
+
+/// One account's latest meter snapshot on a provider. A reading belongs to
+/// the account that reported it, so one account's never replaces another's
+/// (spec: ACCT#what-is-attributed-to-an-account).
+pub(super) fn save_account_meters(
+    conn: &Connection,
+    provider_id: &str,
+    account_number: i64,
+    snapshot: &MetersSnapshot,
+) -> Result<()> {
+    let snapshot_json = serde_json::to_string(&snapshot.snapshot)?;
+    conn.execute(
+        "INSERT INTO meters_by_account (provider_id, account_number, updated_ms, snapshot)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (provider_id, account_number) DO UPDATE SET
+             updated_ms = excluded.updated_ms,
+             snapshot = excluded.snapshot",
+        (
+            provider_id,
+            account_number,
+            snapshot.updated_ms,
+            snapshot_json,
+        ),
+    )?;
+    Ok(())
+}
+
+pub(super) fn load_account_meters(
+    conn: &Connection,
+    provider_id: &str,
+    account_number: i64,
+) -> Result<Option<MetersSnapshot>> {
+    row_of(
+        conn,
+        "SELECT updated_ms, snapshot FROM meters_by_account
+         WHERE provider_id = ?1 AND account_number = ?2",
+        (provider_id, account_number),
+        read_meters,
+    )
+}
+
+/// Every account's latest snapshot on a provider, by account number: the
+/// dashboard's strip reads them together to lay them out side by side.
+pub(super) fn load_meters_by_account(
+    conn: &Connection,
+    provider_id: &str,
+) -> Result<Vec<(i64, MetersSnapshot)>> {
+    rows_of(
+        conn,
+        "SELECT account_number, updated_ms, snapshot FROM meters_by_account
+         WHERE provider_id = ?1 ORDER BY account_number",
+        [provider_id],
+        |row| Ok((row.get("account_number")?, read_meters(row)?)),
     )
 }
 

@@ -44,6 +44,8 @@ fn allowances_of(value: Option<&Value>) -> Vec<Allowance> {
         if let Some(reset) = value.get(key).and_then(Value::as_i64) {
             out.push(Allowance {
                 session_id: "fixture".to_owned(),
+                // ctp metered one account, so the fixture is all one.
+                account_number: 1,
                 meter: meter.to_owned(),
                 reset_value: reset,
                 // ctp had only the one marker.

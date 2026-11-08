@@ -948,6 +948,38 @@ pub(super) const MIGRATIONS: &[&str] = &[
     CREATE INDEX requests_provider_account_idx
         ON requests (provider, account_number, ts_ms);
     "#,
+    // v20 — quota state belongs to the account that spent it rather than to
+    // the provider it was spent through (spec: ACCT#what-is-attributed-to-an-account).
+    // A provider whose accounts Toker cannot tell apart holds none, and keeps
+    // reading and writing `meters_by_provider`.
+    //
+    // Allowances rebuild rather than widen: the key gains the account, and a
+    // row that names none could not be honoured under the new rule anyway.
+    // Nothing is lost that the ledger needs — this table is live state, and
+    // every row in it prunes when its own window ends.
+    r#"
+    CREATE TABLE meters_by_account (
+        provider_id    TEXT NOT NULL,
+        account_number INTEGER NOT NULL REFERENCES accounts(number),
+        updated_ms     INTEGER NOT NULL,
+        snapshot       TEXT NOT NULL,
+        PRIMARY KEY (provider_id, account_number)
+    );
+
+    CREATE TABLE allowances_v20 (
+        session_id     TEXT NOT NULL,
+        account_number INTEGER NOT NULL REFERENCES accounts(number),
+        meter          TEXT NOT NULL,
+        reset_value    INTEGER NOT NULL,
+        release        TEXT NOT NULL DEFAULT 'overage',
+        PRIMARY KEY (session_id, account_number, meter, reset_value)
+    );
+    DROP TABLE allowances;
+    ALTER TABLE allowances_v20 RENAME TO allowances;
+
+    ALTER TABLE pings ADD COLUMN account_number INTEGER REFERENCES accounts(number);
+    ALTER TABLE lanes ADD COLUMN account_number INTEGER REFERENCES accounts(number);
+    "#,
 ];
 
 fn validate_v10_history(conn: &Connection) -> Result<()> {

@@ -300,7 +300,11 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     };
     let gate_model = Some(policy_attempt.plan.effective_model.clone());
     let backend = target.provider().clone();
-    let meters = super::quota_gate::load_meters(&server, backend.id());
+    let meters = super::quota_gate::load_meters_for(
+        &server,
+        backend.id(),
+        super::quota_gate::gate_account(&server, backend.id(), session_id.as_deref()),
+    );
     let release = crate::middleware::canonical::release_marker(&inference.canonical());
     if let Some((release, grant)) = super::quota_gate::grant_release(
         &server,
