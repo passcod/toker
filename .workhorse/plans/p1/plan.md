@@ -80,9 +80,25 @@ The deeper divergences go to #S1, because they are behaviour rather than wording
 
 ## Steps
 
-- [ ] Write `design-system.md`
-- [ ] Write `mockups.md`
-- [ ] Write `designs/tui-shell.html`
-- [ ] Build the 120×40 dashboard worked example in colour
-- [ ] Tighten UTUI: colour as function, glyphs as function, the full shedding order
-- [ ] Bring the config pages' panel titles into line
+- [x] Write `design-system.md`
+- [x] Write `mockups.md`
+- [x] Write `designs/tui-shell.html`
+- [x] Build the 120×40 dashboard worked example in colour, as `designs/dashboard-reference.html`
+- [x] Tighten UTUI: colour as function, glyphs as function, the full shedding order
+- [x] Bring the config pages' panel titles into line
+- [x] Pin the config pages as frames, which they had never been
+
+## What building it taught
+
+Hand-padding a frame does not work.
+The first shell frame came out between 85 and 91 cells a row, which is the exact failure the guide warns about, so both frames are now built by a method that makes the width right by construction: author the plain grid, assert every row, then wrap styled runs in spans without ever rewriting the text.
+That rule — wrap, never rewrite — is what lets `dashboard-reference.html` be checked character-for-character against the snapshot it came from, and it is why the width check is in the guide rather than left to the eye.
+
+Reading the styles out rather than guessing them paid twice.
+The hit rate's figure is plain and only its bar is coloured, which no reasonable author would guess.
+And ses-crow sits at 85% occupancy, over the band that would turn a bar red, but it has been idle ten minutes, so the bar dims and the `← compacts soon` marker never appears — idle wins over the threshold.
+Both are now in the reference with the reason beside them.
+
+The config pages turned out to have no frame tests at all, alone among the rendered surfaces.
+That is why changing their titles broke nothing, and it was also a hole in the guide, which tells a mockup author to start from a pinned frame and could not point at one for those pages.
+They now have three: providers, settings, and either page with the service down.

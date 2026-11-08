@@ -14,10 +14,53 @@ Rendering MUST be a pure function of a captured snapshot, the clock and the view
 > [!NOTE]
 > A renderer that reads the time or the environment cannot be asserted against at several terminal sizes without a real terminal.
 
-A table MUST shed columns before its content is truncated.
-
 A number shown to a person MAY be formatted to the host's locale.
 That formatting MUST NOT reach a gate notice, as [GNOTE](../gates/notices.md#a-notice-is-byte-stable) requires.
+
+### What is shed first
+
+The dashboard MUST render into whatever terminal size it is given, shedding in a fixed order rather than clipping.
+
+Panel framing MUST be shed before any content is.
+A table MUST shed columns before its content is truncated.
+A panel MUST shed its own rows down to the reading it exists to give before any panel is dropped whole.
+The quota block MUST NOT be shed.
+
+> [!NOTE]
+> A border is the cheapest thing on the page to lose and the quota block is the part worth watching, so the order is a statement of what the dashboard is for, written as what it gives up last.
+
+The column naming a session MUST keep a width it can be read at in preference to any column of figures, and MUST fall back to an identifier short enough to tell sessions apart where it cannot.
+
+> [!NOTE]
+> A session's title is what identifies the row; a peak or an output total is not.
+
+### Distinguishing a reading
+
+A meter approaching exhaustion MUST read as distinct from one on track, and an exhausted one from both.
+A forecast that reaches an armed gate MUST read as distinct from one that reaches true exhaustion.
+
+> [!NOTE]
+> A gate is recoverable, a release spending past it, where exhaustion is not. They are different walls, and an operator acts differently on each.
+
+A reading taken from a window that has rolled over, or one there is too little data to make, MUST say so in words rather than render a figure that looks measured.
+
+A reading MUST NOT be distinguished by colour alone.
+The dashboard MUST honour `NO_COLOR`, and MUST remain readable with every colour removed.
+
+> [!NOTE]
+> Rendering without colour is a supported mode, so a distinction carried by hue alone vanishes in it. This spec therefore names no colour and no threshold; which hue carries which reading, and where each band falls, are design decisions recorded in [the design guide](../../design/design-system.md).
+
+### Marks
+
+A session MUST be marked where it was served on a model newer than the one it asked for, and that mark MUST distinguish the latest turn from an earlier one.
+A session MUST be marked where it holds a release, and the two kinds of release MUST be distinguishable from each other.
+
+A value that was not reported MUST be marked as such, and MUST be distinguishable both from one that is unknown and from a floor, as [STORE](../store/overview.md#not-recorded-is-not-zero) requires.
+
+Every mark the dashboard renders MUST be explained in the legend, and the legend MUST explain no mark the dashboard does not render.
+
+> [!NOTE]
+> The legend is the operator's dictionary. A mark missing from it is undocumented, and an entry with nothing behind it is a claim about a screen that does not exist. Which glyph carries which mark is a design decision, recorded in the design guide.
 
 ## The views
 

@@ -1,0 +1,211 @@
+<!-- spec: tui/dashboard.md -->
+<!-- The pinned 120x40 dashboard frame, drawn in colour.
+
+     The grid below is src/tui/snapshots/toker__tui__view__tests__
+     full_frame_120x40.snap, character for character. insta pins each
+     cell's symbol and discards its style, so the colour was added by
+     wrapping runs of that text in spans, never by rewriting it.
+
+     This is the thing to diff a mockup against when it looks wrong and
+     you cannot say why. Regenerate it if the snapshot changes. -->
+<!DOCTYPE html>
+<html lang="en-NZ">
+<head>
+<meta charset="utf-8">
+<title>Dashboard reference, 120x40, four sessions and an empty ledger</title>
+<style>
+  /* Ghostty's stock palette, the reference ground toker is developed
+     against. The TUI sets no RGB anywhere: it names the ANSI sixteen, so
+     these are the reference theme's answer, not values from the code. */
+  :root {
+    --bg: #282c34;  /* background      */  --fg: #ffffff;  /* foreground   */
+    --c0: #1d1f21;  /* black           */  --c8: #666666;  /* dark gray    */
+    --c1: #cc6666;  /* red             */  --c9: #d54e53;  /* bright red   */
+    --c2: #b5bd68;  /* green           */  --c10:#b9ca4a;  /* bright green */
+    --c3: #f0c674;  /* yellow          */  --c11:#e7c547;  /* bright yellow*/
+    --c4: #81a2be;  /* blue            */  --c12:#7aa6da;  /* bright blue  */
+    --c5: #b294bb;  /* magenta         */  --c13:#c397d8;  /* bright mag.  */
+    --c6: #8abeb7;  /* cyan            */  --c14:#70c0b1;  /* bright cyan  */
+    --c7: #c5c8c6;  /* white           */  --c15:#eaeaea;  /* bright white */
+  }
+
+  body {
+    background: #14161a;
+    color: var(--c7);
+    font-family: system-ui, sans-serif;
+    margin: 0;
+    padding: 2rem;
+  }
+
+  /* One terminal frame. Width is set in ch so it resolves against
+     Iosevka's own advance rather than a guessed cell size: naming the
+     font matters, because Iosevka is narrower per cell than most
+     monospace faces and a frame set in a generic monospace comes out
+     wider than it ever renders. */
+  .frame {
+    font-family: Iosevka, "Iosevka Term", "Iosevka Fixed", monospace;
+    font-size: 15px;
+    line-height: 1.2;
+    background: var(--bg);
+    color: var(--fg);
+    padding: 0.6rem 1rem;
+    margin: 0 0 0.5rem;
+    white-space: pre;
+    overflow-x: auto;
+    width: max-content;
+    font-variant-ligatures: none;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Foreground colours. Each sets --now as well, so .r can swap them. */
+  .black   { color: var(--c0); --now: var(--c0); }
+  .red     { color: var(--c1); --now: var(--c1); }
+  .green   { color: var(--c2); --now: var(--c2); }
+  .yellow  { color: var(--c3); --now: var(--c3); }
+  .blue    { color: var(--c4); --now: var(--c4); }
+  .cyan    { color: var(--c6); --now: var(--c6); }
+  .gray    { color: var(--c8); --now: var(--c8); }
+
+  /* Modifiers. Compose them: class="green b", class="cyan d". */
+
+  /* BOLD is the emphasis channel, since colour is not. It keeps its
+     colour: the reference terminal leaves bold-color unset, so bold does
+     not remap onto the bright palette. */
+  .b { font-weight: 700; }
+
+  /* DIM at exactly the terminal's faint-opacity, so it keeps the colour
+     underneath rather than flattening to grey. A dim green mark is still
+     a green mark. */
+  .d { opacity: 0.5; }
+
+  /* REVERSED swaps foreground and background. --now carries whatever
+     colour class came before; plain text falls back to the foreground. */
+  .r { color: var(--bg); background-color: var(--now, var(--fg)); }
+
+  /* The one explicit pair in the TUI: an armed burn control. */
+  .on-yellow { color: var(--c0); background-color: var(--c3); }
+
+  /* A key rather than a screen, so its rows are deliberately ragged.
+     Anything claiming to be a frame has rows of equal width. */
+  .swatch { width: auto; }
+
+  /* Annotation outside the frame. Never inside it: a terminal has no
+     room for a note, and a mockup that puts one there is not a frame. */
+  .note {
+    font-size: 0.85rem;
+    color: #8b8f96;
+    margin: 0 0 1.5rem;
+    max-width: 70ch;
+    line-height: 1.5;
+  }
+  .note strong { color: var(--c7); font-weight: 600; }
+  h1 { font-size: 1.1rem; font-weight: 600; color: var(--fg); margin: 0 0 0.25rem; }
+  h2 { font-size: 0.95rem; font-weight: 600; color: var(--c7); margin: 2rem 0 0.5rem; }
+</style>
+</head>
+<body>
+
+<h1>Dashboard reference &mdash; 120&times;40</h1>
+<p class="note">
+  The pinned test frame, character for character, with the styles the
+  renderer applies to it. Four sessions, one of them idle, twelve
+  requests, and a ledger with no recent row. Use it to check a mockup:
+  if an unchanged region of yours does not match this, the mockup is
+  wrong, not the reference.
+</p>
+
+<pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>last 30m · 4 sessions · 1 idle · 12 requests                                             last req <span class="red">no data</span> · 12:34:56
+┌SESSIONS──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│session                                                    ctx model         reqs prompt now    peak msgs ↺   out idle│
+│ses-free                                                    <span class="green b">1M</span> sonnet-5 <span class="yellow">$</span>       3      2,500   2,500    <span class="d">-</span> <span class="d">-</span>    60   1m│
+│ses-hot                                                     <span class="green b">1M</span> opus-5 <span class="green b">↑</span>         3    470,893 472,000   77 1 2,304   1m│
+│ses-myst                                                     <span class="d">?</span> gpt-5.6-terra    3      3,132   3,132    <span class="d">-</span> <span class="d">-</span>    40   2m│
+│ses-crow                                                  <span class="yellow">200k</span> haiku-4-5        3    170,000 170,000    <span class="d">-</span> <span class="d">-</span>   100  <span class="d">10m</span>│
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌CONTEXT───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ses-free                  <span class="cyan">░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░</span>         2,500 / <span class="green b">1M</span>     0%              │
+│ses-hot                   <span class="cyan">████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░</span>       470,893 / <span class="green b">1M</span>    47%              │
+│ses-myst                          3,132 / <span class="d">?</span>                                                                           │
+│ses-crow                  <span class="d">████████████████████████████████████████████░░░░░░░░</span>       170,000 / <span class="yellow">200k</span>  85%  <span class="d">idle 10m</span>    │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌TOKENS────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│fresh input           31,493  <span class="d">▬</span>                                                                          2%           │
+│cache read         1,608,393  <span class="d">▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬</span>       93%           │
+│cache write 1h        87,000  <span class="d">▬▬▬▬</span>                                                                       5%           │
+│cache write 5m        10,000                                                                             1%           │
+│output                ≥2,504  <span class="d">2 req unknown</span>                                                                           │
+│hit rate               94.3%  <span class="yellow">███████████████████████████████████████████████████████████████░░░░</span><span class="d"> of reusable prefix</span>  │
+│missed                97,000  <span class="d">rewritten · 8,083/req · 1 of 12 req reused nothing</span>                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌CACHE REBUILDS────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│2 of 9 requests rewrote ≥50,000 tokens                                                                                │
+│system prompt changed      1  <span class="d">▬</span>                                                                                       │
+│new prefix / first turn    1  <span class="d">▬</span>                                                                                       │
+│<span class="d">· ses-hot — system prompt changed (43,696 → 43,801 chars; block 1, in the last 8 bytes)</span>                               │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌RATE &amp; QUOTA──────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  requests <span class="d">·················</span>▄▄▄<span class="d">···</span>▄▄▄███<span class="d">·</span> 0.4/min                                                                     │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</pre>
+
+<h2>Why each thing is coloured</h2>
+<p class="note">
+  <strong>Header.</strong> The <span class="gray r">&nbsp;?&nbsp;</span>
+  and <span class="blue r">&#8644;</span> chips are reversed, the only
+  handles on the page. <span class="red">no data</span> is red because
+  the ledger has no row at all, which is the same reading as a proxy
+  that has gone quiet &mdash; written out rather than shown as a zero age.
+</p>
+<p class="note">
+  <strong>Sessions.</strong> <span class="green b">1M</span> is green and
+  bold for a native million-token ceiling, the best case;
+  <span class="yellow">200k</span> is yellow for a known ceiling that is
+  not that; the dim <span class="d">?</span> is an unknown one. The
+  <span class="yellow">$</span> marks a session released past the armed
+  gate, and the <span class="green b">&uarr;</span> one served on a newer
+  model than it asked for, bright because it was the latest turn. Each
+  <span class="d">-</span> is dim: not reported, which is not zero. The
+  idle column dims only past three minutes, so
+  <span class="d">10m</span> is dim and <span>1m</span> is not.
+</p>
+<p class="note">
+  <strong>Context.</strong> Occupancy bars are cyan, which is identity
+  rather than judgement &mdash; a share is not good or bad. ses-crow sits
+  at 85%, over the threshold that would turn it red and add
+  <span class="red">&larr; compacts soon</span>, but it has been quiet
+  ten minutes, so the bar dims instead and the row says
+  <span class="d">idle 10m</span>. A quiet session is not about to
+  compact.
+</p>
+<p class="note">
+  <strong>Tokens.</strong> The <span class="d">&#9644;</span> proportion
+  bars are dim throughout: they annotate the counts, which are the row's
+  point. At 94.3% the hit rate falls in the yellow band, and only the bar
+  carries that colour &mdash; the figure itself stays plain, because plain
+  is the most prominent thing on the screen. The note and the
+  <span class="d">2 req unknown</span> caveat are dim.
+</p>
+<p class="note">
+  <strong>Rate.</strong> Empty minutes are a dim
+  <span class="d">&middot;</span> rather than a gap, so a quiet stretch
+  reads as quiet. No bucket here holds an error; one that did would be
+  bold red. The sparkline spans the whole window at any width, folding
+  minutes into wider buckets rather than dropping the oldest.
+</p>
+<p class="note">
+  <strong>What is not coloured</strong> is most of it. Names, counts,
+  models, column headings and panel borders are all plain, and plain
+  white sits at 14:1 against the ground while red sits at 3.77:1. The
+  screen reads as a calm readout because colour is doing less work than
+  an author expects.
+</p>
+
+</body>
+</html>

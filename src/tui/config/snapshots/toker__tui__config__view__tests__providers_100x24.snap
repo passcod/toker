@@ -1,0 +1,28 @@
+---
+source: src/tui/config/view.rs
+assertion_line: 258
+expression: "frame(&loaded(), 100, 24)"
+---
+ 1 providers   2 settings
+┌PROVIDERS─────────────────────────────────────────────────────────────────────────────────────────┐
+│anthropic_sub    on                                                                               │
+│    endpoint           (the built-in one)                                                         │
+│    credential         keyring                                                                    │
+│codex_sub        off                                                                              │
+│    endpoint           http://gateway.invalid                                                     │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+  space toggles  e edits  1/2 switches  q quits

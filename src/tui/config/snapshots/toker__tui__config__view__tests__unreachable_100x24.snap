@@ -1,0 +1,29 @@
+---
+source: src/tui/config/view.rs
+assertion_line: 275
+expression: "frame(&state, 100, 24)"
+---
+ 1 providers   2 settings
+┌CONFIGURATION─────────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                                  │
+│  the service is not answering                                                                    │
+│  configuration is edited through it, so there is nothing to show                                 │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+  space toggles  e edits  1/2 switches  q quits
+  config-snapshot: the service is not answering
