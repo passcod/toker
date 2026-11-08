@@ -1,1 +1,4 @@
 /target
+
+# Atomic-write temp files, left behind when an editor is interrupted.
+*.tmp.*
