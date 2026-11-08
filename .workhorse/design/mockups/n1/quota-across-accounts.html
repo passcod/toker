@@ -102,7 +102,21 @@
 │  <span class="d">binding</span>  five_hour<span class="red">   overage IN USE</span>             five_hour                                       │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘</pre>
 <p class="note">
-  Below the width two addresses need, accounts show by number, and the ones that do not fit are reached by cycling. <strong>… N more</strong> is the list-cut phrase the dashboard already uses, so the cut is stated rather than silent. The key that cycles is the open question: <strong>←</strong>/<strong>→</strong> already move between views, so reusing them costs no new glyph, but it does need a legend row.
+  Below the width two addresses need, accounts show by number. The strip scrolls sideways to reach the rest, so it needs no key of its own: the wheel and the arrows that already move between views carry it, and nothing new enters the legend. <strong>… N more</strong> is the list-cut phrase the dashboard already uses, turned on its side — a column at the edge rather than a line at the foot.
+</p>
+
+<h2>The same strip, scrolled one account</h2>
+<pre class="frame">┌RATE & QUOTA──────────────────────────────────────────────────────────────────────────────────────┐
+│  requests █<span class="d">··················</span>▂<span class="d">··········</span> 0.2/min                                                 │
+│           <span class="d">1 more …   </span><span class="cyan">acct 2</span><span class="d"> · 3 req</span>                         <span class="cyan">acct 3</span><span class="d"> · 1 req</span>                       │
+│  5-hour              <span class="red">██████████████████░</span> <span class="red"> 96%</span>  <span class="red">out ~15:12</span>   <span class="green">█░░░░░░░░░░░░░░░░░░</span> <span class="green">  7%</span>  <span class="green">on track</span>   │
+│  7-day               <span class="green">████░░░░░░░░░░░░░░░░░</span> <span class="green"> 18%</span>  <span class="green">on track</span>   <span class="green">█████████░░░░░░░░░░░░</span> <span class="green"> 41%</span>  <span class="green">on track</span> │
+│  overage             <span class="d">-</span>                                      <span class="d">-</span>                                    │
+│  spent               <span class="d">today </span><span class="d">0%</span><span class="d">  ·  </span><span class="d">30m </span><span class="d">0%</span>                    <span class="d">today </span><span class="d">0%</span><span class="d">  ·  </span><span class="d">30m </span><span class="d">0%</span>                  │
+│  <span class="d">binding</span>             five_hour                              five_hour                            │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘</pre>
+<p class="note">
+  The strip comes to rest on whole accounts. Scrolling by the cell would leave a bar cut down the middle, and a cut bar reads as a smaller share — the one comparison the columns exist to make, read wrong. The marker moves to whichever side is hiding something, so the cut is never silent.
 </p>
 
 </body>

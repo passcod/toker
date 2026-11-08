@@ -93,7 +93,17 @@ The dashboard MUST show the meters of each account that served traffic within it
 > The accounts worth a place are the ones the window is already about, the same rule the session rows follow, so an account the operator stopped using does not hold space forever.
 
 Meters MUST be laid out across the width available, showing as many accounts as fit.
-The accounts that do not fit MUST be reachable by cycling through them.
+The accounts that do not fit MUST be reachable by scrolling sideways.
+
+Scrolling MUST come to rest on whole accounts, and MUST NOT leave a meter showing in part.
+
+> [!NOTE]
+> A bar cut partway along reads as a smaller share than it holds, which is the comparison below read wrong rather than merely interrupted.
+
+The dashboard MUST say how many accounts are hidden, on each side hiding any.
+
+> [!NOTE]
+> The dashboard writes every other absence rather than computing it away, and a strip that quietly ends offers the accounts in view as though they were all of them.
 
 One meter's readings MUST be comparable by eye across the accounts shown together.
 
