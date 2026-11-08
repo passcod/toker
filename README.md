@@ -54,13 +54,12 @@ When using opencode, a custom sidebar and footer plugin augments the context and
 
 ## Routing
 
-Which backend serves a model, which models appear in Claude Code's `/model` picker, and the rest of Toker's routing live in the database, not in `toker.toml`.
+Which backend serves a model, which models appear in Claude Code's `/model` picker, and the rest of Toker's routing live in the database.
 Edit them in the routing page of `toker tui`: changes go into a draft, which you validate, preview and then activate, without restarting anything.
-`toker.toml` keeps the providers, their credentials, and the listener.
+The providers, their credentials and the gates live there too, on the providers and settings pages.
 
-`toker setup` writes that file and, the first time, compiles your routing choices (and any routing fields an older `toker.toml` carried: protocol defaults, model maps, picker rules) into the first active revision.
+`toker setup` writes that configuration and, the first time, compiles your routing choices (and any routing fields a `toker.toml` from an older version carried: protocol defaults, model maps, picker rules) into the first active revision.
 After that it never replaces the active routing.
-If you edit those fields in `toker.toml` by hand afterwards, use the routing page's status view to import them: `i` replaces the draft with the compiled file, and you activate it like any other draft.
 
 Claude Code's `/model` picker follows the active routing.
 Setup installs a daily timer that keeps the rows current, and the routing page syncs them after each activation.
@@ -72,12 +71,8 @@ Only models that take tools are offered, but OpenRouter only guarantees Claude C
 
 The setup wizard can enable `openai_api` and place its key in the OS keyring,
 read it from `OPENAI_API_KEY`, or leave authentication to the frontend.
-To
-configure it by hand, add the provider block:
-
-```toml
-[providers.openai_api]
-```
+You can
+also switch it on afterwards from the providers page of `toker tui`.
 
 Make it the Chat default in the routing page: in the routes view (`2`), select
 the default whose scope is `openai_chat`, press `e`, set its route to
@@ -103,11 +98,8 @@ with the same key and feeds the shared model catalogue.
 
 An OpenAI Chat frontend such as opencode can use the Codex subscription
 backend through the canonical mux.
-Enable the provider:
-
-```toml
-[providers.codex_sub]
-```
+Enable `codex_sub` on the providers page of
+`toker tui`.
 
 Then make it the Chat default in the routing page the same way as above, with
 `legacy-route-codex_sub-codex_responses` as the route (`e` on the
