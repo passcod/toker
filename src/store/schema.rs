@@ -948,6 +948,94 @@ pub(super) const MIGRATIONS: &[&str] = &[
     CREATE INDEX requests_provider_account_idx
         ON requests (provider, account_number, ts_ms);
     "#,
+    // v20 — mutable quota and cache state belongs to an account. Legacy state
+    // remains in its original provider-scoped rows until setup can safely
+    // attribute it; an unresolved digest does not feed any account state.
+    r#"
+    CREATE TABLE meters_by_account (
+        provider_id    TEXT NOT NULL,
+        account_number INTEGER NOT NULL REFERENCES accounts(number),
+        updated_ms     INTEGER NOT NULL,
+        snapshot       TEXT NOT NULL,
+        PRIMARY KEY (provider_id, account_number)
+    );
+
+    CREATE TABLE allowances_new (
+        session_id     TEXT NOT NULL,
+        account_number INTEGER REFERENCES accounts(number),
+        meter          TEXT NOT NULL,
+        reset_value    INTEGER NOT NULL,
+        release        TEXT NOT NULL DEFAULT 'overage',
+        PRIMARY KEY (session_id, account_number, meter, reset_value)
+    );
+    INSERT INTO allowances_new (session_id, account_number, meter, reset_value, release)
+        SELECT session_id, NULL, meter, reset_value, release FROM allowances;
+    DROP TABLE allowances;
+    ALTER TABLE allowances_new RENAME TO allowances;
+
+    ALTER TABLE pings ADD COLUMN account_number INTEGER REFERENCES accounts(number);
+
+    ALTER TABLE lanes ADD COLUMN pin_account_number INTEGER REFERENCES accounts(number);
+    DROP TRIGGER lanes_pin_insert_check;
+    DROP TRIGGER lanes_pin_update_check;
+    CREATE TRIGGER lanes_pin_insert_check
+    BEFORE INSERT ON lanes
+    WHEN NOT (
+        (NEW.policy_revision_id IS NULL
+         AND NEW.policy_route_id IS NULL
+         AND NEW.route_fingerprint IS NULL
+         AND NEW.candidate_id IS NULL
+         AND NEW.binding_id IS NULL
+         AND NEW.pin_account_number IS NULL
+         AND NEW.baseline_model IS NULL
+         AND NEW.effective_model IS NULL)
+        OR
+        (NEW.policy_revision_id IS NOT NULL
+         AND NEW.policy_route_id IS NOT NULL
+         AND NEW.route_fingerprint IS NOT NULL
+         AND NEW.candidate_id IS NOT NULL
+         AND NEW.binding_id IS NOT NULL
+         AND NEW.pin_account_number IS NOT NULL
+         AND NEW.baseline_model IS NOT NULL
+         AND NEW.effective_model IS NOT NULL
+         AND EXISTS (
+             SELECT 1 FROM routing_policy_revisions
+             WHERE revision_id = NEW.policy_revision_id
+         ))
+    ) BEGIN
+        SELECT RAISE(ABORT, 'invalid lane pin');
+    END;
+    CREATE TRIGGER lanes_pin_update_check
+    BEFORE UPDATE OF policy_revision_id, policy_route_id, route_fingerprint,
+                     candidate_id, binding_id, pin_account_number, baseline_model,
+                     effective_model
+    ON lanes
+    WHEN NOT (
+        (NEW.policy_revision_id IS NULL
+         AND NEW.policy_route_id IS NULL
+         AND NEW.route_fingerprint IS NULL
+         AND NEW.candidate_id IS NULL
+         AND NEW.binding_id IS NULL
+         AND NEW.pin_account_number IS NULL
+         AND NEW.baseline_model IS NULL
+         AND NEW.effective_model IS NULL)
+        OR
+        (NEW.policy_revision_id IS NOT NULL
+         AND NEW.policy_route_id IS NOT NULL
+         AND NEW.route_fingerprint IS NOT NULL
+         AND NEW.candidate_id IS NOT NULL
+         AND NEW.binding_id IS NOT NULL
+         AND NEW.pin_account_number IS NOT NULL
+         AND NEW.baseline_model IS NOT NULL
+         AND NEW.effective_model IS NOT NULL
+         AND EXISTS (
+             SELECT 1 FROM routing_policy_revisions
+             WHERE revision_id = NEW.policy_revision_id
+         ))
+    ) BEGIN
+        SELECT RAISE(ABORT, 'invalid lane pin');
+    END;
+    "#,
 ];
 
 fn validate_v10_history(conn: &Connection) -> Result<()> {
