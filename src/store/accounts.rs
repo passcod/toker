@@ -297,3 +297,92 @@ pub(super) fn load_credentials(conn: &Connection) -> Result<Vec<CredentialAccoun
         },
     )
 }
+
+/// How many of a provider's rows predate accounts: carrying neither an
+/// account nor the digest of the credential that served them
+/// (spec: ACCT#moving-a-machine-onto-accounts).
+///
+/// A row carrying a digest but no account is not one of these. Its account is
+/// simply not resolved yet, and resolving the digest backfills it.
+pub(super) fn unattributed_row_count(conn: &Connection, provider: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM requests
+         WHERE provider = ?1 AND account_number IS NULL AND credential_digest IS NULL",
+        [provider],
+        |row| row.get(0),
+    )?)
+}
+
+/// Why a history cannot be attributed to one account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixedHistory {
+    /// When the row that contradicted the window was logged.
+    pub at_ms: i64,
+    /// The reset the window open at that moment reported.
+    pub open_reset_s: i64,
+    /// The reset that row reported instead.
+    pub row_reset_s: i64,
+}
+
+/// Whether a provider's pre-account rows carry the meter windows of a single
+/// account (spec: ACCT#moving-a-machine-onto-accounts).
+///
+/// One account's windows form a series, each starting where the last one
+/// reset, so a row logged while a window is still open can only report that
+/// window's own reset. A row that reports a different one was served on a
+/// second account, whose window overlaps the first's in time.
+pub(super) fn unattributed_window_conflict(
+    conn: &Connection,
+    provider: &str,
+) -> Result<Option<MixedHistory>> {
+    let mut statement = conn.prepare(
+        "SELECT ts_ms, CAST(json_extract(rate_limits, '$.reset5h') AS INTEGER) AS reset5h
+         FROM requests
+         WHERE provider = ?1 AND account_number IS NULL AND credential_digest IS NULL
+           AND kind IS NULL AND rate_limits IS NOT NULL
+           AND json_type(rate_limits, '$.reset5h') IN ('integer', 'real')
+         ORDER BY ts_ms, id",
+    )?;
+    let mut rows = statement.query([provider])?;
+    // The window the walk believes is open, and the moment it last saw a row
+    // reporting it. A window ends at its reset, so a later row inside it that
+    // names another reset is the contradiction being looked for.
+    let mut open: Option<i64> = None;
+    while let Some(row) = rows.next()? {
+        let at_ms: i64 = row.get("ts_ms")?;
+        let reset_s: i64 = row.get("reset5h")?;
+        // Still inside the window the rows before it reported, yet naming a
+        // different one: the two cannot both be one account's.
+        if let Some(open_reset_s) = open
+            && open_reset_s != reset_s
+            && at_ms < open_reset_s.saturating_mul(1000)
+        {
+            return Ok(Some(MixedHistory {
+                at_ms,
+                open_reset_s,
+                row_reset_s: reset_s,
+            }));
+        }
+        open = Some(reset_s);
+    }
+    Ok(None)
+}
+
+/// Write `account` onto every one of a provider's pre-account rows, in one
+/// transaction (spec: ACCT#moving-a-machine-onto-accounts). Returns how many
+/// rows moved, so an interrupted move repeats harmlessly: a second run finds
+/// none left and reports zero.
+pub(super) fn attribute_unattributed_rows(
+    conn: &mut Connection,
+    provider: &str,
+    account: i64,
+) -> Result<usize> {
+    let tx = conn.transaction()?;
+    let moved = tx.execute(
+        "UPDATE requests SET account_number = ?2
+         WHERE provider = ?1 AND account_number IS NULL AND credential_digest IS NULL",
+        rusqlite::params![provider, account],
+    )?;
+    tx.commit()?;
+    Ok(moved)
+}

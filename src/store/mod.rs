@@ -32,7 +32,7 @@ mod schema;
 mod state;
 
 pub use accounts::{
-    Account, AccountIdentity, AccountNameSource, CredentialAccount, CredentialDigest,
+    Account, AccountIdentity, AccountNameSource, CredentialAccount, CredentialDigest, MixedHistory,
 };
 pub use config::{Configuration, ProviderConfigRow, SettingsConfigRow};
 pub use ledger::{
@@ -234,6 +234,26 @@ impl Store {
     /// Every observed credential digest, including entries no source has named.
     pub fn load_credential_accounts(&self) -> Result<Vec<CredentialAccount>> {
         accounts::load_credentials(&*self.conn()?)
+    }
+
+    /// How many of a provider's rows predate accounts, carrying neither an
+    /// account nor a credential digest. Setup moves these onto an account,
+    /// and every other command refuses while any remain.
+    pub fn unattributed_row_count(&self, provider: &str) -> Result<i64> {
+        accounts::unattributed_row_count(&*self.conn()?, provider)
+    }
+
+    /// Where a provider's pre-account rows carry two accounts' windows, the
+    /// row that proves it. `None` when they read as one account's history.
+    pub fn unattributed_window_conflict(&self, provider: &str) -> Result<Option<MixedHistory>> {
+        accounts::unattributed_window_conflict(&*self.conn()?, provider)
+    }
+
+    /// Write `account` onto every one of a provider's pre-account rows, in
+    /// one transaction. Returns how many moved.
+    pub fn attribute_unattributed_rows(&self, provider: &str, account: i64) -> Result<usize> {
+        let mut conn = self.conn()?;
+        accounts::attribute_unattributed_rows(&mut conn, provider, account)
     }
 
     /// Append many rows in one transaction — the import batch path (plan:
@@ -1746,6 +1766,123 @@ mod tests {
             Err(Error::UnknownDbValue { column: "kind", .. }) => {}
             other => panic!("unknown kind must error, got {other:?}"),
         }
+    }
+
+    /// A measurement row on `provider` reporting a five-hour reset.
+    #[cfg(test)]
+    fn window_row(ts_ms: i64, provider: &str, reset_s: i64) -> RequestRow {
+        let mut row = bare_row(ts_ms);
+        row.provider = Some(provider.to_owned());
+        row.rate_limits = Some(json!({"util5h": 0.1, "reset5h": reset_s}));
+        row
+    }
+
+    const HOUR_MS: i64 = 60 * 60 * 1000;
+
+    #[test]
+    fn rows_predating_accounts_are_counted_apart_from_rows_awaiting_resolution() {
+        let store = mem_store();
+        store
+            .record_request(&window_row(1_000, "anthropic_sub", 500))
+            .expect("record");
+        // Another provider's rows are not waiting on anything: it has no
+        // accounts to tell apart, so nothing could ever attribute them.
+        store
+            .record_request(&window_row(2_000, "openrouter", 500))
+            .expect("record");
+        // Served under a credential whose identity is not resolved yet. That
+        // row is attributed, to a digest, and resolving it backfills the
+        // account; setup has nothing to do for it.
+        let mut pending = window_row(3_000, "anthropic_sub", 500);
+        pending.credential_digest =
+            Some(CredentialDigest::new("ab".repeat(32)).expect("a well-formed digest"));
+        store.record_request(&pending).expect("record");
+
+        assert_eq!(
+            store
+                .unattributed_row_count("anthropic_sub")
+                .expect("count"),
+            1
+        );
+        assert_eq!(
+            store.unattributed_row_count("openrouter").expect("count"),
+            1,
+            "counted per provider, so a caller asks only about one that has accounts"
+        );
+    }
+
+    #[test]
+    fn one_accounts_windows_read_as_one_series_and_two_accounts_do_not() {
+        let store = mem_store();
+        let reset = |hours: i64| hours * 3_600;
+        // One series: each window's rows report its own reset, and the next
+        // window starts where the last one ended.
+        for (at_h, reset_h) in [(1, 5), (3, 5), (6, 10), (9, 10)] {
+            store
+                .record_request(&window_row(at_h * HOUR_MS, "anthropic_sub", reset(reset_h)))
+                .expect("record");
+        }
+        assert_eq!(
+            store
+                .unattributed_window_conflict("anthropic_sub")
+                .expect("walk"),
+            None
+        );
+
+        // A second account's window overlaps the first's: a row logged at
+        // hour 4, while the window resetting at hour 5 is still open, reports
+        // a reset of hour 8 instead.
+        store
+            .record_request(&window_row(4 * HOUR_MS, "anthropic_sub", reset(8)))
+            .expect("record");
+        assert_eq!(
+            store
+                .unattributed_window_conflict("anthropic_sub")
+                .expect("walk"),
+            Some(crate::store::MixedHistory {
+                at_ms: 4 * HOUR_MS,
+                open_reset_s: reset(5),
+                row_reset_s: reset(8),
+            })
+        );
+    }
+
+    #[test]
+    fn attributing_a_history_moves_every_row_once_and_repeats_harmlessly() {
+        let store = mem_store();
+        let account = crate::test_support::account(&store, "anthropic_sub", "one@example.test");
+        for at in [1_000, 2_000, 3_000] {
+            store
+                .record_request(&window_row(at, "anthropic_sub", 500))
+                .expect("record");
+        }
+        // A digest-bearing row is already attributed and must not be moved:
+        // whichever account its digest resolves to is not this one to choose.
+        let mut pending = window_row(4_000, "anthropic_sub", 500);
+        pending.credential_digest =
+            Some(CredentialDigest::new("ab".repeat(32)).expect("a well-formed digest"));
+        store.record_request(&pending).expect("record");
+
+        assert_eq!(
+            store
+                .attribute_unattributed_rows("anthropic_sub", account)
+                .expect("attribute"),
+            3
+        );
+        assert_eq!(
+            store
+                .unattributed_row_count("anthropic_sub")
+                .expect("count"),
+            0
+        );
+        // An interrupted move is repaired by running setup again, which finds
+        // nothing left to do rather than failing.
+        assert_eq!(
+            store
+                .attribute_unattributed_rows("anthropic_sub", account)
+                .expect("attribute"),
+            0
+        );
     }
 
     #[test]

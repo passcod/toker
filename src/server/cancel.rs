@@ -193,7 +193,7 @@ mod tests {
                 .expect("fingerprint"),
             candidate_id: CandidateId::new("candidate").expect("candidate"),
             binding_id: BindingId::new("openrouter.openrouter_chat_completions").expect("binding"),
-            account_number: Some(1),
+            account_number: None,
             baseline_model: "example/model".to_owned(),
             effective_model: "example/model".to_owned(),
         };

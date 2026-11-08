@@ -76,6 +76,46 @@ pub fn local_account_identities(
         .collect())
 }
 
+/// The provider whose accounts Toker can tell apart. The others reach one
+/// upstream identity per configured credential, so there is nothing to move.
+pub const ACCOUNTED_PROVIDER: &str = "anthropic_sub";
+
+/// The exit status a refusal over unattributed rows leaves. Distinct so the
+/// service unit can name it and the supervisor stop retrying: nothing can
+/// change until the operator runs setup.
+pub const EXIT_ROWS_UNATTRIBUTED: i32 = 79;
+
+/// Refuse to run while the store holds rows from before accounts were
+/// recorded (spec: ACCT#moving-a-machine-onto-accounts).
+///
+/// Every command except setup goes through here, the service included.
+/// Refusing is what makes the move safe to interrupt: nothing adds to the
+/// history while the move is outstanding, so running setup again repairs it.
+///
+/// A store that cannot be opened or read is not a refusal. The command is
+/// about to fail on its own terms, with a better account of why than this
+/// could give.
+pub fn refuse_while_rows_are_unattributed() -> anyhow::Result<()> {
+    let Ok(path) = crate::config::store_path() else {
+        return Ok(());
+    };
+    let Ok(store) = crate::store::Store::open(&path) else {
+        return Ok(());
+    };
+    let Ok(rows) = store.unattributed_row_count(ACCOUNTED_PROVIDER) else {
+        return Ok(());
+    };
+    if rows == 0 {
+        return Ok(());
+    }
+    eprintln!(
+        "toker: {rows} rows were served before toker recorded which account they \
+         were on.\n\
+         Run `toker setup` to attribute them; every other command waits until then."
+    );
+    std::process::exit(EXIT_ROWS_UNATTRIBUTED);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

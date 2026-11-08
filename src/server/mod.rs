@@ -4311,7 +4311,7 @@ api_key = "sk-proj-test"
                     .expect("fingerprint"),
                 candidate_id: CandidateId::new(format!("candidate-{session}")).expect("candidate"),
                 binding_id: binding_id.clone(),
-                account_number: Some(1),
+                account_number: None,
                 baseline_model: model.to_owned(),
                 effective_model: model.to_owned(),
             };
