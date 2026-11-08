@@ -53,13 +53,14 @@ Only the request bounds the prefix this send would re-read, so anything reading 
 
 ## Cache identity
 
-A cache identity is the binding together with the exact model sent upstream.
+A cache identity is the binding, the exact model sent upstream and the account that served, together.
 
 A lane MUST have one cache identity at a time.
 
 > [!NOTE]
-> On the providers Toker serves, the same lane sent to another provider, or to the same provider on another model, reads nothing of the cache that was written, however stable the client's own model string stayed.
+> On the providers Toker serves, the same lane sent to another provider, to the same provider on another model, or on another account, reads nothing of the cache that was written, however stable the client's own model string stayed.
 > A virtual slug whose route was edited to another provider otherwise makes two unrelated provider contexts look like one warm lane.
+> A prompt cache belongs to the account that wrote it, so a lane that moved account has no more claim on it than one that moved provider, and the operator's two logins reaching the same endpoint on the same model are the easiest way to miss that.
 
 A binding MAY declare a cache domain, being an identifier and a verified cache lifetime.
 
@@ -78,7 +79,7 @@ A pinned lane MUST start from the first candidate otherwise.
 
 ## The pin
 
-A pin MUST record the policy revision, the route's identifier and fingerprint, the candidate, the binding, the baseline model, the effective model and a generation.
+A pin MUST record the policy revision, the route's identifier and fingerprint, the candidate, the binding, the account that served, the baseline model, the effective model and a generation.
 Those MUST be all present or all absent, and that MUST be enforced by the store.
 
 A pin MUST be written only when a response is recorded as served.
@@ -129,11 +130,16 @@ This MUST be answered for the lane's pinned binding, as warm, cold or unknown.
 
 | condition | answer |
 | --- | --- |
+| the lane is pinned to an account other than the one asked about | cold |
 | the lane is not pinned to the binding asked about | unknown |
 | the lane recorded no cache lifetime | unknown |
 | the lane is stamped in the future | unknown |
 | idle time has reached the lifetime | cold |
 | otherwise | warm |
+
+> [!NOTE]
+> A moved account is the one row of this table answering cold from knowledge rather than from a clock.
+> The cache was written under another account and cannot be read under this one, so answering unknown here would hand every consumer a warm verdict, which is the reading this table's default exists to give where Toker cannot tell and not where it can.
 
 The lifetime MUST be the binding's declared cache domain lifetime where it has one, and the lifetime the lane recorded from the provider's reported usage otherwise.
 

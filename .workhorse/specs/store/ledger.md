@@ -84,6 +84,13 @@ A meter snapshot MUST be kept as the provider reported it, and a header Toker do
 
 A row MUST carry the reset times of the windows its meters named, so that any window can be reconstructed afterwards.
 
+A row reaching a provider MUST carry the account it was served on, as [ACCT](accounts.md#what-is-attributed-to-an-account) requires.
+
+A row whose account is not known MUST carry none, and MUST NOT carry one inferred from the rows around it.
+
+> [!NOTE]
+> Meters belong to the account that reported them, so a row naming the wrong account is worse than one naming none: the first is read as evidence about a window and the second is read as the absence of it.
+
 ## System prompt changes
 
 A system prompt change MUST be localised at capture time, by comparing the request against the newest row in its lane that carries a prompt hash, read from the ledger.

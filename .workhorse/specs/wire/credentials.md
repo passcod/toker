@@ -37,3 +37,14 @@ Where `anthropic_sub` serves a request that did not bring a usable Claude bearer
 Toker MUST read that login file once per request rather than caching it, so that a refreshed or revoked login takes effect without a restart.
 Toker MUST NOT send a token it can see has expired.
 
+## Which account a credential names
+
+The credential a request leaves with names the account it is served on, which [ACCT](../store/accounts.md) specifies.
+
+Toker MUST resolve that account from the credential it sends upstream, and MUST NOT resolve it from the one the client arrived with where the two differ.
+
+> [!NOTE]
+> A request that brought no usable credential is served on whichever of the sources above answered, so the arriving request says nothing about whose window it spends.
+
+A credential that resolves to no account MUST NOT prevent the request being sent.
+

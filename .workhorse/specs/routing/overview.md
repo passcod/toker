@@ -14,7 +14,12 @@ A change to the policy MUST reach live traffic by activation, without restarting
 
 ## Providers
 
-A provider is a configured upstream account, its credential and its endpoint.
+A provider is a configured upstream, the credentials that reach it and its endpoint.
+
+One provider MAY serve several upstream accounts, which are not configured and are specified by [ACCT](../store/accounts.md).
+
+> [!NOTE]
+> An operator holds logins, not providers, so the account a request is served on is a fact about its credential rather than a choice the policy made.
 
 | provider | upstream |
 | --- | --- |
@@ -24,8 +29,7 @@ A provider is a configured upstream account, its credential and its endpoint.
 | `openai_api` | OpenAI directly |
 | `codex_sub` | ChatGPT, on a codex subscription |
 
-A provider is enabled by the presence of its `[providers.<name>]` block in the configuration file, and is disabled by its absence.
-Configuration is specified by [DCONF](../service/config.md).
+A provider is enabled by a field of the row the store holds for it, as [DCONF](../service/config.md#in-the-store) specifies.
 
 A backend adapter renders a canonical request onto a provider's wire and interprets what comes back.
 Several providers MAY share one adapter, and one provider MAY be served by several adapters.

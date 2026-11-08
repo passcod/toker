@@ -42,6 +42,26 @@ An error, a sleep-lock change and a withheld notice are not decisions, and MUST 
 
 A session grouped with its children MUST follow [SLIN](../store/lineage.md#lineage-is-for-display-and-accounting-only).
 
+### Meters across accounts
+
+The dashboard MUST show the meters of each account that served traffic within its window, and MUST NOT show the meters of an account that served none.
+
+> [!NOTE]
+> The accounts worth a place are the ones the window is already about, the same rule the session rows follow, so an account the operator stopped using does not hold space forever.
+
+Meters MUST be laid out across the width available, showing as many accounts as fit.
+The accounts that do not fit MUST be reachable by cycling through them.
+
+Accounts MUST be ordered by how much of the window each served, the busiest first.
+
+That order MUST resist changing while two accounts are close, and MUST NOT be recomputed into a new order on every refresh.
+
+> [!NOTE]
+> Two accounts taking turns otherwise swap places under the operator's eye each time the lead changes hands, which is motion carrying no information.
+
+An account MUST be shown by its email address where there is room for one, and by its number otherwise.
+A view showing an account in full MUST show both, as [ACCT](../store/accounts.md#identity) requires.
+
 ## Gate controls
 
 The dashboard MUST be able to grant a session the same releases a marker grants.
@@ -92,6 +112,20 @@ The page MUST show a provider whose credential does not resolve as not configure
 The settings page MUST show and edit the gate settings, the notice style of each frontend profile, the session and ping header names, whether the idle-sleep lock is held, and the extra transcript roots.
 
 The page MUST show where the store is and which port the listener answers on, and MUST NOT offer to edit either, those being settled before the store is opened as [DCONF](../service/config.md#before-the-store) specifies.
+
+## The accounts page
+
+The accounts page MUST show every account Toker knows, whether or not it served traffic in the window, with its number, its email address and when it was last seen.
+
+The page MUST show a credential that resolved to no account as its own entry, so that a login Toker could not name is visible rather than missing.
+
+The page MUST be able to give such an entry an email address, as [ACCT](../store/accounts.md#the-operator-naming-one) specifies, and MUST show which of its accounts were named that way.
+
+Accounts are otherwise not configuration, so the page MUST NOT offer to add or remove one, those being learned as [ACCT](../store/accounts.md#an-account-is-learned-not-configured) specifies.
+
+> [!NOTE]
+> An account the operator could create would be one no credential names, which nothing could ever be served on.
+> Naming one Toker already found is the opposite: the account is there and only its label is missing.
 
 ## Cost
 
