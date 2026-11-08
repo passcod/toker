@@ -706,6 +706,8 @@ fn map_row(row: &CtpRow, cost_kind: CostKind) -> Result<RequestRow, String> {
         route,
         session_id: row.session_id.clone(),
         ping: row.ping,
+        credential_digest: None,
+        account_number: None,
         model: row.model.clone(),
         raw_model: row.raw_model.clone(),
         requested_model: row.requested_model.clone(),

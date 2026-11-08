@@ -5188,6 +5188,8 @@ api_key = "ak-literal-test"
             requested_model: Some("claude-opus-5".to_owned()),
             effective_model: Some("claude-opus-5".to_owned()),
             backend: target.provider().clone(),
+            credential_digest: None,
+            account_number: None,
             binding_id: target.binding().id().clone(),
             attempt: None,
             policy_routing: None,

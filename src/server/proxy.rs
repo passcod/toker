@@ -1015,6 +1015,8 @@ pub(crate) fn chat_cross_record(ctx: RecordCtx, backend: Arc<dyn Provider>) -> A
         requested_model: ctx.requested_model,
         effective_model: ctx.effective_model,
         backend,
+        credential_digest: None,
+        account_number: None,
         binding_id: ctx.binding_id,
         attempt: ctx.attempt,
         policy_routing: ctx.policy_routing,

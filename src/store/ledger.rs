@@ -921,6 +921,10 @@ pub struct RequestRow {
     pub session_id: Option<String>,
     /// Ping-lane marker; ping lanes never hold the sleep lock.
     pub ping: Option<bool>,
+    /// Non-secret digest of the credential that reached the provider.
+    pub credential_digest: Option<super::CredentialDigest>,
+    /// Stable account number once the digest was resolved.
+    pub account_number: Option<i64>,
     /// Model as reported back by the provider.
     pub model: Option<String>,
     /// Model string verbatim from the provider, pre-normalisation.
@@ -1265,6 +1269,7 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
     let mut stmt = conn.prepare_cached(
         "INSERT INTO requests (
             ts_ms, duration_ms, kind, frontend, provider, route, session_id, ping,
+            credential_digest, account_number,
             model, raw_model, requested_model, effective_model,
             input, cache_read, cache_write_total, cache_write_5m, cache_write_1h,
             output, reasoning, iterations, web_searches, code_execs, ttl_split_known,
@@ -1281,6 +1286,7 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
             parent_session_id, child_role, relation_source
         ) VALUES (
             :ts_ms, :duration_ms, :kind, :frontend, :provider, :route, :session_id, :ping,
+            :credential_digest, :account_number,
             :model, :raw_model, :requested_model, :effective_model,
             :input, :cache_read, :cache_write_total, :cache_write_5m, :cache_write_1h,
             :output, :reasoning, :iterations, :web_searches, :code_execs, :ttl_split_known,
@@ -1306,6 +1312,8 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
         ":route": row.route,
         ":session_id": row.session_id,
         ":ping": row.ping,
+        ":credential_digest": row.credential_digest.as_ref().map(super::CredentialDigest::as_str),
+        ":account_number": row.account_number,
         ":model": row.model,
         ":raw_model": row.raw_model,
         ":requested_model": row.requested_model,
@@ -2346,6 +2354,12 @@ fn read_row(row: &rusqlite::Row<'_>) -> Result<RequestRow> {
         route: row.get("route")?,
         session_id: row.get("session_id")?,
         ping: row.get("ping")?,
+        credential_digest: row
+            .get::<_, Option<String>>("credential_digest")?
+            .map(super::CredentialDigest::new)
+            .transpose()
+            .map_err(Error::InvalidAccountState)?,
+        account_number: row.get("account_number")?,
         model: row.get("model")?,
         raw_model: row.get("raw_model")?,
         requested_model: row.get("requested_model")?,

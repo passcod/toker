@@ -817,6 +817,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             requested_model: model,
             effective_model,
             backend: backend.clone(),
+            credential_digest: None,
+            account_number: None,
             binding_id: target.binding().id().clone(),
             attempt: None,
             policy_routing: None,

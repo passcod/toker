@@ -15,7 +15,7 @@ pub mod codex;
 mod openai;
 mod openrouter;
 
-pub use anthropic::{AnthropicApi, AnthropicSub, parse_rate_limits};
+pub use anthropic::{AnthropicApi, AnthropicSub, credential_digest, parse_rate_limits};
 pub use codex::CodexSub;
 pub use openai::OpenAiApi;
 pub use openrouter::OpenRouter;

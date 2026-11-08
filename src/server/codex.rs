@@ -322,6 +322,8 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         requested_model: Some(requested_model.clone()),
         effective_model: effective_model.clone(),
         backend: backend.clone(),
+        credential_digest: None,
+        account_number: None,
         binding_id: target.binding().id().clone(),
         attempt: None,
         policy_routing: None,

@@ -203,6 +203,8 @@ fn gate_row(
         route: Some(format!("anthropic:{backend_id}")),
         session_id: Some(session_id.to_owned()),
         ping: None,
+        credential_digest: None,
+        account_number: None,
         model: None,
         raw_model: None,
         requested_model: None,
