@@ -1,0 +1,28 @@
+---
+source: src/tui/config/view.rs
+assertion_line: 265
+expression: "frame(&state, 100, 24)"
+---
+ 1 providers   2 settings
+┌SETTINGS──────────────────────────────────────────────────────────────────────────────────────────┐
+│quota gate             on (default)                                                               │
+│cold gate              off                                                                        │
+│cold outlook           on (default)                                                               │
+│cold min tokens        175000                                                                     │
+│cold idle minutes      (the lane's own TTL tier)                                                  │
+│idle-sleep lock        on (default)                                                               │
+│ping header            (the built-in one)                                                         │
+│default notice style   (the built-in one)                                                         │
+│listener port          18123                                                                      │
+│store                  /home/example/.local/share/toker/toker.db                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+  space toggles  e edits  1/2 switches  q quits

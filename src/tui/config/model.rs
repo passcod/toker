@@ -552,14 +552,11 @@ fn text(value: &Value, name: &str) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+/// Builders the state tests and the view tests both draw on, so a frame
+/// is asserted against the same snapshot the behaviour is.
 #[cfg(test)]
-mod tests {
+pub(super) mod testing {
     use super::*;
-    use crossterm::event::{KeyEvent, KeyModifiers};
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
 
     fn snapshot_body() -> Value {
         json!({
@@ -596,7 +593,7 @@ mod tests {
         })
     }
 
-    fn loaded() -> State {
+    pub(crate) fn loaded() -> State {
         let mut state = State::default();
         let reply = Reply::Command(
             Command::snapshot("config-snapshot"),
@@ -607,6 +604,17 @@ mod tests {
         );
         assert!(state.receive(reply).is_none());
         state
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::loaded;
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
     }
 
     #[test]

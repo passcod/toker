@@ -43,7 +43,7 @@ pub(super) fn render(frame: &mut Frame, state: &State) -> Drawn {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(" configuration "),
+                        .title("CONFIGURATION"),
                 ),
                 body,
             );
@@ -90,10 +90,12 @@ fn tabs(state: &State) -> Line<'static> {
     ])
 }
 
+/// The panel title, upper case and unspaced against its rule, as the
+/// dashboard and the routing page both render theirs.
 fn title(state: &State) -> &'static str {
     match state.view() {
-        View::Providers => " providers ",
-        View::Settings => " settings ",
+        View::Providers => "PROVIDERS",
+        View::Settings => "SETTINGS",
     }
 }
 
@@ -222,4 +224,74 @@ fn number(settings: &Settings) -> String {
 
 fn unset(value: Option<String>) -> String {
     value.unwrap_or_else(|| "(the built-in one)".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::model::{State, View, testing::loaded};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// The frame as the screen reads it, trailing blanks trimmed.
+    fn frame(state: &State, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|f| {
+                super::render(f, state);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_providers_page_renders() {
+        insta::assert_snapshot!("providers_100x24", frame(&loaded(), 100, 24));
+    }
+
+    #[test]
+    fn the_settings_page_renders() {
+        let mut state = loaded();
+        state.set_view(View::Settings);
+        insta::assert_snapshot!("settings_100x24", frame(&state, 100, 24));
+    }
+
+    #[test]
+    fn an_unreachable_service_says_so_rather_than_offering_values() {
+        // The service is the only writer, so a form the operator can fill
+        // in while it is down is a form whose edits go nowhere
+        // (spec: UTUI#the-configuration-pages).
+        let mut state = loaded();
+        state.command_refused("config-snapshot");
+        insta::assert_snapshot!("unreachable_100x24", frame(&state, 100, 24));
+    }
+
+    /// The panel title is upper case and runs into its rule, as the
+    /// dashboard's and the routing page's do.
+    #[test]
+    fn the_panel_title_matches_the_other_pages() {
+        for (state, want) in [
+            (loaded(), "\u{250c}PROVIDERS\u{2500}"),
+            (
+                {
+                    let mut state = loaded();
+                    state.set_view(View::Settings);
+                    state
+                },
+                "\u{250c}SETTINGS\u{2500}",
+            ),
+        ] {
+            let text = frame(&state, 100, 24);
+            assert!(text.contains(want), "expected {want:?} in:\n{text}");
+        }
+    }
 }
