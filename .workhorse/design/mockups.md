@@ -53,7 +53,7 @@ Iosevka is narrower per cell than most monospace faces, so a frame set in a gene
 
 A row has to be exactly as many cells wide as the frame you are drawing, 120 for a 120x40, and there are two separate ways to get that wrong.
 
-**Miscounting.** A hand-padded row that runs a character short or long disagrees with its neighbours, and the panel borders stop lining up with the content.
+**Miscounting.** A hand-padded row that runs a character short or long ends in a different column from its neighbours, so the panel's right border steps in or out on that row alone.
 Count rather than trusting the look.
 
 **Mis-advancing.** A row holding the right number of characters can still render too wide, because a browser is not a terminal: it has no cell grid to enforce, and a font may advance a glyph by two cells if it likes.
@@ -110,7 +110,7 @@ How is yours to decide; nothing here prescribes a mechanism or rules one out.
   ```
 
   Plain `Iosevka` anywhere in that list is a bug, whatever its position. Name `"Iosevka Term"` or `"Iosevka Fixed"` and let it fall through to generic `monospace`.
-- Open it in a browser and look at it. A panel border that stops short of the content beside it means the grid has torn, and neither check above will have told you.
+- Open it in a browser and look at the right-hand edge. Every row should end in the same column; one that juts out is carrying a glyph wider than a cell, and neither check above will have told you.
 - Lay it beside the snapshot you started from and confirm the unchanged regions are character-for-character identical.
 - Turn the colours off and confirm it still reads.
 - Check each colour you used against the function table in the design language, rather than against whether it looks right.
