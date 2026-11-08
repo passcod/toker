@@ -54,6 +54,7 @@ Only the request bounds the prefix this send would re-read, so anything reading 
 ## Cache identity
 
 A cache identity is the binding, the exact model sent upstream and the account that served, together.
+Two cache identities recording no account MUST compare as the same account.
 
 A lane MUST have one cache identity at a time.
 
@@ -79,8 +80,15 @@ A pinned lane MUST start from the first candidate otherwise.
 
 ## The pin
 
-A pin MUST record the policy revision, the route's identifier and fingerprint, the candidate, the binding, the account that served, the baseline model, the effective model and a generation.
+A pin MUST record the policy revision, the route's identifier and fingerprint, the candidate, the binding, the baseline model, the effective model and a generation.
 Those MUST be all present or all absent, and that MUST be enforced by the store.
+
+A pin MUST also record the account that served, where the provider it served through has accounts Toker can tell apart.
+A pin served through a provider with no such accounts MUST record none.
+
+> [!NOTE]
+> The account sits outside the all-or-nothing rule because most providers Toker serves have no account identity at all, and requiring one would leave their lanes unable to pin.
+> A pin that records no account still carries a cache identity; it is just one the account cannot narrow.
 
 A pin MUST be written only when a response is recorded as served.
 A failed attempt, a cancelled attempt and a failure before sending MUST NOT pin.
@@ -130,7 +138,7 @@ This MUST be answered for the lane's pinned binding, as warm, cold or unknown.
 
 | condition | answer |
 | --- | --- |
-| the lane is pinned to an account other than the one asked about | cold |
+| the lane is pinned to an account, and it is not the one asked about | cold |
 | the lane is not pinned to the binding asked about | unknown |
 | the lane recorded no cache lifetime | unknown |
 | the lane is stamped in the future | unknown |
@@ -139,6 +147,7 @@ This MUST be answered for the lane's pinned binding, as warm, cold or unknown.
 
 > [!NOTE]
 > A moved account is the one row of this table answering cold from knowledge rather than from a clock.
+> It reads only where both accounts are known: a lane pinned without one, or a question asked without one, has nothing to compare and falls to the rows below.
 > The cache was written under another account and cannot be read under this one, so answering unknown here would hand every consumer a warm verdict, which is the reading this table's default exists to give where Toker cannot tell and not where it can.
 
 The lifetime MUST be the binding's declared cache domain lifetime where it has one, and the lifetime the lane recorded from the provider's reported usage otherwise.

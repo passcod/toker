@@ -978,7 +978,19 @@ pub(super) const MIGRATIONS: &[&str] = &[
     ALTER TABLE allowances_v20 RENAME TO allowances;
 
     ALTER TABLE pings ADD COLUMN account_number INTEGER REFERENCES accounts(number);
+    -- `requests_provider_account_idx` orders by account before time, so the
+    -- newest attributed row for a provider could only be found by sorting
+    -- every attributed row it has: ~96,700 of them on the machine this was
+    -- written against. This index seeks the provider and walks time backwards
+    -- instead, stopping at the first row that names an account.
+    CREATE INDEX requests_provider_ts_idx ON requests (provider, ts_ms);
+
+    -- The account that served, part of the lane's cache identity
+    -- (spec: SLANE#cache-identity). Null where the provider has no accounts
+    -- Toker can tell apart, and on every pin written before this column, so
+    -- it stays outside the pin's all-present-or-all-absent rule.
     ALTER TABLE lanes ADD COLUMN account_number INTEGER REFERENCES accounts(number);
+
     "#,
 ];
 

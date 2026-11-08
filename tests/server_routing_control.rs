@@ -434,6 +434,7 @@ async fn immediate_activation_requires_an_explicit_warm_cache_override() {
                 route_fingerprint: "11".repeat(32).parse().unwrap(),
                 candidate_id: "candidate".parse().unwrap(),
                 binding_id: "openrouter.openai_chat".parse().unwrap(),
+                account_number: None,
                 baseline_model: "base".to_owned(),
                 effective_model: "effective".to_owned(),
             }),
@@ -498,6 +499,7 @@ async fn a_refused_reactivation_leaves_the_draft_and_its_generation_alone() {
                 route_fingerprint: "11".repeat(32).parse().unwrap(),
                 candidate_id: "candidate".parse().unwrap(),
                 binding_id: "openrouter.openai_chat".parse().unwrap(),
+                account_number: None,
                 baseline_model: "base".to_owned(),
                 effective_model: "effective".to_owned(),
             }),
@@ -647,6 +649,7 @@ async fn the_snapshot_carries_derived_content_for_the_active_revision_without_a_
         route_fingerprint: "11".repeat(32).parse().unwrap(),
         candidate_id: "candidate".parse().unwrap(),
         binding_id: "openrouter.openai_chat".parse().unwrap(),
+        account_number: None,
         baseline_model: "base".to_owned(),
         effective_model: "effective".to_owned(),
     };

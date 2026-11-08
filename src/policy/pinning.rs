@@ -81,6 +81,7 @@ mod tests {
             route_fingerprint: "11".repeat(32).parse::<RouteFingerprint>().unwrap(),
             candidate_id: CandidateId::new("candidate").unwrap(),
             binding_id: BindingId::new("openrouter.openrouter_chat_completions").unwrap(),
+            account_number: Some(1),
             baseline_model: "baseline".to_owned(),
             effective_model: effective.to_owned(),
         }

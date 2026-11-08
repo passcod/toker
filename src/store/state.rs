@@ -63,6 +63,13 @@ pub struct LanePin {
     pub route_fingerprint: RouteFingerprint,
     pub candidate_id: CandidateId,
     pub binding_id: BindingId,
+    /// The account that served. Part of the cache identity: a prompt cache
+    /// belongs to the account that wrote it, so a lane that moved account
+    /// reads nothing of the cache under its new one. `None` where the
+    /// provider has no accounts Toker can tell apart, and on a pin written
+    /// before accounts were recorded; such a pin claims no cache identity
+    /// beyond its binding and model.
+    pub account_number: Option<i64>,
     pub baseline_model: String,
     pub effective_model: String,
 }
@@ -571,8 +578,8 @@ pub(super) fn upsert_lane(conn: &Connection, lane: &Lane) -> Result<()> {
 
 const LANE_COLUMNS: &str = "key, session_id, tools_hash, updated_ms, prompt_tokens, ttl, ping,
     noticed_at, forced_from, forced_to, pin_generation, policy_revision_id,
-    policy_route_id, route_fingerprint, candidate_id, binding_id, baseline_model,
-    effective_model";
+    policy_route_id, route_fingerprint, candidate_id, binding_id, account_number,
+    baseline_model, effective_model";
 
 pub(super) fn load_lane(conn: &Connection, key: &str) -> Result<Option<Lane>> {
     row_of(
@@ -639,6 +646,7 @@ fn read_lane(row: &rusqlite::Row<'_>) -> Result<Lane> {
             route_fingerprint: parse_id("lanes.route_fingerprint", fingerprint)?,
             candidate_id: parse_id("lanes.candidate_id", candidate)?,
             binding_id: parse_id("lanes.binding_id", binding)?,
+            account_number: row.get("account_number")?,
             baseline_model,
             effective_model,
         }),
@@ -687,19 +695,20 @@ pub(super) fn compare_and_swap_lane_pin(
     let changed = conn.execute(
         "UPDATE lanes SET pin_generation = pin_generation + 1,
              policy_revision_id = ?1, policy_route_id = ?2, route_fingerprint = ?3,
-             candidate_id = ?4, binding_id = ?5, baseline_model = ?6,
-             effective_model = ?7
-         WHERE key = ?8 AND pin_generation = ?9
-           AND policy_revision_id IS ?10 AND policy_route_id IS ?11
-           AND route_fingerprint IS ?12 AND candidate_id IS ?13
-           AND binding_id IS ?14 AND baseline_model IS ?15
-           AND effective_model IS ?16",
+             candidate_id = ?4, binding_id = ?5, account_number = ?6,
+             baseline_model = ?7, effective_model = ?8
+         WHERE key = ?9 AND pin_generation = ?10
+           AND policy_revision_id IS ?11 AND policy_route_id IS ?12
+           AND route_fingerprint IS ?13 AND candidate_id IS ?14
+           AND binding_id IS ?15 AND account_number IS ?16
+           AND baseline_model IS ?17 AND effective_model IS ?18",
         rusqlite::params![
             new.revision,
             new.route,
             new.fingerprint,
             new.candidate,
             new.binding,
+            new.account,
             new.baseline,
             new.effective,
             key,
@@ -709,6 +718,7 @@ pub(super) fn compare_and_swap_lane_pin(
             expected_pin.map(|p| p.route_fingerprint.to_string()),
             expected_pin.map(|p| p.candidate_id.as_str()),
             expected_pin.map(|p| p.binding_id.as_str()),
+            expected_pin.and_then(|p| p.account_number),
             expected_pin.map(|p| p.baseline_model.as_str()),
             expected_pin.map(|p| p.effective_model.as_str()),
         ],
@@ -728,6 +738,9 @@ struct StoredPinParts<'a> {
     fingerprint: Option<String>,
     candidate: Option<&'a str>,
     binding: Option<&'a str>,
+    /// Already flat: a pin that names no account and no pin at all both
+    /// store NULL here.
+    account: Option<i64>,
     baseline: Option<&'a str>,
     effective: Option<&'a str>,
 }
@@ -741,6 +754,7 @@ impl<'a> From<Option<&'a LanePin>> for StoredPinParts<'a> {
                 fingerprint: Some(pin.route_fingerprint.to_string()),
                 candidate: Some(pin.candidate_id.as_str()),
                 binding: Some(pin.binding_id.as_str()),
+                account: pin.account_number,
                 baseline: Some(&pin.baseline_model),
                 effective: Some(&pin.effective_model),
             },
@@ -750,6 +764,7 @@ impl<'a> From<Option<&'a LanePin>> for StoredPinParts<'a> {
                 fingerprint: None,
                 candidate: None,
                 binding: None,
+                account: None,
                 baseline: None,
                 effective: None,
             },

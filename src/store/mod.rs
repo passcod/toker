@@ -3813,12 +3813,14 @@ mod tests {
         let revision_id = revision(&store, "pin", None);
         let lane = unpinned_lane("session|tools");
         store.upsert_lane(&lane).unwrap();
+        let account = crate::test_support::account(&store, "openrouter", "pin@example.test");
         let pin = LanePin {
             policy_revision_id: revision_id,
             policy_route_id: RouteId::new("route").unwrap(),
             route_fingerprint: "11".repeat(32).parse::<RouteFingerprint>().unwrap(),
             candidate_id: CandidateId::new("candidate").unwrap(),
             binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+            account_number: Some(account),
             baseline_model: "base".to_owned(),
             effective_model: "effective".to_owned(),
         };
@@ -3867,6 +3869,7 @@ mod tests {
             route_fingerprint: "22".repeat(32).parse::<RouteFingerprint>().unwrap(),
             candidate_id: CandidateId::new("candidate").unwrap(),
             binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+            account_number: None,
             baseline_model: "base".to_owned(),
             effective_model: "effective".to_owned(),
         };
@@ -3923,6 +3926,7 @@ mod tests {
             route_fingerprint: "22".repeat(32).parse::<RouteFingerprint>().unwrap(),
             candidate_id: CandidateId::new("candidate").unwrap(),
             binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+            account_number: None,
             baseline_model: "base".to_owned(),
             effective_model: "effective".to_owned(),
         };
@@ -3992,6 +3996,7 @@ mod tests {
             route_fingerprint: fingerprint.parse::<RouteFingerprint>().unwrap(),
             candidate_id: CandidateId::new("candidate").unwrap(),
             binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+            account_number: None,
             baseline_model: "base".to_owned(),
             effective_model: "effective".to_owned(),
         };
