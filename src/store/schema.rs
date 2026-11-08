@@ -907,6 +907,47 @@ pub(super) const MIGRATIONS: &[&str] = &[
         style   TEXT NOT NULL CHECK (style IN ('gfm', 'toker', 'block', 'plain'))
     );
     "#,
+    // v19 — account identity is learned from credential digests, independently
+    // of the configured provider. Values never enter the store; resolution can
+    // later fill an account on every ledger row that carried its digest.
+    r#"
+    CREATE TABLE accounts (
+        number        INTEGER PRIMARY KEY AUTOINCREMENT,
+        provider      TEXT NOT NULL,
+        upstream_id   TEXT,
+        email         TEXT,
+        named_by      TEXT NOT NULL CHECK (named_by IN ('local', 'upstream', 'operator')),
+        first_seen_ms INTEGER NOT NULL,
+        last_seen_ms  INTEGER NOT NULL,
+        CHECK (upstream_id IS NOT NULL OR email IS NOT NULL)
+    );
+    CREATE UNIQUE INDEX accounts_provider_upstream_id_idx
+        ON accounts (provider, upstream_id) WHERE upstream_id IS NOT NULL;
+    CREATE UNIQUE INDEX accounts_provider_email_idx
+        ON accounts (provider, email) WHERE email IS NOT NULL;
+
+    CREATE TABLE credential_accounts (
+        digest         TEXT PRIMARY KEY CHECK (
+            length(digest) = 64 AND digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        provider       TEXT NOT NULL,
+        account_number INTEGER REFERENCES accounts(number),
+        first_seen_ms  INTEGER NOT NULL,
+        last_seen_ms   INTEGER NOT NULL
+    );
+    CREATE INDEX credential_accounts_provider_account_idx
+        ON credential_accounts (provider, account_number);
+
+    ALTER TABLE requests ADD COLUMN credential_digest TEXT CHECK (
+        credential_digest IS NULL OR (
+            length(credential_digest) = 64
+            AND credential_digest NOT GLOB '*[^0-9a-f]*'
+        )
+    );
+    ALTER TABLE requests ADD COLUMN account_number INTEGER REFERENCES accounts(number);
+    CREATE INDEX requests_provider_account_idx
+        ON requests (provider, account_number, ts_ms);
+    "#,
 ];
 
 fn validate_v10_history(conn: &Connection) -> Result<()> {

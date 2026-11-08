@@ -25,11 +25,15 @@
 //! Migrations: the `schema` submodule holds a numbered, append-only list
 //! gated by `PRAGMA user_version` — no external migration files.
 
+mod accounts;
 mod config;
 mod ledger;
 mod schema;
 mod state;
 
+pub use accounts::{
+    Account, AccountIdentity, AccountNameSource, CredentialAccount, CredentialDigest,
+};
 pub use config::{Configuration, ProviderConfigRow, SettingsConfigRow};
 pub use ledger::{
     AttemptGroupId, AttemptIndex, AttemptProvenance, AttemptReason, ChildRole, CostKind,
@@ -77,6 +81,8 @@ pub enum Error {
     InvalidRoutingState(String),
     #[error("invalid policy document: {0}")]
     InvalidPolicyDocument(String),
+    #[error("invalid account state: {0}")]
+    InvalidAccountState(String),
 }
 
 /// Result type for all store operations.
@@ -204,6 +210,30 @@ impl Store {
     /// update or delete path anywhere in the store.
     pub fn record_request(&self, row: &RequestRow) -> Result<()> {
         ledger::insert(&*self.conn()?, row)
+    }
+
+    /// Observe a credential without persisting its value. A resolved identity
+    /// also backfills every older row carrying its digest in this transaction.
+    pub fn observe_credential(
+        &self,
+        provider: &str,
+        digest: &CredentialDigest,
+        at_ms: i64,
+        identity: Option<&AccountIdentity>,
+    ) -> Result<Option<i64>> {
+        let mut conn = self.conn()?;
+        accounts::observe(&mut conn, provider, digest, at_ms, identity)
+    }
+
+    /// Every learned account, including accounts that have not served in a
+    /// current dashboard window.
+    pub fn load_accounts(&self) -> Result<Vec<Account>> {
+        accounts::load_accounts(&*self.conn()?)
+    }
+
+    /// Every observed credential digest, including entries no source has named.
+    pub fn load_credential_accounts(&self) -> Result<Vec<CredentialAccount>> {
+        accounts::load_credentials(&*self.conn()?)
     }
 
     /// Append many rows in one transaction — the import batch path (plan:
@@ -846,14 +876,14 @@ where
 mod tests {
     use super::schema;
     use super::{
-        ActivatePolicyRevision, Allowance, AttemptGroupId, AttemptIndex, AttemptProvenance,
-        AttemptReason, BindingLearningUpdate, CostKind, DisplayRow, DraftCasResult, Error,
-        InitialPublication, Lane, LanePin, LanePinCasResult, MAX_ROUTING_TRACE_EVENTS,
-        MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction, PingRecord,
-        PolicyCompilerOrigin, PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome,
-        PublicationAdapter, PublicationCasResult, PublicationKey, PublicationResultUpdate,
-        PublicationState, RequestLookupProvenance, RequestRow, ResolvedRoute,
-        RevisionOneActivation, RowKind, SessionCostGroup, SessionLineage, Store,
+        AccountIdentity, AccountNameSource, ActivatePolicyRevision, Allowance, AttemptGroupId,
+        AttemptIndex, AttemptProvenance, AttemptReason, BindingLearningUpdate, CostKind,
+        CredentialDigest, DisplayRow, DraftCasResult, Error, InitialPublication, Lane, LanePin,
+        LanePinCasResult, MAX_ROUTING_TRACE_EVENTS, MetersSnapshot, ModelEntry, NewPolicyRevision,
+        PingAction, PingRecord, PolicyCompilerOrigin, PolicyRevisionSource, PolicyRouteProvenance,
+        PolicyRoutingOutcome, PublicationAdapter, PublicationCasResult, PublicationKey,
+        PublicationResultUpdate, PublicationState, RequestLookupProvenance, RequestRow,
+        ResolvedRoute, RevisionOneActivation, RowKind, SessionCostGroup, SessionLineage, Store,
         StoredCandidateState, StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason,
         is_api_measurement,
     };
@@ -1212,6 +1242,81 @@ mod tests {
         );
         drop((reader, writer));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn learned_account_identity_stitches_refreshed_credentials() {
+        let store = mem_store();
+        let first = CredentialDigest::new("1".repeat(64)).expect("digest");
+        let refreshed = CredentialDigest::new("2".repeat(64)).expect("digest");
+        let identity = AccountIdentity {
+            upstream_id: None,
+            email: Some("agent@example.test".to_owned()),
+            named_by: AccountNameSource::Local,
+        };
+
+        assert_eq!(
+            store
+                .observe_credential("anthropic_sub", &first, 100, Some(&identity))
+                .expect("observe first"),
+            Some(1)
+        );
+        assert_eq!(
+            store
+                .observe_credential("anthropic_sub", &refreshed, 200, Some(&identity))
+                .expect("observe refresh"),
+            Some(1)
+        );
+        let accounts = store.load_accounts().expect("accounts");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].number, 1);
+        assert_eq!(accounts[0].email.as_deref(), Some("agent@example.test"));
+        assert_eq!(accounts[0].last_seen_ms, 200);
+        assert_eq!(
+            store
+                .load_credential_accounts()
+                .expect("credentials")
+                .into_iter()
+                .map(|credential| credential.account_number)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(1)]
+        );
+    }
+
+    #[test]
+    fn resolved_identity_backfills_earlier_digest_rows() {
+        let store = mem_store();
+        let digest = CredentialDigest::new("a".repeat(64)).expect("digest");
+        store
+            .execute_for_test(&format!(
+                "INSERT INTO requests (ts_ms, provider, credential_digest) \
+                 VALUES (1, 'anthropic_sub', '{}')",
+                digest.as_str()
+            ))
+            .expect("seed unresolved row");
+        assert_eq!(
+            store
+                .observe_credential("anthropic_sub", &digest, 100, None)
+                .expect("observe"),
+            None
+        );
+        let identity = AccountIdentity {
+            upstream_id: None,
+            email: Some("agent@example.test".to_owned()),
+            named_by: AccountNameSource::Operator,
+        };
+        assert_eq!(
+            store
+                .observe_credential("anthropic_sub", &digest, 200, Some(&identity))
+                .expect("resolve"),
+            Some(1)
+        );
+        let account_number: Option<i64> = store
+            .conn()
+            .expect("connection")
+            .query_row("SELECT account_number FROM requests", [], |row| row.get(0))
+            .expect("read backfill");
+        assert_eq!(account_number, Some(1));
     }
 
     #[test]
