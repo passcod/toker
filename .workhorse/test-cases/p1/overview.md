@@ -8,7 +8,9 @@ A guide that has drifted is worse than none, because it is believed.
 - [x] Every row of every `class="frame"` block in `designs/tui-shell.html` is the same width
 - [x] Every row of the frame in `designs/dashboard-reference.html` is 120 cells
 - [x] The reference frame's text is character-for-character the 120×40 snapshot, once spans are stripped
-- [ ] Both files render in a browser with Iosevka, with the grid aligned and no row wrapping
+- [x] No frame names plain `Iosevka`, which advances the arrows, the proportion mark and the em dash by two cells each
+- [x] Every row of every frame advances the same number of *cells* in the family the stack selects, not merely the same number of characters
+- [ ] Both files render in a browser, every panel border meeting the content beside it, no row wrapping
 - [ ] The reference frame, viewed side by side with `toker tui` at 120×40, matches in colour as well as shape
 
 ## The guide matches the code

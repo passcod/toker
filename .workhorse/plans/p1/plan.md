@@ -99,6 +99,12 @@ The hit rate's figure is plain and only its bar is coloured, which no reasonable
 And ses-crow sits at 85% occupancy, over the band that would turn a bar red, but it has been idle ten minutes, so the bar dims and the `← compacts soon` marker never appears — idle wins over the threshold.
 Both are now in the reference with the reason beside them.
 
+A correct cell count does not mean a correct render, which is the mistake the width check itself invited.
+Both frames counted clean and still tore in the browser, because the font stack led with plain `Iosevka`: that family leaves the characters Unicode calls ambiguous or wide at their natural width, so the arrows, the proportion bar's mark and the em dash each advanced two cells.
+The dashboard's cache-read row carries 74 bar marks and rendered 187 cells against its neighbours' 120, which dragged the frame's width out past every panel border in it.
+Iosevka Term and Iosevka Fixed force one cell; all three declare themselves fixed-pitch, so nothing but measuring the rendered advance separates them.
+The guide now treats miscounting a row and mis-advancing one as two different faults, and says to open the file.
+
 The config pages turned out to have no frame tests at all, alone among the rendered surfaces.
 That is why changing their titles broke nothing, and it was also a hole in the guide, which tells a mockup author to start from a pinned frame and could not point at one for those pages.
 They now have three: providers, settings, and either page with the service down.

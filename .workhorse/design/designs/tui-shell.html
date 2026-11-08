@@ -30,13 +30,25 @@
     padding: 2rem;
   }
 
-  /* One terminal frame. Width is set in ch so it resolves against
-     Iosevka's own advance rather than a guessed cell size: naming the
-     font matters, because Iosevka is narrower per cell than most
-     monospace faces and a frame set in a generic monospace comes out
-     wider than it ever renders. */
+  /* One terminal frame. The frame takes its width from its own longest
+     row, so every row must advance the same number of cells or the grid
+     tears and the panel borders stop lining up with the content.
+
+     Term, never plain Iosevka. The default Iosevka family leaves the
+     characters Unicode calls ambiguous or wide at their natural width,
+     so the glyphs the TUI actually emits here -- the proportion bar's
+     mark, the four arrows and the em dash -- each advance two cells
+     instead of one. That tore the dashboard's cache-read row out to 187
+     cells against its neighbours' 120. Iosevka Term and Iosevka Fixed
+     force every glyph to a single cell; the generic fallbacks below are
+     strictly monospaced and behave.
+
+     All three Iosevka families set post.isFixedPitch, so the font
+     declares itself monospace whichever one is picked, and counting
+     characters cannot tell them apart. Only measuring the rendered
+     advance does. */
   .frame {
-    font-family: Iosevka, "Iosevka Term", "Iosevka Fixed", monospace;
+    font-family: "Iosevka Term", "Iosevka Fixed", "DejaVu Sans Mono", monospace;
     font-size: 15px;
     line-height: 1.2;
     background: var(--bg);

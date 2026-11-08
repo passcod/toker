@@ -48,12 +48,19 @@ The same holds when you author a new region: get the plain grid right and padded
 
 ## The grid
 
-The shell sets Iosevka and a cell size derived from it.
-Both matter: Iosevka is narrower per cell than most monospace faces, so a frame set in a generic `monospace` comes out noticeably wider than it ever renders, and every judgement about whether a column fits is then made against the wrong width.
+The shell names Iosevka Term, and a frame takes its width from its own longest row.
+Iosevka is narrower per cell than most monospace faces, so a frame set in a generic `monospace` comes out noticeably wider than it ever renders, and every judgement about whether a column fits is then made against the wrong width.
 
-Count cells rather than trusting the look.
-A row is exactly as many characters wide as the frame you are drawing — 120 for a 120×40 — and a mockup whose rows disagree with each other has a bug in it, not a style.
-East Asian characters and most box-drawing take one cell; the block and sparkline glyphs the TUI uses are all single-width.
+A row has to be exactly as many cells wide as the frame you are drawing, 120 for a 120x40, and there are two separate ways to get that wrong.
+
+**Miscounting.** A hand-padded row that runs a character short or long disagrees with its neighbours, and the panel borders stop lining up with the content.
+Count rather than trusting the look.
+
+**Mis-advancing.** A row holding the right number of characters can still render too wide, because a browser is not a terminal: it has no cell grid to enforce, and a font may advance a glyph by two cells if it likes.
+A terminal draws the arrows, the proportion bar's mark and the em dash one cell each, and so do Iosevka Term and Iosevka Fixed.
+Plain Iosevka gives them two, which is enough to push one bar row half again as wide as the frame around it.
+Name `Iosevka Term` or `Iosevka Fixed`, and never plain `Iosevka`.
+All three declare themselves fixed-pitch, so no amount of counting characters distinguishes them.
 
 ## What to copy and what to author
 
@@ -96,6 +103,14 @@ How is yours to decide; nothing here prescribes a mechanism or rules one out.
   ```
 
   It matches `class="frame"` exactly, so a key or swatch carrying another class is skipped.
+- The frame names a single-width family. Counting characters cannot catch a glyph that advances two cells, so check the stack itself:
+
+  ```sh
+  grep -n font-family mockups/my-card/my-mockup.html
+  ```
+
+  Plain `Iosevka` anywhere in that list is a bug, whatever its position. Name `"Iosevka Term"` or `"Iosevka Fixed"` and let it fall through to generic `monospace`.
+- Open it in a browser and look at it. A panel border that stops short of the content beside it means the grid has torn, and neither check above will have told you.
 - Lay it beside the snapshot you started from and confirm the unchanged regions are character-for-character identical.
 - Turn the colours off and confirm it still reads.
 - Check each colour you used against the function table in the design language, rather than against whether it looks right.
