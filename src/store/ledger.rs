@@ -2741,6 +2741,10 @@ impl RequestFilter {
 /// ledger; the export re-serialises it compactly (same values, same key
 /// order, possibly different whitespace), because a pretty-printed
 /// provider body would otherwise break the one-row-per-line contract.
+/// How much of a credential digest an export carries, matching the width
+/// of the ledger's other digests (`tools_hash`, `system_hash`).
+const EXPORTED_DIGEST_CHARS: usize = 12;
+
 pub const JSON_TEXT_COLUMNS: &[&str] = &[
     "usage_presence",
     "usage_raw",
@@ -2801,6 +2805,15 @@ pub(super) fn for_each_export(
                     let text = String::from_utf8_lossy(bytes);
                     if JSON_TEXT_COLUMNS.contains(&name.as_str()) {
                         serde_json::from_str(&text).unwrap_or(Value::String(text.into_owned()))
+                    } else if name == "credential_digest" {
+                        // A prefix, the width of the ledger's other digests.
+                        // Whole, it verifies a guessed token against a live
+                        // credential, and an export is the file most likely
+                        // to leave the machine. A prefix still tells one
+                        // credential from another, and still tells a row
+                        // carrying a digest from one written before accounts
+                        // were recorded (spec: ACCT#an-account-not-yet-known).
+                        Value::String(text.chars().take(EXPORTED_DIGEST_CHARS).collect())
                     } else {
                         Value::String(text.into_owned())
                     }

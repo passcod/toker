@@ -144,18 +144,27 @@ pub(super) fn observe(
     if let Some(identity) = identity {
         identity.validate()?;
         let number = account_for_identity(&tx, provider, identity, at_ms)?;
-        tx.execute(
-            "UPDATE credential_accounts
-             SET account_number = ?2, last_seen_ms = ?3
-             WHERE digest = ?1",
-            (digest.as_str(), number, at_ms),
-        )?;
-        tx.execute(
-            "UPDATE requests SET account_number = ?3
-             WHERE provider = ?1 AND credential_digest = ?2 AND account_number IS NULL",
-            (provider, digest.as_str(), number),
-        )?;
-        account_number = Some(number);
+        // Only when the binding actually changes. Rebinding sweeps the
+        // ledger for rows this digest left unattributed, which on a real
+        // store is every row from before accounts were recorded: ~96,700
+        // on the machine this was written against, measured at ~55ms. A
+        // digest that already resolves to this account has nothing to
+        // sweep, and it is the overwhelmingly common case — once per
+        // credential against once per request.
+        if account_number != Some(number) {
+            tx.execute(
+                "UPDATE credential_accounts
+                 SET account_number = ?2, last_seen_ms = ?3
+                 WHERE digest = ?1",
+                (digest.as_str(), number, at_ms),
+            )?;
+            tx.execute(
+                "UPDATE requests SET account_number = ?3
+                 WHERE provider = ?1 AND credential_digest = ?2 AND account_number IS NULL",
+                (provider, digest.as_str(), number),
+            )?;
+            account_number = Some(number);
+        }
     }
     tx.commit()?;
     Ok(account_number)
@@ -194,19 +203,40 @@ fn account_for_identity(
             "upstream id and email name different accounts".into(),
         ));
     }
-    if let Some(number) = by_upstream.or(by_email) {
+    // Matched by upstream id, the thing an account actually is: the address
+    // beside it may have changed, so take the one offered.
+    if let Some(number) = by_upstream {
         conn.execute(
             "UPDATE accounts
-             SET upstream_id = COALESCE(?2, upstream_id),
-                 email = COALESCE(?3, email),
-                 last_seen_ms = MAX(last_seen_ms, ?4)
+             SET email = COALESCE(?2, email), last_seen_ms = MAX(last_seen_ms, ?3)
              WHERE number = ?1",
-            (
-                number,
-                identity.upstream_id.as_deref(),
-                identity.email.as_deref(),
-                at_ms,
-            ),
+            (number, identity.email.as_deref(), at_ms),
+        )?;
+        return Ok(number);
+    }
+    // Matched by address alone, so the account is one held by its address
+    // until an id arrives. Filling an absent id is that arrival; replacing
+    // one already held would be two accounts conflated under one address,
+    // which is the sighting to refuse rather than resolve.
+    if let Some(number) = by_email {
+        let held: Option<String> = conn.query_row(
+            "SELECT upstream_id FROM accounts WHERE number = ?1",
+            [number],
+            |row| row.get(0),
+        )?;
+        if let (Some(held), Some(offered)) = (held.as_deref(), identity.upstream_id.as_deref())
+            && held != offered
+        {
+            return Err(Error::InvalidAccountState(format!(
+                "account {number} is held by upstream id {held}, not {offered}"
+            )));
+        }
+        conn.execute(
+            "UPDATE accounts
+             SET upstream_id = COALESCE(upstream_id, ?2),
+                 last_seen_ms = MAX(last_seen_ms, ?3)
+             WHERE number = ?1",
+            (number, identity.upstream_id.as_deref(), at_ms),
         )?;
         return Ok(number);
     }

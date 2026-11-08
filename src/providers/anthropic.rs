@@ -31,12 +31,10 @@ use axum::http::HeaderMap;
 use axum::http::{HeaderValue, header};
 use reqwest::Url;
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 use super::Provider;
 use crate::routing::{ANTHROPIC_API_MESSAGES, ANTHROPIC_SUB_MESSAGES, BackendBinding, ProtocolId};
-use crate::store::CredentialDigest;
 
 const ANTHROPIC_SUB_BINDINGS: &[BackendBinding] = &[ANTHROPIC_SUB_MESSAGES];
 const ANTHROPIC_API_BINDINGS: &[BackendBinding] = &[ANTHROPIC_API_MESSAGES];
@@ -103,17 +101,6 @@ fn claude_login_token(path: &std::path::Path) -> Option<String> {
 
 fn usable_oauth_token(token: &str) -> bool {
     !token.is_empty() && HeaderValue::from_str(&format!("Bearer {token}")).is_ok()
-}
-
-/// Digest a credential value before it crosses into durable account state.
-/// This intentionally returns the full digest: the truncated request-shape
-/// digests are diagnostic values, not durable credential identities.
-pub fn credential_digest(value: &str) -> CredentialDigest {
-    let mut hex = String::with_capacity(64);
-    for byte in Sha256::digest(value.as_bytes()) {
-        hex.push_str(&format!("{byte:02x}"));
-    }
-    CredentialDigest::new(hex).expect("sha256 is 64 lower-case hexadecimal characters")
 }
 
 /// The anthropic API backend: same upstream, `x-api-key` auth, list-price
