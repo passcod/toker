@@ -631,9 +631,7 @@ pub fn ping_window(
                     accounts.len()
                 )
             } else {
-                format!(
-                    "slot {slot_hhmm}: no window reading in the ledger, assuming none is open"
-                )
+                format!("slot {slot_hhmm}: no window reading in the ledger, assuming none is open")
             };
             say(out, &line)?;
             true

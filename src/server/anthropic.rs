@@ -757,22 +757,22 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 // session Toker cannot place yet records nothing.
                 let account_number =
                     super::quota_gate::gate_account(&server, backend.id(), Some(session));
-                if let Some(account_number) = account_number {
-                    if let Err(error) = crate::release::record_grant(
+                if let Some(account_number) = account_number
+                    && let Err(error) = crate::release::record_grant(
                         &server.store,
                         session,
                         account_number,
                         release,
                         &fresh,
-                    ) {
-                        tracing::error!(%error, "allowance record failed");
-                    }
+                    )
+                {
+                    tracing::error!(%error, "allowance record failed");
                 }
                 let merged = match account_number {
                     Some(account_number) => {
                         crate::release::merged(&server.store, session, account_number, &fresh, now)
                     }
-                    None => fresh.clone(),
+                    None => fresh,
                 };
                 record_anthropic_released(
                     &server,

@@ -29,18 +29,6 @@ pub(crate) fn tempdir(prefix: &str) -> TestDir {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn dropping_the_guard_removes_the_tree() {
-        let dir = super::tempdir("cleanup-proof-");
-        let path = dir.to_path_buf();
-        std::fs::write(path.join("fixture"), b"fixture").expect("write fixture");
-        drop(dir);
-        assert!(!path.exists(), "tempfile removed the tree");
-    }
-}
-
 /// An account in the store, for fixtures that need one to hang quota state
 /// off. Accounts are learned rather than created, so this learns one the
 /// way the proxy does: a credential digest, named by a local identity.
@@ -60,4 +48,16 @@ pub(crate) fn account(store: &crate::store::Store, provider: &str, email: &str) 
         )
         .expect("observe the fixture credential")
         .expect("the identity names an account")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn dropping_the_guard_removes_the_tree() {
+        let dir = super::tempdir("cleanup-proof-");
+        let path = dir.to_path_buf();
+        std::fs::write(path.join("fixture"), b"fixture").expect("write fixture");
+        drop(dir);
+        assert!(!path.exists(), "tempfile removed the tree");
+    }
 }

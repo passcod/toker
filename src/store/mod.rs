@@ -1801,7 +1801,9 @@ mod tests {
             "no ping-tagged reading after the cutoff"
         );
         assert_eq!(
-            store.furthest_reset5h("codex_sub", None, 0, false).expect("read"),
+            store
+                .furthest_reset5h("codex_sub", None, 0, false)
+                .expect("read"),
             None
         );
 
