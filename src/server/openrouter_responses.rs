@@ -130,8 +130,8 @@ impl ReadyAttempt {
                 };
             }
         };
-        let response_status = upstream.status();
-        match super::attempt::precommit_responses(upstream).await {
+        let response_status = upstream.response.status();
+        match super::attempt::precommit_responses(upstream.response).await {
             Ok(super::attempt::PrecommitOutcome::Accepted { response, .. }) => {
                 ReadyOutcome::Accepted {
                     upstream: response,

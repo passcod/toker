@@ -1329,7 +1329,14 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         server.borrow_catalog_credential(backend.as_ref(), &parts.headers);
         return match send_upstream(&server, backend.as_ref(), &parts, forward, &[]).await {
             Ok(upstream) => {
-                forward_administrative_response(server, backend, upstream, record, in_flight).await
+                forward_administrative_response(
+                    server,
+                    backend,
+                    upstream.response,
+                    record,
+                    in_flight,
+                )
+                .await
             }
             Err(error) => {
                 tracing::warn!(%error, "upstream request failed");
@@ -1538,7 +1545,7 @@ pub(crate) async fn retry_thinking_off(
     }
     send_upstream(server, backend, parts, retry, &[])
         .await
-        .map(ThinkingRetry::Retried)
+        .map(|upstream| ThinkingRetry::Retried(upstream.response))
         .map_err(|error| {
             tracing::warn!(%error, "upstream request failed");
             let class = if error.is_connect() {
@@ -1744,7 +1751,7 @@ async fn transparent_to(server: Server, request: Request, target: ModelTarget) -
     };
     match send_upstream(&server, backend.as_ref(), &parts, body, &[]).await {
         Ok(upstream) => {
-            forward_administrative_response(server, backend, upstream, None, None).await
+            forward_administrative_response(server, backend, upstream.response, None, None).await
         }
         Err(error) => {
             tracing::warn!(%error, "upstream request failed");

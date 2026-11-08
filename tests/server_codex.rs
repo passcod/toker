@@ -1618,9 +1618,18 @@ async fn responses_to_anthropic_subscription_prefers_held_token_then_local_login
             .expect("toker answers");
         assert_eq!(response.status(), StatusCode::OK);
         let _ = response.bytes().await.unwrap();
+        let row = wait_for_rows(&store, 1).await.remove(0);
+        assert_eq!(row.route.as_deref(), Some("openai_responses:anthropic_sub"));
         assert_eq!(
-            wait_for_rows(&store, 1).await[0].route.as_deref(),
-            Some("openai_responses:anthropic_sub")
+            row.credential_digest,
+            Some(toker::providers::credential_digest(
+                held.unwrap_or("local-token")
+            )),
+            "the row follows the injected subscription token, never Codex's bearer"
+        );
+        assert_eq!(
+            row.account_number, None,
+            "unresolved credentials remain serviceable"
         );
     }
     let requests = mock.requests.lock().unwrap().clone();

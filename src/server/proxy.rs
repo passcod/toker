@@ -58,8 +58,9 @@ use crate::middleware::cold;
 use crate::middleware::lanes;
 use crate::observe::{SseEvent, SseSplitter, UsageObserver};
 use crate::policy::force_newest;
-use crate::providers::Provider;
+use crate::providers::{Provider, credential_digest};
 use crate::routing::ProtocolId;
+use crate::store::CredentialDigest;
 use crate::translate::{self, OpenAiChatRenderer};
 
 use super::InFlightGuard;
@@ -577,13 +578,18 @@ fn catalog_unavailable(message: &str) -> Response {
 /// passes the configured attribution headers, the anthropic path passes
 /// an empty slice (the predecessor forwarded claude's session header
 /// verbatim).
+pub(crate) struct UpstreamResponse {
+    pub(crate) response: reqwest::Response,
+    pub(crate) credential_digest: Option<CredentialDigest>,
+}
+
 pub(crate) async fn send_upstream(
     server: &Server,
     provider: &dyn Provider,
     parts: &Parts,
     body: Bytes,
     session_header_names: &[String],
-) -> Result<reqwest::Response, reqwest::Error> {
+) -> Result<UpstreamResponse, reqwest::Error> {
     let path = parts
         .uri
         .path_and_query()
@@ -612,7 +618,7 @@ pub(crate) async fn send_upstream_to(
     session_header_names: &[String],
     frontend: ProtocolId,
     path: &str,
-) -> Result<reqwest::Response, reqwest::Error> {
+) -> Result<UpstreamResponse, reqwest::Error> {
     let url = provider.endpoint(path);
     // Pass-through-when-present: a frontend that
     // brings its own credential keeps it verbatim; the stored credential
@@ -627,13 +633,30 @@ pub(crate) async fn send_upstream_to(
         provider.inject_auth(&mut headers);
     }
     provider.prepare_protocol_headers(&mut headers);
-    server
+    let credential_digest = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|token| !token.is_empty())
+        .map(credential_digest)
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                .filter(|key| !key.is_empty())
+                .map(credential_digest)
+        });
+    let response = server
         .http
         .request(parts.method.clone(), url)
         .headers(headers)
         .body(body)
         .send()
-        .await
+        .await?;
+    Ok(UpstreamResponse {
+        response,
+        credential_digest,
+    })
 }
 
 /// A Chat binding's live universal-canonical response path. Accounting
