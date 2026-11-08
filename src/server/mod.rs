@@ -1760,11 +1760,7 @@ impl Server {
         }
     }
 
-    fn attach_plan_account(
-        &self,
-        plan: &mut crate::policy::AttemptPlan,
-        session_id: Option<&str>,
-    ) {
+    fn attach_plan_account(&self, plan: &mut crate::policy::AttemptPlan, session_id: Option<&str>) {
         plan.account_number = self.plan_account(&plan.provider, session_id);
     }
 
