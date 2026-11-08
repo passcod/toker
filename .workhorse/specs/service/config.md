@@ -24,6 +24,11 @@ Two settings are needed before the store can be opened or reached, and so cannot
 
 Each MUST resolve the same way in every process, so that the service, the command line and the dashboard agree on where the store is and which port answers.
 
+Setup MUST write configuration into the store the environment resolves, and MUST carry an overridden store path into the service's unit.
+
+> [!NOTE]
+> The service does not share the shell setup was run from, so without that the two resolve different stores and the service reads one setup never wrote.
+
 Where a command cannot reach the service, it MUST name the port it tried.
 
 > [!NOTE]
@@ -150,6 +155,11 @@ A command MUST look for that file where the operator's environment names it, and
 > [!NOTE]
 > Refusing is what makes the move safe to interrupt.
 > Nothing can read the store's configuration while the file is there, so nothing can have edited a row between the import and the file's removal.
+
+A file naming a store other than the one the environment resolves MUST stop setup before it changes anything.
+
+> [!NOTE]
+> A path the file carried is not an override the store can hold, so importing it would write the configuration into one store and leave every later command reading another.
 
 Setup MUST import the file in one transaction, and MUST remove the file only after that transaction commits.
 
