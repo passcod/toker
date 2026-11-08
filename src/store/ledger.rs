@@ -1498,18 +1498,43 @@ pub(super) fn meter_rows_since(conn: &Connection, ts_ms: i64, limit: i64) -> Res
 pub(super) fn furthest_reset5h(
     conn: &Connection,
     provider: &str,
+    account: Option<i64>,
     ts_ms: i64,
     ping_only: bool,
 ) -> Result<Option<i64>> {
+    // A window belongs to an account (spec: GPING#a-window-belongs-to-an-account),
+    // so a named account reads only its own rows, and a row naming none feeds
+    // no account's answer. `account` is None only where the provider has no
+    // accounts Toker can tell apart, and then every row is the one answer.
     let furthest = conn.query_row(
         "SELECT MAX(CAST(json_extract(rate_limits, '$.reset5h') AS INTEGER)) FROM requests
          WHERE ts_ms >= ?1 AND kind IS NULL AND provider = ?2 AND rate_limits IS NOT NULL
            AND json_type(rate_limits, '$.reset5h') IN ('integer', 'real')
-           AND (?3 = 0 OR ping = 1)",
-        (ts_ms, provider, ping_only),
+           AND (?3 = 0 OR ping = 1)
+           AND (?4 IS NULL OR account_number = ?4)",
+        (ts_ms, provider, ping_only, account),
         |row| row.get::<_, Option<i64>>(0),
     )?;
     Ok(furthest)
+}
+
+/// The account the newest ping-tagged row from `provider` at or after
+/// `ts_ms` was served on, which is the account that ping opened a window
+/// for. `None` when no such row names one.
+pub(super) fn ping_account(conn: &Connection, provider: &str, ts_ms: i64) -> Result<Option<i64>> {
+    let account = conn.query_row(
+        "SELECT account_number FROM requests
+         WHERE ts_ms >= ?1 AND kind IS NULL AND provider = ?2 AND ping = 1
+           AND account_number IS NOT NULL
+         ORDER BY ts_ms DESC, id DESC LIMIT 1",
+        (ts_ms, provider),
+        |row| row.get::<_, Option<i64>>("account_number"),
+    );
+    match account {
+        Ok(account) => Ok(account),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Whether any API-measured row from `provider` logged at or after

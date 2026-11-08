@@ -558,9 +558,26 @@ pub fn ping_window(
     // still ahead (a window ends at most 5 h after any request in it);
     // the extra step is slack for the two clocks disagreeing.
     let lookback = now_ms - WINDOW_MS - ANCHOR_STEP_MS;
+    // Whose window is being read. A provider with no accounts Toker can tell
+    // apart has one window and every row answers for it. One account, and
+    // the reading is that account's. Several, and which of them this ping
+    // will land on is not known until it has: reading them pooled could only
+    // produce a wrong skip, where another account's open window masks this
+    // one's closed one, and a wrong skip forfeits the boundary outright.
+    let accounts = match &store {
+        Ok(store) => store.account_numbers(SUB_PROVIDER).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let ambiguous = accounts.len() > 1;
+    let account = if accounts.len() == 1 {
+        accounts.first().copied()
+    } else {
+        None
+    };
     let open_until = match &store {
+        Ok(_) if ambiguous => Ok(None),
         Ok(store) => store
-            .furthest_reset5h(SUB_PROVIDER, lookback, false)
+            .furthest_reset5h(SUB_PROVIDER, account, lookback, false)
             .map_err(anyhow::Error::from),
         Err(error) => Err(anyhow::anyhow!("opening it: {error}")),
     };
@@ -586,6 +603,7 @@ pub fn ping_window(
                     observed_ms: Some(reset_ms),
                     verified: None,
                     assumed: None,
+                    account_number: account,
                 })
             {
                 say(
@@ -606,12 +624,18 @@ pub fn ping_window(
             false
         }
         Ok(None) => {
-            say(
-                out,
-                &format!(
+            let line = if ambiguous {
+                format!(
+                    "slot {slot_hhmm}: {} accounts known and nothing yet says which this \
+                     ping lands on, assuming no window is open",
+                    accounts.len()
+                )
+            } else {
+                format!(
                     "slot {slot_hhmm}: no window reading in the ledger, assuming none is open"
-                ),
-            )?;
+                )
+            };
+            say(out, &line)?;
             true
         }
         Err(error) => {
@@ -722,9 +746,17 @@ pub fn ping_window(
     // failure mode. `since` is what keeps it honest — the ledger already
     // holds the previous window's reset, and without the cutoff a ping
     // that changed nothing would report that as its own.
+    // Which account the ping opened a window for is read off the rows it
+    // produced, not decided in advance: the account a ping lands on is
+    // whichever one its credential belongs to.
+    let landed_account = if landed {
+        store.ping_account(SUB_PROVIDER, now_ms).ok().flatten()
+    } else {
+        None
+    };
     let observed = if landed {
         store
-            .furthest_reset5h(SUB_PROVIDER, now_ms, true)
+            .furthest_reset5h(SUB_PROVIDER, landed_account, now_ms, true)
             .ok()
             .flatten()
             .map(|reset_s| reset_s.saturating_mul(1000))
@@ -748,6 +780,7 @@ pub fn ping_window(
         observed_ms: observed,
         verified,
         assumed: Some(assumed),
+        account_number: landed_account,
     }) {
         say(
             out,

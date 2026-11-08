@@ -292,10 +292,17 @@ impl Store {
     pub fn furthest_reset5h(
         &self,
         provider: &str,
+        account: Option<i64>,
         ts_ms: i64,
         ping_only: bool,
     ) -> Result<Option<i64>> {
-        ledger::furthest_reset5h(&*self.conn()?, provider, ts_ms, ping_only)
+        ledger::furthest_reset5h(&*self.conn()?, provider, account, ts_ms, ping_only)
+    }
+
+    /// The account the ping that landed at or after `ts_ms` opened a window
+    /// for, read off the rows it produced.
+    pub fn ping_account(&self, provider: &str, ts_ms: i64) -> Result<Option<i64>> {
+        ledger::ping_account(&*self.conn()?, provider, ts_ms)
     }
 
     /// Whether a ping-tagged API-measured row from `provider` was logged
@@ -846,18 +853,24 @@ impl Store {
     /// The provider's only known account, or `None` where it holds none or
     /// holds more than one.
     pub fn sole_account(&self, provider_id: &str) -> Result<Option<i64>> {
-        // Two is enough to know it is not one.
-        let mut numbers: Vec<i64> = rows_of(
-            &*self.conn()?,
-            "SELECT number FROM accounts WHERE provider = ?1 ORDER BY number LIMIT 2",
-            [provider_id],
-            |row| Ok(row.get("number")?),
-        )?;
+        let mut numbers = self.account_numbers(provider_id)?;
         Ok(if numbers.len() == 1 {
             numbers.pop()
         } else {
             None
         })
+    }
+
+    /// Every account known on a provider, in discovery order. Callers that
+    /// need to tell "none" from "more than one" apart read this; the table
+    /// holds one row per login, so reading it whole costs nothing.
+    pub fn account_numbers(&self, provider_id: &str) -> Result<Vec<i64>> {
+        rows_of(
+            &*self.conn()?,
+            "SELECT number FROM accounts WHERE provider = ?1 ORDER BY number",
+            [provider_id],
+            |row| Ok(row.get("number")?),
+        )
     }
 
     /// The account a provider most recently served, whatever the session.
@@ -1769,26 +1782,26 @@ mod tests {
 
         assert_eq!(
             store
-                .furthest_reset5h("anthropic_sub", 0, false)
+                .furthest_reset5h("anthropic_sub", None, 0, false)
                 .expect("read"),
             Some(700)
         );
         assert_eq!(
             store
-                .furthest_reset5h("anthropic_sub", 2_500, false)
+                .furthest_reset5h("anthropic_sub", None, 2_500, false)
                 .expect("read"),
             Some(600),
             "the cutoff drops older rows"
         );
         assert_eq!(
             store
-                .furthest_reset5h("anthropic_sub", 2_500, true)
+                .furthest_reset5h("anthropic_sub", None, 2_500, true)
                 .expect("read"),
             None,
             "no ping-tagged reading after the cutoff"
         );
         assert_eq!(
-            store.furthest_reset5h("codex_sub", 0, false).expect("read"),
+            store.furthest_reset5h("codex_sub", None, 0, false).expect("read"),
             None
         );
 
@@ -2789,6 +2802,7 @@ mod tests {
             observed_ms: Some(2_400),
             verified: Some(true),
             assumed: Some(false),
+            account_number: None,
         };
         store.record_ping(&ping).expect("record ping");
         let mut got = store.pings_since(0, 10).expect("pings");
@@ -2809,6 +2823,7 @@ mod tests {
             observed_ms: None,
             verified: None,
             assumed: None,
+            account_number: None,
         };
         store.record_ping(&late).expect("record ping");
         let ts: Vec<i64> = store

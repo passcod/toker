@@ -471,6 +471,12 @@ pub struct PingRecord {
     /// The decision to ping was taken for want of any meter reading,
     /// not because one showed no window open.
     pub assumed: Option<bool>,
+    /// The account whose window this run opened, or found already open.
+    /// Read off the rows the ping produced rather than chosen in advance,
+    /// because the account a ping lands on is the one its credential
+    /// belongs to. `None` when nothing landed, when the row named no
+    /// account, or on a run recorded before accounts were.
+    pub account_number: Option<i64>,
 }
 
 /// What one ping run did.
@@ -2004,8 +2010,9 @@ fn read_allowance(row: &rusqlite::Row<'_>) -> Result<Allowance> {
 pub(super) fn record_ping(conn: &Connection, ping: &PingRecord) -> Result<()> {
     conn.execute(
         "INSERT INTO pings (ts_ms, exit_code, duration_ms, boundary_ms,
-                            slot, action, observed_ms, verified, assumed)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                            slot, action, observed_ms, verified, assumed,
+                            account_number)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         (
             ping.ts_ms,
             ping.exit_code,
@@ -2016,6 +2023,7 @@ pub(super) fn record_ping(conn: &Connection, ping: &PingRecord) -> Result<()> {
             ping.observed_ms,
             ping.verified,
             ping.assumed,
+            ping.account_number,
         ),
     )?;
     Ok(())
@@ -2053,6 +2061,7 @@ fn read_ping(row: &rusqlite::Row<'_>) -> Result<PingRecord> {
         observed_ms: row.get("observed_ms")?,
         verified: row.get("verified")?,
         assumed: row.get("assumed")?,
+        account_number: row.get("account_number")?,
     })
 }
 
