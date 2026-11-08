@@ -1162,6 +1162,9 @@ pub struct RunReport {
     pub patch_failed: Vec<String>,
     /// The predecessor log imported this run, if any.
     pub import_ran: Option<PathBuf>,
+    /// How many rows that predated accounts this run attributed; `None`
+    /// when there were none to move.
+    pub rows_attributed: Option<usize>,
     /// The opencode plugin installed (or confirmed) this run — its
     /// target dir; `None` when opencode was not detected or the
     /// operator declined the (opt-out) offer.
@@ -1253,6 +1256,9 @@ impl<'a> Wizard<'a> {
         let choices = self.choose_backends(&detected)?;
         let current = self.write_step(choices.as_ref(), &detected, &mut report)?;
         report.port = current.port;
+        // Before the units: the service refuses to start while the ledger
+        // holds rows from before accounts were recorded.
+        self.attribute_step(&mut report)?;
 
         // A port change on a machine whose socket is already up: the
         // running socket keeps its old listener until it is restarted,
@@ -2562,6 +2568,94 @@ impl<'a> Wizard<'a> {
     /// the history import offer (when
     /// the source exists: the existing `toker import` logic,
     /// in-process, into the ledger the config names).
+    /// Move a store's pre-account rows onto the account that served them
+    /// (spec: ACCT#moving-a-machine-onto-accounts).
+    ///
+    /// Silent on a store with nothing to move, which is every fresh machine
+    /// and every machine already moved. Placed before the units go up,
+    /// because the service refuses to start while such rows remain.
+    fn attribute_step(&mut self, report: &mut RunReport) -> Result<()> {
+        let provider = crate::accounts::ACCOUNTED_PROVIDER;
+        let db_path = self.paths.db_path();
+        let store = Store::open(&db_path)
+            .with_context(|| format!("opening the store at {}", db_path.display()))?;
+        let rows = store
+            .unattributed_row_count(provider)
+            .context("counting the rows that predate accounts")?;
+        if rows == 0 {
+            return Ok(());
+        }
+        self.say("")?;
+        self.say("account history")?;
+        self.say(&format!(
+            "  {rows} rows were served before toker recorded which account they were on"
+        ))?;
+
+        // Refusing is the whole point of the check: nothing can separate a
+        // mixed history afterwards, so attributing it to one account would
+        // assert something nothing ever recorded.
+        if let Some(mixed) = store
+            .unattributed_window_conflict(provider)
+            .context("checking whether the rows carry one account's windows")?
+        {
+            let at = jiff::Timestamp::from_millisecond(mixed.at_ms)
+                .map_or_else(|_| mixed.at_ms.to_string(), |at| at.to_string());
+            bail!(
+                "those rows carry more than one account's rate limit windows: a row at {at} \
+                 reports a five-hour reset of {} while the window open then reset at {}. \
+                 Two accounts' windows overlap in time, and nothing can separate them now, \
+                 so toker will not attribute them to one account.",
+                mixed.row_reset_s,
+                mixed.open_reset_s,
+            );
+        }
+
+        // Learn every account a local source can name before offering them,
+        // so an account the operator has but toker has never served on is
+        // still a choice here.
+        if let Some(path) = crate::accounts::local_account_path()
+            && let Ok(identities) = crate::accounts::local_account_identities(&path)
+        {
+            let now = jiff::Timestamp::now().as_millisecond();
+            for (digest, identity) in &identities {
+                let _ = store.observe_credential(provider, digest, now, Some(identity));
+            }
+        }
+
+        let accounts: Vec<_> = store
+            .load_accounts()
+            .context("reading the accounts toker knows")?
+            .into_iter()
+            .filter(|account| account.provider == provider)
+            .collect();
+        if accounts.is_empty() {
+            bail!(
+                "toker knows no {provider} account to attribute those rows to. Sign in, let \
+                 one request through, and run setup again."
+            );
+        }
+        let labels: Vec<String> = accounts
+            .iter()
+            .map(|account| match &account.email {
+                Some(email) => format!("{} {email}", account.number),
+                None => format!("{} (unnamed)", account.number),
+            })
+            .collect();
+        let offered: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let chosen = self.prompt.select(
+            "which account were those rows served on?",
+            &offered,
+            Some(0),
+        )?;
+        let account = accounts[chosen].number;
+        let moved = store
+            .attribute_unattributed_rows(provider, account)
+            .context("attributing the rows that predate accounts")?;
+        self.say(&format!("  attributed {moved} rows to account {account}"))?;
+        report.rows_attributed = Some(moved);
+        Ok(())
+    }
+
     fn toggles_step(
         &mut self,
         detected: &Detected,

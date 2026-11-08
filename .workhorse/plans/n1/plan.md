@@ -18,6 +18,6 @@ Implement the account model described by ACCT and thread it through credential r
   - [x] Parse a bounded local multi-account credential file into digest and email facts without retaining token values.
 - [ ] Discover and resolve account identities without delaying requests, then retroactively attribute rows for a resolved digest.
 - [ ] Key cache identity, meter state, quota fitting, allowances and pings by account.
-- [ ] Migrate historical unattributed rows through setup and refuse other commands until setup completes.
+- [x] Migrate historical unattributed rows through setup and refuse other commands until setup completes.
 - [ ] Add account snapshots and controls to the service and render the account-aware dashboard and accounts page.
 - [ ] Add focused tests for migration, attribution, account isolation and account-aware rendering.
