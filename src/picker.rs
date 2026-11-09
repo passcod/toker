@@ -564,8 +564,8 @@ mod tests {
     fn incompatible_anthropic_profile_presentations_are_rejected() {
         use crate::policy::{
             ArgumentBinding, CURRENT_FORMAT_VERSION, Candidate, CandidateId, CandidateModel,
-            LaneTransitionPolicy, PolicyDocument, PolicyOrigin, Presentation, PresentationId,
-            PresentationSource, Route, RouteChain, RouteId, RouteReference,
+            LaneTransitionPolicy, PolicyDocument, Presentation, PresentationId, PresentationSource,
+            Route, RouteChain, RouteId, RouteReference,
         };
         use crate::routing::ANTHROPIC_SUB_MESSAGES;
 
@@ -632,14 +632,10 @@ mod tests {
         .validate()
         .unwrap();
         let topology = RouteRegistry::configured_bindings([ANTHROPIC_SUB_MESSAGES.id().clone()]);
-        let compiled = crate::policy::compile(
-            policy,
-            &topology,
-            &offers::OfferInventory::default(),
-            PolicyOrigin::Authored,
-        )
-        .into_policy()
-        .unwrap();
+        let compiled =
+            crate::policy::compile(policy, &topology, &offers::OfferInventory::default())
+                .into_policy()
+                .unwrap();
 
         let error = policy_rows(&compiled).unwrap_err();
         assert!(error.downcast_ref::<IncompatibleClaudeProfile>().is_some());

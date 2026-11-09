@@ -1159,11 +1159,20 @@ async fn a_virtual_responses_presentation_is_listed_or_left_out_without_failing_
         .iter()
         .map(|entry| entry["slug"].as_str().unwrap())
         .collect();
-    // The generated `codex_sub/` alias is listed too; the virtual slug without
-    // a record is the one left out.
-    assert_eq!(slugs, ["codex_sub/gpt-5.6-sol", "exact", "with-record"]);
-    assert_eq!(body["models"][2]["priority"], 7);
-    assert_eq!(body["models"][2]["shell_type"], "unified_exec");
+    // The derived `codex_sub/` and bare slugs are listed too, since the
+    // Responses default routes both to codex; the virtual slug without a
+    // record is the one left out.
+    assert_eq!(
+        slugs,
+        [
+            "codex_sub/gpt-5.6-sol",
+            "exact",
+            "gpt-5.6-sol",
+            "with-record"
+        ]
+    );
+    assert_eq!(body["models"][3]["priority"], 7);
+    assert_eq!(body["models"][3]["shell_type"], "unified_exec");
     assert!(mock.requests.lock().unwrap().is_empty());
 }
 

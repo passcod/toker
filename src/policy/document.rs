@@ -28,7 +28,7 @@ pub const MAX_MATCHER_BYTES: usize = 1_024;
 pub const MAX_TEMPLATE_BYTES: usize = 1_024;
 
 pub const MINIMUM_FORMAT_VERSION: u32 = 1;
-pub const CURRENT_FORMAT_VERSION: u32 = 4;
+pub const CURRENT_FORMAT_VERSION: u32 = 5;
 pub const REQUESTED_MODEL_PARAMETER: &str = "requested_model";
 
 /// A stable policy identity with a deliberately narrow spelling.
@@ -281,6 +281,36 @@ impl PolicyDocument {
         Ok(ValidatedPolicyDocument(self.clone()))
     }
 
+    /// The first format-five feature this document uses, by the path that
+    /// names it: an undeclared tuple arity, the scaled evidence bar, or a
+    /// compaction model substitution.
+    fn format_five_feature(&self) -> Option<&'static str> {
+        if self.classifiers.iter().any(|classifier| {
+            matches!(
+                classifier.version_parser,
+                VersionParserSpec::NumericTuple {
+                    components: None,
+                    ..
+                }
+            )
+        }) {
+            return Some("/classifiers/*/version_parser/components");
+        }
+        if self
+            .upgrades
+            .iter()
+            .any(|upgrade| upgrade.minimum_learning == MinimumLearning::Scaled)
+        {
+            return Some("/upgrades/*/minimum_learning");
+        }
+        if self.compaction.as_ref().is_some_and(|compaction| {
+            matches!(compaction.target, CompactionTarget::Substitution { .. })
+        }) {
+            return Some("/compaction/target");
+        }
+        None
+    }
+
     fn validate_inner(&self) -> Result<(), DocumentError> {
         if !(MINIMUM_FORMAT_VERSION..=CURRENT_FORMAT_VERSION).contains(&self.format_version) {
             return Err(DocumentError::UnsupportedFormat(self.format_version));
@@ -297,19 +327,6 @@ impl PolicyDocument {
                 required: 2,
             });
         }
-        if self.format_version < 3
-            && self.compaction.as_ref().is_some_and(|compaction| {
-                matches!(
-                    compaction.target,
-                    CompactionTarget::RevisionOneLegacy { .. }
-                )
-            })
-        {
-            return Err(DocumentError::FeatureRequiresFormat {
-                path: "/compaction/target".to_owned(),
-                required: 3,
-            });
-        }
         if self.format_version < 4
             && self
                 .routes
@@ -319,6 +336,14 @@ impl PolicyDocument {
             return Err(DocumentError::FeatureRequiresFormat {
                 path: "/routes/*/honours_server_safeguards".to_owned(),
                 required: 4,
+            });
+        }
+        if self.format_version < 5
+            && let Some(path) = self.format_five_feature()
+        {
+            return Err(DocumentError::FeatureRequiresFormat {
+                path: path.to_owned(),
+                required: 5,
             });
         }
         check_optional_description(&self.description, "/description")?;
@@ -1092,10 +1117,6 @@ pub struct FamilyClassifier {
     pub family_template: String,
     pub version_template: String,
     pub version_parser: VersionParserSpec,
-    /// Generated revision-one compatibility for legacy ids whose family and
-    /// numeric version segments may be interleaved.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub legacy_hyphenated: bool,
 }
 
 impl Identified for FamilyClassifier {
@@ -1111,9 +1132,7 @@ impl FamilyClassifier {
         check_matcher(&self.model_matcher, &field(path, "model_matcher"))?;
         check_template(&self.family_template, &field(path, "family_template"))?;
         check_template(&self.version_template, &field(path, "version_template"))?;
-        if let VersionParserSpec::NumericTuple { separator, .. }
-        | VersionParserSpec::LegacyNumericTuple { separator } = &self.version_parser
-        {
+        if let VersionParserSpec::NumericTuple { separator, .. } = &self.version_parser {
             check_string(
                 separator,
                 &field(&field(path, "version_parser"), "separator"),
@@ -1138,12 +1157,6 @@ pub struct UpgradePolicy {
     #[serde(default)]
     pub inventory_sources: Vec<InventorySource>,
     pub lane_transition: LaneTransitionPolicy,
-    /// Nothing reads this and revision one no longer sets it. It stays so a
-    /// stored revision one that carries it still decodes and keeps the
-    /// fingerprint it was activated under; the compiler refuses it from an
-    /// authored document.
-    #[serde(default)]
-    pub allow_revision_one_legacy_learning: bool,
 }
 
 impl Identified for UpgradePolicy {
@@ -1168,12 +1181,10 @@ pub enum MinimumLearning {
         days: u16,
     },
     ExplicitPromotion,
-    /// The revision-one election bar: strictly more than
-    /// `min(7, active_days / 2)` distinct days.
-    ///
-    /// This exists only to preserve revision one's adaptive election bar over
-    /// binding-local learning. Authored policy cannot select it.
-    RevisionOneAdaptive,
+    /// Strictly more distinct days than half the days the binding has any
+    /// evidence for, capped (see `learning::requirement`).
+    // spec: RMODEL#electing-a-familys-target
+    Scaled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1196,12 +1207,12 @@ impl CompactionPolicy {
     fn validate(&self, path: &str) -> Result<(), DocumentError> {
         match &self.target {
             CompactionTarget::Route(target) => target.validate(&field(path, "target")),
-            CompactionTarget::RevisionOneLegacy {
-                model_spec,
-                eligible_bindings,
-            } => {
-                check_string(model_spec, &field(path, "model_spec"))?;
-                check_collection(eligible_bindings, &field(path, "eligible_bindings"))
+            CompactionTarget::Substitution { model, bindings } => {
+                let target = field(path, "target");
+                if let Some(model) = model {
+                    check_string(model.value(), &field(&target, "model"))?;
+                }
+                check_collection(bindings, &field(&target, "bindings"))
             }
         }
     }
@@ -1210,11 +1221,31 @@ impl CompactionPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactionTarget {
     Route(RouteReference),
-    /// Revision-one compatibility overlay. Authored policy cannot select it.
-    RevisionOneLegacy {
-        model_spec: String,
-        eligible_bindings: Vec<BindingId>,
+    /// A cheaper model on whichever of `bindings` the request reached. With
+    /// no model it moves nothing, and only licenses the cold transform there.
+    // spec: RCOMP#choosing-the-target
+    Substitution {
+        model: Option<SubstituteModel>,
+        bindings: Vec<BindingId>,
     },
+}
+
+/// What a compaction substitution moves to: one exact model, or the newest
+/// learned member of a family as the reached candidate's upgrade policy
+/// classifies it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum SubstituteModel {
+    Exact(String),
+    Family(String),
+}
+
+impl SubstituteModel {
+    pub fn value(&self) -> &str {
+        match self {
+            Self::Exact(value) | Self::Family(value) => value,
+        }
+    }
 }
 
 impl Serialize for CompactionTarget {
@@ -1224,13 +1255,10 @@ impl Serialize for CompactionTarget {
     {
         match self {
             Self::Route(target) => target.serialize(serializer),
-            Self::RevisionOneLegacy {
-                model_spec,
-                eligible_bindings,
-            } => RevisionOneCompactionTarget {
-                kind: RevisionOneCompactionKind::RevisionOneLegacy,
-                model_spec: model_spec.clone(),
-                eligible_bindings: eligible_bindings.clone(),
+            Self::Substitution { model, bindings } => SubstitutionTarget {
+                kind: SubstitutionKind::Substitution,
+                model: model.clone(),
+                bindings: bindings.clone(),
             }
             .serialize(serializer),
         }
@@ -1244,11 +1272,11 @@ impl<'de> Deserialize<'de> for CompactionTarget {
     {
         let value = serde_json::Value::deserialize(deserializer)?;
         if value.get("kind").is_some() {
-            let legacy: RevisionOneCompactionTarget =
+            let substitution: SubstitutionTarget =
                 serde_json::from_value(value).map_err(serde::de::Error::custom)?;
-            return Ok(Self::RevisionOneLegacy {
-                model_spec: legacy.model_spec,
-                eligible_bindings: legacy.eligible_bindings,
+            return Ok(Self::Substitution {
+                model: substitution.model,
+                bindings: substitution.bindings,
             });
         }
         serde_json::from_value(value)
@@ -1257,18 +1285,21 @@ impl<'de> Deserialize<'de> for CompactionTarget {
     }
 }
 
+/// The wire shape of a substitution: a route reference has no `kind`, so
+/// the tag alone tells the two targets apart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RevisionOneCompactionTarget {
-    kind: RevisionOneCompactionKind,
-    model_spec: String,
-    eligible_bindings: Vec<BindingId>,
+struct SubstitutionTarget {
+    kind: SubstitutionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<SubstituteModel>,
+    bindings: Vec<BindingId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum RevisionOneCompactionKind {
-    RevisionOneLegacy,
+enum SubstitutionKind {
+    Substitution,
 }
 
 fn default_true() -> bool {

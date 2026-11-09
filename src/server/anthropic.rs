@@ -585,7 +585,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             facts.asks_server_safeguards = translate::asks_server_safeguards(request);
             facts.accounts = server.request_accounts(&parts.headers, ProtocolId::AnthropicMessages);
             if class == crate::policy::RequestClass::Compaction {
-                facts.legacy_compaction = Some(legacy_compaction_facts(
+                facts.compaction_evidence = Some(compaction_evidence(
                     &server,
                     request,
                     cold_lane.as_ref(),
@@ -1780,13 +1780,13 @@ fn parts_without_safeguards_beta(parts: &axum::http::request::Parts) -> axum::ht
 /// The evidence the resolver's compaction rules read from a lane: whether
 /// its cache is gone by its own record, how big its prefix is, and whether
 /// the compaction body transform would apply to `request`.
-fn legacy_compaction_facts(
+fn compaction_evidence(
     server: &Server,
     request: &CanonicalRequest,
     lane: Option<&crate::store::Lane>,
     now_ms: i64,
-) -> crate::policy::LegacyCompactionFacts {
-    crate::policy::LegacyCompactionFacts {
+) -> crate::policy::CompactionEvidence {
+    crate::policy::CompactionEvidence {
         lane_cold: cold::lane_is_cold(
             lane,
             server.config().gates.cold_min_tokens,
@@ -1824,7 +1824,7 @@ fn cold_compaction_target(
 ) -> Option<String> {
     let mut facts = facts.clone();
     facts.class = crate::policy::RequestClass::Compaction;
-    facts.legacy_compaction = Some(legacy_compaction_facts(server, request, lane, facts.now_ms));
+    facts.compaction_evidence = Some(compaction_evidence(server, request, lane, facts.now_ms));
     let pinned = lane
         .and_then(|lane| lane.pin.as_ref())
         .and_then(|pin| server.registry.binding(&pin.binding_id));

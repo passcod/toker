@@ -1,6 +1,7 @@
 //! Frontend-visible model lists are projected from canonical backend offers
 //! through the implemented route graph, never one upstream's raw listing.
-//! Revision one's generated Chat and Responses listings are this projection.
+//! The Chat and Responses listings every revision derives start from this
+//! projection.
 
 use std::collections::BTreeMap;
 
@@ -148,14 +149,12 @@ pub fn render_policy(
             None => virtual_presentations.push((slug.to_owned(), presentation)),
         }
     }
-    // Revision one authors presentations for the claude picker only. The
-    // other frontends list what the legacy projection listed, from the
-    // generated publication, under the slug a presentation does not hold.
+    // The derived listing, under the slugs no presentation holds.
     let presented: std::collections::BTreeSet<String> = exact
         .iter()
         .map(|offer| offer.routed_model_id.clone())
         .collect();
-    for (slug, binding_id, model_id) in policy.generated_publication(protocol) {
+    for (slug, binding_id, model_id) in policy.derived_publication(protocol) {
         if presented.contains(slug)
             || virtual_presentations
                 .iter()
@@ -310,37 +309,29 @@ fn anthropic_entry(slug: &str, raw: &Value) -> Value {
     Value::Object(entry)
 }
 
-/// Project one already-captured canonical inventory into the legacy frontend
-/// aliases: `<provider>/<id>` for every implemented edge to a configured
-/// provider, and the bare `<id>` for the offers of `default_provider`, the one
-/// the revision-one document defaults the frontend's protocol to. Equal slugs
-/// on two providers never merge. Staleness remains in `fetched_at_ms`, not a
-/// made-up fresh claim.
+/// Every slug a revision may derive from one already-captured canonical
+/// inventory for `frontend`: `<provider>/<id>` and the bare `<id>` for every
+/// implemented edge to a configured provider. Equal bare slugs on two
+/// providers are both returned; the compiler keeps the one the revision
+/// routes. Staleness remains in `fetched_at_ms`, not a made-up fresh claim.
 ///
-/// This is revision one's generated publication for Chat and Responses, never
-/// a routing decision: the requests these slugs name are routed by the
-/// revision's own rewrites and defaults.
-pub fn for_frontend_inventory(
+/// These are publication only, never a routing decision: the requests these
+/// slugs name are routed by the revision's own rewrites and defaults.
+pub fn derivable_offers(
     registry: &RouteRegistry,
     inventory: &OfferInventory,
     frontend: ProtocolId,
-    default_provider: Option<&str>,
 ) -> Vec<ModelOffer> {
     let mut offers = Vec::new();
     for offer in inventory.iter() {
-        let routed = format!("{}/{}", offer.provider, offer.backend_model_id);
-        if let Some(projected) = projected(registry, offer, frontend, routed) {
-            offers.push(projected);
-        }
-        if default_provider == Some(offer.provider.as_str())
-            && let Some(projected) =
-                projected(registry, offer, frontend, offer.backend_model_id.clone())
-        {
-            offers.push(projected);
+        let prefixed = format!("{}/{}", offer.provider, offer.backend_model_id);
+        for routed in [prefixed, offer.backend_model_id.clone()] {
+            if let Some(projected) = projected(registry, offer, frontend, routed) {
+                offers.push(projected);
+            }
         }
     }
     offers.sort_by(|a, b| a.routed_model_id.cmp(&b.routed_model_id));
-    offers.dedup_by(|a, b| a.routed_model_id == b.routed_model_id);
     offers
 }
 
@@ -453,11 +444,10 @@ mod tests {
 
     fn chat_offers() -> Vec<ModelOffer> {
         let registry = registry();
-        for_frontend_inventory(
+        derivable_offers(
             &registry,
             &inventory(&registry, &catalogs()),
             ProtocolId::OpenAiChat,
-            Some("openrouter"),
         )
     }
 
@@ -497,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_projection_adds_prefix_and_default_alias_without_changing_metadata() {
+    fn derivable_offers_add_prefixed_and_bare_slugs_without_changing_metadata() {
         let offers = chat_offers();
         assert_eq!(offers.len(), 2);
         assert_eq!(offers[0].routed_model_id, "openrouter/vendor/model");

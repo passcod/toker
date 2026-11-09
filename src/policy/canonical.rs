@@ -20,6 +20,7 @@ const POLICY_FINGERPRINT_DOMAIN_V1: &[u8] = b"toker.policy.document.v1\0";
 const POLICY_FINGERPRINT_DOMAIN_V2: &[u8] = b"toker.policy.document.v2\0";
 const POLICY_FINGERPRINT_DOMAIN_V3: &[u8] = b"toker.policy.document.v3\0";
 const POLICY_FINGERPRINT_DOMAIN_V4: &[u8] = b"toker.policy.document.v4\0";
+const POLICY_FINGERPRINT_DOMAIN_V5: &[u8] = b"toker.policy.document.v5\0";
 // Route semantics evolve independently from the document format. Change this
 // domain whenever the closed projection below changes meaning or shape.
 const ROUTE_FINGERPRINT_DOMAIN_V1: &[u8] = b"toker.policy.route-semantics.v1\0";
@@ -82,15 +83,6 @@ pub fn decode_policy(
     if format_version == Some(1) && uses_v2_capability_fields(&lexical) {
         return Err(CanonicalError::InvalidDocument(
             "tool-choice capability fields require policy format version 2".to_owned(),
-        ));
-    }
-    if format_version.is_some_and(|version| version < 3)
-        && lexical
-            .pointer("/compaction/target/kind")
-            .is_some_and(|kind| kind == "revision_one_legacy")
-    {
-        return Err(CanonicalError::InvalidDocument(
-            "revision-one compaction target requires policy format version 3".to_owned(),
         ));
     }
     // Deserialize from the original token stream, not through `Value`:
@@ -241,6 +233,7 @@ pub fn policy_fingerprint(
         2 => POLICY_FINGERPRINT_DOMAIN_V2,
         3 => POLICY_FINGERPRINT_DOMAIN_V3,
         4 => POLICY_FINGERPRINT_DOMAIN_V4,
+        5 => POLICY_FINGERPRINT_DOMAIN_V5,
         version => return Err(CanonicalError::UnsupportedFormat(version)),
     };
     Ok(PolicyFingerprint(hash(domain, &policy_bytes(document)?)))
@@ -425,7 +418,6 @@ struct SemanticUpgrade {
     allow_manual_promotion: bool,
     inventory_sources: Vec<InventorySource>,
     lane_transition: LaneTransitionPolicy,
-    allow_revision_one_legacy_learning: bool,
 }
 
 impl From<&UpgradePolicy> for SemanticUpgrade {
@@ -441,7 +433,6 @@ impl From<&UpgradePolicy> for SemanticUpgrade {
             allow_manual_promotion: policy.allow_manual_promotion,
             inventory_sources,
             lane_transition: policy.lane_transition,
-            allow_revision_one_legacy_learning: policy.allow_revision_one_legacy_learning,
         }
     }
 }
@@ -458,7 +449,7 @@ pub fn route_fingerprint(semantics: &RouteSemantics) -> Result<RouteFingerprint,
 fn route_domain(format_version: u32) -> Result<&'static [u8], CanonicalError> {
     match format_version {
         1 => Ok(ROUTE_FINGERPRINT_DOMAIN_V1),
-        2..=4 => Ok(ROUTE_FINGERPRINT_DOMAIN_V2),
+        2..=5 => Ok(ROUTE_FINGERPRINT_DOMAIN_V2),
         version => Err(CanonicalError::UnsupportedFormat(version)),
     }
 }
@@ -988,16 +979,16 @@ mod tests {
 
         let mut invalid_v2 = v2.into_document();
         invalid_v2.compaction = Some(crate::policy::CompactionPolicy {
-            target: crate::policy::CompactionTarget::RevisionOneLegacy {
-                model_spec: "sonnet".to_owned(),
-                eligible_bindings: vec![BindingId::new("provider.dialect").unwrap()],
+            target: crate::policy::CompactionTarget::Substitution {
+                model: Some(crate::policy::SubstituteModel::Family("sonnet".to_owned())),
+                bindings: vec![BindingId::new("provider.dialect").unwrap()],
             },
             lane_transition: LaneTransitionPolicy::MoveWhenCold,
             cache_transition: CacheTransitionPolicy::AllowWhenCold,
         });
         assert!(matches!(
             invalid_v2.validate(),
-            Err(crate::policy::DocumentError::FeatureRequiresFormat { required: 3, .. })
+            Err(crate::policy::DocumentError::FeatureRequiresFormat { required: 5, .. })
         ));
     }
 
@@ -1060,7 +1051,6 @@ mod tests {
                 family_template: "${1}".to_owned(),
                 version_template: "${1}".to_owned(),
                 version_parser: VersionParserSpec::Semver,
-                legacy_hyphenated: false,
             }],
             upgrades: vec![UpgradePolicy {
                 id: UpgradePolicyId::new("upgrade").unwrap(),
@@ -1070,7 +1060,6 @@ mod tests {
                 allow_manual_promotion: false,
                 inventory_sources: vec![InventorySource::Catalogue],
                 lane_transition: LaneTransitionPolicy::PreservePinned,
-                allow_revision_one_legacy_learning: false,
             }],
             compaction: None,
         }

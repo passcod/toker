@@ -98,9 +98,8 @@ use crate::routing::{FrontendProfile, ModelTarget, ProtocolId, RouteRegistry};
 use crate::secrets::{self, KEYRING_READ_TIMEOUT, OsKeyring, SecretStore};
 use crate::store::{
     ActivatePolicyRevision, ActivatedPolicyRevision, BindingLearning, CredentialDigest,
-    DraftCasResult, PolicyCompilerOrigin, PolicyRevision, PolicyRevisionSource,
-    PublicationCasResult, PublicationKey, PublicationResultUpdate, PublicationState,
-    RoutingPolicyState, RoutingPublication, Store,
+    DraftCasResult, PolicyRevision, PolicyRevisionSource, PublicationCasResult, PublicationKey,
+    PublicationResultUpdate, PublicationState, RoutingPolicyState, RoutingPublication, Store,
 };
 
 use record::now_ms;
@@ -591,27 +590,20 @@ impl Server {
         let inventory = offers::inventory(&registry, &initial_catalogs);
         let availability = Arc::new(availability_for(&registry, &initial_catalogs));
         let publication_generation = fetched::snapshot_generation(&initial_catalogs);
-        let state = store.load_routing_policy_state()?;
-        let (revision, policy) = match state.active_revision_id {
-            Some(revision_id) => {
-                let revision = store.load_policy_revision(revision_id)?.ok_or_else(|| {
-                    anyhow::anyhow!("active policy revision {revision_id} is missing")
-                })?;
-                let policy = compile_stored_policy(&revision, &registry, &inventory)?;
-                (revision, policy)
-            }
-            None => crate::policy::legacy::establish_revision_one(
-                &store,
-                &config,
-                &registry,
-                &inventory,
-                publication_generation,
-                now_ms(),
-                // The service never imports: it refuses to start while a
-                // configuration file exists, so setup is the only importer.
-                None,
-            )?,
-        };
+        // Every start goes through the first-revision transaction, which
+        // retires generated revisions before the pointer is read and loads
+        // the active revision where there is one.
+        let (revision, policy) = crate::policy::legacy::establish_revision_one(
+            &store,
+            &config,
+            &registry,
+            &inventory,
+            publication_generation,
+            now_ms(),
+            // The service never imports: it refuses to start while a
+            // configuration file exists, so setup is the only importer.
+            None,
+        )?;
         let policy_runtime = Arc::new(crate::policy::PolicyRuntime::new(
             store.clone(),
             registry.clone(),
@@ -853,14 +845,10 @@ impl Server {
         let inventory = offers::inventory(&self.registry, &catalogs);
         let availability = availability_for(&self.registry, &catalogs);
         let state = self.store.load_routing_policy_state()?;
-        let draft_compilation = state.draft.as_ref().map(|draft| {
-            compile_control(
-                &draft.document,
-                revision.compiler_origin,
-                &self.registry,
-                &inventory,
-            )
-        });
+        let draft_compilation = state
+            .draft
+            .as_ref()
+            .map(|draft| compile_control(&draft.document, &self.registry, &inventory));
         let draft_diagnostics = draft_compilation
             .as_ref()
             .map(|compilation| compilation.diagnostics().to_vec())
@@ -966,12 +954,7 @@ impl Server {
             .state
             .draft
             .ok_or(RoutingControlError::DraftMissing)?;
-        let compilation = compile_control(
-            &draft.document,
-            snapshot.active_revision.compiler_origin,
-            &self.registry,
-            &snapshot.inventory,
-        );
+        let compilation = compile_control(&draft.document, &self.registry, &snapshot.inventory);
         // Info and warning findings ride along with a policy that compiled,
         // so validate shows the notes (an unconfigured binding, an offer the
         // catalogue lacks) the same way it shows the errors.
@@ -998,12 +981,7 @@ impl Server {
             .state
             .draft
             .ok_or(RoutingControlError::DraftMissing)?;
-        let policy = compile_control_policy(
-            &draft.document,
-            snapshot.active_revision.compiler_origin,
-            &self.registry,
-            &snapshot.inventory,
-        )?;
+        let policy = compile_control_policy(&draft.document, &self.registry, &snapshot.inventory)?;
         let lane = request
             .lane_key
             .as_deref()
@@ -1035,7 +1013,7 @@ impl Server {
             asks_server_safeguards: request.asks_server_safeguards,
             binding_affinity: request.binding_affinity,
             class: RequestClass::Inference,
-            legacy_compaction: None,
+            compaction_evidence: None,
             // A dry run has no request behind it, so no credential to
             // name an account.
             accounts: Default::default(),
@@ -1078,7 +1056,6 @@ impl Server {
                 scope,
                 forced_cache_transition,
                 source: PolicyRevisionSource::Draft,
-                requested_origin: None,
                 parent_revision_id: None,
             },
         )
@@ -1118,12 +1095,7 @@ impl Server {
         let snapshot = self.routing_snapshot_locked()?;
         let impacts = self.routing_lane_impacts_locked(&state, now_ms())?;
         require_cache_consent(&impacts, scope, forced_cache_transition)?;
-        compile_control_policy(
-            &selected.document,
-            selected.compiler_origin,
-            &self.registry,
-            &snapshot.inventory,
-        )?;
+        compile_control_policy(&selected.document, &self.registry, &snapshot.inventory)?;
         match self.store.compare_and_swap_policy_draft(
             expected_generation,
             base_revision_id,
@@ -1137,7 +1109,6 @@ impl Server {
                     scope,
                     forced_cache_transition,
                     source: PolicyRevisionSource::Reactivation,
-                    requested_origin: Some(selected.compiler_origin),
                     parent_revision_id: Some(selected_revision_id),
                 },
             ),
@@ -1179,15 +1150,7 @@ impl Server {
             .ok_or(RoutingControlError::DraftMissing)?;
         let impacts = self.routing_lane_impacts_locked(&snapshot.state, now_ms())?;
         require_cache_consent(&impacts, options.scope, options.forced_cache_transition)?;
-        let compiler_origin = options
-            .requested_origin
-            .unwrap_or(snapshot.active_revision.compiler_origin);
-        let policy = compile_control_policy(
-            &draft.document,
-            compiler_origin,
-            &self.registry,
-            &snapshot.inventory,
-        )?;
+        let policy = compile_control_policy(&draft.document, &self.registry, &snapshot.inventory)?;
         let activation = self
             .store
             .activate_policy_revision(&ActivatePolicyRevision {
@@ -1197,7 +1160,6 @@ impl Server {
                 activation_scope: options.scope,
                 forced_cache_transition: options.forced_cache_transition,
                 source: options.source,
-                compiler_origin,
                 parent_revision_id: options.parent_revision_id,
                 expected_active_revision_id: snapshot.active_revision.revision_id,
                 document: &draft.document,
@@ -1793,7 +1755,7 @@ impl Server {
             asks_server_safeguards: false,
             binding_affinity,
             class,
-            legacy_compaction: None,
+            compaction_evidence: None,
             accounts: Default::default(),
             now_ms: now_ms(),
         }
@@ -2655,7 +2617,6 @@ struct DraftActivationOptions {
     scope: crate::policy::ActivationScope,
     forced_cache_transition: bool,
     source: PolicyRevisionSource,
-    requested_origin: Option<PolicyCompilerOrigin>,
     parent_revision_id: Option<i64>,
 }
 
@@ -2789,30 +2750,18 @@ fn preview_failure_code(error: &crate::policy::ResolveFailure) -> &'static str {
 
 fn compile_control(
     document: &crate::policy::ValidatedPolicyDocument,
-    origin: PolicyCompilerOrigin,
     registry: &RouteRegistry,
     inventory: &crate::catalog::offers::OfferInventory,
 ) -> crate::policy::Compilation {
-    match origin {
-        PolicyCompilerOrigin::Authored => crate::policy::compile(
-            document.clone(),
-            registry,
-            inventory,
-            crate::policy::PolicyOrigin::Authored,
-        ),
-        PolicyCompilerOrigin::GeneratedRevisionOne => {
-            crate::policy::legacy::compile_document(document.clone(), registry, inventory)
-        }
-    }
+    crate::policy::compile(document.clone(), registry, inventory)
 }
 
 fn compile_control_policy(
     document: &crate::policy::ValidatedPolicyDocument,
-    origin: PolicyCompilerOrigin,
     registry: &RouteRegistry,
     inventory: &crate::catalog::offers::OfferInventory,
 ) -> Result<crate::policy::CompiledPolicy, RoutingControlError> {
-    compile_control(document, origin, registry, inventory)
+    compile_control(document, registry, inventory)
         .into_policy()
         .map_err(RoutingControlError::Compilation)
 }
@@ -3302,10 +3251,11 @@ api_key = "sk-test"
         let error = Server::with_seams(config, store, Seams::isolated())
             .err()
             .expect("startup fails");
+        // The first-revision transaction loads the pointer's revision, so it
+        // is the one that reports the pointer naming nothing.
         assert!(
-            error
-                .to_string()
-                .contains("active policy revision 999 is missing")
+            format!("{error:#}").contains("active policy revision 999 does not exist"),
+            "{error:#}"
         );
     }
 
@@ -3519,8 +3469,7 @@ api_key = "sk-ant-test"
         let config = Config::load_from(&dir.join("toker.toml")).expect("config loads");
         let mut document = revision_one_document(&config);
         let route_id =
-            crate::policy::RouteId::new("legacy-route-openrouter-openrouter_chat_completions")
-                .unwrap();
+            crate::policy::RouteId::new("route-openrouter-openrouter_chat_completions").unwrap();
         for default in &mut document.defaults {
             if matches!(
                 &default.scope,
@@ -3613,7 +3562,7 @@ api_key = "sk-proj-test"
         let config = Config::load_from(&dir.join("toker.toml")).expect("config loads");
         let mut document = revision_one_document(&config);
         let openai_route =
-            crate::policy::RouteId::new("legacy-route-openai_api-openai_chat_completions").unwrap();
+            crate::policy::RouteId::new("route-openai_api-openai_chat_completions").unwrap();
         for default in &mut document.defaults {
             if matches!(
                 &default.scope,
@@ -3650,7 +3599,7 @@ api_key = "sk-proj-test"
         let mut document = crate::policy::legacy::document(&server.config(), &server.registry)
             .expect("legacy document");
         let route_id =
-            crate::policy::RouteId::new("legacy-route-openai_api-openai_chat_completions").unwrap();
+            crate::policy::RouteId::new("route-openai_api-openai_chat_completions").unwrap();
         for default in &mut document.defaults {
             if matches!(
                 &default.scope,
@@ -3685,21 +3634,15 @@ api_key = "sk-proj-test"
                 activation_scope: scope,
                 forced_cache_transition,
                 source: crate::store::PolicyRevisionSource::Legacy,
-                compiler_origin: None,
                 parent_revision_id: Some(parent_revision_id),
                 document: &document,
             })
             .expect("insert revision");
         let catalogs = crate::catalog::FetchedCatalogs::default();
         let inventory = crate::catalog::offers::inventory(&server.registry, &catalogs);
-        let policy = crate::policy::compile(
-            document,
-            &server.registry,
-            &inventory,
-            crate::policy::PolicyOrigin::GeneratedRevisionOne,
-        )
-        .into_policy()
-        .expect("policy compiles");
+        let policy = crate::policy::compile(document, &server.registry, &inventory)
+            .into_policy()
+            .expect("policy compiles");
         server.policy_runtime.replace_active(
             &revision,
             Arc::new(policy),
@@ -3738,7 +3681,7 @@ api_key = "sk-proj-test"
         let runtime = &server.policy_runtime;
         let snapshot = runtime.capture();
         let route_id =
-            crate::policy::RouteId::new("legacy-route-openai_api-openai_chat_completions").unwrap();
+            crate::policy::RouteId::new("route-openai_api-openai_chat_completions").unwrap();
         let mut document = crate::policy::legacy::document(&server.config(), &server.registry)
             .expect("legacy document");
         for default in &mut document.defaults {
@@ -3795,20 +3738,14 @@ api_key = "sk-proj-test"
                 activation_scope: crate::policy::ActivationScope::NewLanes,
                 forced_cache_transition: false,
                 source: crate::store::PolicyRevisionSource::Legacy,
-                compiler_origin: None,
                 parent_revision_id: Some(snapshot.revision_id()),
                 document: &document,
             })
             .expect("insert revision");
         let inventory = snapshot.inventory().clone();
-        let policy = crate::policy::compile(
-            document,
-            &server.registry,
-            &inventory,
-            crate::policy::PolicyOrigin::GeneratedRevisionOne,
-        )
-        .into_policy()
-        .expect("policy compiles");
+        let policy = crate::policy::compile(document, &server.registry, &inventory)
+            .into_policy()
+            .expect("policy compiles");
         runtime.replace_active(
             &revision,
             Arc::new(policy),
@@ -4567,7 +4504,7 @@ api_key = "sk-proj-test"
         let route = snapshot
             .policy()
             .route(
-                &crate::policy::RouteId::new("legacy-route-openrouter-openrouter_chat_completions")
+                &crate::policy::RouteId::new("route-openrouter-openrouter_chat_completions")
                     .unwrap(),
             )
             .unwrap();
@@ -4655,7 +4592,7 @@ api_key = "sk-proj-test"
         let route = snapshot
             .policy()
             .route(
-                &crate::policy::RouteId::new("legacy-route-openrouter-openrouter_chat_completions")
+                &crate::policy::RouteId::new("route-openrouter-openrouter_chat_completions")
                     .unwrap(),
             )
             .unwrap();
@@ -4825,7 +4762,7 @@ api_key = "sk-proj-test"
         assert_eq!(routing.policy_revision_id, 1);
         assert_eq!(
             routing.route.as_ref().unwrap().route_id.as_str(),
-            "legacy-route-openai_api-openai_chat_completions"
+            "route-openai_api-openai_chat_completions"
         );
         assert!(rows[0].attempt.is_some());
         let lane = store

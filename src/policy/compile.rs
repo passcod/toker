@@ -9,11 +9,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 
-use crate::catalog::offers::OfferInventory;
+use crate::catalog::model_identity;
+use crate::catalog::offers::{OfferInventory, derivable_offers};
 use crate::routing::{BackendBinding, Capabilities, ProtocolId, RouteRegistry};
 
 use super::canonical::generated_route_fingerprint;
-use super::family::{Family, family_of};
 use super::{
     AdapterMetadata, AliasPolicy, ArgumentBinding, BindingId, BoundaryConsent,
     CacheTransitionPolicy, Candidate, CandidateEdge, CandidateId, CandidateModel, CaptureSchema,
@@ -22,20 +22,10 @@ use super::{
     FrontendProtocol, FrontendScope, LaneTransitionPolicy, MatcherError, MatcherSpec,
     ParsedVersion, PolicyFingerprint, Presentation, PresentationId, PresentationSource, ProfileId,
     REQUESTED_MODEL_PARAMETER, RewriteId, Route, RouteFingerprint, RouteId, RouteReference,
-    RouteSemantics, SelectorOrdering, Severity, StableId, Template, TemplateError, UpgradePolicy,
-    UpgradePolicyId, ValidatedPolicyDocument, VersionParserSpec, policy_fingerprint,
+    RouteSemantics, SelectorOrdering, Severity, StableId, SubstituteModel, Template, TemplateError,
+    UpgradePolicy, UpgradePolicyId, ValidatedPolicyDocument, VersionParserSpec, policy_fingerprint,
     route_fingerprint,
 };
-
-/// Whether compilation is allowed to consume revision-one legacy learning.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum PolicyOrigin {
-    /// Authored and edited policies must use binding-scoped learning.
-    #[default]
-    Authored,
-    /// A policy generated directly from legacy configuration.
-    GeneratedRevisionOne,
-}
 
 /// The result of compiling one document.
 #[derive(Debug)]
@@ -56,10 +46,6 @@ impl Compilation {
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
     }
-
-    pub(crate) fn policy_mut(&mut self) -> Option<&mut CompiledPolicy> {
-        self.policy.as_mut()
-    }
 }
 
 /// A closed, immutable policy ready for an eventual resolver.
@@ -69,10 +55,10 @@ pub struct CompiledPolicy {
     routes: BTreeMap<RouteId, CompiledRoute>,
     presentations: BTreeMap<ScopeKey, BTreeMap<String, CompiledPresentation>>,
     publication: BTreeMap<ScopeKey, BTreeSet<String>>,
-    /// Revision one's inventory listing for the frontends it authors no
-    /// presentations for: slug to the offer it names. These are published
-    /// by `/v1/models` and never matched when routing a request.
-    generated_offers: BTreeMap<ScopeKey, BTreeMap<String, (BindingId, String)>>,
+    /// The Chat and Responses listings derived from the inventory: slug to
+    /// the offer it names. These are published by `/v1/models` and never
+    /// matched when routing a request.
+    derived_offers: BTreeMap<ScopeKey, BTreeMap<String, (BindingId, String)>>,
     rewrites: BTreeMap<ScopeKey, Vec<CompiledRewrite>>,
     defaults: BTreeMap<ScopeKey, CompiledRouteReference>,
     classifiers: BTreeMap<ClassifierId, CompiledClassifier>,
@@ -137,15 +123,6 @@ impl CompiledPolicy {
 
     pub fn classifier(&self, id: &ClassifierId) -> Option<&CompiledClassifier> {
         self.classifiers.get(id)
-    }
-
-    /// The family split revision one generated for `binding`, if it has one.
-    /// Revision-one compaction reads its model spec through this, so a
-    /// binding whose classifier was edited away has no compaction retarget.
-    pub fn family_split_for(&self, binding: &BindingId) -> Option<&CompiledClassifier> {
-        self.classifiers
-            .values()
-            .find(|classifier| classifier.legacy_family && classifier.binding_id == *binding)
     }
 
     pub fn upgrade(&self, id: &UpgradePolicyId) -> Option<&CompiledUpgradePolicy> {
@@ -269,38 +246,13 @@ impl CompiledPolicy {
         expanded
     }
 
-    /// Publish `offers` (slug, binding, backend model) to every profile of
-    /// `protocol`. They are listed but never routed: a request naming one
-    /// still resolves through the rewrites and defaults, which keep the
-    /// upgrade and alias policy of the route they reach.
-    pub(crate) fn add_generated_publication(
-        &mut self,
-        protocol: FrontendProtocol,
-        offers: impl IntoIterator<Item = (String, BindingId, String)>,
-    ) {
-        let key = ScopeKey {
-            profile: None,
-            protocol,
-        };
-        for (slug, binding_id, model_id) in offers {
-            self.publication
-                .entry(key.clone())
-                .or_default()
-                .insert(slug.clone());
-            self.generated_offers
-                .entry(key.clone())
-                .or_default()
-                .insert(slug, (binding_id, model_id));
-        }
-    }
-
-    /// The generated listing for one protocol. A slug a presentation also
+    /// The derived listing for one protocol. A slug a presentation also
     /// publishes is the presentation's to render.
-    pub fn generated_publication(
+    pub fn derived_publication(
         &self,
         protocol: FrontendProtocol,
     ) -> impl Iterator<Item = (&str, &BindingId, &str)> {
-        self.generated_offers
+        self.derived_offers
             .get(&ScopeKey {
                 profile: None,
                 protocol,
@@ -557,7 +509,6 @@ pub struct CompiledClassifier {
     family_template: Template,
     version_template: Template,
     parser: VersionParserSpec,
-    legacy_family: bool,
 }
 
 impl CompiledClassifier {
@@ -580,34 +531,20 @@ impl CompiledClassifier {
         &self.parser
     }
 
-    /// The family split revision one's generated classifier reads, in place
-    /// of its stored regex. `None` for an authored classifier, which has
-    /// only its matcher.
-    pub fn family_split(&self, model: &str) -> Option<Family> {
-        self.legacy_family.then(|| family_of(model)).flatten()
+    /// Whether the matcher accepts `model`'s canonical identity, whether or
+    /// not its version then parses.
+    pub fn matches(&self, model: &str) -> Result<bool, MatcherError> {
+        model_identity(model).map_or(Ok(false), |identity| self.matcher.is_match(&identity))
     }
 
+    /// Classify `model` by its canonical identity, so that a published
+    /// dated snapshot takes the family and version of its undated form.
+    // spec: RMODEL#classifying-an-identity
     pub fn classify(&self, model: &str) -> Result<Option<ClassifiedModel>, ClassificationError> {
-        if self.legacy_family {
-            let Some(family) = family_of(model) else {
-                return Ok(None);
-            };
-            let version = family
-                .version
-                .iter()
-                .map(u64::to_string)
-                .collect::<Vec<_>>()
-                .join("-");
-            return Ok(self
-                .parser
-                .parse(&version)
-                .ok()
-                .map(|version| ClassifiedModel {
-                    family: family.name,
-                    version,
-                }));
-        }
-        let Some(captures) = self.matcher.captures(model)? else {
+        let Some(identity) = model_identity(model) else {
+            return Ok(None);
+        };
+        let Some(captures) = self.matcher.captures(&identity)? else {
             return Ok(None);
         };
         let empty = BTreeMap::new();
@@ -639,9 +576,9 @@ pub enum CompiledCompaction {
         lane_transition: LaneTransitionPolicy,
         cache_transition: CacheTransitionPolicy,
     },
-    RevisionOneLegacy {
-        model_spec: String,
-        eligible_bindings: BTreeSet<BindingId>,
+    Substitution {
+        model: Option<SubstituteModel>,
+        bindings: BTreeSet<BindingId>,
     },
 }
 
@@ -659,16 +596,13 @@ impl CompiledCompaction {
                 lane_transition,
                 cache_transition,
             } => Some((target, *lane_transition, *cache_transition)),
-            Self::RevisionOneLegacy { .. } => None,
+            Self::Substitution { .. } => None,
         }
     }
 
-    pub fn revision_one_legacy(&self) -> Option<(&str, &BTreeSet<BindingId>)> {
+    pub fn substitution(&self) -> Option<(Option<&SubstituteModel>, &BTreeSet<BindingId>)> {
         match self {
-            Self::RevisionOneLegacy {
-                model_spec,
-                eligible_bindings,
-            } => Some((model_spec, eligible_bindings)),
+            Self::Substitution { model, bindings } => Some((model.as_ref(), bindings)),
             Self::Route { .. } => None,
         }
     }
@@ -701,16 +635,14 @@ pub fn compile(
     document: ValidatedPolicyDocument,
     topology: &RouteRegistry,
     inventory: &OfferInventory,
-    origin: PolicyOrigin,
 ) -> Compilation {
-    Compiler::new(document, topology, inventory, origin).run()
+    Compiler::new(document, topology, inventory).run()
 }
 
 struct Compiler<'a> {
     document: ValidatedPolicyDocument,
     topology: &'a RouteRegistry,
     inventory: &'a OfferInventory,
-    origin: PolicyOrigin,
     diagnostics: Vec<Diagnostic>,
     failed: bool,
 }
@@ -720,13 +652,11 @@ impl<'a> Compiler<'a> {
         document: ValidatedPolicyDocument,
         topology: &'a RouteRegistry,
         inventory: &'a OfferInventory,
-        origin: PolicyOrigin,
     ) -> Self {
         Self {
             document,
             topology,
             inventory,
-            origin,
             diagnostics: vec![],
             failed: false,
         }
@@ -759,10 +689,17 @@ impl<'a> Compiler<'a> {
         let defaults = self.compile_defaults(&route_positions, &routes);
         let rewrites = self.compile_rewrites(&route_positions, &routes);
         let presentations = self.compile_presentations(&route_positions, &routes, &classifiers);
-        let publication = presentations
+        let mut publication: BTreeMap<ScopeKey, BTreeSet<String>> = presentations
             .iter()
             .map(|(scope, items)| (scope.clone(), items.keys().cloned().collect()))
             .collect();
+        let derived_offers = self.derive_publication(&rewrites, &defaults, &routes);
+        for (scope, offers) in &derived_offers {
+            publication
+                .entry(scope.clone())
+                .or_default()
+                .extend(offers.keys().cloned());
+        }
         let compaction = self.compile_compaction(&route_positions, &routes);
 
         if self.failed {
@@ -779,7 +716,7 @@ impl<'a> Compiler<'a> {
                 routes,
                 presentations,
                 publication,
-                generated_offers: BTreeMap::new(),
+                derived_offers,
                 rewrites,
                 defaults,
                 classifiers,
@@ -795,14 +732,6 @@ impl<'a> Compiler<'a> {
         let mut out = BTreeMap::new();
         for (index, item) in items.iter().enumerate() {
             let base = path("classifiers", index);
-            if item.legacy_hyphenated && self.origin != PolicyOrigin::GeneratedRevisionOne {
-                self.error(
-                    "legacy-classifier-forbidden",
-                    base.clone().field(f("legacy_hyphenated")),
-                    item.id.as_stable_id(),
-                );
-                continue;
-            }
             let Some(_) = self.binding(
                 &item.binding_id,
                 base.clone().field(f("binding_id")),
@@ -846,7 +775,6 @@ impl<'a> Compiler<'a> {
                     family_template,
                     version_template,
                     parser: item.version_parser.clone(),
-                    legacy_family: item.legacy_hyphenated,
                 },
             );
         }
@@ -865,26 +793,6 @@ impl<'a> Compiler<'a> {
                 self.error(
                     "missing-classifier",
                     base.clone().field(f("classifier_id")),
-                    item.id.as_stable_id(),
-                );
-                continue;
-            }
-            if item.allow_revision_one_legacy_learning
-                && self.origin != PolicyOrigin::GeneratedRevisionOne
-            {
-                self.error(
-                    "legacy-learning-forbidden",
-                    base.clone().field(f("allow_revision_one_legacy_learning")),
-                    item.id.as_stable_id(),
-                );
-                continue;
-            }
-            if item.minimum_learning == super::MinimumLearning::RevisionOneAdaptive
-                && self.origin != PolicyOrigin::GeneratedRevisionOne
-            {
-                self.error(
-                    "legacy-adaptive-learning-forbidden",
-                    base.clone().field(f("minimum_learning")),
                     item.id.as_stable_id(),
                 );
                 continue;
@@ -1667,40 +1575,70 @@ impl<'a> Compiler<'a> {
                     cache_transition: item.cache_transition,
                 })
             }
-            CompactionTarget::RevisionOneLegacy {
-                model_spec,
-                eligible_bindings,
-            } => {
-                if self.origin != PolicyOrigin::GeneratedRevisionOne {
-                    self.error(
-                        "legacy-compaction-forbidden",
-                        base.clone().field(f("target_kind")),
-                        &StableId::new("compaction").expect("static id"),
-                    );
-                    return None;
-                }
-                let mut bindings = BTreeSet::new();
-                for (index, binding_id) in eligible_bindings.into_iter().enumerate() {
+            CompactionTarget::Substitution { model, bindings } => {
+                let mut compiled = BTreeSet::new();
+                for (index, binding_id) in bindings.into_iter().enumerate() {
                     if self
                         .binding(
                             &binding_id,
                             base.clone()
-                                .field(f("eligible_bindings"))
+                                .field(f("target"))
+                                .field(f("bindings"))
                                 .index(index)
                                 .expect("validated collection bound"),
                             &StableId::new("compaction").expect("static id"),
                         )
                         .is_some()
                     {
-                        bindings.insert(binding_id);
+                        compiled.insert(binding_id);
                     }
                 }
-                Some(CompiledCompaction::RevisionOneLegacy {
-                    model_spec,
-                    eligible_bindings: bindings,
+                Some(CompiledCompaction::Substitution {
+                    model,
+                    bindings: compiled,
                 })
             }
         }
+    }
+
+    /// The Chat and Responses slugs this revision derives from the
+    /// inventory, each kept only where the revision's own rewrites and
+    /// default route it to the binding holding the offer, so a revision lists
+    /// what it routes.
+    // spec: RPUB#derived-listings
+    fn derive_publication(
+        &self,
+        rewrites: &BTreeMap<ScopeKey, Vec<CompiledRewrite>>,
+        defaults: &BTreeMap<ScopeKey, CompiledRouteReference>,
+        routes: &BTreeMap<RouteId, CompiledRoute>,
+    ) -> BTreeMap<ScopeKey, BTreeMap<String, (BindingId, String)>> {
+        let mut out = BTreeMap::new();
+        for protocol in [ProtocolId::OpenAiChat, ProtocolId::OpenAiResponses] {
+            let key = ScopeKey {
+                profile: None,
+                protocol: protocol.into(),
+            };
+            let scope_rewrites = rewrites.get(&key).map(Vec::as_slice).unwrap_or_default();
+            let mut listed = BTreeMap::new();
+            for offer in derivable_offers(self.topology, self.inventory, protocol) {
+                let routed = routed_binding(
+                    &offer.routed_model_id,
+                    scope_rewrites,
+                    defaults.get(&key),
+                    routes,
+                );
+                if routed == Some(offer.binding.id()) {
+                    listed.insert(
+                        offer.routed_model_id,
+                        (offer.binding.id().clone(), offer.backend_model_id),
+                    );
+                }
+            }
+            if !listed.is_empty() {
+                out.insert(key, listed);
+            }
+        }
+        out
     }
 
     fn route_reference(
@@ -1928,14 +1866,6 @@ impl<'a> Compiler<'a> {
         path: DiagnosticPath,
         record: &StableId,
     ) -> Option<CompiledMatcher> {
-        if matches!(
-            spec,
-            MatcherSpec::RevisionOneModel(_) | MatcherSpec::RevisionOneFamily(_)
-        ) && self.origin != PolicyOrigin::GeneratedRevisionOne
-        {
-            self.error("legacy-matcher-forbidden", path, record);
-            return None;
-        }
         match spec.compile() {
             Ok(value) => Some(value),
             Err(_) => {
@@ -2041,6 +1971,28 @@ impl<'a> Compiler<'a> {
             );
         }
     }
+}
+
+/// The binding a request naming `slug` reaches under one protocol scope's
+/// rewrites and default: the first candidate of the route it selects.
+fn routed_binding<'p>(
+    slug: &str,
+    rewrites: &[CompiledRewrite],
+    default: Option<&CompiledRouteReference>,
+    routes: &'p BTreeMap<RouteId, CompiledRoute>,
+) -> Option<&'p BindingId> {
+    let reference = match rewrites
+        .iter()
+        .find(|rewrite| rewrite.matcher().is_match(slug).unwrap_or(false))
+    {
+        Some(rewrite) => rewrite.target(),
+        None => default?,
+    };
+    routes
+        .get(reference.route_id())?
+        .candidates()
+        .first()
+        .map(CompiledCandidate::binding_id)
 }
 
 fn generated_id_suffix(
@@ -2234,12 +2186,11 @@ mod tests {
         }
     }
 
-    fn compile_document(document: PolicyDocument, origin: PolicyOrigin) -> Compilation {
+    fn compile_document(document: PolicyDocument) -> Compilation {
         compile(
             document.validate().unwrap(),
             &topology(),
             &empty_inventory(),
-            origin,
         )
     }
 
@@ -2253,7 +2204,7 @@ mod tests {
 
     #[test]
     fn authored_document_compiles_to_closed_lookup_indexes() {
-        let compilation = compile_document(document(), PolicyOrigin::Authored);
+        let compilation = compile_document(document());
         let policy = compilation.policy().expect("compiled");
         let route = policy.route(&route_id("route")).expect("route");
         assert_eq!(
@@ -2275,7 +2226,7 @@ mod tests {
             failure: FailureClass::Overload,
             duration_seconds: 17,
         }];
-        let compilation = compile_document(document, PolicyOrigin::Authored);
+        let compilation = compile_document(document);
         let candidate = &compilation
             .policy()
             .expect("compiled")
@@ -2315,9 +2266,7 @@ mod tests {
             },
             metadata: None,
         });
-        let policy = compile_document(document, PolicyOrigin::Authored)
-            .into_policy()
-            .unwrap();
+        let policy = compile_document(document).into_policy().unwrap();
         assert_eq!(
             policy
                 .anthropic_profiles()
@@ -2344,7 +2293,7 @@ mod tests {
         profile_only.slug = "profile-only".to_owned();
         document.presentations = vec![inherited, profile, profile_only];
 
-        let compilation = compile_document(document, PolicyOrigin::Authored);
+        let compilation = compile_document(document);
         let policy = compilation.policy().expect("compiled policy");
         let profile = ProfileId::new("opencode").unwrap();
         assert_eq!(
@@ -2431,7 +2380,7 @@ mod tests {
         document.presentations[0].metadata = Some(AdapterMetadata::Codex {
             model: Some(codex_record()),
         });
-        let compilation = compile_document(document, PolicyOrigin::Authored);
+        let compilation = compile_document(document);
         assert!(
             !codes(&compilation).contains(&"virtual-presentation-unlisted-in-responses"),
             "{:?}",
@@ -2475,7 +2424,7 @@ mod tests {
             model_id: "gpt-6-sol".to_owned(),
         };
         document.presentations.push(exact);
-        let compilation = compile_document(document, PolicyOrigin::Authored);
+        let compilation = compile_document(document);
         assert!(codes(&compilation).contains(&"virtual-presentation-unlisted-in-responses"));
         let policy = compilation.policy().expect("compiled");
 
@@ -2510,7 +2459,7 @@ mod tests {
             model: Some(codex_record()),
         });
         for document in [messages, exact] {
-            let compilation = compile_document(document, PolicyOrigin::Authored);
+            let compilation = compile_document(document);
             let warning = compilation
                 .diagnostics()
                 .iter()
@@ -2554,7 +2503,7 @@ mod tests {
         };
         document.defaults[0].scope = document.presentations[0].scope.clone();
         document.routes[0].chain.first = candidate(&OPENAI_API_CHAT);
-        let compilation = compile_document(document, PolicyOrigin::Authored);
+        let compilation = compile_document(document);
         let policy = compilation.policy().expect("compiled");
         let crate::catalog::offers::PolicyPublication::Ready(listing) =
             crate::catalog::offers::render_policy(
@@ -2606,7 +2555,7 @@ mod tests {
         cases.push(("binding-not-routable-from-scope", incompatible));
 
         for (expected, document) in cases {
-            let result = compile_document(document, PolicyOrigin::Authored);
+            let result = compile_document(document);
             assert!(
                 result.policy().is_none(),
                 "{expected} unexpectedly compiled"
@@ -2620,7 +2569,7 @@ mod tests {
     }
 
     #[test]
-    fn matcher_alias_classifier_upgrade_and_legacy_learning_errors_are_rejected() {
+    fn reference_errors_are_rejected_and_authored_vocabulary_compiles() {
         let mut matcher = document();
         matcher.rewrites.push(RewriteRule {
             id: RewriteId::new("bad-matcher").unwrap(),
@@ -2629,9 +2578,7 @@ mod tests {
             model_matcher: MatcherSpec::Regex("(".to_owned()),
             target: reference("route"),
         });
-        assert!(
-            codes(&compile_document(matcher, PolicyOrigin::Authored)).contains(&"invalid-matcher")
-        );
+        assert!(codes(&compile_document(matcher)).contains(&"invalid-matcher"));
 
         let mut duplicate_priority = document();
         for name in ["one", "two"] {
@@ -2644,11 +2591,7 @@ mod tests {
             });
         }
         assert!(
-            codes(&compile_document(
-                duplicate_priority,
-                PolicyOrigin::Authored
-            ))
-            .contains(&"duplicate-rewrite-priority")
+            codes(&compile_document(duplicate_priority)).contains(&"duplicate-rewrite-priority")
         );
 
         let mut alias = document();
@@ -2659,9 +2602,7 @@ mod tests {
                 replacement: "target".to_owned(),
             }],
         });
-        assert!(
-            codes(&compile_document(alias, PolicyOrigin::Authored)).contains(&"invalid-matcher")
-        );
+        assert!(codes(&compile_document(alias)).contains(&"invalid-matcher"));
 
         let mut upgrade = document();
         upgrade.upgrades.push(UpgradePolicy {
@@ -2672,46 +2613,74 @@ mod tests {
             allow_manual_promotion: false,
             inventory_sources: vec![],
             lane_transition: LaneTransitionPolicy::PreservePinned,
-            allow_revision_one_legacy_learning: false,
         });
-        assert!(
-            codes(&compile_document(upgrade, PolicyOrigin::Authored))
-                .contains(&"missing-classifier")
-        );
+        assert!(codes(&compile_document(upgrade)).contains(&"missing-classifier"));
 
-        let mut forbidden_classifier = document();
-        let mut generated_only = classifier(&ANTHROPIC_SUB_MESSAGES);
-        generated_only.legacy_hyphenated = true;
-        forbidden_classifier.classifiers.push(generated_only);
-        assert!(
-            codes(&compile_document(
-                forbidden_classifier,
-                PolicyOrigin::Authored
-            ))
-            .contains(&"legacy-classifier-forbidden")
-        );
-
-        let mut legacy = document();
-        legacy.classifiers.push(classifier(&ANTHROPIC_SUB_MESSAGES));
-        legacy.upgrades.push(UpgradePolicy {
+        let mut scaled = document();
+        scaled.classifiers.push(classifier(&ANTHROPIC_SUB_MESSAGES));
+        scaled.upgrades.push(UpgradePolicy {
             id: UpgradePolicyId::new("upgrade").unwrap(),
             classifier_id: ClassifierId::new("classifier").unwrap(),
             enabled: true,
-            minimum_learning: MinimumLearning::None,
-            allow_manual_promotion: false,
+            minimum_learning: MinimumLearning::Scaled,
+            allow_manual_promotion: true,
             inventory_sources: vec![],
             lane_transition: LaneTransitionPolicy::PreservePinned,
-            allow_revision_one_legacy_learning: true,
         });
-        assert!(
-            codes(&compile_document(legacy.clone(), PolicyOrigin::Authored))
-                .contains(&"legacy-learning-forbidden")
+        scaled.classifiers[0].version_parser = VersionParserSpec::NumericTuple {
+            components: None,
+            separator: "-".to_owned(),
+        };
+        scaled.compaction = Some(CompactionPolicy {
+            target: CompactionTarget::Substitution {
+                model: Some(SubstituteModel::Family("sonnet".to_owned())),
+                bindings: vec![ANTHROPIC_SUB_MESSAGES.id().clone()],
+            },
+            lane_transition: LaneTransitionPolicy::MoveWhenCold,
+            cache_transition: CacheTransitionPolicy::AllowWhenCold,
+        });
+        let scaled = compile_document(scaled);
+        assert!(scaled.policy().is_some(), "{:?}", scaled.diagnostics());
+    }
+
+    #[test]
+    fn classifiers_read_the_canonical_identity() {
+        let mut document = document();
+        let mut anthropic = classifier(&ANTHROPIC_SUB_MESSAGES);
+        anthropic.model_matcher = MatcherSpec::Regex(
+            r"^claude-(?P<f>[a-z]+)-(?P<v>[0-9]{1,4}(?:-[0-9]{1,4})*)$".to_owned(),
         );
-        assert!(
-            compile_document(legacy, PolicyOrigin::GeneratedRevisionOne)
-                .policy()
-                .is_some()
+        anthropic.version_parser = VersionParserSpec::NumericTuple {
+            components: None,
+            separator: "-".to_owned(),
+        };
+        document.classifiers.push(anthropic);
+        let policy = compile_document(document).into_policy().unwrap();
+        let classifier = policy.classifiers().next().unwrap();
+        let family = |model: &str| {
+            classifier
+                .classify(model)
+                .unwrap()
+                .map(|classified| (classified.family, classified.version.to_string()))
+        };
+        assert_eq!(
+            family("claude-opus-4-5"),
+            Some(("opus".into(), "4.5".into()))
         );
+        // A published snapshot and a bracketed context suffix fold to the
+        // undated identity before matching.
+        assert_eq!(
+            family("claude-opus-4-5-20251101"),
+            Some(("opus".into(), "4.5".into()))
+        );
+        assert_eq!(
+            family("CLAUDE-SONNET-4-5[1m]"),
+            Some(("sonnet".into(), "4.5".into()))
+        );
+        // An unpublished snapshot still carries its date, so it has none.
+        assert_eq!(family("claude-opus-4-5-20990101"), None);
+        assert!(!classifier.matches("claude-opus-4-5-20990101").unwrap());
+        assert!(classifier.matches("claude-opus-4-5-20251101").unwrap());
     }
 
     fn classifier(binding: &BackendBinding) -> FamilyClassifier {
@@ -2722,10 +2691,9 @@ mod tests {
             family_template: "${f}".to_owned(),
             version_template: "${v}".to_owned(),
             version_parser: VersionParserSpec::NumericTuple {
-                components: 1,
+                components: Some(1),
                 separator: "-".to_owned(),
             },
-            legacy_hyphenated: false,
         }
     }
 
@@ -2742,10 +2710,7 @@ mod tests {
             document
         };
 
-        let billed = compile_document(
-            build(&ANTHROPIC_API_MESSAGES, edge()),
-            PolicyOrigin::Authored,
-        );
+        let billed = compile_document(build(&ANTHROPIC_API_MESSAGES, edge()));
         assert!(codes(&billed).contains(&"billed-boundary-consent-required"));
 
         let mut ambiguous_edge = edge();
@@ -2753,27 +2718,18 @@ mod tests {
         ambiguous_edge
             .post_send
             .push(FailureClass::AmbiguousTransport);
-        let ambiguous = compile_document(
-            build(&ANTHROPIC_API_MESSAGES, ambiguous_edge),
-            PolicyOrigin::Authored,
-        );
+        let ambiguous = compile_document(build(&ANTHROPIC_API_MESSAGES, ambiguous_edge));
         assert!(codes(&ambiguous).contains(&"ambiguous-transport-consent-required"));
 
         let mut cache_edge = edge();
         cache_edge.billed_boundary = BoundaryConsent::Allow;
         cache_edge.cache_transition = CacheTransitionPolicy::PreserveWarm;
-        let cache = compile_document(
-            build(&ANTHROPIC_API_MESSAGES, cache_edge),
-            PolicyOrigin::Authored,
-        );
+        let cache = compile_document(build(&ANTHROPIC_API_MESSAGES, cache_edge));
         assert!(codes(&cache).contains(&"cache-loss-consent-required"));
 
         let mut allowed = edge();
         allowed.billed_boundary = BoundaryConsent::Allow;
-        let allowed = compile_document(
-            build(&ANTHROPIC_API_MESSAGES, allowed),
-            PolicyOrigin::Authored,
-        );
+        let allowed = compile_document(build(&ANTHROPIC_API_MESSAGES, allowed));
         assert!(allowed.policy().is_some());
     }
 
@@ -2791,16 +2747,11 @@ mod tests {
             allow_manual_promotion: false,
             inventory_sources: vec![],
             lane_transition: LaneTransitionPolicy::PreservePinned,
-            allow_revision_one_legacy_learning: false,
         });
         classifier_mismatch.routes[0].chain.first.upgrade_policy_id =
             Some(UpgradePolicyId::new("upgrade").unwrap());
         assert!(
-            codes(&compile_document(
-                classifier_mismatch,
-                PolicyOrigin::Authored
-            ))
-            .contains(&"classifier-binding-mismatch")
+            codes(&compile_document(classifier_mismatch)).contains(&"classifier-binding-mismatch")
         );
 
         let mut capability = document();
@@ -2810,10 +2761,7 @@ mod tests {
             .first
             .required_capabilities
             .sampling = true;
-        assert!(
-            codes(&compile_document(capability, PolicyOrigin::Authored))
-                .contains(&"capability-unavailable")
-        );
+        assert!(codes(&compile_document(capability)).contains(&"capability-unavailable"));
 
         let mut unknown_capability = document();
         unknown_capability.routes[0].chain.first.binding_id = OPENAI_API_CHAT.id().clone();
@@ -2822,35 +2770,23 @@ mod tests {
             .first
             .required_capabilities
             .sampling = true;
-        assert!(
-            !codes(&compile_document(
-                unknown_capability,
-                PolicyOrigin::Authored
-            ))
-            .contains(&"capability-unavailable")
-        );
+        assert!(!codes(&compile_document(unknown_capability)).contains(&"capability-unavailable"));
 
         let mut defaults = document();
         defaults.defaults.push(defaults.defaults[0].clone());
-        assert!(
-            codes(&compile_document(defaults, PolicyOrigin::Authored))
-                .contains(&"duplicate-default-scope")
-        );
+        assert!(codes(&compile_document(defaults)).contains(&"duplicate-default-scope"));
 
         let mut presentations = document();
         let mut duplicate = presentations.presentations[0].clone();
         duplicate.id = PresentationId::new("other").unwrap();
         presentations.presentations.push(duplicate);
-        assert!(
-            codes(&compile_document(presentations, PolicyOrigin::Authored))
-                .contains(&"duplicate-presentation-slug")
-        );
+        assert!(codes(&compile_document(presentations)).contains(&"duplicate-presentation-slug"));
     }
 
     #[test]
     fn diagnostics_are_deterministic_and_do_not_copy_model_content() {
-        let first = compile_document(document(), PolicyOrigin::Authored);
-        let second = compile_document(document(), PolicyOrigin::Authored);
+        let first = compile_document(document());
+        let second = compile_document(document());
         let first = serde_json::to_string(first.diagnostics()).unwrap();
         let second = serde_json::to_string(second.diagnostics()).unwrap();
         assert_eq!(first, second);

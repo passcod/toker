@@ -47,10 +47,10 @@ pub use ledger::{
 pub use state::{
     ActivatePolicyRevision, ActivatedPolicyRevision, Allowance, BindingLearning,
     BindingLearningUpdate, DraftCasResult, InitialPublication, Lane, LanePin, LanePinCasResult,
-    MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction, PingRecord, PolicyCompilerOrigin,
-    PolicyDraft, PolicyRevision, PolicyRevisionSource, PublicationAdapter, PublicationCasResult,
-    PublicationKey, PublicationResultUpdate, PublicationState, RevisionOneActivation,
-    RoutingPolicyState, RoutingPublication, SafeguardsMark, local_day, publication_targets,
+    MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction, PingRecord, PolicyDraft,
+    PolicyRevision, PolicyRevisionSource, PublicationAdapter, PublicationCasResult, PublicationKey,
+    PublicationResultUpdate, PublicationState, RevisionOneActivation, RoutingPolicyState,
+    RoutingPublication, SafeguardsMark, local_day, publication_targets,
 };
 
 use std::env;
@@ -539,7 +539,7 @@ impl Store {
         publications: &[InitialPublication],
     ) -> Result<RevisionOneActivation> {
         self.activate_revision_one_importing(
-            document,
+            Some(document),
             activated_ms,
             desired_inventory_generation,
             publications,
@@ -550,9 +550,12 @@ impl Store {
     /// Activate revision one and import a configuration in the same
     /// transaction, so a machine moving off its file does both or neither
     /// (spec: RMIG#migrating-the-file-and-the-store-together).
+    /// `document` is built only where it can be: a machine that already owns
+    /// its routing needs none, and gets [`RevisionOneActivation::NeedsDocument`]
+    /// back only where retiring its generated revisions left it with nothing.
     pub fn activate_revision_one_importing(
         &self,
-        document: &crate::policy::ValidatedPolicyDocument,
+        document: Option<&crate::policy::ValidatedPolicyDocument>,
         activated_ms: i64,
         desired_inventory_generation: i64,
         publications: &[InitialPublication],
@@ -1011,10 +1014,10 @@ mod tests {
         AttemptIndex, AttemptProvenance, AttemptReason, BindingLearningUpdate, CostKind,
         CredentialDigest, DisplayRow, DraftCasResult, Error, InitialPublication, Lane, LanePin,
         LanePinCasResult, MAX_ROUTING_TRACE_EVENTS, MetersSnapshot, ModelEntry, NewPolicyRevision,
-        PingAction, PingRecord, PolicyCompilerOrigin, PolicyRevisionSource, PolicyRouteProvenance,
-        PolicyRoutingOutcome, PublicationAdapter, PublicationCasResult, PublicationKey,
-        PublicationResultUpdate, PublicationState, RequestLookupProvenance, RequestRow,
-        ResolvedRoute, RevisionOneActivation, RowKind, SessionCostGroup, SessionLineage, Store,
+        PingAction, PingRecord, PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome,
+        PublicationAdapter, PublicationCasResult, PublicationKey, PublicationResultUpdate,
+        PublicationState, RequestLookupProvenance, RequestRow, ResolvedRoute,
+        RevisionOneActivation, RowKind, SessionCostGroup, SessionLineage, Store,
         StoredCandidateState, StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason,
         is_api_measurement,
     };
@@ -1094,7 +1097,6 @@ mod tests {
                 activation_scope: ActivationScope::NewLanes,
                 forced_cache_transition: false,
                 source: PolicyRevisionSource::Draft,
-                compiler_origin: None,
                 parent_revision_id,
                 document: &document,
             })
@@ -3417,7 +3419,6 @@ mod tests {
             activation_scope: ActivationScope::Immediate,
             forced_cache_transition: true,
             source: PolicyRevisionSource::Reactivation,
-            compiler_origin: None,
             parent_revision_id: Some(999_999),
             document: &policy("missing-parent"),
         });
@@ -3540,7 +3541,7 @@ mod tests {
     }
 
     #[test]
-    fn live_activation_is_atomic_and_reactivation_preserves_compiler_origin() {
+    fn live_activation_is_atomic_and_reactivation_creates_a_forward_revision() {
         let store = mem_store();
         let legacy = policy("legacy routing");
         let RevisionOneActivation::Activated {
@@ -3568,7 +3569,6 @@ mod tests {
                 activation_scope: ActivationScope::Immediate,
                 forced_cache_transition: false,
                 source: PolicyRevisionSource::Reactivation,
-                compiler_origin: PolicyCompilerOrigin::GeneratedRevisionOne,
                 parent_revision_id: Some(first.revision_id),
                 expected_active_revision_id: first.revision_id,
                 document: &first.document,
@@ -3585,10 +3585,6 @@ mod tests {
         assert_eq!(
             activated.revision.source,
             PolicyRevisionSource::Reactivation
-        );
-        assert_eq!(
-            activated.revision.compiler_origin,
-            PolicyCompilerOrigin::GeneratedRevisionOne
         );
         assert_eq!(
             store
@@ -3635,7 +3631,6 @@ mod tests {
                     activation_scope: ActivationScope::Immediate,
                     forced_cache_transition: false,
                     source: PolicyRevisionSource::Draft,
-                    compiler_origin: PolicyCompilerOrigin::Authored,
                     parent_revision_id: None,
                     expected_active_revision_id: 1,
                     document: &policy("new routing"),
@@ -5240,7 +5235,6 @@ mod tests {
                 activation_scope: ActivationScope::NewLanes,
                 forced_cache_transition: false,
                 source: PolicyRevisionSource::Draft,
-                compiler_origin: None,
                 parent_revision_id: None,
                 document: &document,
             })
@@ -5253,7 +5247,6 @@ mod tests {
                 activation_scope: ActivationScope::Immediate,
                 forced_cache_transition: false,
                 source: PolicyRevisionSource::Reactivation,
-                compiler_origin: None,
                 parent_revision_id: Some(parent.revision_id),
                 document: &document,
             })
@@ -5474,7 +5467,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v15_preserves_legacy_compiler_origin_for_historical_reactivation() {
+    fn migration_v15_marks_legacy_revisions_and_their_reactivations_generated() {
         let dir = test_dir("v14-compiler-origin");
         let db = dir.join("toker.db");
         std::fs::create_dir_all(&dir).unwrap();
@@ -5513,29 +5506,241 @@ mod tests {
         }
         let store = Store::open(&db).unwrap();
         assert_eq!(
-            store
-                .load_policy_revision(1)
-                .unwrap()
-                .unwrap()
-                .compiler_origin,
-            PolicyCompilerOrigin::GeneratedRevisionOne
-        );
-        assert_eq!(
-            store
-                .load_policy_revision(2)
-                .unwrap()
-                .unwrap()
-                .compiler_origin,
-            PolicyCompilerOrigin::GeneratedRevisionOne
-        );
-        assert_eq!(
-            store
-                .load_policy_revision(3)
-                .unwrap()
-                .unwrap()
-                .compiler_origin,
-            PolicyCompilerOrigin::GeneratedRevisionOne,
+            compiler_origins(&store),
+            [1, 2, 3].map(|revision| (revision, "generated_revision_one".to_owned())),
             "compiler origin propagates across every historical reactivation"
+        );
+    }
+
+    fn compiler_origins(store: &Store) -> Vec<(i64, String)> {
+        let conn = store.conn.lock().unwrap();
+        conn.prepare(
+            "SELECT revision_id, compiler_origin FROM routing_policy_revisions
+             ORDER BY revision_id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// Mark `revision` as written by an earlier version's generator.
+    fn mark_generated(store: &Store, revision: i64) {
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE routing_policy_revisions SET compiler_origin = 'generated_revision_one'
+                 WHERE revision_id = ?1",
+                [revision],
+            )
+            .unwrap();
+    }
+
+    fn pin_lane(store: &Store, key: &str, revision: i64) {
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO lanes
+                 (key, updated_ms, policy_revision_id, policy_route_id, route_fingerprint,
+                  candidate_id, binding_id, baseline_model, effective_model)
+                 VALUES (?1, 1, ?2, 'route', ?3, 'candidate', 'provider.dialect', 'm', 'm')",
+                rusqlite::params![key, revision, "11".repeat(32)],
+            )
+            .unwrap();
+    }
+
+    fn chat_publication() -> InitialPublication {
+        InitialPublication {
+            key: PublicationKey::new(
+                FrontendScope::Protocol {
+                    protocol: FrontendProtocol::OpenaiChat,
+                },
+                PublicationAdapter::new("dynamic_chat_models").unwrap(),
+            ),
+            state: PublicationState::Pending,
+        }
+    }
+
+    #[test]
+    fn retiring_a_generated_active_revision_establishes_the_first_revision_afresh() {
+        let store = mem_store();
+        let publication = chat_publication();
+        let RevisionOneActivation::Activated { revision: old, .. } = store
+            .activate_revision_one(
+                &policy("generated"),
+                100,
+                4,
+                std::slice::from_ref(&publication),
+            )
+            .unwrap()
+        else {
+            panic!("revision one is activated")
+        };
+        mark_generated(&store, old.revision_id);
+
+        let fresh = policy("first revision");
+        let RevisionOneActivation::Activated {
+            revision,
+            state,
+            publications,
+        } = store
+            .activate_revision_one(&fresh, 200, 5, std::slice::from_ref(&publication))
+            .unwrap()
+        else {
+            panic!("a retired active revision is replaced by a fresh first revision")
+        };
+        assert_ne!(
+            revision.revision_id, old.revision_id,
+            "ids are never reused"
+        );
+        assert_eq!(revision.document, fresh);
+        assert_eq!(state.active_revision_id, Some(revision.revision_id));
+        assert_eq!(state.legacy_imported_ms, Some(200));
+        assert_eq!(state.draft.unwrap().base_revision_id, revision.revision_id);
+        assert!(
+            store
+                .load_policy_revision(old.revision_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            compiler_origins(&store),
+            [(revision.revision_id, "authored".to_owned())]
+        );
+        assert!(
+            publications
+                .iter()
+                .all(|publication| publication.desired_revision_id == revision.revision_id)
+        );
+    }
+
+    #[test]
+    fn retiring_generated_history_keeps_an_authored_active_revision_and_rebases_its_draft() {
+        let store = mem_store();
+        let RevisionOneActivation::Activated { revision: old, .. } = store
+            .activate_revision_one(&policy("generated"), 100, 4, &[])
+            .unwrap()
+        else {
+            panic!("revision one is activated")
+        };
+        let authored = store
+            .activate_policy_revision(&ActivatePolicyRevision {
+                created_ms: 150,
+                expected_draft_generation: None,
+                description: None,
+                activation_scope: ActivationScope::Immediate,
+                forced_cache_transition: false,
+                source: PolicyRevisionSource::Draft,
+                parent_revision_id: None,
+                expected_active_revision_id: old.revision_id,
+                document: &policy("authored"),
+                desired_inventory_generation: 4,
+                publications: std::slice::from_ref(&chat_publication()),
+            })
+            .unwrap()
+            .revision;
+        mark_generated(&store, old.revision_id);
+        let before = store.load_routing_policy_state().unwrap();
+        // A draft based on the retired revision, as an import or an edit
+        // made before the authored activation would leave.
+        store
+            .compare_and_swap_policy_draft(
+                before.draft_generation,
+                old.revision_id,
+                &policy("draft on generated"),
+                160,
+            )
+            .unwrap();
+
+        let RevisionOneActivation::AlreadyActive {
+            revision, state, ..
+        } = store
+            .activate_revision_one(&policy("unused"), 200, 5, &[])
+            .unwrap()
+        else {
+            panic!("an authored active revision stays active")
+        };
+        assert_eq!(revision.revision_id, authored.revision_id);
+        let draft = state.draft.unwrap();
+        assert_eq!(draft.base_revision_id, authored.revision_id);
+        assert_eq!(draft.document, authored.document);
+        assert_eq!(state.draft_generation, before.draft_generation + 2);
+        assert!(
+            store
+                .load_policy_revision(old.revision_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .load_policy_revision(authored.revision_id)
+                .unwrap()
+                .unwrap()
+                .parent_revision_id,
+            None,
+            "a lineage pointer to a deleted revision is cleared"
+        );
+    }
+
+    #[test]
+    fn retirement_clears_every_pin_to_a_generated_revision() {
+        let store = mem_store();
+        let RevisionOneActivation::Activated { revision: old, .. } = store
+            .activate_revision_one(&policy("generated"), 100, 4, &[])
+            .unwrap()
+        else {
+            panic!("revision one is activated")
+        };
+        mark_generated(&store, old.revision_id);
+        pin_lane(&store, "a", old.revision_id);
+        pin_lane(&store, "b", old.revision_id);
+
+        let RevisionOneActivation::Activated { revision, .. } = store
+            .activate_revision_one(&policy("fresh"), 200, 5, &[])
+            .unwrap()
+        else {
+            panic!("the first revision is established afresh")
+        };
+        assert_ne!(revision.revision_id, old.revision_id);
+        for key in ["a", "b"] {
+            let lane = store.load_lane(key).unwrap().expect("the lane is kept");
+            assert_eq!(lane.pin, None, "{key}");
+            assert_eq!(lane.pin_generation, 1, "{key}: a stale pin swap must fail");
+        }
+        assert!(
+            store
+                .load_policy_revision(old.revision_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn retirement_without_a_first_revision_to_establish_changes_nothing() {
+        let store = mem_store();
+        let RevisionOneActivation::Activated { revision: old, .. } = store
+            .activate_revision_one(&policy("generated"), 100, 4, &[])
+            .unwrap()
+        else {
+            panic!("revision one is activated")
+        };
+        mark_generated(&store, old.revision_id);
+        let before = store.load_routing_policy_state().unwrap();
+        assert!(matches!(
+            store.activate_revision_one_importing(None, 200, 5, &[], None),
+            Ok(RevisionOneActivation::NeedsDocument)
+        ));
+        assert_eq!(store.load_routing_policy_state().unwrap(), before);
+        assert!(
+            store
+                .load_policy_revision(old.revision_id)
+                .unwrap()
+                .is_some()
         );
     }
 
@@ -5692,7 +5897,6 @@ mod tests {
                 activation_scope: ActivationScope::Immediate,
                 forced_cache_transition: false,
                 source: PolicyRevisionSource::Reactivation,
-                compiler_origin: None,
                 parent_revision_id: Some(1),
                 document: &document,
             })

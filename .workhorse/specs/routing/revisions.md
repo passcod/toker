@@ -59,7 +59,7 @@ A revision a lane is pinned to MUST be kept and compiled on demand against curre
 
 ## History and reactivation
 
-A revision MUST never be edited.
+A revision MUST never be edited, and MUST be deleted only by the [retirement of a generated revision](migration.md#retiring-generated-revisions).
 
 The active pointer MUST never move backwards.
 Reactivating an earlier revision MUST copy it into a new revision rather than move the pointer, and a pin to a revision newer than the active one MUST be a stale-revision error.
@@ -69,15 +69,10 @@ Reactivating an earlier revision MUST copy it into a new revision rather than mo
 
 Reactivation MUST check consent and compilation before replacing the draft, so that a refused reactivation leaves the draft and its generation untouched.
 
-The operation that produced a revision and the meaning of its document are separate properties, and both MUST be stored.
+A revision MUST record the operation that produced it.
+Every revision MUST be compiled by the same compiler, whichever operation produced it.
 
-> [!NOTE]
-> Restoring a generated revision keeps the generated semantics only because its compiler origin travels with it, independently of the fact that a reactivation produced it.
-
-A revision MUST record its compiler origin, and a revision derived from another MUST inherit it.
-Semantics marked as generated MUST be refused in an authored document.
-
-The contents of the generated first revision are specified by [RMIG](migration.md).
+The contents of the generated first revision are specified by [RMIG](migration.md#the-first-revision).
 
 ## Catalogue refresh
 

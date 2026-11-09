@@ -108,39 +108,6 @@ impl PolicyRevisionSource {
     }
 }
 
-/// Which compiler semantics a revision's document requires. This is separate
-/// from its history source: restoring generated revision one must retain its
-/// legacy compatibility semantics while still recording a reactivation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PolicyCompilerOrigin {
-    Authored,
-    GeneratedRevisionOne,
-}
-
-impl PolicyCompilerOrigin {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Authored => "authored",
-            Self::GeneratedRevisionOne => "generated_revision_one",
-        }
-    }
-
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "authored" => Some(Self::Authored),
-            "generated_revision_one" => Some(Self::GeneratedRevisionOne),
-            _ => None,
-        }
-    }
-
-    fn for_source(source: PolicyRevisionSource) -> Self {
-        match source {
-            PolicyRevisionSource::Legacy => Self::GeneratedRevisionOne,
-            PolicyRevisionSource::Draft | PolicyRevisionSource::Reactivation => Self::Authored,
-        }
-    }
-}
-
 /// One immutable stored policy revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyRevision {
@@ -151,7 +118,6 @@ pub struct PolicyRevision {
     pub activation_scope: ActivationScope,
     pub forced_cache_transition: bool,
     pub source: PolicyRevisionSource,
-    pub compiler_origin: PolicyCompilerOrigin,
     pub parent_revision_id: Option<i64>,
     pub document: ValidatedPolicyDocument,
     pub fingerprint: PolicyFingerprint,
@@ -166,9 +132,6 @@ pub struct NewPolicyRevision<'a> {
     pub activation_scope: ActivationScope,
     pub forced_cache_transition: bool,
     pub source: PolicyRevisionSource,
-    /// `None` preserves the source-derived legacy behaviour used by existing
-    /// callers; live restore passes the selected revision's origin explicitly.
-    pub compiler_origin: Option<PolicyCompilerOrigin>,
     pub parent_revision_id: Option<i64>,
     pub document: &'a ValidatedPolicyDocument,
 }
@@ -214,6 +177,9 @@ pub enum RevisionOneActivation {
         state: RoutingPolicyState,
         publications: Vec<RoutingPublication>,
     },
+    /// No revision is active and the caller supplied no first revision, so
+    /// nothing was changed.
+    NeedsDocument,
 }
 
 /// Input to atomically install a new live policy revision and publication
@@ -227,7 +193,6 @@ pub struct ActivatePolicyRevision<'a> {
     pub activation_scope: ActivationScope,
     pub forced_cache_transition: bool,
     pub source: PolicyRevisionSource,
-    pub compiler_origin: PolicyCompilerOrigin,
     /// The selected history revision for reactivation, or no explicit parent
     /// for a direct apply.
     pub parent_revision_id: Option<i64>,
@@ -847,12 +812,15 @@ pub(super) fn insert_policy_revision(
         .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?;
     let fingerprint = policy_fingerprint(revision.document)
         .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?;
+    // `compiler_origin` is left to its `authored` default: every revision
+    // compiles the same way, and the column only marks the generated
+    // rows an earlier version wrote, for retirement to find.
     conn.execute(
         "INSERT INTO routing_policy_revisions
          (created_ms, activated_ms, description, activation_scope,
-          forced_cache_transition, source, compiler_origin, parent_revision_id, document_json,
+          forced_cache_transition, source, parent_revision_id, document_json,
           fingerprint)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
             revision.created_ms,
             revision.activated_ms,
@@ -860,10 +828,6 @@ pub(super) fn insert_policy_revision(
             activation_scope_name(revision.activation_scope),
             revision.forced_cache_transition,
             revision.source.as_str(),
-            revision
-                .compiler_origin
-                .unwrap_or_else(|| PolicyCompilerOrigin::for_source(revision.source))
-                .as_str(),
             revision.parent_revision_id,
             document_json,
             fingerprint.to_string(),
@@ -882,7 +846,7 @@ pub(super) fn insert_policy_revision(
 /// still has a file full of providers to import.
 pub(super) fn activate_revision_one(
     conn: &mut Connection,
-    document: &ValidatedPolicyDocument,
+    document: Option<&ValidatedPolicyDocument>,
     activated_ms: i64,
     desired_inventory_generation: i64,
     publications: &[InitialPublication],
@@ -894,6 +858,7 @@ pub(super) fn activate_revision_one(
         ));
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let retired = retire_generated_revisions(&tx, activated_ms)?;
     let current = load_routing_policy_state(&tx)?;
     if let Some(revision_id) = current.active_revision_id {
         let revision = load_policy_revision(&tx, revision_id)?.ok_or_else(|| {
@@ -901,6 +866,7 @@ pub(super) fn activate_revision_one(
                 "active policy revision {revision_id} does not exist"
             ))
         })?;
+        repoint_retired_publications(&tx, &retired, revision_id)?;
         let publications = load_publications(&tx)?;
         if let Some(configuration) = configuration {
             super::config::write_configuration(&tx, configuration)?;
@@ -917,6 +883,11 @@ pub(super) fn activate_revision_one(
             "legacy import marker exists without an active revision".into(),
         ));
     }
+    // Dropping the transaction rolls back any retirement with it, so a
+    // machine that cannot build its first revision keeps what it had.
+    let Some(document) = document else {
+        return Ok(RevisionOneActivation::NeedsDocument);
+    };
 
     if let Some(configuration) = configuration {
         super::config::write_configuration(&tx, configuration)?;
@@ -927,11 +898,10 @@ pub(super) fn activate_revision_one(
         &NewPolicyRevision {
             created_ms: activated_ms,
             activated_ms,
-            description: Some("Generated revision-one legacy routing"),
+            description: Some("Generated first revision"),
             activation_scope: ActivationScope::NewLanes,
             forced_cache_transition: false,
             source: PolicyRevisionSource::Legacy,
-            compiler_origin: Some(PolicyCompilerOrigin::GeneratedRevisionOne),
             parent_revision_id: None,
             document,
         },
@@ -990,6 +960,7 @@ pub(super) fn activate_revision_one(
             ));
         }
     }
+    repoint_retired_publications(&tx, &retired, revision.revision_id)?;
     let state = load_routing_policy_state(&tx)?;
     let publications = load_publications(&tx)?;
     tx.commit()?;
@@ -998,6 +969,134 @@ pub(super) fn activate_revision_one(
         state,
         publications,
     })
+}
+
+/// Delete every revision an earlier version stored with generated-only
+/// semantics, which no longer decode, and return their ids.
+///
+/// Runs inside the first-revision transaction, before anything reads the
+/// pointer or the draft. Lanes pinned to one lose their pin. Where the
+/// pointer named one, the pointer, draft and import marker are cleared so the caller
+/// establishes the first revision afresh; where only the draft was based on
+/// one, the draft restarts from the active revision.
+// spec: RMIG#retiring-generated-revisions
+fn retire_generated_revisions(conn: &Connection, now_ms: i64) -> Result<Vec<i64>> {
+    let retired: Vec<i64> = conn
+        .prepare(
+            "SELECT revision_id FROM routing_policy_revisions
+             WHERE compiler_origin = 'generated_revision_one' ORDER BY revision_id",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if retired.is_empty() {
+        return Ok(retired);
+    }
+    // A lane pinned to a retired revision is unpinned whatever its
+    // temperature: one cache rebuild on a lane that happened to be warm
+    // costs less than holding the service down until the prune drops it.
+    // The generation moves so a compare-and-swap built on the old pin fails.
+    conn.execute(
+        "UPDATE lanes SET pin_generation = pin_generation + 1,
+             policy_revision_id = NULL, policy_route_id = NULL,
+             route_fingerprint = NULL, candidate_id = NULL, binding_id = NULL,
+             baseline_model = NULL, effective_model = NULL
+         WHERE policy_revision_id IN (SELECT value FROM json_each(?1))",
+        [id_list(&retired)],
+    )?;
+
+    // The rows still referring to the retired revisions are repointed or
+    // cleared below and by the caller, all before this transaction commits.
+    conn.pragma_update(None, "defer_foreign_keys", true)?;
+    let (active, draft_base, draft_json): (Option<i64>, Option<i64>, Option<String>) = conn
+        .query_row(
+            "SELECT active_revision_id, draft_base_revision_id, draft_document_json
+             FROM routing_policy_state WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    let is_retired = |id: Option<i64>| id.is_some_and(|id| retired.contains(&id));
+    if is_retired(active) {
+        conn.execute(
+            "UPDATE routing_policy_state SET active_revision_id = NULL,
+                 draft_base_revision_id = NULL, draft_document_json = NULL,
+                 draft_fingerprint = NULL, draft_updated_ms = NULL,
+                 legacy_imported_ms = NULL
+             WHERE id = 1",
+            [],
+        )?;
+    } else if let Some(active) = active {
+        // An imported draft carries the same generated semantics whatever
+        // revision it was based on, so a draft that no longer decodes goes
+        // the same way as one based on a retired revision.
+        let undecodable = draft_json.is_some_and(|json| {
+            decode_policy(json.as_bytes(), CanonicalLimits::default()).is_err()
+        });
+        if is_retired(draft_base) || undecodable {
+            let revision = load_policy_revision(conn, active)?.ok_or_else(|| {
+                Error::InvalidRoutingState(format!(
+                    "active policy revision {active} does not exist"
+                ))
+            })?;
+            let document_json = String::from_utf8(
+                policy_bytes(&revision.document)
+                    .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?,
+            )
+            .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?;
+            conn.execute(
+                "UPDATE routing_policy_state SET draft_generation = draft_generation + 1,
+                     draft_base_revision_id = ?1, draft_document_json = ?2,
+                     draft_fingerprint = ?3, draft_updated_ms = ?4
+                 WHERE id = 1",
+                rusqlite::params![
+                    active,
+                    document_json,
+                    revision.fingerprint.to_string(),
+                    now_ms
+                ],
+            )?;
+        }
+    }
+    // Only a generated revision derives from a generated one, but a lineage
+    // pointer to a deleted row cannot be kept whatever wrote it.
+    conn.execute(
+        "UPDATE routing_policy_revisions SET parent_revision_id = NULL
+         WHERE parent_revision_id IN (SELECT value FROM json_each(?1))",
+        [id_list(&retired)],
+    )?;
+    conn.execute(
+        "DELETE FROM routing_policy_revisions
+         WHERE revision_id IN (SELECT value FROM json_each(?1))",
+        [id_list(&retired)],
+    )?;
+    Ok(retired)
+}
+
+/// Point every publication that named a retired revision at `active`, to
+/// be applied afresh. An applied publication of a retired revision has
+/// nothing left to stand for, so it is cleared as well.
+fn repoint_retired_publications(conn: &Connection, retired: &[i64], active: i64) -> Result<()> {
+    if retired.is_empty() {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE routing_publications SET applied_revision_id = NULL,
+             applied_inventory_generation = NULL,
+             state = CASE WHEN state = 'applied' THEN 'pending' ELSE state END
+         WHERE applied_revision_id IN (SELECT value FROM json_each(?1))",
+        [id_list(retired)],
+    )?;
+    conn.execute(
+        "UPDATE routing_publications SET desired_revision_id = ?2,
+             state = CASE WHEN state = 'applied' THEN 'pending' ELSE state END
+         WHERE desired_revision_id IN (SELECT value FROM json_each(?1))",
+        rusqlite::params![id_list(retired), active],
+    )?;
+    Ok(())
+}
+
+/// A list of revision ids as the JSON array `json_each` reads.
+fn id_list(ids: &[i64]) -> String {
+    serde_json::to_string(ids).expect("integers serialise")
 }
 
 /// Insert, activate, and hand publication desire to every adapter in one
@@ -1047,7 +1146,6 @@ pub(super) fn activate_policy_revision(
             activation_scope: activation.activation_scope,
             forced_cache_transition: activation.forced_cache_transition,
             source: activation.source,
-            compiler_origin: Some(activation.compiler_origin),
             parent_revision_id: activation.parent_revision_id.or(Some(active_revision_id)),
             document: activation.document,
         },
@@ -1126,7 +1224,7 @@ pub(super) fn load_policy_revision(
     row_of(
         conn,
         "SELECT revision_id, created_ms, activated_ms, description, activation_scope,
-                forced_cache_transition, source, compiler_origin, parent_revision_id, document_json, fingerprint
+                forced_cache_transition, source, parent_revision_id, document_json, fingerprint
          FROM routing_policy_revisions WHERE revision_id = ?1",
         [revision_id],
         read_policy_revision,
@@ -1137,7 +1235,7 @@ pub(super) fn load_policy_revisions(conn: &Connection) -> Result<Vec<PolicyRevis
     rows_of(
         conn,
         "SELECT revision_id, created_ms, activated_ms, description, activation_scope,
-                forced_cache_transition, source, compiler_origin, parent_revision_id, document_json, fingerprint
+                forced_cache_transition, source, parent_revision_id, document_json, fingerprint
          FROM routing_policy_revisions ORDER BY revision_id",
         [],
         read_policy_revision,
@@ -1162,11 +1260,6 @@ fn read_policy_revision(row: &rusqlite::Row<'_>) -> Result<PolicyRevision> {
             "routing_policy_revisions.source",
             row.get("source")?,
             PolicyRevisionSource::parse,
-        )?,
-        compiler_origin: parse_required(
-            "routing_policy_revisions.compiler_origin",
-            row.get("compiler_origin")?,
-            PolicyCompilerOrigin::parse,
         )?,
         parent_revision_id: row.get("parent_revision_id")?,
         document,

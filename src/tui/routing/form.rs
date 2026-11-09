@@ -110,11 +110,6 @@ const MATCHER: Node = Node::Union {
         variant("exact", &[field("value", "value", Node::Text)]),
         variant("glob", &[field("value", "pattern", Node::Text)]),
         variant("regex", &[field("value", "pattern", Node::Text)]),
-        variant("revision_one_model", &[field("value", "model", Node::Text)]),
-        variant(
-            "revision_one_family",
-            &[field("value", "family", Node::Text)],
-        ),
     ],
 };
 
@@ -399,13 +394,10 @@ const CLASSIFIER: &[Field] = &[
                 variant(
                     "numeric_tuple",
                     &[
-                        field("components", "components", Node::Int),
+                        // Empty takes any count of components.
+                        field("components", "components", Node::OptInt),
                         field("separator", "separator", Node::Text),
                     ],
-                ),
-                variant(
-                    "legacy_numeric_tuple",
-                    &[field("separator", "separator", Node::Text)],
                 ),
             ],
         },
@@ -433,7 +425,7 @@ const UPGRADE: &[Field] = &[
                 variant("none", &[]),
                 variant("distinct_days", &[field("days", "days", Node::Int)]),
                 variant("explicit_promotion", &[]),
-                variant("revision_one_adaptive", &[]),
+                variant("scaled", &[]),
             ],
         },
     ),
@@ -2404,7 +2396,7 @@ mod tests {
     #[test]
     fn keys_the_schema_does_not_name_survive_an_edit() {
         let mut value = template("classifiers", None);
-        value["legacy_hyphenated"] = Value::Bool(true);
+        value["future_field"] = Value::Bool(true);
         let mut form = Form::new(
             Purpose::Record {
                 kind: "classifiers",
@@ -2415,7 +2407,7 @@ mod tests {
         );
         focus_label(&mut form, "id");
         type_text(&mut form, "x");
-        assert_eq!(form.value()["legacy_hyphenated"], true);
+        assert_eq!(form.value()["future_field"], true);
     }
 
     #[test]

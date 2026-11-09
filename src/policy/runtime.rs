@@ -9,11 +9,11 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::catalog::offers::OfferInventory;
 use crate::routing::RouteRegistry;
-use crate::store::{PolicyCompilerOrigin, PolicyRevision, Store};
+use crate::store::{PolicyRevision, Store};
 
 use super::{
     ActivationScope, AvailabilitySnapshot, BindingId, CandidateId, Compilation, CompiledPolicy,
-    FailureClass, PolicyOrigin, RouteId,
+    FailureClass, RouteId,
 };
 
 const REVISION_CACHE_CAPACITY: usize = 32;
@@ -211,17 +211,7 @@ pub(crate) fn compile_stored_revision(
     topology: &RouteRegistry,
     inventory: &OfferInventory,
 ) -> Compilation {
-    match revision.compiler_origin {
-        PolicyCompilerOrigin::GeneratedRevisionOne => {
-            super::legacy::compile_document(revision.document.clone(), topology, inventory)
-        }
-        PolicyCompilerOrigin::Authored => super::compile(
-            revision.document.clone(),
-            topology,
-            inventory,
-            PolicyOrigin::Authored,
-        ),
-    }
+    super::compile(revision.document.clone(), topology, inventory)
 }
 
 fn clear_binding_circuits(
@@ -617,7 +607,6 @@ mod tests {
                 document(description),
                 &RouteRegistry::new(std::iter::empty::<Arc<dyn crate::providers::Provider>>()),
                 &OfferInventory::default(),
-                PolicyOrigin::Authored,
             )
             .into_policy()
             .unwrap(),
@@ -669,7 +658,6 @@ mod tests {
                 activation_scope: ActivationScope::NewLanes,
                 forced_cache_transition: false,
                 source: PolicyRevisionSource::Draft,
-                compiler_origin: None,
                 parent_revision_id: None,
                 document: &document(description),
             })
@@ -772,7 +760,6 @@ mod tests {
                 activation_scope: ActivationScope::NewLanes,
                 forced_cache_transition: false,
                 source: PolicyRevisionSource::Draft,
-                compiler_origin: None,
                 parent_revision_id: None,
                 document: &document,
             })

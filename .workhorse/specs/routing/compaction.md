@@ -38,6 +38,13 @@ A policy revision names either a route for compactions, or a model substitution 
 
 A compaction route MUST apply only to a lane proven cold, and MAY move the compaction to a different provider as well as a different model.
 
+A model substitution names the bindings it applies to, and either an exact model or a family to move to.
+It MUST keep the binding the request reached, and MUST apply only where that binding is among those it names.
+A substitution naming no model MUST keep every compaction's model, so only the transform applies.
+
+> [!NOTE]
+> A compaction route fixes one binding, so it cannot say "a cheaper model on whichever account the lane was already using", and that is what keeps a substituted compaction on the subscription it was going to spend anyway.
+
 A model substitution MUST apply only where all of these hold:
 
 | condition |
@@ -48,7 +55,8 @@ A model substitution MUST apply only where all of these hold:
 | the target's input rate is strictly below the source's, after aliasing |
 | the target has a known price |
 
-Where the substitution names a family rather than a model, Toker MUST pick that family's newest model the binding has learned, under the same bar the upgrade election uses, which [RMODEL](models.md) specifies.
+Where the substitution names a family, Toker MUST classify through the upgrade policy of the candidate the request reached, and MUST pick that family's newest model the binding has learned that clears that policy's evidence bar, which [RMODEL](models.md#electing-a-familys-target) specifies.
+Where that candidate declares no upgrade policy, a family substitution MUST NOT apply.
 Where any condition fails, the compaction MUST keep its model and only the transform applies.
 
 ## The transform

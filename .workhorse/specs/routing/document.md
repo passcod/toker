@@ -65,8 +65,29 @@ A candidate's model MUST be an exact identifier, the requested model, a template
 
 A candidate MAY declare an upgrade policy, an alias policy applied after the upgrade, the capabilities it requires, whether it is enabled, and the failures that open a circuit against it.
 
+An alias rule's matcher MUST be matched against the model's [canonical identity](models.md#identities-are-exact), so that a rule naming an undated model also covers its published dated snapshots.
+
 A candidate's required capabilities MUST be within those its binding declares.
 A candidate's binding MUST be reachable from every scope the route is used in.
+
+## Classifiers
+
+A classifier names a binding, a matcher, a template for the family and one for the version, both over the matcher's captures, and the parser that reads the version.
+
+A classifier's matcher MUST be matched against the model's [canonical identity](models.md#identities-are-exact).
+An identity the matcher does not match, or whose version the parser cannot read, has no family.
+
+A version parser MUST be one of these.
+
+| parser | reads |
+| --- | --- |
+| semver | a semantic version |
+| date | a release date, in one of two spellings |
+| numeric tuple | numeric segments joined by a separator, either exactly a declared count of them or any count up to a bound |
+
+A declared count MUST be within that bound, and a separator MUST NOT be empty.
+
+How classified versions are compared, and how a family's target is elected, is specified by [RMODEL](models.md#electing-a-familys-target).
 
 ## Presentations
 
