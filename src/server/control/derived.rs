@@ -459,7 +459,7 @@ mod tests {
             ["claude-opus-4-8", "claude-opus-5", "claude-opus-x", "gpt-5"].map(offer),
         );
         let document: PolicyDocument = serde_json::from_value(json!({
-            "format_version": 3,
+            "format_version": 5,
             "classifiers": [{
                 "id": "family",
                 "binding_id": "anthropic_sub.anthropic_messages",
@@ -469,7 +469,7 @@ mod tests {
                 },
                 "family_template": "${family}",
                 "version_template": "${version}",
-                "version_parser": {"kind": "legacy_numeric_tuple", "separator": "-"},
+                "version_parser": {"kind": "numeric_tuple", "separator": "-"},
             }],
         }))
         .expect("document");

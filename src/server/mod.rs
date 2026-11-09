@@ -3251,10 +3251,11 @@ api_key = "sk-test"
         let error = Server::with_seams(config, store, Seams::isolated())
             .err()
             .expect("startup fails");
+        // The first-revision transaction loads the pointer's revision, so it
+        // is the one that reports the pointer naming nothing.
         assert!(
-            error
-                .to_string()
-                .contains("active policy revision 999 is missing")
+            format!("{error:#}").contains("active policy revision 999 does not exist"),
+            "{error:#}"
         );
     }
 
