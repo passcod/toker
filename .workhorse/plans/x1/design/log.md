@@ -30,6 +30,14 @@ No browser rig: Toker is a terminal app. Captures come from running the real TUI
 
 | # | call | reason | before | after | verdict |
 | --- | --- | --- | --- | --- | --- |
+| 1 | `V` is deleted rather than improved, and its diagnostics attach to the records they concern | `RREV#draft` already validates the whole draft before storing it, so `V` adds nothing to validity; its only unique content is the advisory diagnostics | `current/routing-status-validated-100x24.png` | all five directions | kept: no spec change needed, and it removes a command and a popup |
+| 2 | The draft is stated as a count of changes, not as a generation number | `draft 2` tells the operator nothing they can act on; "3 changes not live" names the action | the live header `draft 2 · …` | A `draft ≠ rev 2 · +1 ~2 · a activate`, B `revision 2 live · no changes` | kept; B's wording reads better than A's |
+| 3 | Activation keeps its consent step for an immediate activation that would lose a warm cache, and loses it everywhere else | `RREV#activation` requires that consent, and the design language requires a destructive action to arm rather than fire; every other scope disturbs nothing in flight | the current activation modal | the live-apply note | kept |
+
+Observations held for the critique rather than settled here:
+
+- **Every direction so far wastes most of the terminal.** A, B and C all leave 20 to 30 of 40 rows empty on their main frames, and the operator's terminal is 50 rows. The current design does this too, so it is not a regression, but no direction has taken the space. The dashboard, by contrast, fills its height.
+- **C's `cannot serve` and `no candidate` are reversed red blocks**, which makes them the loudest thing on the screen. The design language is explicit that colour is a de-emphasis channel here and that red is quieter than yellow, so this inverts the house hierarchy.
 
 ## Step 1 continued — the live instance
 

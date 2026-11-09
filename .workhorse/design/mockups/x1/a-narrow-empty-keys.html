@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+
+<html lang="en-NZ">
+<head>
+<meta charset="utf-8">
+<title>TUI mockup shell</title>
+<style>
+  /* Ghostty's stock palette, the reference ground toker is developed
+     against. The TUI sets no RGB anywhere: it names the ANSI sixteen, so
+     these are the reference theme's answer, not values from the code. */
+  :root {
+    --bg: #282c34;  /* background      */  --fg: #ffffff;  /* foreground   */
+    --c0: #1d1f21;  /* black           */  --c8: #666666;  /* dark gray    */
+    --c1: #cc6666;  /* red             */  --c9: #d54e53;  /* bright red   */
+    --c2: #b5bd68;  /* green           */  --c10:#b9ca4a;  /* bright green */
+    --c3: #f0c674;  /* yellow          */  --c11:#e7c547;  /* bright yellow*/
+    --c4: #81a2be;  /* blue            */  --c12:#7aa6da;  /* bright blue  */
+    --c5: #b294bb;  /* magenta         */  --c13:#c397d8;  /* bright mag.  */
+    --c6: #8abeb7;  /* cyan            */  --c14:#70c0b1;  /* bright cyan  */
+    --c7: #c5c8c6;  /* white           */  --c15:#eaeaea;  /* bright white */
+  }
+
+  body {
+    background: #14161a;
+    color: var(--c7);
+    font-family: system-ui, sans-serif;
+    margin: 0;
+    padding: 2rem;
+  }
+
+  /* One terminal frame. The frame takes its width from its own longest
+     row, so every row must advance the same number of cells or the grid
+     tears and the panel borders stop lining up with the content.
+
+     Term, never plain Iosevka. The default Iosevka family leaves the
+     characters Unicode calls ambiguous or wide at their natural width,
+     so the glyphs the TUI actually emits here -- the proportion bar's
+     mark, the four arrows and the em dash -- each advance two cells
+     instead of one. That tore the dashboard's cache-read row out to 187
+     cells against its neighbours' 120. Iosevka Term and Iosevka Fixed
+     force every glyph to a single cell; the generic fallbacks below are
+     strictly monospaced and behave.
+
+     All three Iosevka families set post.isFixedPitch, so the font
+     declares itself monospace whichever one is picked, and counting
+     characters cannot tell them apart. Only measuring the rendered
+     advance does. */
+  .frame {
+    font-family: "Iosevka Term", "Iosevka Fixed", "DejaVu Sans Mono", monospace;
+    font-size: 15px;
+    line-height: 1.2;
+    background: var(--bg);
+    color: var(--fg);
+    padding: 0.6rem 1rem;
+    margin: 0 0 0.5rem;
+    white-space: pre;
+    overflow-x: auto;
+    width: max-content;
+    /* The terminal runs Iosevka with calt on, but every arrow and
+       comparison the TUI emits is a precomposed character rather than an
+       ASCII sequence, so there is nothing here for a ligature to join.
+       Off, because a browser ligature need not stay cell-aligned and the
+       grid matters more than a feature nothing triggers. */
+    font-variant-ligatures: none;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Foreground colours. Each sets --now as well, so .r can swap them. */
+  .black   { color: var(--c0); --now: var(--c0); }
+  .red     { color: var(--c1); --now: var(--c1); }
+  .green   { color: var(--c2); --now: var(--c2); }
+  .yellow  { color: var(--c3); --now: var(--c3); }
+  .blue    { color: var(--c4); --now: var(--c4); }
+  .cyan    { color: var(--c6); --now: var(--c6); }
+  .gray    { color: var(--c8); --now: var(--c8); }
+
+  /* Modifiers. Compose them: class="green b", class="cyan d". */
+
+  /* BOLD is the emphasis channel, since colour is not. It keeps its
+     colour: the reference terminal leaves bold-color unset, so bold does
+     not remap onto the bright palette. */
+  .b { font-weight: 700; }
+
+  /* DIM at exactly the terminal's faint-opacity, so it keeps the colour
+     underneath rather than flattening to grey. A dim green mark is still
+     a green mark. */
+  .d { opacity: 0.5; }
+
+  /* REVERSED swaps foreground and background. --now carries whatever
+     colour class came before; plain text falls back to the foreground. */
+  .r { color: var(--bg); background-color: var(--now, var(--fg)); }
+
+  /* The one explicit pair in the TUI: an armed burn control. */
+  .on-yellow { color: var(--c0); background-color: var(--c3); }
+
+  /* A key rather than a screen, so its rows are deliberately ragged.
+     Anything claiming to be a frame has rows of equal width. */
+  .swatch { width: auto; }
+
+  /* Annotation outside the frame. Never inside it: a terminal has no
+     room for a note, and a mockup that puts one there is not a frame. */
+  .note {
+    font-size: 0.85rem;
+    color: #8b8f96;
+    margin: 0 0 1.5rem;
+    max-width: 70ch;
+    line-height: 1.5;
+  }
+  .note strong { color: var(--c7); font-weight: 600; }
+  h1 { font-size: 1.1rem; font-weight: 600; color: var(--fg); margin: 0 0 0.25rem; }
+  h2 { font-size: 0.95rem; font-weight: 600; color: var(--c7); margin: 2rem 0 0.5rem; }
+
+  .cap { font-size: 0.85rem; color: #aab0b8; margin: 0 0 0.4rem; max-width: 110ch; line-height: 1.5; }
+  .cap strong { color: var(--c7); font-weight: 600; }
+</style>
+</head>
+<body>
+
+<h1>Direction A: narrow, empty, and the key overlays</h1>
+<p class="note">Shedding at 100x24 and 80x24, empty states, and the revised overlays.</p>
+<h2>Routing 1 at 100x24 <span style="color:#8b8f96;font-weight:400">· 100x24</span></h2>
+<p class="cap">The same presentations view at the repo's own snapshot size. Panels are still boxed because everything fits; the exclude column went first, then nothing else.</p>
+<pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span> <span class="b r">1 presentations</span>  <span class="d">2 routes</span>  <span class="d">3 rules</span>  <span class="d">4 revisions</span>              draft ≠ rev 2 · +1 ~2 · a activate
+┌PRESENTATIONS───────────────────────────────────┐┌DETAIL──────────────────────────────────────────┐
+│<span class="b">claude · anthropic_messages</span><span class="d"> ───────────────── 15</span>││<span class="b">moonshotai/kimi-k*</span>                              │
+│  <span class="d">behaves as newest match                 </span>      ││<span class="d">a Claude picker row, listed as openrouter/${mod…</span>│
+│<span class="b"> </span> opus       openai/gpt-*-sol                   ││                                                │
+│<span class="b"> </span> haiku      openai/gpt-*-luna                  ││<span class="d">lists       </span>the newest model matching           │
+│<span class="b"> </span> sonnet     google/gemini-*-flash              ││            moonshotai/kimi-k*                  │
+│<span class="b r">~</span><span class="r"> sonnet     moonshotai/kimi-k*                 </span>││<span class="d">except      </span>*-code · *-thinking <span class="d">(was *-code)</span>    │
+│<span class="b"> </span> sonnet     z-ai/glm-*                         ││<span class="d">behaves as  </span>sonnet                              │
+│<span class="b"> </span> haiku      z-ai/glm-*-flash                   ││<span class="d">scope       </span>claude · anthropic_messages         │
+│<span class="b"> </span> sonnet     deepseek/deepseek-v*-pro*          ││<span class="d">changed     </span><span class="b">~</span> edited since revision 2           │
+│<span class="b"> </span> haiku      deepseek/deepseek-v*-flash*        ││                                                │
+│<span class="b"> </span> sonnet     qwen/qwen*-max*                    ││<span class="b">PUBLICATION</span><span class="d"> ────────────────────────────────────</span>│
+│<span class="b"> </span> sonnet     minimax/minimax-m*                 ││  not published by any adapter                  │
+│<span class="b"> </span> sonnet     openrouter/auto                    ││                                                │
+│<span class="b"> </span> opus       anthropic/claude-opus-*            ││<span class="d">enter more fields ▸   e edit   d remove</span>         │
+│<span class="b"> </span> sonnet     anthropic/claude-sonnet-*          ││                                                │
+│<span class="b"> </span> haiku      anthropic/claude-haiku-*           ││                                                │
+│<span class="b"> </span> fable      anthropic/claude-fable-*           ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+└────────────────────────────────────────────────┘└────────────────────────────────────────────────┘</pre>
+<h2>Routing 4 at 100x24, offers open <span style="color:#8b8f96;font-weight:400">· 100x24</span></h2>
+<p class="cap">The hardest case: a long list in a short terminal. Panels are ruled rather than boxed to save two rows. The sticky heading keeps the section and position on the first line, so a reader never loses which list they are in.</p>
+<pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span> <span class="d">1 presentations</span>  <span class="d">2 routes</span>  <span class="d">3 rules</span>  <span class="b r">4 revisions</span>              draft ≠ rev 2 · +1 ~2 · a activate
+<span class="b">REVISIONS</span> <span class="d">───────────────────────────────────────</span> <span class="b">DETAIL</span> <span class="d">──────────────────────────────────────────</span> 
+ ▾ <span class="b">offers › openrouter.openrouter_chat_c…</span><span class="d"> 187/440</span>  <span class="b">openai/gpt-4o-2024-08-06</span>                         
+ <span class="d">… 177 above</span>                                       <span class="d">offered on openrouter.openrouter_chat_completio…</span> 
+   openai/gpt-4-0314               <span class="d">   8k</span>  <span class="d">2023-03</span>                                                   
+   openai/gpt-4-1106-preview       <span class="d"> 128k</span>  <span class="d">2023-11</span>  <span class="d">context     </span>128k                                 
+   openai/gpt-4-turbo              <span class="d"> 128k</span>  <span class="d">2024-04</span>  <span class="d">released    </span>2024-08                              
+   openai/gpt-4-turbo-preview      <span class="d"> 128k</span>  <span class="d">2024-01</span>  <span class="d">family      -</span> no classifier covers this binding  
+   openai/gpt-4.1                  <span class="d">   1M</span>  <span class="d">2025-04</span>                                                   
+   openai/gpt-4.1-mini             <span class="d">   1M</span>  <span class="d">2025-04</span>  [p] promote this model                           
+   openai/gpt-4.1-nano             <span class="d">   1M</span>  <span class="d">2025-04</span>  <span class="d">only a model Toker has served can be promoted</span>    
+   openai/gpt-4o                   <span class="d"> 128k</span>  <span class="d">2024-05</span>                                                   
+   openai/gpt-4o-2024-05-13        <span class="d"> 128k</span>  <span class="d">2024-05</span>                                                   
+ <span class="r">  openai/gpt-4o-2024-08-06        </span><span class="d r"> 128k</span><span class="r">  </span><span class="d r">2024-08</span>                                                   
+   openai/gpt-4o-2024-11-20        <span class="d"> 128k</span>  <span class="d">2024-11</span>                                                   
+   openai/gpt-4o-audio-preview     <span class="d"> 128k</span>  <span class="d">2024-10</span>                                                   
+   openai/gpt-4o-mini              <span class="d"> 128k</span>  <span class="d">2024-07</span>                                                   
+   openai/gpt-4o-mini-2024-07-18   <span class="d"> 128k</span>  <span class="d">2024-07</span>                                                   
+   openai/gpt-4o-mini-search-previ…<span class="d"> 128k</span>  <span class="d">2025-03</span>                                                   
+   openai/gpt-4o-search-preview    <span class="d"> 128k</span>  <span class="d">2025-03</span>                                                   
+   openai/gpt-4o:extended          <span class="d"> 128k</span>  <span class="d">2024-05</span>                                                   
+   openai/gpt-5                    <span class="d"> 400k</span>  <span class="d">2025-08</span>                                                   
+   openai/gpt-5-chat               <span class="d"> 128k</span>  <span class="d">2025-08</span>                                                   
+ <span class="d">… 244 more offers</span>                                                                                  </pre>
+<h2>Routing 2 at 80x24 <span style="color:#8b8f96;font-weight:400">· 80x24</span></h2>
+<p class="cap">What is shed. Below 100 columns the list stacks over the detail. Two-line entries drop to one, the chain shrinks to the provider, section glosses go, the status shortens to <code>draft +1 ~2</code>, and the detail is cut with a count of what it left out. The tab strip still fits in full.</p>
+<pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span> <span class="d">1 presentations</span>  <span class="b r">2 routes</span>  <span class="d">3 rules</span>  <span class="d">4 revisions</span>                 draft +1 ~2
+<span class="b">ROUTES</span> <span class="d">────────────────────────────────────────────────────────────────────────</span> 
+ <span class="b">routes</span><span class="d">  stage 4 ──────────────────────────────────────────────────────────── 7</span> 
+ <span class="b r">~</span><span class="r"> </span><span class="d r">legacy-route-</span><span class="r">anthropic_sub-anthropic_messages  anthropic_sub → openrouter   </span> 
+ <span class="b d"> </span><span class="d"> </span><span class="d d">legacy-route-</span><span class="d">anthropic_api-anthropic_messages  </span><span class="d d">anthropic_api</span>                 
+ <span class="b d"> </span><span class="d"> </span><span class="d d">legacy-route-</span><span class="d">openai_api-openai_chat_completions  </span><span class="d d">openai_api</span>                  
+ <span class="b"> </span> <span class="d">legacy-route-</span>openrouter-openrouter_chat_completions  <span class="d">openrouter</span>              
+ <span class="b"> </span> <span class="d">legacy-route-</span>openrouter-openrouter_messages  <span class="d">openrouter</span>                      
+ <span class="d">… 3 more records</span>                                                               
+<span class="b">DETAIL</span> <span class="d">────────────────────────────────────────────────────────────────────────</span> 
+ <span class="b">legacy-route-anthropic_sub-anthropic_messages</span>                                  
+ <span class="b">~</span> candidate 2 added since revision 2                                           
+                                                                                
+ <span class="b">CANDIDATES, IN ORDER</span><span class="d"> ─────────────────────────────────────────────────────────</span> 
+ 1  anthropic_sub.anthropic_messages  subscription                              
+    <span class="d">model:</span> the requested model · <span class="d">now:</span> available                                 
+    falls to 2 on rate_limit · <span class="yellow">billed spend</span> allowed                             
+ 2  openrouter.openrouter_messages  billed                                      
+    <span class="d">model:</span> the requested model · <span class="d">now:</span> available                                 
+                                                                                
+ <span class="b">PROBLEM</span><span class="d"> ──────────────────────────────────────────────────────────────────────</span> 
+   anthropic_sub is on but holds no credential. Tab opens the config page; s    
+ <span class="d">… 9 more lines · pgdn</span>                                                          
+                                                                                </pre>
+<h2>Fresh install, no policy <span style="color:#8b8f96;font-weight:400">· 100x24</span></h2>
+<p class="cap">Routing view 1 with no active revision and no draft. Absence is written: the list says there are none and the detail says what that means and what to press.</p>
+<pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span> <span class="b r">1 presentations</span>  <span class="d">2 routes</span>  <span class="d">3 rules</span>  <span class="d">4 revisions</span>                   no active revision · no draft
+┌PRESENTATIONS───────────────────────────────────┐┌DETAIL──────────────────────────────────────────┐
+│<span class="d">no presentations</span>                                ││<span class="b">no policy yet</span>                                   │
+│<span class="d">the draft holds none, so no model list is publi…</span>││                                                │
+│                                                ││There is no active revision and no draft.       │
+│n add one                                       ││A draft begins with your first record. Nothing  │
+│                                                ││takes effect until it is activated, and requests│
+│                                                ││are answered as not configured until then.      │
+│                                                ││                                                │
+│                                                ││n add a presentation · i import toker.toml <span class="d">(rev…</span>│
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+└────────────────────────────────────────────────┘└────────────────────────────────────────────────┘</pre>
+<h2>Accounts, nothing seen yet <span style="color:#8b8f96;font-weight:400">· 100x12</span></h2>
+<p class="cap">The accounts page with nothing in it, which today draws an empty box. Not part of the redesign proper; a one-line fix.</p>
+<pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>                                                                                                
+┌ACCOUNTS──────────────────────────────────────────────────────────────────────────────────────────┐
+│<span class="d">no accounts yet</span>                                                                                   │
+│<span class="d">an account appears the first time a request carries a credential Toker can tell apart</span>             │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘</pre>
+<h2>The ? overlay, routing <span style="color:#8b8f96;font-weight:400">· 120x40</span></h2>
+<p class="cap">Over view 2. Keys are grouped by what they act on. The in-form section is gone: the overlay cannot open over a form, and a form states its own keys on its last line. V is gone. The marks block is the legend for + ~ - and ▸ ▾.</p>
+<pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span> <span class="d">1 presentations</span>  <span class="b r">2 routes</span>  <span class="d">3 rules</span>  <span class="d">4 revisions</span>                                  draft ≠ rev 2 · +1 ~2 · a activate
+┌ROUTES────────────────────────────────────────────────────┐┌DETAIL────────────────────────────────────────────────────┐
+│<span class="b">routes</span><span class="d">  stage 4 ──────────────────────────────────────── 7</span>││<span class="b">legacy-route-anthropic_sub-anthropic_messages</span>             │
+│<span class="b r">~</span><span class="r"> </span><span class="d r">legacy-route-</span><span class="r">anthropic_sub-anthropic_messages           </span>││<span class="b">~</span> candidate 2 added since revision 2                      │
+│<span class="r">  anthropic_sub → openrouter · </span><span class="yellow r">billed fallback</span><span class="r">            </span>││                                                          │
+│<span class="b d"> </span><span class="d"> </span><span class="d d">legacy-route-</span><span class="d">anthropic_ap</span>┌KEYS──────────────────────────────────────────────────────────┐<span class="d">───────────────────────────</span>│
+│<span class="d">  anthropic_api · billed · </span>│ <span class="b">↑/↓ j/k</span>      select a record                                 │ages  subscription         │
+│<span class="b d"> </span><span class="d"> </span><span class="d d">legacy-route-</span><span class="d">openai_api-o</span>│ <span class="b">←/→ h/l 1–4</span>  switch view                                     │ <span class="d">now:</span> available            │
+│<span class="d">  openai_api · billed · can</span>│ <span class="b">[ ]</span>          previous or next section                        │<span class="yellow">illed spend</span> allowed        │
+│<span class="b"> </span> <span class="d">legacy-route-</span>openrouter-o│ <span class="b">space</span>        fold or open a section                          │es  billed                 │
+│  openrouter · billed      │ <span class="b">/</span>            filter this view                                │ <span class="d">now:</span> available            │
+│<span class="b"> </span> <span class="d">legacy-route-</span>openrouter-o│ <span class="b">pgup/pgdn</span>    scroll the detail                               │                           │
+│  openrouter · billed      │ <span class="b">enter</span>        more fields for the selected record             │<span class="d">───────────────────────────</span>│
+│<span class="b"> </span> <span class="d">legacy-route-</span>openrouter-o│ <span class="b">click</span>        select a record, or focus a form field          │ no credential. Tab opens  │
+│  openrouter · billed      │ <span class="b">wheel</span>        scroll what is under the pointer                │es a key.                  │
+│<span class="b d"> </span><span class="d"> </span><span class="d d">legacy-route-</span><span class="d">codex_sub-co</span>│ <span class="b">THE DRAFT</span>                                                    │                           │
+│<span class="d">  codex_sub · subscription </span>│ <span class="b">n</span>            add a record of the selected kind               │<span class="d">───────────────────────────</span>│
+│<span class="b">defaults</span><span class="d">  stage 3 · when no</span>│ <span class="b">e</span>            edit the selected record in a form              │   anthropic_sub/*         │
+│<span class="b"> </span> anthropic_messages       │ <span class="b">d</span>            remove the selected record                      │essages                    │
+│  <span class="d">→ legacy-route-</span>anthropic_│ <span class="b">v</span>            preview a request                               │thropic_messages           │
+│<span class="b"> </span> unprefixed/anthropic_mess│ <span class="b">a</span>            activate the draft                              │                           │
+│  <span class="d">→ legacy-route-</span>anthropic_│ <span class="b">THE REVISIONS VIEW</span>                                           │                           │
+│<span class="b"> </span> openai_chat              │ <span class="b">x</span>            reactivate the selected revision                │<span class="d">edit   d remove</span>            │
+│  <span class="d">→ legacy-route-</span>openai_api│ <span class="b">i</span>            import toker.toml into the draft                │                           │
+│<span class="b"> </span> unprefixed/openai_chat   │ <span class="b">p</span>            promote the selected offer                      │                           │
+│  <span class="d">→ legacy-route-</span>openai_api│ <span class="b">ANYWHERE</span>                                                     │                           │
+│<span class="b">+</span> openai_responses         │ <span class="b">r</span>            refresh                                         │                           │
+│  <span class="d">→ legacy-route-</span>codex_sub-│ <span class="b">esc</span>          back to the dashboard                           │                           │
+│                           │ <span class="b">tab or ⇄</span>     next page                                       │                           │
+│                           │ <span class="b">q</span>            quit                                            │                           │
+│                           │ <span class="b">MARKS</span>                                                        │                           │
+│                           │ <span class="b">+ ~ -</span>        added, changed, removed vs the active revision  │                           │
+│                           │ <span class="b">▸ ▾</span>          a section folded, or open                       │                           │
+│                           │ <span class="b">…</span>            clipped, or more rows above or below            │                           │
+│                           └? or esc close────────────────────────────────────────────────┘                           │
+│                                                          ││                                                          │
+│                                                          ││                                                          │
+│                                                          ││                                                          │
+│                                                          ││                                                          │
+└──────────────────────────────────────────────────────────┘└──────────────────────────────────────────────────────────┘</pre>
+<h2>The ? overlay, config <span style="color:#8b8f96;font-weight:400">· 100x24</span></h2>
+<p class="cap">Over the providers page at its smaller size.</p>
+<pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span> <span class="b r">1 providers</span>  <span class="d">2 settings</span>                                           1 provider needs a credential
+┌PROVIDERS───────────────────────────────────────┐┌DETAIL──────────────────────────────────────────┐
+│  <span class="d">provider        state credential</span>              ││<span class="b">anthropic_sub</span>                                   │
+│<span class="d">  anthropic_api  off   none         </span>            ││<span class="d">Anthropic on a Claude subscription</span>              │
+│<span class="r">  anthropic_sub  on    none         </span><span class="yellow r">no credenti…</span>││                                                │
+│<span class="d">  codex_sub      off   codex login  </span>            ││<span class="d">state       </span>on · <span class="yellow">not configured</span>                 │
+│<span class="d">  openai_api     off   none         </span>            ││<span class="d">credential  </span>none                                │
+│  openrouter     ┌KEYS──────────────────────────────────────────────────────────┐ic.com/          │
+│                 │ <span class="b">↑/↓ j/k</span>    select                                            │opic_messages    │
+│                 │ <span class="b">←/→ h/l 1 2</span>  switch view                                     │                 │
+│                 │ <span class="b">space</span>      turn the selected provider or setting on or off   │<span class="d">─────────────────</span>│
+│                 │ <span class="b">e</span>          edit the endpoint, or the selected setting        │s its credential,│
+│                 │ <span class="b">s</span>          store a credential for the selected provider      │ent. Store a key │
+│                 │ <span class="b">c</span>          clear a server-safeguards mark                    │ead one from the │
+│                 │ <span class="b">enter</span>      more about the selection                          │iable.           │
+│                 │ <span class="b">r</span>          refresh                                           │                 │
+│                 │ <span class="b">esc</span>        back to the dashboard                             │off   [e] endpoi…│
+│                 │ <span class="b">tab or ⇄</span>   next page                                         │<span class="d">refresh url ▸</span>    │
+│                 │ <span class="b">q</span>          quit                                              │                 │
+│                 └? or esc close────────────────────────────────────────────────┘                 │
+│                                                ││                                                │
+│                                                ││                                                │
+│                                                ││                                                │
+└────────────────────────────────────────────────┘└────────────────────────────────────────────────┘</pre>
+</body>
+</html>

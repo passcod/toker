@@ -1,0 +1,222 @@
+<!-- spec: tui/dashboard.md -->
+<!DOCTYPE html>
+<html lang="en-NZ">
+<head>
+<meta charset="utf-8">
+<title>Direction B at 100x24 and 80x24</title>
+<style>
+  /* Ghostty's stock palette, the reference ground toker is developed
+     against. The TUI sets no RGB anywhere: it names the ANSI sixteen, so
+     these are the reference theme's answer, not values from the code. */
+  :root {
+    --bg: #282c34;  /* background      */  --fg: #ffffff;  /* foreground   */
+    --c0: #1d1f21;  /* black           */  --c8: #666666;  /* dark gray    */
+    --c1: #cc6666;  /* red             */  --c9: #d54e53;  /* bright red   */
+    --c2: #b5bd68;  /* green           */  --c10:#b9ca4a;  /* bright green */
+    --c3: #f0c674;  /* yellow          */  --c11:#e7c547;  /* bright yellow*/
+    --c4: #81a2be;  /* blue            */  --c12:#7aa6da;  /* bright blue  */
+    --c5: #b294bb;  /* magenta         */  --c13:#c397d8;  /* bright mag.  */
+    --c6: #8abeb7;  /* cyan            */  --c14:#70c0b1;  /* bright cyan  */
+    --c7: #c5c8c6;  /* white           */  --c15:#eaeaea;  /* bright white */
+  }
+
+  body {
+    background: #14161a;
+    color: var(--c7);
+    font-family: system-ui, sans-serif;
+    margin: 0;
+    padding: 2rem;
+  }
+
+  /* One terminal frame. The frame takes its width from its own longest
+     row, so every row must advance the same number of cells or the grid
+     tears and the panel borders stop lining up with the content.
+
+     Term, never plain Iosevka. The default Iosevka family leaves the
+     characters Unicode calls ambiguous or wide at their natural width,
+     so the glyphs the TUI actually emits here -- the proportion bar's
+     mark, the four arrows and the em dash -- each advance two cells
+     instead of one. That tore the dashboard's cache-read row out to 187
+     cells against its neighbours' 120. Iosevka Term and Iosevka Fixed
+     force every glyph to a single cell; the generic fallbacks below are
+     strictly monospaced and behave.
+
+     All three Iosevka families set post.isFixedPitch, so the font
+     declares itself monospace whichever one is picked, and counting
+     characters cannot tell them apart. Only measuring the rendered
+     advance does. */
+  .frame {
+    font-family: "Iosevka Term", "Iosevka Fixed", "DejaVu Sans Mono", monospace;
+    font-size: 15px;
+    line-height: 1.2;
+    background: var(--bg);
+    color: var(--fg);
+    padding: 0.6rem 1rem;
+    margin: 0 0 0.5rem;
+    white-space: pre;
+    overflow-x: auto;
+    width: max-content;
+    /* The terminal runs Iosevka with calt on, but every arrow and
+       comparison the TUI emits is a precomposed character rather than an
+       ASCII sequence, so there is nothing here for a ligature to join.
+       Off, because a browser ligature need not stay cell-aligned and the
+       grid matters more than a feature nothing triggers. */
+    font-variant-ligatures: none;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Foreground colours. Each sets --now as well, so .r can swap them. */
+  .black   { color: var(--c0); --now: var(--c0); }
+  .red     { color: var(--c1); --now: var(--c1); }
+  .green   { color: var(--c2); --now: var(--c2); }
+  .yellow  { color: var(--c3); --now: var(--c3); }
+  .blue    { color: var(--c4); --now: var(--c4); }
+  .cyan    { color: var(--c6); --now: var(--c6); }
+  .gray    { color: var(--c8); --now: var(--c8); }
+
+  /* Modifiers. Compose them: class="green b", class="cyan d". */
+
+  /* BOLD is the emphasis channel, since colour is not. It keeps its
+     colour: the reference terminal leaves bold-color unset, so bold does
+     not remap onto the bright palette. */
+  .b { font-weight: 700; }
+
+  /* DIM at exactly the terminal's faint-opacity, so it keeps the colour
+     underneath rather than flattening to grey. A dim green mark is still
+     a green mark. */
+  .d { opacity: 0.5; }
+
+  /* REVERSED swaps foreground and background. --now carries whatever
+     colour class came before; plain text falls back to the foreground. */
+  .r { color: var(--bg); background-color: var(--now, var(--fg)); }
+
+  /* The one explicit pair in the TUI: an armed burn control. */
+  .on-yellow { color: var(--c0); background-color: var(--c3); }
+
+  /* A key rather than a screen, so its rows are deliberately ragged.
+     Anything claiming to be a frame has rows of equal width. */
+  .swatch { width: auto; }
+
+  /* Annotation outside the frame. Never inside it: a terminal has no
+     room for a note, and a mockup that puts one there is not a frame. */
+  .note {
+    font-size: 0.85rem;
+    color: #8b8f96;
+    margin: 0 0 1.5rem;
+    max-width: 70ch;
+    line-height: 1.5;
+  }
+  .note strong { color: var(--c7); font-weight: 600; }
+  h1 { font-size: 1.1rem; font-weight: 600; color: var(--fg); margin: 0 0 0.25rem; }
+  h2 { font-size: 0.95rem; font-weight: 600; color: var(--c7); margin: 2rem 0 0.5rem; }
+</style>
+</head>
+<body>
+<h1>Direction B at 100x24 and 80x24</h1>
+<p class="note">At 100 columns the tree and the detail still share the width, with the tree shedding its right-hand counts. At 80 they cannot, so the detail takes the whole page when the operator goes deeper, with the same key.</p>
+<h2>11. 100x24: a route selected</h2>
+<p class="note">The operator opened 4 routes and selected the first. The tree sheds the 1 candidate column and clips the long openrouter row; providers and settings are closed and keep their health on the row. Everything else is as at 120.</p>
+<pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span> configuration                                                      revision 2 live · no changes
+┌CONFIGURATION─────────────────────────────┐┌DETAIL────────────────────────────────────────────────┐
+│<span class="b"> </span>▸ providers  5 · <span class="yellow">1 not configured</span>        ││ <span class="d">routes › </span><span class="b">anthropic_sub-anthropic_messages</span>    <span class="d">on apply</span>│
+│<span class="b"> </span>▸ settings  10 · all default             ││ <span class="d">legacy-route-anthropic_sub-anthropic_messages</span>        │
+│<span class="b"> </span>▾ policy  revision 2 · no changes        ││                                                      │
+│<span class="b"> </span>  ▸ 1 presentations  15                  ││ <span class="b">candidates, tried in order</span>                           │
+│<span class="b"> </span>  ▸ 2 rewrites  14                       ││ <span class="b"> 1  </span>anthropic_sub.anthropic_messages<span class="d">  subscription</span>   │
+│<span class="b"> </span>  ▸ 3 defaults  4                        ││     the requested model · <span class="yellow">provider not configured</span>    │
+│<span class="b"> </span>  ▾ 4 routes  7                          ││ <span class="d">    now: available; catalogue fresh</span>                  │
+│<span class="b r"> </span><span class="r">      anthropic_sub-anthropic_messages   </span>││ <span class="d">    no fallback yet</span>                                  │
+│<span class="b"> </span>      anthropic_api-anthropic_messages   ││                                                      │
+│<span class="b"> </span>      openai_api-openai_chat_completions ││ <span class="d">→ lanes: 2 warm, 5 cold · reached by 3 rewrites</span>      │
+│<span class="b"> </span>      openrouter-openrouter_chat_complet…││                                                      │
+│<span class="b"> </span>      openrouter-openrouter_messages     ││                                                      │
+│<span class="b"> </span>      openrouter-openrouter_responses    ││                                                      │
+│<span class="b"> </span>      codex_sub-codex_responses          ││                                                      │
+│<span class="b"> </span>  ▸ classifiers  5                       ││                                                      │
+│<span class="b"> </span>  ▸ upgrades  5                          ││                                                      │
+│<span class="b"> </span>    compaction<span class="d">  allow_when_cold</span>          ││                                                      │
+│<span class="b"> </span>▸ revisions  2                           ││                                                      │
+│<span class="b"> </span>▸ accounts  3 · 1 unnamed                ││                                                      │
+│                                          ││                                                      │
+│                                          ││ [enter] edit   [n] add a fallback   [d] remove       │
+└──────────────────────────────────────────┘└──────────────────────────────────────────────────────┘</pre>
+<h2>12. 100x24: a fallback being added, invalid</h2>
+<p class="note">The operator pressed n on the route and a second step appeared. It crosses from a subscription binding to a billed one, so the consent field is flagged in red beside itself and the save control is dim with its reason. Nothing was validated by command; the page simply will not let this be saved yet. Space turns the consent on.</p>
+<pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span> configuration                                                      revision 2 live · no changes
+┌CONFIGURATION─────────────────────────────┐┌DETAIL────────────────────────────────────────────────┐
+│<span class="b"> </span>▸ providers  5 · <span class="yellow">1 not configured</span>        ││ <span class="d">routes › </span><span class="b">anthropic_sub-anthropic_messages</span>     <span class="d">editing</span>│
+│<span class="b"> </span>▸ settings  10 · all default             ││ <span class="d">not saved yet</span>                                        │
+│<span class="b"> </span>▾ policy  revision 2 · no changes        ││                                                      │
+│<span class="b"> </span>  ▸ 1 presentations  15                  ││ <span class="b">candidates, tried in order</span>                           │
+│<span class="b"> </span>  ▸ 2 rewrites  14                       ││ <span class="b"> 1  </span>anthropic_sub.anthropic_messages<span class="d">  subscription</span>   │
+│<span class="b"> </span>  ▸ 3 defaults  4                        ││     the requested model · <span class="yellow">provider not configured</span>    │
+│<span class="b"> </span>  ▾ 4 routes  7                          ││ <span class="d">    then, before send, when unavailable</span>              │
+│<span class="b r"> </span><span class="r">      anthropic_sub-anthropic_messages   </span>││ <span class="b"> 2  </span>openrouter.openrouter_messages<span class="d">  billed</span>           │
+│<span class="b"> </span>      anthropic_api-anthropic_messages   ││     the requested model                              │
+│<span class="b"> </span>      openai_api-openai_chat_completions ││     may start billed spend  <span class="r">deny</span>                     │
+│<span class="b"> </span>      openrouter-openrouter_chat_complet…││ <span class="red">    a fall from subscription to billed needs this on</span> │
+│<span class="b"> </span>      openrouter-openrouter_messages     ││                                                      │
+│<span class="b"> </span>      openrouter-openrouter_responses    ││                                                      │
+│<span class="b"> </span>      codex_sub-codex_responses          ││                                                      │
+│<span class="b"> </span>  ▸ classifiers  5                       ││                                                      │
+│<span class="b"> </span>  ▸ upgrades  5                          ││                                                      │
+│<span class="b"> </span>    compaction<span class="d">  allow_when_cold</span>          ││                                                      │
+│<span class="b"> </span>▸ revisions  2                           ││                                                      │
+│<span class="b"> </span>▸ accounts  3 · 1 unnamed                ││                                                      │
+│                                          ││                                                      │
+│                                          ││ [space] allow   <span class="d">[enter] fix the field first</span>   [esc] …│
+└──────────────────────────────────────────┘└──────────────────────────────────────────────────────┘</pre>
+<h2>13. 80x24: the tree alone</h2>
+<p class="note">At 80 columns the tree takes the whole width and the detail is not drawn. The operator is on anthropic_sub. The health on the row is the only summary.</p>
+<pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span> configuration                                  revision 2 live · no changes
+┌CONFIGURATION─────────────────────────────────────────────────────────────────┐
+│<span class="b"> </span>▾ providers  5 · <span class="yellow">1 not configured</span>                                            │
+│<span class="b d"> </span><span class="d">  ▸ anthropic_api   off                                                      </span>│
+│<span class="b r"> </span><span class="r">  ▸ anthropic_sub   </span><span class="yellow r">on, not configured</span><span class="r">                                       </span>│
+│<span class="b d"> </span><span class="d">  ▸ codex_sub       off                                                      </span>│
+│<span class="b d"> </span><span class="d">  ▸ openai_api      off                                                      </span>│
+│<span class="b"> </span>  ▸ openrouter      on                                                       │
+│<span class="b"> </span>▸ settings  10 · all default                                                 │
+│<span class="b"> </span>▾ policy  revision 2 · no changes                                            │
+│<span class="b"> </span>  ▸ 1 presentations  15                                                      │
+│<span class="b"> </span>  ▸ 2 rewrites  14                                                           │
+│<span class="b"> </span>  ▸ 3 defaults  4                                                            │
+│<span class="b"> </span>  ▸ 4 routes  7                                                              │
+│<span class="b"> </span>  ▸ classifiers  5                                                           │
+│<span class="b"> </span>  ▸ upgrades  5                                                              │
+│<span class="b"> </span>    compaction<span class="d">  allow_when_cold</span>                                              │
+│<span class="b"> </span>▸ revisions  2                                                               │
+│<span class="b"> </span>▸ accounts  3 · 1 unnamed                                                    │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘</pre>
+<h2>14. 80x24: the same node, gone into</h2>
+<p class="note">The operator pressed right on anthropic_sub. The detail replaces the tree and fills the page; left or esc returns to the tree with the cursor where it was. No new key was needed.</p>
+<pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span> configuration                                  revision 2 live · no changes
+┌DETAIL────────────────────────────────────────────────────────────────────────┐
+│ <span class="d">providers › </span><span class="b">anthropic_sub</span>                                                <span class="d">live</span>│
+│                                                                              │
+│ <span class="yellow">on, not configured</span>                                                           │
+│ no credential, so nothing is sent to this provider.                          │
+│                                                                              │
+│ k  type a key here; it is stored and never shown                             │
+│ or run toker setup to read one from the keyring or an environment variable   │
+│                                                                              │
+│ <span class="d">→ endpoint https://api.anthropic.com/ · 1 binding · safeguards</span>               │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│ <span class="b">[k] set a key</span>   [space] turn off   [e] endpoint   <span class="d">[c] no mark</span>                │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘</pre>
+</body>
+</html>
