@@ -41,6 +41,9 @@ No browser rig: Toker is a terminal app. Captures come from running the real TUI
 | 9 | A revision is one record's edit, and history reads as a list of single changes | Under call 4 every save is a revision, so a revision bundling three edits describes a workflow the design does not have | the first history frame, `add rewrite, add claude-sub fallback, drop a default` | `converged-04-history.html` | kept; rev 1, written by setup, is the one exception |
 | 10 | Reactivating a revision is `a make live`, not `r` | `r` refreshes on every page; overloading it on one tab would make the same key do two things | `[r] reactivate` | `converged-04-history.html` and the `?` overlay | kept |
 | 11 | Only the focused panel shows a selected row | Two reversed rows on one screen leave the operator not knowing where `e` goes | Models with both UPGRADES and OFFERS selected | `converged-03-tables.html` | kept |
+| 12 | Rules are not named; a rule reads as `match → route` everywhere | The form has no name field and call 5 retired generated names, so a name could only be derived; deriving it for every rule keeps one shape | `strip anthropic_sub/` beside a derived `claude-* → openrouter-messages` | round-2 fixes | kept |
+| 13 | History and the after-save frame show the same moment: rev 10 live, two warm lanes left on rev 9 | The lane counts disagreed between three frames; one moment drawn everywhere makes every count checkable | `critique-round-2.md` #10 | round-2 fixes | kept |
+| 14 | Every form saves with `ctrl+s`; `enter` opens the route and nothing else | One key per meaning: settings saved with `enter` and the 24-row summary opened the detail with it | `critique-round-2.md` #3, #4 | round-2 fixes | kept; the detail at 24 rows opens with `pgdn` |
 
 Observations held for the critique rather than settled here:
 
@@ -117,10 +120,17 @@ Its findings that are defects in the current product were filed as issues; the o
 
 Round 1 found 2 criticals (D has no revision surface at all; panels are drawn to the frame), 9 suggestions and 3 nits.
 
+## Round 2 — the converged set
+
+Fresh critic, screenshots only (`critique-round-2.md`): no criticals, 14 suggestions, 10 nits.
+The structure held; what stood in the way was disagreement between frames (focus shown twice, `enter` and the save key meaning different things on different pages, lane counts) and a few sentences and raw enums back on the page.
+All 24 are being applied (calls 12 to 14 settle the ones that needed a decision).
+The mockup findings are not filed as issues: the Workhorse run for this loop had already ended when round 1 tried to report, so they live here and in the critique.
+
 ## In flight
 
-- step 2.3: the converged mockups, from `brief-converged.md`, drawn by two agents in parallel (01-03 and 08; 04, 05 and 07); a consistency pass on both, then the narrow frames (06)
+- round 2's fixes, by the two drawing agents
 
 ## Next
 
-- critique the converged set with a fresh critic, change one thing at a time, and repeat until two clean critiques in a row, the second by a critic who has not seen the earlier rounds
+- round 3: a fresh critic on the fixed set; the stop rule wants it and the round after it clean (no criticals, at most three suggestions), the second by a critic who has seen neither
