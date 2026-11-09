@@ -126,7 +126,7 @@
 │ 1  anthropic_sub.anthropic_messages  subscription    as asked                                <span class="yellow">no cred</span>                 │
 │    ↓ when unavailable before send · overloaded · 5xx   <span class="d">billed:</span> <span class="yellow">allow</span>   <span class="d">ambiguous retry:</span> deny   <span class="d">cache:</span> preserve warm  │
 │ 2  openrouter.openrouter_messages    <span class="yellow">billed</span>          alias claude-* → anthropic/claude-*     ok                      │
-│ [e] edit   [n] add fallback   [t] trace   [enter] open route                                                         │
+│ [e] edit   [n] add fallback   [m] move   [t] trace   [enter] open route                                              │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
                                                                                                                         
                                                                                                                         
@@ -162,7 +162,7 @@
 │                                                                                                                      │
 │ <span class="b">handled by</span>  4 on · 3 off<span class="d">: server safeguards · required capabilities · health circuits</span>                                │
 │   upgrade          newest on claude-sub<span class="d"> · claude-opus-4-7 → claude-opus-5</span>                                            │
-│   lane transition  moves when cold<span class="d"> · 2 warm, 5 cold pinned</span>                                                           │
+│   lane transition  moves when cold<span class="d"> · 2 warm · 5 cold</span>                                                                 │
 │   compaction       cold compactions → sonnet<span class="d"> · cache allowed when cold</span>                                               │
 │   alias            claude-* → anthropic/claude-*<span class="d"> · on openrouter</span>                                                     │
 │                                                                                                                      │
@@ -201,12 +201,12 @@
 │    ↓ when unavailable before send · overloaded · 5xx   <span class="d">billed:</span> <span class="yellow">allow</span>   <span class="d">ambiguous retry:</span> deny   <span class="d">cache:</span> preserve warm  │
 │ 2  openrouter.openrouter_messages    <span class="yellow">billed</span>          alias claude-* → anthropic/claude-*     ok                      │
 │ 3  <span class="d">┌</span> <span class="d">binding</span>  codex_sub.codex_responses    <span class="d">codex_sub is off: skipped until it is on</span>                                  │
-│    <span class="d">│</span> <span class="d">model</span>    <span class="r">claude-sonnet-5▏          </span>   <span class="red">codex_responses does not offer claude-sonnet-5</span>                            │
-│    <span class="d">└</span> [ctrl+s] <span class="d">fix model to save</span>   [esc] cancel                                                                       │
+│    <span class="d">│</span> <span class="d">sends</span>    <span class="r">claude-sonnet-5▏      ←/→    </span><span class="b red">codex_responses does not offer claude-sonnet-5</span>                            │
+│    <span class="d">└</span> [ctrl+s] <span class="d">fix sends to save</span>   [esc] cancel                                                                       │
 │                                                                                                                      │
 │ <span class="b">handled by</span>  4 on · 3 off<span class="d">: server safeguards · required capabilities · health circuits</span>                                │
 │   upgrade          newest on claude-sub<span class="d"> · claude-opus-4-7 → claude-opus-5</span>                                            │
-│   lane transition  moves when cold<span class="d"> · 2 warm, 5 cold pinned</span>                                                           │
+│   lane transition  moves when cold<span class="d"> · 2 warm · 5 cold</span>                                                                 │
 │   compaction       cold compactions → sonnet<span class="d"> · cache allowed when cold</span>                                               │
 │   alias            claude-* → anthropic/claude-*<span class="d"> · on openrouter</span>                                                     │
 │                                                                                                                      │

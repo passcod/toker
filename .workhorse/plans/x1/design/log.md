@@ -154,11 +154,18 @@ Structure, colour, widths and recurring counts held; the findings are wording an
 All six are being fixed, along with the nits on `claude-sonnet` naming, `promote` in the overlay, `needed` beside empty fields, `5 rules · 1 new`, and `set in toker.toml`.
 Skipped: the history lanes column shape, because lanes on the live revision are a mix of warm and cold, so the bare count is the right reading; `published no` stays plain, because it's a presentation's setting rather than a sync fault; and the focus-dependent control line is how every panel behaves.
 
+## Round 5
+
+A fresh critic (Opus), who read no earlier round, judged all 30 frames: 0 critical, 3 suggestions, 12 nits (`critique-round-5.md`).
+Clean, so the clean count is 1.
+The suggestions: the overlay lacked `not synced`, `unprefixed`, `${model_id}`, `as` and `published`, and its `off` didn't say the request is refused; `5 cold pinned` contradicted the overlay's definition of pinned; and the settings frame refused `175k`, the TUI's own notation.
+All three are being fixed, with eleven of the nits.
+Skipped: nit 10, the shorter after-save header, because the full tab strip takes about 100 of 120 cells and no lifecycle clause fits beside it; the collapse is the design system's order.
+
 ## Where it stands
 
-- round 4's fixes applied and checked by eye; the route page's fourth off handler was resolved by turning aliases on (`4 on · 3 off`), since candidate 2 carries one and a `classifier` off would contradict the upgrade
-- round 5 critic (Opus, fresh) running
+- round 5's fixes, by the two drawing agents
 
 ## Next
 
-- if round 5 is clean, round 6 with another fresh critic decides the stop; round 6 is the cap either way
+- round 6, the cap: a fresh critic; clean means the stop rule is met
