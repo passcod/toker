@@ -45,17 +45,17 @@ Check that `/status` in Claude Code reads the auto mode server as enabled throug
 
 - [x] Add `server_safeguards` to `Capabilities` in `src/routing.rs`: supported on the Anthropic sub and API Messages bindings, unknown on OpenRouter Messages, unsupported on every other protocol's binding; update the pinned-capability tests in `src/ir/canonical.rs`
 - [ ] Capture and fixture the real response shape as described above, with the user's go-ahead before running a live turn, before flipping the Anthropic bindings to supported
-- [ ] Derive "asks for server safeguards" from the canonical request's `safeguards` extension, beside `required_capabilities` in `src/server/anthropic.rs`, as a separate fact rather than a `CapabilityFlags` member
-- [ ] Withhold the pair where effective support is unsupported: drop the `safeguards` extension in the licensed-transformation step and strip only the paired beta value from the outgoing `anthropic-beta` header, leaving the others
-- [ ] Translated routes: confirm the codex and Chat backends report the `safeguards` extension as an incompatible-dialect loss and never forward the beta
+- [x] Derive "asks for server safeguards" from the canonical request's `safeguards` extension, beside `required_capabilities` in `src/server/anthropic.rs`, as a separate fact rather than a `CapabilityFlags` member
+- [x] Withhold the pair where effective support is unsupported: drop the `safeguards` extension in the licensed-transformation step and strip only the paired beta value from the outgoing `anthropic-beta` header, leaving the others
+- [x] Translated routes: confirm the codex and Chat backends report the `safeguards` extension as an incompatible-dialect loss and never forward the beta
 
 ### Rejection retry and mark (WSAFE)
 
-- [ ] Migration: a `binding_safeguards_marks` table keyed by binding id with the time it was set; read-modify-write state, not ledger
-- [ ] Generalise `retry_thinking_off` into one precommit refusal step: on a 400 from a binding whose declared support is unknown, whose error names `safeguards`, record the refusal row, set the mark, and send once more with the pair withheld
-- [ ] Never retry or mark on a binding declared supported
-- [ ] Apply the mark when building `BindingAvailability` in `src/server/mod.rs`, narrowing unknown to unsupported for both the resolver and rendering
-- [ ] Clear the mark on a catalogue change for the binding, on a credential edit for its provider, and through the new control operation
+- [x] Migration: a `binding_safeguards_marks` table keyed by binding id with the time it was set; read-modify-write state, not ledger
+- [x] Generalise `retry_thinking_off` into one precommit refusal step: on a 400 from a binding whose declared support is unknown, whose error names `safeguards`, record the refusal row, set the mark, and send once more with the pair withheld
+- [x] Never retry or mark on a binding declared supported
+- [x] Apply the mark when building `BindingAvailability` in `src/server/mod.rs`, narrowing unknown to unsupported for both the resolver and rendering
+- [x] Clear the mark on a catalogue change for the binding, on a credential edit for its provider, and through the new control operation
 
 ### Routing (RDOC, RSOLV, RREV)
 
@@ -69,19 +69,19 @@ Check that `/status` in Claude Code reads the auto mode server as enabled throug
 
 ### Ledger (SLEDGR)
 
-- [ ] Migration: nullable request columns for the ask, the serving binding's effective support and whether it was marked, whether results were seen and whether they reached the client, and the routing outcome (skipped a candidate, walked again)
-- [ ] Fill them from the attempt plan and the response observer; results seen means the adapter's recogniser matched an extension, replayed means the renderer emitted it
-- [ ] Leave them null on rows for requests outside the Messages frontend and on imported rows; map them in export, and count them as deliberately unmapped in import
+- [x] Migration: nullable request columns for the ask, the serving binding's effective support and whether it was marked, whether results were seen and whether they reached the client, and the routing outcome (skipped a candidate, walked again)
+- [x] Fill them from the attempt plan and the response observer; results seen means the adapter's recogniser matched an extension, replayed means the renderer emitted it
+- [x] Leave them null on rows for requests outside the Messages frontend and on imported rows; map them in export, and count them as deliberately unmapped in import
 
 ### Operator surfaces (DCTRL, UTUI)
 
-- [ ] Control: a `safeguards mark clear` mutation behind the usual operation, method and JSON checks, and the marks in the config snapshot
+- [x] Control: a `safeguards mark clear` mutation behind the usual operation, method and JSON checks, and the marks in the config snapshot
 - [ ] Providers page: each Messages binding's declared support and mark, with a key to clear the mark; update the page's key overlay and snapshots
 - [ ] Routing page: the ask as a preview input, and per-candidate support in the preview result
 
 ### Verification
 
-- [ ] Server tests against mock upstreams: Anthropic binding round-trips the pair and results unchanged; an unknown binding forwards the pair; a rejection retries once without it, writes two rows in one attempt group and marks the binding; a marked binding withholds the pair; a codex route never receives it
+- [x] Server tests against mock upstreams: Anthropic binding round-trips the pair and results unchanged; an unknown binding forwards the pair; a rejection retries once without it, writes two rows in one attempt group and marks the binding; a marked binding withholds the pair; a codex route never receives it
 - [ ] Resolver tests: honouring route skips an unsupported candidate, keeps an unknown one, walks again when nothing capable is reachable through the edges, and leaves a non-honouring route untouched
 - [ ] A test that no log line, ledger column or translation-loss report carries the contents of the field or of a result
 - [ ] Live check in Claude Code: `/status` reads the auto mode server as enabled through an Anthropic route and falls back through `codex_sub`

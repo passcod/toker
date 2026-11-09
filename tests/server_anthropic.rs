@@ -226,6 +226,39 @@ const ERROR_BODY: &str =
 
 const BETWEEN_TOOLS_ERROR: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"To turn thinking off on this model, send \"thinking\": {\"type\": \"between_tools\"} instead of {\"type\": \"disabled\"}. The model does not think before responding. The short updates it writes between tool calls come back as thinking blocks."}}"#;
 
+/// The results the mock returns: invented, with a tool-use id the client must
+/// see exactly as sent.
+fn safeguards_results() -> Value {
+    json!([{"tool_use_id": "toolu_sg1", "verdict": "invented-verdict"}])
+}
+
+fn safeguards_response_body() -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "id": "msg_sg",
+        "type": "message",
+        "role": "assistant",
+        "model": "sg-answer",
+        "content": [{"type": "tool_use", "id": "toolu_sg1", "name": "Bash", "input": {}}],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 5, "output_tokens": 6},
+        "safeguard_results": safeguards_results(),
+    }))
+    .expect("serialise safeguards body")
+}
+
+const SAFEGUARDS_RESPONSE_SSE: &[u8] = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_sg\",\"model\":\"sg-answer\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_sg1\",\"name\":\"Bash\",\"input\":{}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":6},\"safeguard_results\":[{\"tool_use_id\":\"toolu_sg1\",\"verdict\":\"invented-verdict\"}]}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+
 const THINKING_RESPONSE_SSE: &[u8] = b"event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_thinking\",\"model\":\"thinking-response\",\"usage\":{\"input_tokens\":7,\"output_tokens\":0}}}\n\n\
 event: content_block_start\n\
@@ -314,6 +347,26 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
             Bytes::from_static(
                 br#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#,
             ),
+        ),
+        // Server safeguards, with invented contents. `sg-refuse` refuses the
+        // ask the way an upstream that lacks it does and answers normally
+        // without it; `sg-answer` returns results where the ask came.
+        "sg-refuse" if json.get("safeguards").is_some() => raw_response(
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            Bytes::from_static(
+                br#"{"type":"error","error":{"type":"invalid_request_error","message":"safeguards: Extra inputs are not permitted"}}"#,
+            ),
+        ),
+        "sg-answer" if json.get("safeguards").is_some() && stream => raw_response(
+            StatusCode::OK,
+            "text/event-stream",
+            Bytes::from_static(SAFEGUARDS_RESPONSE_SSE),
+        ),
+        "sg-answer" if json.get("safeguards").is_some() => raw_response(
+            StatusCode::OK,
+            "application/json",
+            Bytes::from(safeguards_response_body()),
         ),
         "gzip-me" => {
             // "Compressed" bytes that are not really gzip: the point is
@@ -4267,4 +4320,229 @@ async fn a_policy_rewrite_routes_bare_claude_models_to_openrouter() {
         row.lineage, None,
         "a side query is never attached to a parent"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Server safeguards (spec: WSAFE)
+// ---------------------------------------------------------------------------
+
+const SAFEGUARDS_BETA: &str = "dangerous-tool-use-2026-09-03";
+
+fn safeguards_request_body(model: &str, stream: bool) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "model": model,
+        "stream": stream,
+        "messages": [{"role": "user", "content": "Hi"}],
+        "safeguards": {"invented": ["shape", 1]},
+    }))
+    .expect("serialise safeguards request")
+}
+
+/// The `anthropic-beta` values the upstream received, split.
+fn upstream_betas(request: &CapturedRequest) -> Vec<String> {
+    request
+        .headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|value| value.trim().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_native_binding_carries_the_ask_and_its_results_unchanged() {
+    for stream in [false, true] {
+        let (mock, upstream) = spawn_mock().await;
+        let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+
+        let body = safeguards_request_body("sg-answer", stream);
+        let response = post_messages(
+            addr,
+            "/v1/messages",
+            &[(
+                "anthropic-beta",
+                "context-1m-2026-01-01,dangerous-tool-use-2026-09-03",
+            )],
+            &body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "stream={stream}");
+        let bytes = response.bytes().await.expect("body");
+
+        let captured = mock.captured();
+        assert_eq!(captured.len(), 1);
+        let sent: Value = serde_json::from_slice(&captured[0].body).expect("sent JSON");
+        assert_eq!(sent["safeguards"], json!({"invented": ["shape", 1]}));
+        let betas = upstream_betas(&captured[0]);
+        assert!(betas.contains(&SAFEGUARDS_BETA.to_owned()), "{betas:?}");
+        assert!(
+            betas.contains(&"context-1m-2026-01-01".to_owned()),
+            "{betas:?}"
+        );
+
+        if stream {
+            let rendered = String::from_utf8(bytes.to_vec()).expect("SSE is UTF-8");
+            let delta = rendered
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                .find(|event| event["type"] == "message_delta")
+                .expect("a message_delta");
+            assert_eq!(delta["safeguard_results"], safeguards_results());
+            assert!(
+                rendered.contains("toolu_sg1"),
+                "the id is untouched: {rendered}"
+            );
+        } else {
+            let rendered: Value = serde_json::from_slice(&bytes).expect("message JSON");
+            assert_eq!(rendered["safeguard_results"], safeguards_results());
+            assert_eq!(rendered["content"][0]["id"], json!("toolu_sg1"));
+        }
+
+        let rows = wait_for_rows(&store, 1).await;
+        let safeguards = rows[0].safeguards;
+        assert_eq!(safeguards.asked, Some(true));
+        assert_eq!(
+            safeguards.support,
+            Some(toker::routing::CapabilityEvidence::Supported)
+        );
+        assert_eq!(safeguards.marked, Some(false));
+        assert_eq!(safeguards.results_seen, Some(true));
+        assert_eq!(safeguards.results_replayed, Some(true));
+        assert_eq!(safeguards.skipped_candidate, Some(false));
+        assert_eq!(safeguards.walked_again, Some(false));
+        let extra = rows[0]
+            .extra
+            .as_ref()
+            .map(Value::to_string)
+            .unwrap_or_default();
+        assert!(
+            !extra.contains("invented") && !extra.contains("toolu_sg1"),
+            "the ledger carries no contents: {extra}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_request_that_does_not_ask_is_recorded_as_not_asking() {
+    let (_mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+    // The beta alone is not an ask, and its answer carries no results.
+    let body = messages_body("sg-answer", false);
+    let response = post_messages(
+        addr,
+        "/v1/messages",
+        &[("anthropic-beta", SAFEGUARDS_BETA)],
+        &body,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let rendered: Value = response.json().await.expect("message JSON");
+    assert!(rendered.get("safeguard_results").is_none());
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].safeguards.asked, Some(false));
+    assert_eq!(rows[0].safeguards.support, None);
+    assert_eq!(rows[0].safeguards.results_seen, None);
+}
+
+#[tokio::test]
+async fn a_binding_declaring_support_that_refuses_the_ask_is_forwarded_unretried_and_unmarked() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+
+    let body = safeguards_request_body("sg-refuse", false);
+    let response = post_messages(
+        addr,
+        "/v1/messages",
+        &[("anthropic-beta", SAFEGUARDS_BETA)],
+        &body,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(mock.captured().len(), 1, "never a second send");
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].status, Some(400));
+    assert!(store.load_safeguards_marks().expect("marks").is_empty());
+}
+
+#[tokio::test]
+async fn an_unknown_binding_that_refuses_the_ask_is_retried_once_without_it_and_marked() {
+    let (_anthropic, anthropic_upstream) = spawn_mock().await;
+    let (openrouter, openrouter_upstream) = spawn_mock().await;
+    let (addr, store) =
+        spawn_toker(openrouter_config(anthropic_upstream, &openrouter_upstream)).await;
+    let betas = [(
+        "anthropic-beta",
+        "context-1m-2026-01-01,dangerous-tool-use-2026-09-03",
+    )];
+
+    let body = safeguards_request_body("openrouter/sg-refuse", false);
+    let response = post_messages(addr, "/v1/messages", &betas, &body).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the second send is forwarded"
+    );
+
+    let captured = openrouter.captured();
+    assert_eq!(captured.len(), 2, "one refusal, one retry");
+    let first: Value = serde_json::from_slice(&captured[0].body).expect("first JSON");
+    let second: Value = serde_json::from_slice(&captured[1].body).expect("retry JSON");
+    assert!(
+        first.get("safeguards").is_some(),
+        "an unknown binding is sent the pair"
+    );
+    assert!(upstream_betas(&captured[0]).contains(&SAFEGUARDS_BETA.to_owned()));
+    assert!(
+        second.get("safeguards").is_none(),
+        "the retry withholds the field"
+    );
+    assert_eq!(
+        upstream_betas(&captured[1]),
+        vec!["context-1m-2026-01-01".to_owned()],
+        "and only its own beta, the others left in place"
+    );
+
+    let rows = wait_for_rows(&store, 2).await;
+    let first_attempt = rows[0].attempt.as_ref().expect("first attempt");
+    let second_attempt = rows[1].attempt.as_ref().expect("retry attempt");
+    assert_eq!(first_attempt.reason, toker::store::AttemptReason::Initial);
+    assert_eq!(
+        second_attempt.reason,
+        toker::store::AttemptReason::SafeguardsNegotiation
+    );
+    assert_eq!(
+        first_attempt.attempt_group_id,
+        second_attempt.attempt_group_id
+    );
+    assert_eq!(rows[0].status, Some(400));
+    assert_eq!(
+        rows[0].safeguards.marked,
+        Some(false),
+        "the refusal row is as it was sent"
+    );
+    assert_eq!(rows[1].safeguards.marked, Some(true));
+    let marks = store.load_safeguards_marks().expect("marks");
+    assert_eq!(marks.len(), 1);
+    assert_eq!(
+        marks[0].binding_id.as_str(),
+        "openrouter.openrouter_messages"
+    );
+
+    // The mark withholds the pair from the next request's first send.
+    let response = post_messages(addr, "/v1/messages", &betas, &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let captured = openrouter.captured();
+    assert_eq!(captured.len(), 3, "no refused send is repeated");
+    let third: Value = serde_json::from_slice(&captured[2].body).expect("third JSON");
+    assert!(third.get("safeguards").is_none());
+    assert!(!upstream_betas(&captured[2]).contains(&SAFEGUARDS_BETA.to_owned()));
+    let rows = wait_for_rows(&store, 3).await;
+    assert_eq!(rows[2].safeguards.asked, Some(true));
+    assert_eq!(
+        rows[2].safeguards.support,
+        Some(toker::routing::CapabilityEvidence::Unsupported)
+    );
+    assert_eq!(rows[2].safeguards.marked, Some(true));
 }
