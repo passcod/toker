@@ -138,8 +138,6 @@
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌PATH──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">matched by</span>  rewrite anthropic_messages · rewrite openai_chat · default anthropic_messages                            │
@@ -148,6 +146,8 @@
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ATTENTION─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="yellow">anthropic_sub</span>  on, not configured · first choice of route 1                                                          │
+│ <span class="yellow">anthropic_api</span>  off · the only choice of route 2                                                                      │
+│ <span class="yellow">openai_api</span>     off · the only choice of route 3                                                                      │
 │ <span class="yellow">codex_sub</span>      off · first choice of route 7, which falls to billed openrouter                                       │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌TABLES────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -166,7 +166,7 @@
 │ │                                                                                                                    │
 │ ├─ <span class="b">matched by</span>  3 rules                                                                                               │
 │ │ <span class="r">   rewrite  anthropic_messages  ^anthropic_sub/(?P&lt;model&gt;.+)$         priority 0                                   </span>│
-│ │    rewrite  openai_chat         ^anthropic_sub/(?P&lt;model&gt;.+)$         <span class="d">priority 0</span>                                   │
+│ │    rewrite  openai_chat         ^anthropic_sub/(?P&lt;model&gt;.+)$         <span class="d">priority 4</span>                                   │
 │ │    default  anthropic_messages  <span class="d">any name nothing above matched      </span>                                               │
 │ │                                                                                                                    │
 │ ├─ <span class="b">handled by</span>  3 blocks · 4 off                                                                                      │
@@ -208,7 +208,7 @@
 │ │                                                                                                                    │
 │ ├─ <span class="b">matched by</span>  3 rules                                                                                               │
 │ │    rewrite  anthropic_messages  ^anthropic_sub/(?P&lt;model&gt;.+)$         <span class="d">priority 0</span>                                   │
-│ │    rewrite  openai_chat         ^anthropic_sub/(?P&lt;model&gt;.+)$         <span class="d">priority 0</span>                                   │
+│ │    rewrite  openai_chat         ^anthropic_sub/(?P&lt;model&gt;.+)$         <span class="d">priority 4</span>                                   │
 │ │    default  anthropic_messages  <span class="d">any name nothing above matched      </span>                                               │
 │ │                                                                                                                    │
 │ ├─ <span class="b">handled by</span>  3 blocks · 4 off                                                                                      │
@@ -292,7 +292,7 @@
 │ │                                                                                                                    │
 │ ├─ <span class="b">matched by</span>  3 rules                                                                                               │
 │ │    rewrite  anthropic_messages  ^anthropic_sub/(?P&lt;model&gt;.+)$         <span class="d">priority 0</span>                                   │
-│ │    rewrite  openai_chat         ^anthropic_sub/(?P&lt;model&gt;.+)$         <span class="d">priority 0</span>                                   │
+│ │    rewrite  openai_chat         ^anthropic_sub/(?P&lt;model&gt;.+)$         <span class="d">priority 4</span>                                   │
 │ │    default  anthropic_messages  <span class="d">any name nothing above matched      </span>                                               │
 │ │                                                                                                                    │
 │ ├─ <span class="b">handled by</span>  3 blocks · 4 off                                                                                      │
@@ -304,9 +304,9 @@
 │ ├─ <span class="b">sent to</span>  1 candidate                                                                                              │
 │ │ <span class="r">   1  anthropic_sub.anthropic_messages  the requested model  subscription                                          </span>│
 │ │       <span class="yellow">not configured</span><span class="d"> · provider on, credential none · catalogue fresh</span>                                              │
-│ │      provider    anthropic_sub is on and holds no credential of its own                                            │
-│ │      credential  none · it can come from the keyring, an environment variable or a stored key                      │
-│ │      <span class="b">[g]</span> set up the credential   <span class="b">[e]</span> edit this candidate                                                           │
+│ │       provider    anthropic_sub is on and holds no credential of its own                                           │
+│ │       credential  none · it can come from the keyring, an environment variable or a stored key                     │
+│ │       <span class="b">[g]</span> set up the credential   <span class="b">[e]</span> edit this candidate                                                          │
 │ │                                                                                                                    │
 │ └─ <span class="d">provider</span>                                                                                                          │
 │                                                                                                                      │
@@ -338,7 +338,7 @@
 │ │ <span class="r">     rewrite  ^anthropic_sub/(?P&lt;model&gt;.+)$         priority 0  legacy-prefix-anthropic-anthropic_sub              </span>│
 │ │      default  <span class="d">any name nothing above matched      </span>  <span class="d">no id · one per scope</span>                                          │
 │ │    <span class="b">openai_chat</span>                                                                                                     │
-│ │      rewrite  ^anthropic_sub/(?P&lt;model&gt;.+)$         priority 0  <span class="d">legacy-prefix-openai-chat-anthropic_sub</span>            │
+│ │      rewrite  ^anthropic_sub/(?P&lt;model&gt;.+)$         priority 4  <span class="d">legacy-prefix-openai-chat-anthropic_sub</span>            │
 │ │    <span class="d">presentations  none point here</span>                                                                                  │
 │ │                                                                                                                    │
 │ ├─ <span class="b">handled by</span>  3 blocks · 4 off                                                                                      │
@@ -376,7 +376,7 @@
 │ │                                                                                                                    │
 │ ├─ <span class="b">matched by</span>  3 rules                                                                                               │
 │ │    rewrite  anthropic_messages  ^anthropic_sub/(?P&lt;model&gt;.+)$         <span class="d">priority 0</span>                                   │
-│ │    rewrite  openai_chat         ^anthropic_sub/(?P&lt;model&gt;.+)$         <span class="d">priority 0</span>                                   │
+│ │    rewrite  openai_chat         ^anthropic_sub/(?P&lt;model&gt;.+)$         <span class="d">priority 4</span>                                   │
 │ │    default  anthropic_messages  <span class="d">any name nothing above matched      </span>                                               │
 │ │                                                                                                                    │
 │ ├─ <span class="b">handled by</span>  2 blocks · 5 off                                                                                      │

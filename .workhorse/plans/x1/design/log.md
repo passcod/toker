@@ -85,9 +85,25 @@ The scripts are in `scripts/` there: `matrix.py`, `empty.py`, `ansi2html.py`, `s
 **The captures carry real account email addresses**, because they come from a copy of the real store.
 Toker is public, so nothing from them goes into the repository without invented names in place of the real ones.
 
+All five are drawn: 76 frames in 19 files, screenshotted to PNG frame by frame with `split_shot.py` in the rig work directory, and 43 of them curated into `compare/` as a matched set of eight per direction plus the reference and the current design.
+
 ## In flight
 
-- directions A, B, C, D and E
+- the fresh critique of all five (step 2.2)
+
+## What I have seen myself, before the critique
+
+Not a verdict; the fresh critic has not reported yet.
+
+- **D fills the frame and the others do not.** D at 80x24 carries all fourteen rewrite rules in three scope groups, each ending in its `else` row, with a `reach` column, inside 24 rows. A, B, C and E leave 20 to 30 of 40 rows empty on their main frames.
+- **D's tab strip is the chain.** `1 presentations 15 ↓→ 2 rewrites 14 > → 3 defaults 4 → 4 routes 7 · 5 mangle 11` is the tab strip, the pipeline and the trace in one row, and it still reads at 80 columns as `1 → 2 rewrites 14 → 3 → 4 · 5`. It solves the collapsing-tab-label problem as a side effect.
+- **D's `else` rows surface a latent fault.** The `openai_responses` group ends `else no default openai_responses → no route: nothing catches it`. Nothing in the current design would show that.
+- **E's overview is the best "what is wrong" surface of the five.** Its ATTENTION panel reads `anthropic_sub  on, not configured · first choice of route 1`, naming the fault and what it costs in one line, for each of four providers.
+- **E's route page reads downward as asked.** A rail of `client`, `matched by`, `handled by`, `sent to`, `provider`, with blocks that are off collapsed to one dim line.
+- **C answers the diagnostic question fastest.** Ten numbered links with a verdict each, the answer at the top, and the credential editable in place at the link that failed.
+- **B teaches the model best.** Selecting `policy` prints the lookup order with counts, which nothing in the app says today.
+- **A is the safest and the least ambitious**, and its presentations table is a complete fix for the fifteen identical rows.
+- **D and E may not be competitors.** D is the rule level and E the route level; D's `[enter] open the rule's route` and E's `2 rules` tab already point at each other, and E's overview is an index to D's tables rather than a copy of them.
 
 ## Next
 
