@@ -77,3 +77,19 @@ Applied from `critique-round-2.md` section 4 with the coordinator's rulings. Wid
 - **#24.** `[m] move` is dropped from the ROUTES detail line; the route page keeps it.
 - **Routes table width.** Back to 120x40. `now` is `no cred · billed fallback` for claude-sub and `off · billed fallback` for codex, with `billed fallback` yellow outside the reversed row. Columns are tighter, with two spaces between each pair.
 - **Lanes (#10).** The 01-05 header `saved · rev 10 live · 2 lanes on rev 9` stands. The strip in that frame cannot read `6 history 10`: the long status forces the non-current tabs to collapse to numbers, so it shows `6`. At 120 columns the full strip (90 cells) and that status (38) do not fit together. Everywhere else it is `6 history 9` and `rev 9 live`.
+
+## Round 3 fixes
+
+Applied from `critique-round-3.md` section 4. Width and font checks re-run on 01, 02, 03, 06 and 08 (all rows exactly the claimed width, Iosevka Term only); every touched frame re-shot and looked at.
+
+- **#1 reach.** Rules and else rows ending at `claude-sub` read `no cred · billed fallback`; at `codex`, `off · billed fallback`. `no cred` is yellow and `off` dim, `billed fallback` yellow outside the reversed row. Plain dim `off` stays on `claude-api` and `openai-chat`; `ok` and `nothing catches it` are unchanged. RULE's reach line reads `no cred · billed fallback  anthropic_sub has no credential, so openrouter serves it, billed`, and fits at 120. At 80 the column sheds to its first clause. The 100-wide summary line carries the full clause plus a shortened reason (`anthropic_sub has no credential`); the 80-wide one has `no cred` only. I also applied the same wording to the Defaults frame in 03 and its DEFAULT detail, for consistency.
+- **#2.** The digit switcher is gone from the route page (02-02, 02-03, 06-03); a dim `1 of 7` sits at the right of the name line. The control line is `[e] edit   [n] add fallback   [m] move   [t] trace   [←/→] other routes   [esc] back`.
+- **#6.** While a form is open the heads count saved records (`5 rules`, `2 candidates`); after the save the head reads `6 rules`.
+- **#7, #8.** Trace link 4 is `4 route  claude-sub` with no arrow; `> caught` is bold (and reversed, as the selected link), like `> serves`.
+- **#9, #10, #5 in 06-04.** `refresh url  built-in`; off providers are dim as whole rows. `none` is yellow on an `on` provider; in this frame that row is selected, so the yellow shows only in the detail (which has it).
+- **#11.** The ROUTE detail line is `[e] edit   [n] add fallback   [t] trace   [enter] open route`.
+- **#13.** UPGRADES rows begin at the route name (`claude-sub   claude-opus-4-7 → claude-opus-5`).
+- **#14.** `[p] promote` kept.
+- **#15.** COMPACTION reads `cold compactions → sonnet   cache allowed when cold`.
+- **#17.** The `claude-*` RULE detail reads `match  glob  claude-* · sends as asked`.
+- **#18.** The new-row placeholder in save-flow state 1 leaves untyped cells blank: only `6` and `prefix` remain. The form beneath keeps its own `-` for the empty route field.
