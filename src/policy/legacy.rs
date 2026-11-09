@@ -7,7 +7,8 @@ use std::collections::BTreeMap;
 
 use anyhow::Context;
 
-use crate::catalog::offers::{self, OfferInventory};
+use crate::catalog::model_identity;
+use crate::catalog::offers::OfferInventory;
 use crate::config::Config;
 use crate::middleware::model_map::ModelMap;
 use crate::picker::{PickerRule, default_rules};
@@ -18,14 +19,27 @@ use super::{
     CacheTransitionPolicy, Candidate, CandidateId, CandidateModel, CompactionPolicy,
     CompactionTarget, Compilation, DefaultRoute, FamilyClassifier, FrontendProtocol, FrontendScope,
     InventorySource, LaneTransitionPolicy, MatcherSpec, MinimumLearning, OfferSelector,
-    PolicyDocument, PolicyOrigin, Presentation, PresentationId, PresentationSource, ProfileId,
+    PolicyDocument, Presentation, PresentationId, PresentationSource, ProfileId,
     REQUESTED_MODEL_PARAMETER, RewriteId, RewriteRule, Route, RouteChain, RouteId, RouteReference,
-    SelectorOrdering, StableId, UpgradePolicy, UpgradePolicyId, VersionParserSpec,
+    SelectorOrdering, StableId, SubstituteModel, UpgradePolicy, UpgradePolicyId, VersionParserSpec,
 };
 
-const LEGACY_FAMILY_CLASSIFIER: &str = "legacy-family";
-const LEGACY_UPGRADE_POLICY: &str = "legacy-force-newest";
+const FAMILY_CLASSIFIER: &str = "family";
+const UPGRADE_POLICY: &str = "force-newest";
 const REQUESTED_ROUTE_PARAMETER: &str = REQUESTED_MODEL_PARAMETER;
+
+/// A version as the generated classifier reads it: numeric segments joined
+/// by `-`, none long enough to be a date, so an identity still carrying a
+/// date after folding (an unpublished snapshot) has no family.
+// spec: RMIG#in-authored-vocabulary
+const ANTHROPIC_VERSION: &str = "[0-9]{1,4}(?:-[0-9]{1,4})*";
+
+/// The compaction model the configuration names when it names none.
+const DEFAULT_COMPACTION_FAMILY: &str = "sonnet";
+
+/// The compaction model that turns the model change off, leaving the cold
+/// transform alone.
+const COMPACTION_MODEL_OFF: &str = "off";
 
 /// Build the inventory-independent revision-one routing document from config.
 pub fn document(config: &Config, topology: &RouteRegistry) -> anyhow::Result<PolicyDocument> {
@@ -48,7 +62,7 @@ pub fn compile(
     topology: &RouteRegistry,
     inventory: &OfferInventory,
 ) -> anyhow::Result<Compilation> {
-    Ok(compile_document(
+    Ok(super::compile(
         validated(config, topology)?,
         topology,
         inventory,
@@ -58,7 +72,12 @@ pub fn compile(
 /// Compile and activate revision one from the legacy config, or load the
 /// revision that is already active without consulting the config. Startup and
 /// setup both go through here, so a machine setup activates is the machine the
-/// service would have activated itself.
+/// service would have activated itself, and both retire the generated
+/// revisions an earlier version stored before anything reads them.
+///
+/// The config is built into a first revision up front but only needed where
+/// no revision is active, so a config that cannot route stops only a machine
+/// that has nothing else to route by.
 pub fn establish_revision_one(
     store: &crate::store::Store,
     config: &Config,
@@ -68,18 +87,22 @@ pub fn establish_revision_one(
     activated_ms: i64,
     configuration: Option<&crate::store::Configuration>,
 ) -> anyhow::Result<(crate::store::PolicyRevision, super::CompiledPolicy)> {
-    config.validate()?;
-    let document = validated(config, topology)?;
-    let generated = compile_document(document.clone(), topology, inventory)
-        .into_policy()
-        .map_err(|diagnostics| {
-            anyhow::anyhow!(
-                "generated revision one has {} compile diagnostics",
-                diagnostics.len()
-            )
-        })?;
+    let first = config
+        .validate()
+        .and_then(|()| validated(config, topology))
+        .and_then(|document| {
+            let policy = super::compile(document.clone(), topology, inventory)
+                .into_policy()
+                .map_err(|diagnostics| {
+                    anyhow::anyhow!(
+                        "generated revision one has {} compile diagnostics",
+                        diagnostics.len()
+                    )
+                })?;
+            Ok((document, policy))
+        });
     let activation = store.activate_revision_one_importing(
-        &document,
+        first.as_ref().ok().map(|(document, _)| document),
         activated_ms,
         publication_generation,
         &crate::store::publication_targets()?,
@@ -87,7 +110,8 @@ pub fn establish_revision_one(
     )?;
     match activation {
         crate::store::RevisionOneActivation::Activated { revision, .. } => {
-            Ok((revision, generated))
+            let (_, policy) = first.expect("activation used the first revision");
+            Ok((revision, policy))
         }
         crate::store::RevisionOneActivation::AlreadyActive { revision, .. } => {
             let policy = super::runtime::compile_stored_revision(&revision, topology, inventory)
@@ -101,74 +125,10 @@ pub fn establish_revision_one(
                 })?;
             Ok((revision, policy))
         }
-    }
-}
-
-pub fn compile_document(
-    document: super::ValidatedPolicyDocument,
-    topology: &RouteRegistry,
-    inventory: &OfferInventory,
-) -> Compilation {
-    // The bare-slug half of the listing follows the document's own protocol
-    // default, so a stored revision lists what it routes rather than what
-    // the config says today.
-    let defaults: Vec<_> = [ProtocolId::OpenAiChat, ProtocolId::OpenAiResponses]
-        .into_iter()
-        .map(|protocol| {
-            let provider = default_provider(document.document(), topology, protocol);
-            (protocol, provider)
-        })
-        .collect();
-    let mut compilation = super::compile(
-        document,
-        topology,
-        inventory,
-        PolicyOrigin::GeneratedRevisionOne,
-    );
-    if let Some(policy) = compilation.policy_mut() {
-        for (protocol, default_provider) in defaults {
-            policy.add_generated_publication(
-                protocol.into(),
-                offers::for_frontend_inventory(
-                    topology,
-                    inventory,
-                    protocol,
-                    default_provider.as_deref(),
-                )
-                .into_iter()
-                .map(|offer| {
-                    (
-                        offer.routed_model_id,
-                        offer.binding.id().clone(),
-                        offer.backend_model_id,
-                    )
-                }),
-            );
+        crate::store::RevisionOneActivation::NeedsDocument => {
+            Err(first.expect_err("a first revision was offered unless it failed to build"))
         }
     }
-    compilation
-}
-
-/// The provider a generated document defaults `protocol` to, if any.
-fn default_provider(
-    document: &PolicyDocument,
-    topology: &RouteRegistry,
-    protocol: ProtocolId,
-) -> Option<String> {
-    let scope = FrontendScope::Protocol {
-        protocol: protocol.into(),
-    };
-    let default = document
-        .defaults
-        .iter()
-        .find(|default| default.scope == scope)?;
-    topology
-        .routes()
-        .filter(|route| route.frontend() == protocol)
-        .find(|route| {
-            backend_route_id(route.binding()).is_ok_and(|id| id == default.target.route_id)
-        })
-        .map(|route| route.binding().provider().to_owned())
 }
 
 struct LegacyBuilder<'a> {
@@ -184,7 +144,7 @@ impl<'a> LegacyBuilder<'a> {
             topology,
             policy: PolicyDocument {
                 format_version: CURRENT_FORMAT_VERSION,
-                description: Some("Generated revision-one legacy routing".to_owned()),
+                description: Some("Generated first revision".to_owned()),
                 defaults: vec![],
                 presentations: vec![],
                 routes: vec![],
@@ -203,46 +163,37 @@ impl<'a> LegacyBuilder<'a> {
         self.add_explicit_prefixes()?;
         self.add_anthropic_alias()?;
         self.add_picker()?;
-        self.add_compaction()?;
+        self.add_compaction();
         Ok(self.policy)
     }
 
     fn add_family_policy(&mut self) -> anyhow::Result<()> {
         for binding in self.topology.bindings() {
-            if !supports_legacy_families(binding) {
+            if !serves_anthropic_identities(binding) {
                 continue;
             }
             let classifier_id = classifier_id(binding)?;
             self.policy.classifiers.push(FamilyClassifier {
                 id: classifier_id.clone(),
                 binding_id: binding.id().clone(),
-                // The generated classifier intentionally reproduces the
-                // legacy family split only for known hyphenated ids. An
-                // unpublished eight-digit Claude snapshot is excluded.
-                // Compilation replaces this generated classifier with the
-                // exact revision-one family split, including numeric-prefix
-                // names and published-alias folding. The matcher remains the
-                // bounded authored shape carried by the canonical document.
-                model_matcher: MatcherSpec::Regex(
-                    r"^(?:claude-)?(?P<family>[a-z0-9][a-z0-9-]*?)-(?P<version>[0-9]+(?:-[0-9]+)*)$"
-                        .to_owned(),
-                ),
+                model_matcher: MatcherSpec::Regex(format!(
+                    "^claude-(?P<family>[a-z]+(?:-[a-z]+)*)-(?P<version>{ANTHROPIC_VERSION})$"
+                )),
                 family_template: "${family}".to_owned(),
                 version_template: "${version}".to_owned(),
-                version_parser: VersionParserSpec::LegacyNumericTuple {
+                version_parser: VersionParserSpec::NumericTuple {
+                    components: None,
                     separator: "-".to_owned(),
                 },
-                legacy_hyphenated: true,
             });
             self.policy.upgrades.push(UpgradePolicy {
                 id: upgrade_id(binding)?,
                 classifier_id,
                 enabled: self.config.gates.force_newest,
-                minimum_learning: MinimumLearning::RevisionOneAdaptive,
+                minimum_learning: MinimumLearning::Scaled,
                 allow_manual_promotion: true,
                 inventory_sources: vec![InventorySource::Learned, InventorySource::Served],
                 lane_transition: LaneTransitionPolicy::MoveWhenCold,
-                allow_revision_one_legacy_learning: false,
             });
         }
         Ok(())
@@ -254,13 +205,13 @@ impl<'a> LegacyBuilder<'a> {
             let alias_policy = model_map_for(self.config, binding.provider())
                 .map(alias_policy)
                 .transpose()?;
-            let upgrade_policy_id = supports_legacy_families(binding)
+            let upgrade_policy_id = serves_anthropic_identities(binding)
                 .then(|| upgrade_id(binding))
                 .transpose()?;
             self.policy.routes.push(Route {
                 honours_server_safeguards: false,
                 id: route_id,
-                display_name: format!("Legacy {} route", binding.provider()),
+                display_name: format!("{} route", binding.provider()),
                 description: None,
                 parameters: vec![parameter(REQUESTED_ROUTE_PARAMETER)?],
                 chain: RouteChain {
@@ -334,7 +285,7 @@ impl<'a> LegacyBuilder<'a> {
             let pattern = format!(r"^{}/(?P<model>.+)$", regex::escape(provider));
             self.policy.rewrites.push(RewriteRule {
                 id: RewriteId::new(format!(
-                    "legacy-prefix-{}-{}",
+                    "prefix-{}-{}",
                     protocol_slug(route.frontend()),
                     provider
                 ))?,
@@ -367,7 +318,7 @@ impl<'a> LegacyBuilder<'a> {
             return Ok(());
         };
         self.policy.rewrites.push(RewriteRule {
-            id: RewriteId::new("legacy-anthropic-protocol-alias")?,
+            id: RewriteId::new("anthropic-protocol-alias")?,
             scope: FrontendScope::Protocol {
                 protocol: FrontendProtocol::AnthropicMessages,
             },
@@ -408,31 +359,39 @@ impl<'a> LegacyBuilder<'a> {
         Ok(())
     }
 
-    fn add_compaction(&mut self) -> anyhow::Result<()> {
-        let spec = self
+    fn add_compaction(&mut self) {
+        let configured = self
             .config
             .gates
             .compact_model
             .as_deref()
-            .unwrap_or("sonnet");
-        let eligible_bindings = self
+            .unwrap_or(DEFAULT_COMPACTION_FAMILY);
+        let model = compaction_model(configured);
+        let bindings = self
             .topology
-            .routes()
-            .filter(|route| route.frontend() == ProtocolId::AnthropicMessages)
-            .map(|route| route.binding())
-            .filter(|binding| binding.provider() != "openrouter")
+            .bindings()
+            .filter(|binding| serves_anthropic_identities(binding))
             .map(|binding| binding.id().clone())
             .collect();
         self.policy.compaction = Some(CompactionPolicy {
-            target: CompactionTarget::RevisionOneLegacy {
-                model_spec: spec.to_owned(),
-                eligible_bindings,
-            },
+            target: CompactionTarget::Substitution { model, bindings },
             lane_transition: LaneTransitionPolicy::MoveWhenCold,
             cache_transition: CacheTransitionPolicy::AllowWhenCold,
         });
-        Ok(())
     }
+}
+
+/// The configured compaction model as a substitution target: an identity
+/// carrying a version is one exact model, a bare name is a family, and
+/// `off` or nothing at all moves no model.
+fn compaction_model(configured: &str) -> Option<SubstituteModel> {
+    let identity =
+        model_identity(configured).filter(|identity| identity != COMPACTION_MODEL_OFF)?;
+    if identity.bytes().any(|byte| byte.is_ascii_digit()) {
+        return Some(SubstituteModel::Exact(identity));
+    }
+    let family = identity.strip_prefix("claude-").unwrap_or(&identity);
+    (!family.is_empty()).then(|| SubstituteModel::Family(family.to_owned()))
 }
 
 fn picker_presentation(
@@ -452,7 +411,7 @@ fn picker_presentation(
         .collect();
     let variant = rule.variant.as_deref().unwrap_or_default();
     Ok(Presentation {
-        id: PresentationId::new(format!("legacy-picker-{index}"))?,
+        id: PresentationId::new(format!("picker-{index}"))?,
         scope: FrontendScope::Profile {
             profile: ProfileId::new("claude")?,
             protocol: FrontendProtocol::AnthropicMessages,
@@ -461,7 +420,7 @@ fn picker_presentation(
         label: None,
         description: None,
         enabled: true,
-        // Legacy picker rows intentionally publish the native routed slug.
+        // Picker rows intentionally publish the native routed slug.
         shadow_native: true,
         source: PresentationSource::OfferSelector {
             selector: OfferSelector {
@@ -479,12 +438,17 @@ fn picker_presentation(
     })
 }
 
+/// A model map as alias rules, exact models first. Alias rules match the
+/// canonical identity, so the map's canonical model selectors match exactly,
+/// and a family selector matches what the generated classifier places in
+/// that family.
+// spec: RMIG#in-authored-vocabulary
 fn alias_policy(map: &ModelMap) -> anyhow::Result<AliasPolicy> {
     let mut rules = Vec::new();
     for (selector, target) in map.entries() {
         if let Some(model) = selector.strip_prefix("model:") {
             rules.push(AliasRule {
-                matcher: MatcherSpec::RevisionOneModel(model.to_owned()),
+                matcher: MatcherSpec::Exact(model.to_owned()),
                 exclude: vec![],
                 replacement: target.to_owned(),
             });
@@ -495,7 +459,10 @@ fn alias_policy(map: &ModelMap) -> anyhow::Result<AliasPolicy> {
             continue;
         };
         rules.push(AliasRule {
-            matcher: MatcherSpec::RevisionOneFamily(family.to_owned()),
+            matcher: MatcherSpec::Regex(format!(
+                "^claude-{}-{ANTHROPIC_VERSION}$",
+                regex::escape(family)
+            )),
             exclude: vec![],
             replacement: target.to_owned(),
         });
@@ -536,28 +503,24 @@ fn binding_for<'a>(
         .map(|route| route.binding())
 }
 
-fn supports_legacy_families(binding: &BackendBinding) -> bool {
-    matches!(
-        binding.protocol(),
-        ProtocolId::AnthropicMessages | ProtocolId::OpenAiResponses
-    )
+/// Whether `binding` serves Anthropic's own `claude-<family>-<version>`
+/// identities, the only shape the generated classifier reads. OpenRouter's
+/// and codex's identities are other shapes, so they get no family policy.
+fn serves_anthropic_identities(binding: &BackendBinding) -> bool {
+    matches!(binding.provider(), "anthropic_sub" | "anthropic_api")
 }
 
 fn backend_route_id(binding: &BackendBinding) -> anyhow::Result<RouteId> {
-    RouteId::new(format!("legacy-route-{}", stable_part(binding.id_str()))).map_err(Into::into)
+    RouteId::new(format!("route-{}", stable_part(binding.id_str()))).map_err(Into::into)
 }
 
 fn candidate_id(binding: &BackendBinding) -> anyhow::Result<CandidateId> {
-    CandidateId::new(format!(
-        "legacy-candidate-{}",
-        stable_part(binding.id_str())
-    ))
-    .map_err(Into::into)
+    CandidateId::new(format!("candidate-{}", stable_part(binding.id_str()))).map_err(Into::into)
 }
 
 fn classifier_id(binding: &BackendBinding) -> anyhow::Result<super::ClassifierId> {
     super::ClassifierId::new(format!(
-        "{LEGACY_FAMILY_CLASSIFIER}-{}",
+        "{FAMILY_CLASSIFIER}-{}",
         stable_part(binding.id_str())
     ))
     .map_err(Into::into)
@@ -565,7 +528,7 @@ fn classifier_id(binding: &BackendBinding) -> anyhow::Result<super::ClassifierId
 
 fn upgrade_id(binding: &BackendBinding) -> anyhow::Result<UpgradePolicyId> {
     UpgradePolicyId::new(format!(
-        "{LEGACY_UPGRADE_POLICY}-{}",
+        "{UPGRADE_POLICY}-{}",
         stable_part(binding.id_str())
     ))
     .map_err(Into::into)
@@ -698,13 +661,13 @@ mod tests {
             document
                 .rewrites
                 .iter()
-                .any(|rule| rule.id.as_str() == "legacy-prefix-anthropic-openrouter")
+                .any(|rule| rule.id.as_str() == "prefix-anthropic-openrouter")
         );
         assert!(
             document
                 .rewrites
                 .iter()
-                .any(|rule| rule.id.as_str() == "legacy-anthropic-protocol-alias")
+                .any(|rule| rule.id.as_str() == "anthropic-protocol-alias")
         );
         assert!(document.defaults.iter().any(|default| matches!(
             default.scope,
@@ -719,7 +682,7 @@ mod tests {
         let rewrite = disabled_document
             .rewrites
             .iter()
-            .find(|rule| rule.id.as_str() == "legacy-prefix-anthropic-openrouter")
+            .find(|rule| rule.id.as_str() == "prefix-anthropic-openrouter")
             .unwrap();
         let route = disabled_document
             .routes
@@ -741,21 +704,20 @@ mod tests {
         .unwrap();
         let policy = alias_policy(&map).unwrap();
         assert_eq!(policy.rules.len(), 2);
-        assert!(matches!(
-            &policy.rules[0].matcher,
-            MatcherSpec::RevisionOneModel(value) if value == "claude-opus-4-5"
-        ));
-        assert!(matches!(
-            &policy.rules[1].matcher,
-            MatcherSpec::RevisionOneFamily(value) if value == "opus"
-        ));
+        assert_eq!(
+            policy.rules[0].matcher,
+            MatcherSpec::Exact("claude-opus-4-5".to_owned())
+        );
         assert_eq!(policy.rules[0].replacement, "exact-target");
         assert_eq!(policy.rules[1].replacement, "family-target");
-        let exact = policy.rules[0].matcher.compile().unwrap();
-        assert!(exact.is_match("claude-opus-4-5-20251101").unwrap());
+        // Alias rules match the canonical identity, so a published snapshot
+        // reaches them already folded to its undated form.
         let family = policy.rules[1].matcher.compile().unwrap();
-        assert!(family.is_match("claude-3-7-opus").unwrap());
-        assert!(family.is_match("claude-opus-4-5-20251101").unwrap());
+        assert!(family.is_match("claude-opus-4-5").unwrap());
+        assert!(family.is_match("claude-opus-5").unwrap());
+        assert!(!family.is_match("claude-opus-4-5-20990101").unwrap());
+        assert!(!family.is_match("claude-sonnet-4-5").unwrap());
+        assert!(!family.is_match("claude-3-7-opus").unwrap());
     }
 
     #[test]
@@ -822,25 +784,33 @@ mod tests {
     }
 
     #[test]
-    fn force_newest_generates_explicit_classifiers_and_legacy_upgrades() {
+    fn force_newest_generates_anthropic_classifiers_with_the_scaled_bar() {
         for (setting, expected) in [("true", true), ("false", false)] {
             let config = load_config(&format!(
-                "[providers.anthropic_sub]\n[gates]\nforce_newest = {setting}\n"
+                "[providers.anthropic_sub]\n[providers.openrouter]\n[providers.codex_sub]\n\
+                 [gates]\nforce_newest = {setting}\n"
             ));
             let topology = topology(&config);
             let document = document(&config, &topology).unwrap();
-            assert!(
+            assert_eq!(
                 document
                     .classifiers
                     .iter()
-                    .all(|classifier| matches!(classifier.model_matcher, MatcherSpec::Regex(_)))
+                    .map(|classifier| classifier.binding_id.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "anthropic_sub.anthropic_messages",
+                    "anthropic_api.anthropic_messages"
+                ],
+                "only Anthropic's identities are classified, whether or not configured"
             );
             assert!(
                 document
                     .upgrades
                     .iter()
                     .all(|upgrade| upgrade.enabled == expected
-                        && !upgrade.allow_revision_one_legacy_learning)
+                        && upgrade.minimum_learning == MinimumLearning::Scaled
+                        && upgrade.allow_manual_promotion)
             );
             let compilation = compile(&config, &topology, &OfferInventory::default()).unwrap();
             let policy = compilation
@@ -851,92 +821,97 @@ mod tests {
                 .next()
                 .and_then(|upgrade| policy.classifier(&upgrade.policy().classifier_id))
                 .expect("generated classifier");
-            for model in [
-                "claude-opus-4-10",
-                "claude-3-7-sonnet",
-                "claude-3-7-sonnet-20250219",
+            let parser = VersionParserSpec::NumericTuple {
+                components: None,
+                separator: "-".to_owned(),
+            };
+            for (model, family, version) in [
+                ("claude-opus-4-10", "opus", "4-10"),
+                ("claude-opus-5", "opus", "5"),
+                ("claude-sonnet-4-5-20250929", "sonnet", "4-5"),
+                ("claude-haiku-4-5[1m]", "haiku", "4-5"),
             ] {
-                let expected = crate::policy::family::family_of(model).expect("legacy family");
                 let classified = classifier
                     .classify(model)
                     .expect("classification succeeds")
                     .expect("compiled family");
-                assert_eq!(classified.family, expected.name, "{model}");
+                assert_eq!(classified.family, family, "{model}");
                 assert_eq!(
                     classified.version,
-                    VersionParserSpec::LegacyNumericTuple {
-                        separator: "-".to_owned(),
-                    }
-                    .parse(
-                        &expected
-                            .version
-                            .iter()
-                            .map(u64::to_string)
-                            .collect::<Vec<_>>()
-                            .join("-")
-                    )
-                    .unwrap(),
+                    parser.parse(version).unwrap(),
                     "{model}"
                 );
             }
-            assert!(
-                classifier
-                    .classify("claude-opus-4-9-20261225")
-                    .expect("classification succeeds")
-                    .is_none(),
-                "unpublished snapshots stay unclassified",
-            );
+            for model in [
+                "claude-opus-4-9-20261225",
+                "claude-3-7-sonnet",
+                "claude-mythos-preview",
+                "gpt-5-codex",
+            ] {
+                assert!(
+                    classifier
+                        .classify(model)
+                        .expect("classification succeeds")
+                        .is_none(),
+                    "{model} has no family",
+                );
+            }
         }
     }
 
     #[test]
     fn compact_target_handles_none_off_family_and_exact() {
+        let sonnet = Some(SubstituteModel::Family("sonnet".to_owned()));
         let cases = [
-            (None, "sonnet"),
-            (Some("off"), "off"),
-            (Some(""), ""),
-            (Some("sonnet"), "sonnet"),
-            (Some("claude-sonnet-5"), "claude-sonnet-5"),
+            (None, sonnet.clone()),
+            (Some("off"), None),
+            (Some(""), None),
+            (Some("sonnet"), sonnet.clone()),
+            (Some("claude-sonnet"), sonnet),
+            (
+                Some("claude-sonnet-5"),
+                Some(SubstituteModel::Exact("claude-sonnet-5".to_owned())),
+            ),
         ];
         for (spec, expected) in cases {
             let compact = spec
                 .map(|value| format!("compact_model = \"{value}\"\n"))
                 .unwrap_or_default();
             let config = load_config(&format!(
-                "[providers.anthropic_sub]\n[providers.openrouter]\n[gates]\n{compact}"
+                "[providers.anthropic_sub]\n[providers.openrouter]\n[providers.codex_sub]\n\
+                 [gates]\n{compact}"
             ));
             let topology = topology(&config);
             let document = document(&config, &topology).unwrap();
-            let CompactionTarget::RevisionOneLegacy {
-                model_spec,
-                eligible_bindings,
-            } = &document.compaction.as_ref().unwrap().target
+            let CompactionTarget::Substitution { model, bindings } =
+                &document.compaction.as_ref().unwrap().target
             else {
-                panic!("generated compaction is a legacy overlay")
+                panic!("generated compaction is a substitution")
             };
-            assert_eq!(model_spec, expected);
-            assert!(
-                eligible_bindings
+            assert_eq!(model, &expected, "{spec:?}");
+            assert_eq!(
+                bindings
                     .iter()
-                    .any(|binding| { binding.as_str() == "anthropic_sub.anthropic_messages" })
-            );
-            assert!(
-                eligible_bindings
-                    .iter()
-                    .all(|binding| { binding.as_str() != "openrouter.openrouter_messages" })
+                    .map(|binding| binding.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "anthropic_sub.anthropic_messages",
+                    "anthropic_api.anthropic_messages"
+                ],
+                "{spec:?}"
             );
             assert!(
                 document
                     .routes
                     .iter()
-                    .all(|route| route.id.as_str() != "legacy-compaction"),
+                    .all(|route| route.id.as_str() != "compaction"),
                 "compaction preserves the ordinarily selected route"
             );
         }
     }
 
     #[test]
-    fn chat_publication_matches_the_shared_legacy_projection() {
+    fn chat_publication_lists_what_the_revision_routes() {
         let config = load_config(
             "default_backend_openai_chat = \"openrouter\"\n\
              [providers.openrouter]\n[providers.openai_api]\n",
@@ -961,7 +936,7 @@ mod tests {
             );
         }
         let inventory = offers::inventory(&topology, &catalogs);
-        let legacy: std::collections::BTreeSet<String> = [
+        let expected: std::collections::BTreeSet<String> = [
             "openrouter/openrouter-shared",
             "openrouter/openrouter-specific",
             "openrouter-shared",
@@ -979,7 +954,7 @@ mod tests {
             .into_iter()
             .map(str::to_owned)
             .collect();
-        assert_eq!(compiled, legacy);
+        assert_eq!(compiled, expected);
         let scope = FrontendScope::Protocol {
             protocol: FrontendProtocol::OpenaiChat,
         };
@@ -1024,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_listing_renders_the_generated_publication() {
+    fn chat_listing_renders_the_derived_publication() {
         let config = load_config(
             "default_backend_openai_chat = \"openrouter\"\n\
              [providers.openrouter]\n",
@@ -1051,7 +1026,7 @@ mod tests {
         let offers::PolicyPublication::Ready(listing) =
             offers::render_policy(policy, &inventory, None, FrontendProtocol::OpenaiChat)
         else {
-            panic!("the inventory resolves every generated slug");
+            panic!("the inventory resolves every derived slug");
         };
         let ids: Vec<_> = listing["data"]
             .as_array()
@@ -1061,7 +1036,7 @@ mod tests {
             .collect();
         assert_eq!(ids, ["lab/one", "openrouter/lab/one"]);
 
-        // A Messages frontend has no generated listing to add.
+        // A Messages frontend has no derived listing to add.
         let offers::PolicyPublication::Ready(messages) = offers::render_policy(
             policy,
             &inventory,
@@ -1074,7 +1049,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_publication_is_not_limited_by_authored_document_bounds() {
+    fn derived_publication_is_not_limited_by_document_bounds() {
         let config = load_config("[providers.openrouter]\n");
         let topology = topology(&config);
         let mut catalogs = FetchedCatalogs::default();

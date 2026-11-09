@@ -22,7 +22,6 @@
 use std::collections::BTreeMap;
 
 use crate::catalog::windows::model_identity;
-use crate::policy::family::family_of;
 
 // ── the lexical JSON tree ────────────────────────────────────────────
 
@@ -289,25 +288,35 @@ pub fn parse_model_map(raw: &str) -> anyhow::Result<Option<ModelMap>> {
             continue;
         }
 
-        // A family selector must name a family, never a model version
-        // (a selector with no version segments).
-        let Some(family) = family_of(selector).filter(|family| family.version.is_empty()) else {
+        // A family selector must name a family, never a model version.
+        let Some(family) = family_name(selector) else {
             return Err(invalid(format!(
                 "family selector {} must name a family, not a model version",
                 serde_json::to_string(selector).expect("a bare string serialises")
             )));
         };
-        let selector = format!("family:{}", family.name);
-        if map.families.contains_key(&family.name) {
+        let selector = format!("family:{family}");
+        if map.families.contains_key(&family) {
             return Err(invalid(format!(
                 "duplicate canonical selector {}",
                 serde_json::to_string(&selector).expect("a bare string serialises")
             )));
         }
-        map.families
-            .insert(family.name.clone(), MapTarget { target, selector });
+        map.families.insert(family, MapTarget { target, selector });
     }
     Ok(Some(map))
+}
+
+/// The family a family selector names, in the shape the first revision's
+/// generated classifier reads: lowercase words joined by `-`, after an
+/// optional `claude-` prefix. A digit would be a version, which a family
+/// selector must not carry.
+fn family_name(selector: &str) -> Option<String> {
+    let identity = model_identity(selector)?;
+    let name = identity.strip_prefix("claude-").unwrap_or(&identity);
+    name.split('-')
+        .all(|word| !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_lowercase()))
+        .then(|| name.to_owned())
 }
 
 // ── the rewrite ──────────────────────────────────────────────────────

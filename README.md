@@ -76,7 +76,7 @@ also switch it on afterwards from the providers page of `toker tui`.
 
 Make it the Chat default in the routing page: in the routes view (`2`), select
 the default whose scope is `openai_chat`, press `e`, set its route to
-`legacy-route-openai_api-openai_chat_completions` (Tab completes it) and save
+`route-openai_api-openai_chat_completions` (Tab completes it) and save
 with Ctrl+S.
 Setup writes a second default for the `unprefixed` profile, which is what a
 frontend without a `/f/<name>` prefix uses and which wins over the protocol
@@ -102,7 +102,7 @@ Enable `codex_sub` on the providers page of
 `toker tui`.
 
 Then make it the Chat default in the routing page the same way as above, with
-`legacy-route-codex_sub-codex_responses` as the route (`e` on the
+`route-codex_sub-codex_responses` as the route (`e` on the
 `openai_chat` and `unprefixed/openai_chat` defaults, or `n` to add one).
 Bare Chat model names then route to the subscription.
 With several Chat

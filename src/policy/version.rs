@@ -23,13 +23,12 @@ pub enum VersionParserSpec {
     Date {
         format: DateFormat,
     },
+    /// Numeric segments joined by `separator`. With `components` absent the
+    /// tuple takes any count up to the maximum, so `5` and `4-8` both parse
+    /// and compare segment by segment.
     NumericTuple {
-        components: u8,
-        separator: String,
-    },
-    /// Revision-one compatibility for the legacy family parser, whose
-    /// numeric suffix has one to eight components.
-    LegacyNumericTuple {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        components: Option<u8>,
         separator: String,
     },
 }
@@ -49,25 +48,20 @@ impl VersionParserSpec {
                 separator,
             } => NumericVersion::parse(value, *components, separator)
                 .map(ParsedVersion::NumericTuple),
-            Self::LegacyNumericTuple { separator } => {
-                NumericVersion::parse_variable(value, separator).map(ParsedVersion::NumericTuple)
-            }
         }
     }
 
     pub fn validate(&self) -> Result<(), VersionError> {
         match self {
             Self::NumericTuple {
-                components,
-                separator,
+                components: Some(components),
+                ..
             } if !(Self::MIN_TUPLE_COMPONENTS..=Self::MAX_TUPLE_COMPONENTS)
                 .contains(components) =>
             {
                 Err(VersionError::ComponentCount)
             }
-            Self::NumericTuple { separator, .. } | Self::LegacyNumericTuple { separator }
-                if separator.is_empty() =>
-            {
+            Self::NumericTuple { separator, .. } if separator.is_empty() => {
                 Err(VersionError::EmptySeparator)
             }
             _ => Ok(()),
@@ -158,30 +152,18 @@ const fn days_in_month(year: u16, month: u8) -> u8 {
     }
 }
 
-/// A numeric version whose arity was declared by policy.
+/// A numeric version, of the arity policy declared where it declared one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NumericVersion(Vec<u64>);
 
 impl NumericVersion {
-    fn parse_variable(value: &str, separator: &str) -> Result<Self, VersionError> {
-        if separator.is_empty() {
-            return Err(VersionError::EmptySeparator);
-        }
-        let values: Vec<u64> = value
-            .split(separator)
-            .map(parse_digits)
-            .collect::<Result<_, _>>()?;
-        if values.is_empty() || values.len() > usize::from(VersionParserSpec::MAX_TUPLE_COMPONENTS)
-        {
-            return Err(VersionError::ComponentCount);
-        }
-        Ok(Self(values))
-    }
-
-    fn parse(value: &str, components: u8, separator: &str) -> Result<Self, VersionError> {
-        if !(VersionParserSpec::MIN_TUPLE_COMPONENTS..=VersionParserSpec::MAX_TUPLE_COMPONENTS)
-            .contains(&components)
-        {
+    /// Parse exactly `components` segments, or any count from one to the
+    /// maximum where policy declared none.
+    fn parse(value: &str, components: Option<u8>, separator: &str) -> Result<Self, VersionError> {
+        if components.is_some_and(|components| {
+            !(VersionParserSpec::MIN_TUPLE_COMPONENTS..=VersionParserSpec::MAX_TUPLE_COMPONENTS)
+                .contains(&components)
+        }) {
             return Err(VersionError::ComponentCount);
         }
         if separator.is_empty() {
@@ -191,7 +173,11 @@ impl NumericVersion {
             .split(separator)
             .map(parse_digits)
             .collect::<Result<_, _>>()?;
-        if values.len() != usize::from(components) {
+        let count_fits = match components {
+            Some(components) => values.len() == usize::from(components),
+            None => values.len() <= usize::from(VersionParserSpec::MAX_TUPLE_COMPONENTS),
+        };
+        if !count_fits {
             return Err(VersionError::ComponentCount);
         }
         Ok(Self(values))
@@ -291,7 +277,7 @@ mod tests {
     #[test]
     fn numeric_tuples_have_fixed_arity_and_checked_components() {
         let parser = VersionParserSpec::NumericTuple {
-            components: 3,
+            components: Some(3),
             separator: ".".to_owned(),
         };
         let ten = parser.parse("2.10.0").unwrap();
@@ -306,16 +292,23 @@ mod tests {
     }
 
     #[test]
-    fn revision_one_variable_tuples_preserve_legacy_segment_order() {
-        let parser = VersionParserSpec::LegacyNumericTuple {
+    fn undeclared_arity_tuples_compare_segment_by_segment() {
+        let parser = VersionParserSpec::NumericTuple {
+            components: None,
             separator: "-".to_owned(),
         };
         assert!(parser.validate().is_ok());
         assert!(parser.parse("5").unwrap() > parser.parse("4-8").unwrap());
         assert!(parser.parse("5-1").unwrap() > parser.parse("5").unwrap());
+        assert!(parser.parse("4-10").unwrap() > parser.parse("4-8").unwrap());
         assert_eq!(parser.parse(""), Err(VersionError::Malformed));
         assert_eq!(
-            VersionParserSpec::LegacyNumericTuple {
+            parser.parse("1-2-3-4-5-6-7-8-9"),
+            Err(VersionError::ComponentCount)
+        );
+        assert_eq!(
+            VersionParserSpec::NumericTuple {
+                components: None,
                 separator: String::new(),
             }
             .validate(),

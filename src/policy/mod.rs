@@ -9,7 +9,6 @@ pub mod compile;
 pub mod diagnostic;
 pub mod document;
 pub mod edit;
-pub mod family;
 pub mod force_newest;
 pub mod learning;
 pub mod legacy;
@@ -29,7 +28,7 @@ pub use compile::{
     ClassificationError, ClassifiedModel, Compilation, CompiledAliasRule, CompiledCandidate,
     CompiledCandidateModel, CompiledClassifier, CompiledCompaction, CompiledPolicy,
     CompiledPresentation, CompiledRewrite, CompiledRoute, CompiledRouteReference, CompiledSelector,
-    CompiledUpgradePolicy, PolicyOrigin, PresentationRoute, compile,
+    CompiledUpgradePolicy, PresentationRoute, compile,
 };
 pub use diagnostic::{
     Diagnostic, DiagnosticCode, DiagnosticField, DiagnosticPath, DiagnosticPathError, Severity,
@@ -49,11 +48,11 @@ pub use matcher::{
 pub use pinning::{PinPersistence, persist_transition};
 pub use resolve::{
     AttemptPlan, AvailabilitySnapshot, BindingAvailability, CandidateEvidence,
-    CatalogueAvailability, CircuitSnapshot, CredentialSnapshot, Evidence, LaneFacts,
-    LegacyCompactionFacts, NoLearning, OpenCircuitTarget, ProvisionalPin, RequestClass,
-    RequestFacts, ResolveFailure, RouteProvenance, SafeguardsPlan, SkipReason, TraceEvent,
-    UpgradeElection, UpgradeRejection, resolve, resolve_after_failure, resolve_first_candidate,
-    resolve_model_free, resolve_with_circuits, upgrade_standing,
+    CatalogueAvailability, CircuitSnapshot, CompactionEvidence, CredentialSnapshot, Evidence,
+    LaneFacts, NoLearning, OpenCircuitTarget, ProvisionalPin, RequestClass, RequestFacts,
+    ResolveFailure, RouteProvenance, SafeguardsPlan, SkipReason, TraceEvent, UpgradeElection,
+    UpgradeRejection, resolve, resolve_after_failure, resolve_first_candidate, resolve_model_free,
+    resolve_with_circuits, upgrade_standing,
 };
 pub use runtime::{HealthCircuitKey, PolicyRuntime, PolicyRuntimeError, PolicySnapshot};
 pub use transition::{

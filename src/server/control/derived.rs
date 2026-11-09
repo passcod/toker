@@ -257,7 +257,7 @@ fn classifier_body(classifier: &CompiledClassifier, inventory: &OfferInventory) 
             // A classifier that does not parse a model either never matched
             // it, which is no example, or matched and could not read a
             // version, which is the one worth seeing.
-            Ok(None) if classifier.matcher().is_match(model).unwrap_or(false) => {
+            Ok(None) if classifier.matches(model).unwrap_or(false) => {
                 if unparsed.len() < UNPARSED_EXAMPLES {
                     unparsed.push(json!({"model": model}));
                 }
@@ -434,7 +434,7 @@ mod tests {
 
     use super::classifier_body;
     use crate::catalog::offers::{BackendOffer, OfferInventory};
-    use crate::policy::{PolicyDocument, PolicyOrigin, compile};
+    use crate::policy::{PolicyDocument, compile};
     use crate::routing::{ANTHROPIC_SUB_MESSAGES, RouteRegistry};
 
     fn offer(model: &str) -> BackendOffer {
@@ -475,14 +475,9 @@ mod tests {
         .expect("document");
         let topology =
             RouteRegistry::new(std::iter::empty::<Arc<dyn crate::providers::Provider>>());
-        let policy = compile(
-            document.validate().expect("valid"),
-            &topology,
-            &inventory,
-            PolicyOrigin::Authored,
-        )
-        .into_policy()
-        .expect("compiles");
+        let policy = compile(document.validate().expect("valid"), &topology, &inventory)
+            .into_policy()
+            .expect("compiles");
 
         let body = classifier_body(policy.classifiers().next().unwrap(), &inventory);
 

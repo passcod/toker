@@ -56,7 +56,7 @@ It MUST generate each of these.
 | a rewrite per provider prefix | the known providers |
 | presentation selectors | the configured picker rules |
 | a classifier and an upgrade policy per binding serving Anthropic's model identities | enabled only where the equivalent toggle was |
-| a compaction model substitution over the Anthropic Messages bindings other than OpenRouter | the configured compaction model |
+| a compaction model substitution over the bindings serving Anthropic's model identities | the configured compaction model |
 
 Every known provider MUST own its prefix even while disabled.
 
@@ -92,7 +92,7 @@ An identity whose version segments precede its family name has no family under t
 
 The generated upgrade policies MUST use the scaled evidence bar, and MUST let a promotion stand in for evidence, as [RMODEL](models.md#electing-a-familys-target) specifies.
 
-The generated compaction substitution MUST name the configured compaction model, or the Sonnet family where none is configured, as [RCOMP](compaction.md#choosing-the-target) specifies.
+The generated compaction substitution MUST name the configured compaction model, the Sonnet family where none is configured, and no model where the configuration turns the model change off, as [RCOMP](compaction.md#choosing-the-target) specifies.
 
 ### Creating it
 
@@ -166,16 +166,20 @@ The result MUST be an ordinary draft, validated, previewed, edited and activated
 ## Retiring generated revisions
 
 An earlier version stored revisions whose documents carried semantics only its generated first revision could use, and recorded them with a generated compiler origin.
-Such a revision no longer decodes, and MUST be retired by the service at startup, before it establishes or loads the active revision.
+Such a revision no longer decodes, and MUST be retired in the transaction that [creates the first revision](#creating-it), before it reads the pointer.
+The service MUST reach that transaction on every start, whether or not a revision is active, and setup reaches it as before.
 
 Where any lane is pinned to a generated revision, the service MUST refuse to start, naming how many lanes are pinned and to which revisions, and MUST change nothing.
 
 > [!NOTE]
 > A pinned lane's cache was built under that revision, and resolving it under another one could lose that cache without the consent [RPIN](pins.md#one-decision-for-every-move) requires for a move.
 
-Otherwise, in one immediate transaction, the service MUST delete every generated revision.
+Otherwise, that transaction MUST delete every generated revision.
 Where the active pointer named one, the same transaction MUST clear the pointer, the draft and the import marker, and MUST then establish the first revision as a machine with no file to read does, as [creating it](#creating-it) specifies.
-Where the draft was based on a generated revision, the same transaction MUST replace the draft with the active revision's document at the next generation.
+Where the draft was based on a generated revision, or no longer decodes, the same transaction MUST replace the draft with the active revision's document at the next generation.
+
+> [!NOTE]
+> An imported draft carries the generated semantics whichever revision it was based on.
 
 > [!NOTE]
 > Deleting these rows is the one exception to keeping the store's history, because a revision that cannot be decoded keeps nothing a reader could use.

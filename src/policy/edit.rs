@@ -759,7 +759,6 @@ mod tests {
             family_template: "family".to_owned(),
             version_template: "version".to_owned(),
             version_parser: crate::policy::VersionParserSpec::Semver,
-            legacy_hyphenated: false,
         }
     }
 

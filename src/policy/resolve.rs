@@ -20,7 +20,7 @@ use super::{
     FailureClass, FallbackPermission, FrontendProtocol, FrontendScope, InventorySource,
     LaneTransitionPolicy, LearningView, MatcherCaptures, MinimumLearning, ParsedVersion,
     PolicyFingerprint, PresentationId, PresentationRoute, ProfileId, REQUESTED_MODEL_PARAMETER,
-    RewriteId, RouteFingerprint, RouteId, StableId, UpgradePolicy,
+    RewriteId, RouteFingerprint, RouteId, StableId, SubstituteModel, UpgradePolicy,
 };
 
 /// The kind of request being resolved. This is derived from fixed markers;
@@ -33,7 +33,7 @@ pub enum RequestClass {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LegacyCompactionFacts {
+pub struct CompactionEvidence {
     pub lane_cold: bool,
     pub prompt_tokens: u64,
     /// Whether the authoritative all-or-nothing body transform succeeded.
@@ -57,9 +57,9 @@ pub struct RequestFacts {
     pub asks_server_safeguards: bool,
     pub binding_affinity: Option<BindingId>,
     pub class: RequestClass,
-    /// Exact revision-one compaction evidence, separate from generic cache
-    /// temperature so it cannot authorize unrelated transitions.
-    pub legacy_compaction: Option<LegacyCompactionFacts>,
+    /// A compaction's own evidence of how cold its lane is, separate from
+    /// generic cache temperature so it cannot authorize unrelated transitions.
+    pub compaction_evidence: Option<CompactionEvidence>,
     /// The account each provider's credential names for this request, by
     /// provider id. A provider with no entry is one whose accounts Toker
     /// cannot tell apart, or whose credential no source has named yet.
@@ -882,7 +882,7 @@ fn walk_selected<L: LearningView>(
             });
         }
         let before_compaction = upgraded.as_deref().unwrap_or(&baseline);
-        let retargeted = choose_revision_one_compaction(
+        let retargeted = choose_substitution(
             policy,
             inventory,
             learning,
@@ -970,11 +970,11 @@ fn walk_selected<L: LearningView>(
             effective_model: effective,
             compaction: selected.provenance == RouteProvenance::Compaction
                 || (facts
-                    .legacy_compaction
+                    .compaction_evidence
                     .is_some_and(|facts| facts.transform_applied)
                     && policy
                         .compaction()
-                        .and_then(CompiledCompaction::revision_one_legacy)
+                        .and_then(CompiledCompaction::substitution)
                         .is_some_and(|(_, bindings)| bindings.contains(candidate.binding_id()))),
             lane_transition: lane_policy,
             cache_transition: selected.cache_transition,
@@ -1541,7 +1541,7 @@ fn choose_upgrade<L: LearningView>(
     if let Some(lane) = lane
         && lane.temperature != super::CacheTemperature::Cold
         && !facts
-            .legacy_compaction
+            .compaction_evidence
             .is_some_and(|compaction| compaction.lane_cold)
         && lane.forced_from.as_deref() == Some(baseline)
         && let Some(to) = lane.forced_to.as_ref()
@@ -1728,7 +1728,12 @@ fn elect_upgrade<L: LearningView>(
     })
 }
 
-fn choose_revision_one_compaction<L: LearningView>(
+/// The model a compaction substitution moves this candidate to, if every
+/// condition holds: a proven-cold lane, a transform that applied, a reached
+/// binding the substitution names, a target that fits the lane and is priced
+/// strictly below the source after aliasing.
+// spec: RCOMP#choosing-the-target
+fn choose_substitution<L: LearningView>(
     policy: &CompiledPolicy,
     inventory: &OfferInventory,
     learning: &L,
@@ -1737,68 +1742,27 @@ fn choose_revision_one_compaction<L: LearningView>(
     parameters: &BTreeMap<StableId, String>,
     source: &str,
 ) -> Result<Option<String>, ResolveFailure> {
-    let Some(compaction_facts) = facts
-        .legacy_compaction
-        .filter(|facts| facts.lane_cold && facts.transform_applied)
+    let Some(evidence) = facts
+        .compaction_evidence
+        .filter(|evidence| evidence.lane_cold && evidence.transform_applied)
     else {
         return Ok(None);
     };
-    let Some((spec, eligible_bindings)) = policy
+    let Some((model, bindings)) = policy
         .compaction()
-        .and_then(CompiledCompaction::revision_one_legacy)
+        .and_then(CompiledCompaction::substitution)
     else {
         return Ok(None);
     };
-    if facts.class != RequestClass::Compaction
-        || !eligible_bindings.contains(candidate.binding_id())
-    {
+    if facts.class != RequestClass::Compaction || !bindings.contains(candidate.binding_id()) {
         return Ok(None);
     }
 
-    // The binding's generated classifier splits the ids, so compaction reads
-    // the same family and version the upgrade election does.
-    let Some(classifier) = policy.family_split_for(candidate.binding_id()) else {
-        return Ok(None);
-    };
-    let target = match classifier.family_split(spec) {
-        Some(family) if family.version.is_empty() => {
-            let mut best: Option<(String, super::family::Family)> = None;
-            let Ok(models) = learning.known_models(candidate.binding_id()) else {
-                return Ok(None);
-            };
-            for model in models {
-                let Some(member) = classifier
-                    .family_split(&model)
-                    .filter(|member| member.name == family.name)
-                else {
-                    continue;
-                };
-                if !learning_minimum(
-                    MinimumLearning::RevisionOneAdaptive,
-                    false,
-                    learning,
-                    candidate.binding_id(),
-                    &model,
-                )
-                .unwrap_or(false)
-                {
-                    continue;
-                }
-                let mapped =
-                    apply_alias(candidate, &model, parameters)?.unwrap_or_else(|| model.clone());
-                if crate::catalog::pricing::price(&mapped, false, None).is_none() {
-                    continue;
-                }
-                if best
-                    .as_ref()
-                    .is_none_or(|(_, current)| member.is_newer_than(current))
-                {
-                    best = Some((model, member));
-                }
-            }
-            best.map(|(model, _)| model)
+    let target = match model {
+        Some(SubstituteModel::Exact(model)) => crate::catalog::model_identity(model),
+        Some(SubstituteModel::Family(family)) => {
+            newest_learned_member(policy, learning, candidate, parameters, family)?
         }
-        Some(_) => crate::catalog::model_identity(spec),
         None => None,
     };
     let Some(target) = target else {
@@ -1810,14 +1774,14 @@ fn choose_revision_one_compaction<L: LearningView>(
         .get(candidate.binding_id(), &mapped_target)
         .and_then(|offer| offer.context_window)
     {
-        compaction_facts.prompt_tokens <= window
+        evidence.prompt_tokens <= window
     } else {
         learning
             .learned(candidate.binding_id(), &target)
             .ok()
             .flatten()
             .and_then(|evidence| evidence.max_prompt())
-            .is_some_and(|max| compaction_facts.prompt_tokens <= max)
+            .is_some_and(|max| evidence.prompt_tokens <= max)
     };
     if !fits {
         return Ok(None);
@@ -1833,6 +1797,67 @@ fn choose_revision_one_compaction<L: LearningView>(
         matches!((target_price, source_price), (Some(target), Some(source)) if target < source)
             .then_some(target),
     )
+}
+
+/// The newest model of `family` this candidate's binding has learned, as its
+/// upgrade policy classifies it and under that policy's evidence bar, with a
+/// known price after aliasing. A candidate with no upgrade policy has no way
+/// to read a family, so it gets none.
+fn newest_learned_member<L: LearningView>(
+    policy: &CompiledPolicy,
+    learning: &L,
+    candidate: &CompiledCandidate,
+    parameters: &BTreeMap<StableId, String>,
+    family: &str,
+) -> Result<Option<String>, ResolveFailure> {
+    let Some(upgrade) = candidate
+        .upgrade_policy_id()
+        .and_then(|id| policy.upgrade(id))
+        .map(|upgrade| upgrade.policy())
+    else {
+        return Ok(None);
+    };
+    let Some(classifier) = policy.classifier(&upgrade.classifier_id) else {
+        return Ok(None);
+    };
+    let Ok(models) = learning.known_models(candidate.binding_id()) else {
+        return Ok(None);
+    };
+    let mut best: Option<(String, ParsedVersion)> = None;
+    for model in models {
+        let Some(member) = classifier
+            .classify(&model)
+            .ok()
+            .flatten()
+            .filter(|member| member.family == family)
+        else {
+            continue;
+        };
+        if !learning_minimum(
+            upgrade.minimum_learning,
+            upgrade.allow_manual_promotion,
+            learning,
+            candidate.binding_id(),
+            &model,
+        )
+        .unwrap_or(false)
+        {
+            continue;
+        }
+        let mapped = apply_alias(candidate, &model, parameters)?.unwrap_or_else(|| model.clone());
+        if crate::catalog::pricing::price(&mapped, false, None).is_none() {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(_, current)| {
+            member
+                .version
+                .partial_cmp(current)
+                .is_some_and(|order| order.is_gt())
+        }) {
+            best = Some((model, member.version));
+        }
+    }
+    Ok(best.map(|(model, _)| model))
 }
 
 fn learning_minimum<L: LearningView>(
@@ -1863,7 +1888,7 @@ fn learning_minimum<L: LearningView>(
         MinimumLearning::ExplicitPromotion => {
             Ok(evidence.is_some_and(|evidence| evidence.explicitly_promoted()))
         }
-        MinimumLearning::RevisionOneAdaptive => {
+        MinimumLearning::Scaled => {
             let active_days = learning
                 .active_days(binding)
                 .map_err(|_| ResolveFailure::LearningUnavailable)?;
@@ -1893,22 +1918,28 @@ fn fits_context<L: LearningView>(
         .is_some_and(|max| prompt <= max))
 }
 
+/// The first alias rule matching `model`'s canonical identity rewrites it, so
+/// a rule naming an undated model covers its published dated snapshots.
+// spec: RDOC#routes-and-candidates
 fn apply_alias(
     candidate: &CompiledCandidate,
     model: &str,
     parameters: &BTreeMap<StableId, String>,
 ) -> Result<Option<String>, ResolveFailure> {
+    let Some(identity) = crate::catalog::model_identity(model) else {
+        return Ok(None);
+    };
     for rule in candidate.alias_rules() {
         if rule
             .exclude()
             .iter()
-            .any(|matcher| matcher.is_match(model).unwrap_or(false))
+            .any(|matcher| matcher.is_match(&identity).unwrap_or(false))
         {
             continue;
         }
         let Some(captures) = rule
             .matcher()
-            .captures(model)
+            .captures(&identity)
             .map_err(|_| ResolveFailure::InvalidTemplate)?
         else {
             continue;
@@ -2036,17 +2067,9 @@ mod tests {
     }
 
     fn compile(document: PolicyDocument, inventory: &OfferInventory) -> CompiledPolicy {
-        compile_origin(document, inventory, PolicyOrigin::Authored)
-    }
-
-    fn compile_origin(
-        document: PolicyDocument,
-        inventory: &OfferInventory,
-        origin: PolicyOrigin,
-    ) -> CompiledPolicy {
         let topology =
             RouteRegistry::new(std::iter::empty::<Arc<dyn crate::providers::Provider>>());
-        crate::policy::compile(document.validate().unwrap(), &topology, inventory, origin)
+        crate::policy::compile(document.validate().unwrap(), &topology, inventory)
             .into_policy()
             .unwrap()
     }
@@ -2082,10 +2105,10 @@ mod tests {
             ),
             family_template: "${family}".to_owned(),
             version_template: "${version}".to_owned(),
-            version_parser: VersionParserSpec::LegacyNumericTuple {
+            version_parser: VersionParserSpec::NumericTuple {
+                components: None,
                 separator: "-".to_owned(),
             },
-            legacy_hyphenated: false,
         });
         document.upgrades.push(UpgradePolicy {
             id: id("upgrade"),
@@ -2095,7 +2118,6 @@ mod tests {
             allow_manual_promotion: false,
             inventory_sources: vec![InventorySource::Catalogue],
             lane_transition: LaneTransitionPolicy::MoveWhenCold,
-            allow_revision_one_legacy_learning: false,
         });
         document
     }
@@ -2194,7 +2216,7 @@ mod tests {
             asks_server_safeguards: false,
             binding_affinity: None,
             class: RequestClass::Inference,
-            legacy_compaction: None,
+            compaction_evidence: None,
             accounts: BTreeMap::new(),
             now_ms: 100,
         }
@@ -2406,7 +2428,7 @@ mod tests {
         let policy = compile(upgrade_document(), &inventory);
         let mut request = facts("claude-opus-4-8");
         request.class = RequestClass::Compaction;
-        request.legacy_compaction = Some(LegacyCompactionFacts {
+        request.compaction_evidence = Some(CompactionEvidence {
             lane_cold: true,
             prompt_tokens: 100,
             transform_applied: true,
@@ -4200,42 +4222,56 @@ mod tests {
         assert_eq!(pin.effective_model, plan.effective_model);
     }
 
-    #[test]
-    fn revision_one_compaction_overlays_the_selected_binding_and_legacy_guards() {
-        let mut document = document(route(
-            candidate(
-                "first",
-                &ANTHROPIC_SUB_MESSAGES,
-                CandidateModel::RequestedModel,
-            ),
-            vec![],
-        ));
+    fn substitution_document(upgrade: bool, model: Option<SubstituteModel>) -> PolicyDocument {
+        let mut first = candidate(
+            "first",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::RequestedModel,
+        );
+        if upgrade {
+            first.upgrade_policy_id = Some(UpgradePolicyId::new("upgrade").unwrap());
+        }
+        let mut document = document(route(first, vec![]));
         document.classifiers.push(FamilyClassifier {
             id: ClassifierId::new("family").unwrap(),
             binding_id: ANTHROPIC_SUB_MESSAGES.id().clone(),
             model_matcher: MatcherSpec::Regex(
-                r"^(?:claude-)?(?P<family>[a-z0-9][a-z0-9-]*?)-(?P<version>[0-9]+(?:-[0-9]+)*)$"
-                    .to_owned(),
+                r"^claude-(?P<family>[a-z]+)-(?P<version>[0-9]{1,4}(?:-[0-9]{1,4})*)$".to_owned(),
             ),
             family_template: "${family}".to_owned(),
             version_template: "${version}".to_owned(),
-            version_parser: VersionParserSpec::LegacyNumericTuple {
+            version_parser: VersionParserSpec::NumericTuple {
+                components: None,
                 separator: "-".to_owned(),
             },
-            legacy_hyphenated: true,
+        });
+        document.upgrades.push(UpgradePolicy {
+            id: UpgradePolicyId::new("upgrade").unwrap(),
+            classifier_id: ClassifierId::new("family").unwrap(),
+            // The substitution reads the classifier and bar whether or not
+            // the upgrade itself is switched on.
+            enabled: false,
+            minimum_learning: MinimumLearning::Scaled,
+            allow_manual_promotion: true,
+            inventory_sources: vec![InventorySource::Learned, InventorySource::Served],
+            lane_transition: LaneTransitionPolicy::MoveWhenCold,
         });
         document.compaction = Some(CompactionPolicy {
-            target: CompactionTarget::RevisionOneLegacy {
-                model_spec: "sonnet".to_owned(),
-                eligible_bindings: vec![ANTHROPIC_SUB_MESSAGES.id().clone()],
+            target: CompactionTarget::Substitution {
+                model,
+                bindings: vec![ANTHROPIC_SUB_MESSAGES.id().clone()],
             },
             lane_transition: LaneTransitionPolicy::MoveWhenCold,
             cache_transition: CacheTransitionPolicy::AllowWhenCold,
         });
-        let policy = compile_origin(
-            document,
+        document
+    }
+
+    #[test]
+    fn compaction_substitution_keeps_the_binding_and_reads_the_candidates_upgrade_policy() {
+        let policy = compile(
+            substitution_document(true, Some(SubstituteModel::Family("sonnet".to_owned()))),
             &OfferInventory::default(),
-            PolicyOrigin::GeneratedRevisionOne,
         );
         let learning = TestLearning {
             models: BTreeMap::from([
@@ -4246,7 +4282,7 @@ mod tests {
         };
         let mut request = facts("claude-opus-5");
         request.class = RequestClass::Compaction;
-        request.legacy_compaction = Some(LegacyCompactionFacts {
+        request.compaction_evidence = Some(CompactionEvidence {
             lane_cold: true,
             prompt_tokens: 200_000,
             transform_applied: true,
@@ -4268,8 +4304,8 @@ mod tests {
         assert!(plan.compaction);
 
         let mut warm = request.clone();
-        warm.legacy_compaction.as_mut().unwrap().lane_cold = false;
-        warm.legacy_compaction.as_mut().unwrap().transform_applied = false;
+        warm.compaction_evidence.as_mut().unwrap().lane_cold = false;
+        warm.compaction_evidence.as_mut().unwrap().transform_applied = false;
         let plan = resolve(
             &policy,
             &OfferInventory::default(),
@@ -4284,7 +4320,7 @@ mod tests {
 
         let mut declined = request.clone();
         declined
-            .legacy_compaction
+            .compaction_evidence
             .as_mut()
             .unwrap()
             .transform_applied = false;
@@ -4319,6 +4355,40 @@ mod tests {
             plan.compaction,
             "cold same-model transform remains licensed"
         );
+
+        // Without an upgrade policy the candidate has no way to read a
+        // family, but an exact substitution still applies.
+        let unclassified = compile(
+            substitution_document(false, Some(SubstituteModel::Family("sonnet".to_owned()))),
+            &OfferInventory::default(),
+        );
+        let plan = resolve(
+            &unclassified,
+            &OfferInventory::default(),
+            &learning,
+            None,
+            &availability(true, false),
+            &request,
+        )
+        .unwrap();
+        assert_eq!(plan.retargeted_model, None);
+        let exact = compile(
+            substitution_document(
+                false,
+                Some(SubstituteModel::Exact("claude-sonnet-5".to_owned())),
+            ),
+            &OfferInventory::default(),
+        );
+        let plan = resolve(
+            &exact,
+            &OfferInventory::default(),
+            &learning,
+            None,
+            &availability(true, false),
+            &request,
+        )
+        .unwrap();
+        assert_eq!(plan.retargeted_model.as_deref(), Some("claude-sonnet-5"));
     }
 
     #[test]
