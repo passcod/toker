@@ -255,6 +255,23 @@ fn account_for_identity(
     Ok(conn.last_insert_rowid())
 }
 
+/// Open (or find) the account `identity` names, without a credential to
+/// hang it on. This is how history that predates accounts is given one on a
+/// machine that has never seen a login for it
+/// (spec: ACCT#moving-a-machine-onto-accounts).
+pub(super) fn open_account(
+    conn: &mut Connection,
+    provider: &str,
+    identity: &AccountIdentity,
+    at_ms: i64,
+) -> Result<i64> {
+    identity.validate()?;
+    let tx = conn.transaction()?;
+    let number = account_for_identity(&tx, provider, identity, at_ms)?;
+    tx.commit()?;
+    Ok(number)
+}
+
 pub(super) fn load_accounts(conn: &Connection) -> Result<Vec<Account>> {
     rows_of(
         conn,

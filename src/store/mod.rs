@@ -225,6 +225,19 @@ impl Store {
         accounts::observe(&mut conn, provider, digest, at_ms, identity)
     }
 
+    /// The account `identity` names, opened if none matches. Unlike
+    /// [`Store::observe_credential`] it needs no credential: it is for naming
+    /// the account a history that predates accounts was served on.
+    pub fn open_account(
+        &self,
+        provider: &str,
+        identity: &AccountIdentity,
+        at_ms: i64,
+    ) -> Result<i64> {
+        let mut conn = self.conn()?;
+        accounts::open_account(&mut conn, provider, identity, at_ms)
+    }
+
     /// Every learned account, including accounts that have not served in a
     /// current dashboard window.
     pub fn load_accounts(&self) -> Result<Vec<Account>> {
@@ -1472,6 +1485,50 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some(1), Some(1)]
         );
+    }
+
+    #[test]
+    fn an_account_opens_without_a_credential_and_is_found_again_by_address() {
+        let store = mem_store();
+        let identity = AccountIdentity {
+            upstream_id: None,
+            email: Some("agent@example.test".to_owned()),
+            named_by: AccountNameSource::Operator,
+        };
+        let first = store
+            .open_account("anthropic_sub", &identity, 100)
+            .expect("open");
+        assert_eq!(
+            store
+                .open_account("anthropic_sub", &identity, 200)
+                .expect("reopen"),
+            first,
+            "the same address is the same account"
+        );
+        let accounts = store.load_accounts().expect("accounts");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].named_by, AccountNameSource::Operator);
+
+        // A credential that later resolves to that address joins it rather
+        // than opening a second account.
+        let digest = CredentialDigest::new("b".repeat(64)).expect("digest");
+        let local = AccountIdentity {
+            named_by: AccountNameSource::Local,
+            ..identity.clone()
+        };
+        assert_eq!(
+            store
+                .observe_credential("anthropic_sub", &digest, 300, Some(&local))
+                .expect("resolve"),
+            Some(first)
+        );
+        assert_eq!(store.load_accounts().expect("accounts").len(), 1);
+
+        let blank = AccountIdentity {
+            email: None,
+            ..identity
+        };
+        assert!(store.open_account("anthropic_sub", &blank, 400).is_err());
     }
 
     #[test]

@@ -2579,6 +2579,7 @@ impl<'a> Wizard<'a> {
     /// Silent on a store with nothing to move, which is every fresh machine
     /// and every machine already moved. Placed before the units go up,
     /// because the service refuses to start while such rows remain.
+    /// Where no account is known to offer, the operator names one.
     fn attribute_step(&mut self, report: &mut RunReport) -> Result<()> {
         let provider = crate::accounts::ACCOUNTED_PROVIDER;
         let db_path = self.paths.db_path();
@@ -2633,26 +2634,50 @@ impl<'a> Wizard<'a> {
             .into_iter()
             .filter(|account| account.provider == provider)
             .collect();
-        if accounts.is_empty() {
-            bail!(
-                "toker knows no {provider} account to attribute those rows to. Sign in, let \
-                 one request through, and run setup again."
-            );
-        }
-        let labels: Vec<String> = accounts
-            .iter()
-            .map(|account| match &account.email {
-                Some(email) => format!("{} {email}", account.number),
-                None => format!("{} (unnamed)", account.number),
-            })
-            .collect();
-        let offered: Vec<&str> = labels.iter().map(String::as_str).collect();
-        let chosen = self.prompt.select(
-            "which account were those rows served on?",
-            &offered,
-            Some(0),
-        )?;
-        let account = accounts[chosen].number;
+        let account = if accounts.is_empty() {
+            // A history imported or copied from elsewhere, on a machine that
+            // has never served this provider: there is no login to learn the
+            // account from, so the operator is the only source left. Refusing
+            // here would leave every command refusing too.
+            self.say("  toker knows no account those rows could belong to")?;
+            let address = self.prompt.text(
+                "which email address were those rows served on?",
+                None,
+                false,
+            )?;
+            let address = address.trim();
+            if address.is_empty() {
+                bail!(
+                    "toker knows no {provider} account to attribute those rows to, and no \
+                     address was given to open one with. Give the address the rows were served \
+                     on, or sign in, let one request through, and run setup again."
+                );
+            }
+            let identity = crate::store::AccountIdentity {
+                upstream_id: None,
+                email: Some(address.to_owned()),
+                named_by: crate::store::AccountNameSource::Operator,
+            };
+            let now = jiff::Timestamp::now().as_millisecond();
+            store
+                .open_account(provider, &identity, now)
+                .context("opening the account those rows were served on")?
+        } else {
+            let labels: Vec<String> = accounts
+                .iter()
+                .map(|account| match &account.email {
+                    Some(email) => format!("{} {email}", account.number),
+                    None => format!("{} (unnamed)", account.number),
+                })
+                .collect();
+            let offered: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let chosen = self.prompt.select(
+                "which account were those rows served on?",
+                &offered,
+                Some(0),
+            )?;
+            accounts[chosen].number
+        };
         let moved = store
             .attribute_unattributed_rows(provider, account)
             .context("attributing the rows that predate accounts")?;
