@@ -1477,13 +1477,21 @@ pub(crate) fn note_meters(
         updated_ms: now_ms(),
         snapshot: meters,
     };
-    let Some(account_number) = account_number else {
-        return;
+    // A reading belongs to the account that spent it, where the account is
+    // known (spec: ACCT#what-is-attributed-to-an-account). A provider whose
+    // accounts toker cannot tell apart holds none, and keeps its reading
+    // against the provider — which is also where a reading lands while a
+    // credential's identity is still unresolved, so a window is never
+    // unreadable merely because nothing has named the login yet.
+    let saved = match account_number {
+        Some(account_number) => {
+            server
+                .store
+                .save_account_meters(backend.id(), account_number, &snapshot)
+        }
+        None => server.store.save_meters(backend.id(), &snapshot),
     };
-    if let Err(error) = server
-        .store
-        .save_account_meters(backend.id(), account_number, &snapshot)
-    {
+    if let Err(error) = saved {
         tracing::error!(%error, "meter snapshot save failed");
     }
 }

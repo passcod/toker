@@ -3060,12 +3060,16 @@ async fn the_over_marker_spends_the_plan_and_stops_before_overage() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
     let (reset5h, snapshot) = poison_meters(&store, 0.99, 3600);
+    // The gate reads the account's own slot, which is where `poison_meters`
+    // put the first reading, so every later one has to land there too.
+    let account = fixture_account(&store);
     let reading = |util: f64| {
         let mut reading = snapshot.clone();
         reading["util5h"] = json!(util);
         store
-            .save_meters(
+            .save_account_meters(
                 "anthropic_sub",
+                account,
                 &MetersSnapshot {
                     updated_ms: jiff::Timestamp::now().as_millisecond(),
                     snapshot: reading,
@@ -3357,7 +3361,7 @@ async fn count_tokens_and_the_api_backend_never_gate() {
     assert_eq!(rows[0].kind, None, "a measurement, not a blocked row");
     assert_eq!(rows[0].provider.as_deref(), Some("anthropic_api"));
     let meters = store
-        .load_meters("anthropic_sub")
+        .load_account_meters("anthropic_sub", fixture_account(&store))
         .expect("meters")
         .expect("still poisoned");
     assert_eq!(

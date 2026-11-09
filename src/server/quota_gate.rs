@@ -61,6 +61,13 @@ pub(crate) fn load_meters_for(
     if !armed(server, backend_id) {
         return None;
     }
+    // Only the account's own reading. A gate with no account to read has no
+    // evidence and does not fire: the provider's slot pools every account
+    // that ever served through it, and gating one account's session on
+    // another's spend is exactly what this card exists to stop. It would
+    // also stop a session the release marker could not then free, because
+    // an allowance is keyed by the account it was granted on
+    // (spec: GQUOTA#an-allowance-belongs-to-an-account).
     server
         .store
         .load_account_meters(backend_id, account_number?)
