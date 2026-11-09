@@ -540,7 +540,7 @@ fn strip_colour(frame: &mut Frame) {
 }
 
 /// The legend's rows: a glyph or marker, and what it means.
-const LEGEND: [(&str, &str); 19] = [
+const LEGEND: [(&str, &str); 21] = [
     (
         "↑",
         "served on a newer model: bright on the latest turn, dim earlier",
@@ -569,6 +569,8 @@ const LEGEND: [(&str, &str); 19] = [
         "·",
         "no requests in that slice of the window; red holds an error",
     ),
+    ("‹N", "N accounts hidden to the left of the meters shown"),
+    ("… N more", "N accounts hidden to the right"),
     ("on track", "the meter resets before it runs out"),
     ("estimating", "too little data to separate burn from noise"),
     ("stops ~T", "reaches the armed gate's threshold at T"),

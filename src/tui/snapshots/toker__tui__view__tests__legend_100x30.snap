@@ -5,30 +5,30 @@ expression: "rows.join(\"\\n\")"
  ? ⇄last 30m · 4 sessions · 1 idle · 12 requests                         last req no data · 12:34:56
 ┌SESSIONS──────────────────────────────────────────────────────────────────────────────────────────┐
 │session                                ctx model         reqs prompt now    peak msgs ↺   out idle│
-│ses-free                                1M sonnet-5 $       3      2,500   2,500    - -    60   1m│
-│ses-hot  ┌LEGEND───────────────────────────────────────────────────────────────────────┐2,304   1m│
-│… 2 more │ ↑           served on a newer model: bright on the latest turn, dim earlier │          │
-└─────────│ $           released past the armed quota gate for this window              │──────────┘
-┌CONTEXT──│ %           released to the end of the plan, stopping before overage        │──────────┐
-│ses-free │ !           stopped: the last thing this session got was a gate notice      │          │
-│ses-hot  │ ↺           compactions so far; - for none                                  │          │
-│… 2 more │ -           not reported, which is not zero                                 │          │
-└─────────│ ?           unknown: model, context ceiling, or token count                 │──────────┘
-┌TOKENS───│ ≥           a floor: some rows unknown, or the span predates the data       │──────────┐
-│fresh inp│ <1%         spent less than the meter's 1% step shows; 0% is none at all    │          │
-│cache rea│ ·           no requests in that slice of the window; red holds an error     │          │
+│ses-free ┌LEGEND───────────────────────────────────────────────────────────────────────┐   60   1m│
+│ses-hot  │ ↑           served on a newer model: bright on the latest turn, dim earlier │2,304   1m│
+│… 2 more │ $           released past the armed quota gate for this window              │          │
+└─────────│ %           released to the end of the plan, stopping before overage        │──────────┘
+┌CONTEXT──│ !           stopped: the last thing this session got was a gate notice      │──────────┐
+│ses-free │ ↺           compactions so far; - for none                                  │          │
+│ses-hot  │ -           not reported, which is not zero                                 │          │
+│… 2 more │ ?           unknown: model, context ceiling, or token count                 │          │
+└─────────│ ≥           a floor: some rows unknown, or the span predates the data       │──────────┘
+┌TOKENS───│ <1%         spent less than the meter's 1% step shows; 0% is none at all    │──────────┐
+│fresh inp│ ·           no requests in that slice of the window; red holds an error     │          │
+│cache rea│ ‹N          N accounts hidden to the left of the meters shown               │          │
+│cache wri│ … N more    N accounts hidden to the right                                  │          │
 │cache wri│ on track    the meter resets before it runs out                             │          │
-│cache wri│ estimating  too little data to separate burn from noise                     │          │
-│output   │ stops ~T    reaches the armed gate's threshold at T                         │          │
-│hit rate │ out ~T      runs out at T                                                   │e prefix  │
-│missed   │ gated ·     past the gate; the countdown is to exhaustion                   │          │
-└─────────│ on track?   a trailing ?: the gate's state is assumed, not observed         │──────────┘
-┌CACHE REB│ last req    green under 30s, yellow under 5m, red beyond                    │──────────┐
-│2 of 9 re│ ctx         green: native 1M; yellow: another known ceiling                 │          │
-│system pr│ idle        dim once a session has been quiet 3m                            │          │
-│new prefi│ ? or Esc closes                                                             │          │
-│· ses-hot└─────────────────────────────────────────────────────────────────────────────┘          │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+│output   │ estimating  too little data to separate burn from noise                     │          │
+│hit rate │ stops ~T    reaches the armed gate's threshold at T                         │e prefix  │
+│missed   │ out ~T      runs out at T                                                   │          │
+└─────────│ gated ·     past the gate; the countdown is to exhaustion                   │──────────┘
+┌CACHE REB│ on track?   a trailing ?: the gate's state is assumed, not observed         │──────────┐
+│2 of 9 re│ last req    green under 30s, yellow under 5m, red beyond                    │          │
+│system pr│ ctx         green: native 1M; yellow: another known ceiling                 │          │
+│new prefi│ idle        dim once a session has been quiet 3m                            │          │
+│· ses-hot│ ? or Esc closes                                                             │          │
+└─────────└─────────────────────────────────────────────────────────────────────────────┘──────────┘
 ┌RATE & QUOTA──────────────────────────────────────────────────────────────────────────────────────┐
 │  requests ·················▄▄▄···▄▄▄███· 0.4/min                                                 │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘

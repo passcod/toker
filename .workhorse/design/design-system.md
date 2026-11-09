@@ -107,9 +107,10 @@ Bold and dim therefore have to carry the reading alone, which is why nothing is 
 
 ### The operator's vocabulary
 
-These 19 are documented to the operator in the `?` legend, which makes them a contract rather than a habit.
+Every mark the dashboard renders is documented to the operator in the `?` legend, which makes them a contract rather than a habit.
 The table is `LEGEND` in `src/tui/view.rs` verbatim, so a drift between the two is a plain diff.
 The legend and the renderer must agree: a mark missing from it is undocumented, and an entry with nothing behind it describes a screen that does not exist.
+The contract is that agreement and not the length of the list: a screen that gains a mark gains a legend entry with it.
 
 | mark | meaning |
 | --- | --- |
@@ -123,6 +124,8 @@ The legend and the renderer must agree: a mark missing from it is undocumented, 
 | `≥` | a floor: some rows unknown, or the span predates the data |
 | `<1%` | spent less than the meter's 1% step shows; 0% is none at all |
 | `·` | no requests in that slice of the window; red holds an error |
+| `‹N` | N accounts hidden to the left of the meters shown |
+| `… N more` | N accounts hidden to the right |
 | `on track` | the meter resets before it runs out |
 | `estimating` | too little data to separate burn from noise |
 | `stops ~T` | reaches the armed gate's threshold at T |
