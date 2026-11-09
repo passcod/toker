@@ -118,3 +118,14 @@ Caption ids kept; widths and fonts re-checked on 01, 02, 03, 06 and 08; files re
 - **Nit 8.** At 100x24 there are two spaces between `subscription` and `as asked` (the model and reach columns moved one cell right).
 - **Nit 9.** The routes tab's ROUTE detail line gains `[m] move`: `[e] edit   [n] add fallback   [m] move   [t] trace   [enter] open route`.
 - **Nit 11.** Every refusal is bold and red: the sends refusal (01-04, 08 refused states) and the model refusal in 02-03.
+
+## Round 6 polish
+
+Caption ids kept; widths and fonts re-checked on 01, 02, 03, 06 and 08 (no ragged rows); files re-shot and the changed frames looked at.
+
+- **S1.** The column is headed `hits 24h` in the rewrites tables (01, 06, 08) and the defaults table (03). It fits at 80 columns too, so no frame falls back to `hits`.
+- **S2.** PRESENTATION reads `published  yes`.
+- **Nit 3.** Add-fallback reads `sent to  2 candidates · 1 new`.
+- **Nit 6.** RULE has its own `sends` row between `match` and `sends to`: `as asked` for the new rule (01-05, 08-04, 08-08) and `${model}` for the at-rest rule.
+- **Nit 7.** PREVIEW shows a session id on every row, in a labelled `session` column (`ses-free`, `ses-hot`, `ses-crow`, `ses-moth`, `ses-wren`), dim on the two rows that don't change.
+- **Nit 8.** The routes table's last column is headed `reach`.
