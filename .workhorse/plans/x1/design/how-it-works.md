@@ -145,12 +145,12 @@ That's the only confirmation anywhere in routing, because it's the only change t
 
 ## The config page
 
-[The providers tab](../../../design/mockups/x1/converged-05-config.html#providers) lists the five providers with whether each is on, where its credential comes from, how many endpoints it has, and what in routing uses it.
+[The providers tab](../../../design/mockups/x1/converged-05-config.html#providers) lists the five providers with whether each is on, where its credential comes from, how many endpoints it has, and what in routing depends on it, counting every route it serves, fallbacks included, so turning a provider off shows its full reach.
 The page opens on whatever needs attention, so here `anthropic_sub` is selected: it's on, but has no credential, which is why so much of the rewrites tab reads `no cred · billed fallback`.
 The detail says the same in label-and-value form and offers the fix on its last line (`[e] enter key`), alongside turning it off or jumping to the route it feeds.
 
 [The settings tab](../../../design/mockups/x1/converged-05-config.html#settings) holds the gates, the session headers, the notice styles, and two values fixed elsewhere (the listener port and the store path, each saying what set it).
-Editing works as it does in routing: here `175k` is refused because the field wants a whole number of tokens, and the save control says so until it's fixed.
+Editing works as it does in routing, in a small form that opens under the row: token counts take the same `175k` and `1M` shorthand the rest of the TUI shows, and here `2M` is refused because no configured model has a context that large, so the save control says so until it's fixed.
 
 ## Smaller terminals, a first run, and help
 

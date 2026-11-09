@@ -115,3 +115,23 @@ All six frames are 120x40, built from a small generator (not in the repo) so eve
 - **History:** lanes column untouched.
 - The frame captions keep their ids (`history`, `armed`, `providers`, `settings`, `empty`, `keys`); my generator now writes them, so regenerating does not drop them.
 - Checks: `/tmp/x1gen/check.py` reports 120 cells x 40 rows on every frame of the three files and the Iosevka Term stack; all three re-shot, and the overlay frame viewed.
+
+## Round 5 fixes
+
+- **S1 overlay MARKS:** added `not synced`, `unprefixed`, `${model_id}`, `as` and `published`; `off` now reads `turned off; a request caught here is refused unless a fallback follows` (two lines).
+- **Nit 7, inset and fit:** the popup is 116 wide at column 2, rows 2 to 39 (38 rows), so the page header and the panel title rows stay visible.
+  It fits without a `… N more` line by moving `IN A TRACE` under `IN AN EDIT` on the left and keeping `ON A ROUTE` under MARKS on the right; every existing key and mark is kept.
+- **Call made in 07-02:** the page behind the overlay draws no focus mark (the selected rewrite row is plain), because a modal takes every key and a reversed row's edge cells showed as white blocks beside the popup.
+  The panel corners still show `┌R` where a panel's title starts, which any two-column inset does.
+- **S3 and nits 4, 5, 6 (settings):**
+  - `cold min tokens` reads `175k` at rest and opens the `┌ │ └` inline form under its row, with the field `2M▏` reversed.
+  - The refusal sits on the field's row in bold red: `more than any configured model's context, 1M`.
+  - The control line `[ctrl+s] fix value to save   [esc] cancel` is on the form's `└`; the foot of the panel carries no control line.
+- **Nit 1:** the REVISIONS, PROVIDERS, SETTINGS and empty-REWRITES header rows are dim (the underlay's REWRITES header too).
+- **Nit 6 (history):** rev 3 is `add presentation anthropic/claude-sonnet-*`, rev 8 `move anthropic_sub/${model} above anthropic_api/${model} in anthropic_messages`, rev 10's lanes `8 cold`.
+  The detail line reads `8 cold lanes moved to rev 10 · 2 warm lanes still on rev 9`, which agrees with the after-save state (10 lanes, 2 warm left on rev 9, 8 cold moved).
+- **Nit 12 (providers):** `used by` counts every route a provider serves, fallbacks included.
+  openrouter reads `10 rewrites · 4 defaults · 5 routes`; the others stand (`anthropic_api` 3 rewrites · 1 route, `anthropic_sub` 4 rewrites · 2 defaults · 1 route, `codex_sub` 3 rewrites · 1 route, `openai_api` 1 rewrite · 1 route).
+  For the 80x24 providers frame (06-04) only the openrouter row changes, to `10 rewrites · 4 defaults · 5 routes`, clipped as needed.
+- **10:** the 07-02 underlay's scope heads read `5 rules · prefix · sends ${model}`; the 07-01 empty heads say `0 rules` with no clause, so they are unchanged.
+- Caption ids kept; `/tmp/x1gen/check.py` reports 120 cells by 40 rows on all six frames with the Iosevka Term stack; all six re-shot, and the overlay, settings, history, providers and empty frames viewed.

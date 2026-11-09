@@ -159,12 +159,12 @@ Skipped: the history lanes column shape, because lanes on the live revision are 
 A fresh critic (Opus), who read no earlier round, judged all 30 frames: 0 critical, 3 suggestions, 12 nits (`critique-round-5.md`).
 Clean, so the clean count is 1.
 The suggestions: the overlay lacked `not synced`, `unprefixed`, `${model_id}`, `as` and `published`, and its `off` didn't say the request is refused; `5 cold pinned` contradicted the overlay's definition of pinned; and the settings frame refused `175k`, the TUI's own notation.
-All three are being fixed, with eleven of the nits.
+All three were fixed, with eleven of the nits, and checked by eye: the settings edit is now an inline form refusing `2M` against the largest context, the overlay is inset and carries the new marks, and openrouter's `used by` counts through its fallback routes (`10 rewrites · 4 defaults · 5 routes`).
 Skipped: nit 10, the shorter after-save header, because the full tab strip takes about 100 of 120 cells and no lifecycle clause fits beside it; the collapse is the design system's order.
 
 ## Where it stands
 
-- round 5's fixes, by the two drawing agents
+- round 6 critic (Fable, fresh) running
 
 ## Next
 
