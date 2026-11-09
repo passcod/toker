@@ -22,6 +22,12 @@ The lane must still be both cold and large.
 > [!NOTE]
 > Subagents share their parent's session identifier, so a fresh subagent carrying a sibling's tool set lands in that sibling's lane and would otherwise be stopped over a re-read it was never going to perform.
 
+A configured minimum larger than every context window the enabled bindings resolve, as [RMODEL](../routing/models.md#resolving-a-declared-window) specifies, MUST be refused, naming the largest of those windows.
+Where no window resolves, the minimum MUST be accepted.
+
+> [!NOTE]
+> No request could reach such a minimum, so the gate would be switched off without saying so.
+
 ## Staying quiet
 
 On a provider that reports meters, the gate MUST stay quiet unless the short window is already projected to run out before it resets, with the re-read's cost added.

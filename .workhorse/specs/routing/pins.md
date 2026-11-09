@@ -19,6 +19,8 @@ A lane, and the fields its pin records, are specified by [SLANE](../store/lanes.
 | older, under a new-and-cold-lanes activation | the active revision where the lane is provably cold, else the pinned one |
 | older, under an immediate activation | the active revision, unless the move would lose a warm cache and the activation was not forced |
 
+The activation read is the active revision's, with its scope and consent as last [widened](revisions.md#widening-an-activation).
+
 An older revision MUST be compiled on demand against the current inventory and availability.
 
 > [!NOTE]
@@ -43,7 +45,7 @@ A denied request MUST NOT be sent.
 | fallback | the strictest cache transition among the crossed edges |
 | the operator choosing another route, candidate or model | nothing; the choice carries its own consent to lose the cache it leaves |
 | anything else differing under the same revision | the route's own cache transition |
-| activation | the activation's scope, and its force consent where a warm cache would be lost |
+| activation | the active revision's scope as last widened, and its force consent where a warm cache would be lost |
 
 Where no consent is recorded, the decision MUST be to keep the pin.
 

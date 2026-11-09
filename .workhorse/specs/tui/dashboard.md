@@ -154,13 +154,13 @@ The dashboard MUST be able to revoke a session's releases.
 The routing page shows the active revision and edits it.
 
 It MUST present the policy as tabs in the order a request is resolved, as [RSOLV](../routing/resolver.md#lookup-order) specifies: presentations, rewrites, defaults and routes, then models and the revision history.
-The tabs a request passes through in turn MUST read as a sequence, distinct from the two it does not.
+The four lookup tabs MUST read as a sequence, set apart from models and history, which shape and record a route rather than find one.
 Each tab MUST show how many records it holds.
 
 > [!NOTE]
 > The policy is ordered rules across several tables, the way a router's or a firewall's is, and the tab strip is the one place the whole order can be read at a glance.
 
-The page MUST open on the first tab holding a record that cannot be served as written, and on the first tab otherwise.
+The page MUST open on the first tab holding a record whose [reach](#reading-a-table) is refused, and on the first tab otherwise.
 
 Each tab MUST show its records as a table, with the selected record's detail beneath it.
 A panel MUST be no taller than its content, except a list that scrolls, which takes the rows left over.
@@ -174,23 +174,38 @@ A matcher MUST be shown in its own notation, such as a prefix with the part it c
 
 ### Reading a table
 
-Rewrites MUST be grouped by scope, in priority order, and each group MUST end with the default that catches what none of its rules did.
-A scope with no default MUST say that a request no rule catches is refused.
+Rewrites MUST be grouped by scope, each profile ahead of its protocol, with each group in ascending priority.
+A profile's group MUST end by passing to its protocol's group, since what a profile's rules miss is tried against the protocol's rules before any default.
+A protocol's group MUST end with the defaults that catch what no rule did, each profile's own default ahead of the protocol's, and MUST say that the request is refused wherever none would catch it.
 
 A value every row of a group shares MUST be stated once for the group rather than repeated as a column.
 
 A rewrite MUST be shown by what it matches and the route it picks, and MUST NOT need a name of its own.
 
-Each rewrite and default MUST show its reach: what a request it catches gets now, being served by the route's first candidate, served by a later one that is billed, refused because every candidate is disabled or unconfigured, or refused for want of a route.
+Each rewrite and default MUST show its reach, being what a request it catches gets now, as one of:
+
+- served by the route's first candidate
+- served by a later candidate, saying whether it is billed
+- refused at an edge, saying which consent or setting stopped the walk
+- refused because every candidate is unavailable
+- refused for want of a route
+
 Reach MUST be worked out from the same availability [preview](../routing/revisions.md#preview) uses.
 
 > [!NOTE]
 > Whether the first candidate is up is the wrong question: a rule whose first choice is off but whose fallback serves is spending money, not failing, and the operator needs to see which.
 
-Each rewrite and default MUST show how many requests it caught in the last 24 hours, counted from the provenance [RPROV](../routing/provenance.md) records.
-That count MUST read as a floor where some of the window predates the record, and as not recorded where none of it does.
+Each rewrite and default MUST show how many requests it caught in the last 24 hours, counted from the provenance [RPROV](../routing/provenance.md) records, by the record's identifier across every revision the window spans.
+That count MUST read as a floor where some of the window predates rows recording what matched, and as not recorded where all of it does.
 
-A rule's detail MUST show what it matches with a worked example, what it sends on, the route and its candidates, its reach with the reason for it, whether an earlier rule in its scope already catches what it matches, and its recent catches.
+A rule's detail MUST show:
+
+- what it matches, with a worked example
+- what it sends on
+- the route and its candidates
+- its reach, with the reason for it
+- anything earlier in the lookup order that already catches all or part of what it matches, being a presentation, a rule of a profile ahead of its scope, or an earlier rule in its own
+- its recent catches
 
 ### Routes
 
@@ -206,32 +221,39 @@ The route view MUST be able to step to the other routes without returning to the
 
 ### Tracing a request
 
-Every routing tab MUST be able to trace a described request through the active revision, by the same [preview](../routing/revisions.md#preview) the editor uses.
+Every routing tab MUST be able to trace a request, invented or taken from a recent one, through the active revision, by the same [preview](../routing/revisions.md#preview) the editor uses.
 
 A trace MUST give its outcome first, being the binding and model that would serve and whether that is billed, then each stage of the lookup order and the route walk with its verdict and the reason for it.
-The table behind a trace MUST mark the row that caught the request and the rows it fell past.
+Each table the trace passed through MUST mark the row that caught the request and the rows it fell past.
+A recent request that cannot be replayed MUST be shown as such rather than traced.
 
 ### Editing
 
 A record MUST be edited in place, in the table that shows it, as a form of fields.
+A record MUST be able to be added by the same form, in the table that will show it, and to be removed.
+A rewrite MUST be able to be moved earlier or later within its scope, and a route's candidates added, removed and reordered.
 
 Each field MUST be checked as it changes, against the same compilation an activation runs.
 A field that is refused MUST say beside itself why, and how to make it acceptable.
 A field that is accepted MAY say beside itself what it does.
 
-A form holding a refused field MUST NOT be saveable, and its save control MUST name the field in the way.
+A field the compilation reports on without refusing, such as a candidate whose provider is not configured, MUST say so beside itself and MUST NOT block the save.
+
+A refusal that belongs to no one field, such as removing a route another record still sends to, MUST be shown with the form and MUST name the records it concerns.
+
+A form holding a refusal MUST NOT be saveable, and its save control MUST name the field or record in the way.
 
 > [!NOTE]
 > There is no separate validation step for the operator to remember, because a form that would not compile cannot be saved in the first place.
 
-While a rewrite or default is being edited, the page MUST show how the scope's recent requests would route with the change, beside how they routed.
+While a record is being edited, the page MUST show how the last 24 hours of requests it bears on would route with the change, beside how they routed, and MUST say how many of them could not be replayed.
 
 Saving MUST [save](../routing/revisions.md#saving-an-edit) the form as one edit, activated for new and cold lanes.
-The page MUST NOT offer a separate control to validate or to activate.
+Where a save fails because the live revision moved, the form MUST be kept as entered, and the page MUST say which revision is now live.
 
 The page MUST always show which revision is live.
-After a save that left lanes on an earlier revision, it MUST say how many.
-Where a client's settings have not been reconciled with the live revision, it MUST say so, and MUST NOT wait for that reconciliation, as [RPUB](../routing/publication.md) requires.
+Where lanes are pinned to an earlier revision, it MUST say how many.
+Where a client's settings are not applied for the live revision, it MUST say whether that is pending, failed or unsupported, with the detail [RPUB](../routing/publication.md#publication-state) records, and MUST NOT wait for reconciliation.
 
 ### History
 
@@ -241,9 +263,9 @@ A revision's detail MUST list each record it added, changed or removed, in words
 
 The history tab MUST be able to:
 
-- [reactivate](../routing/revisions.md#history-and-reactivation) the selected revision
+- [reactivate](../routing/revisions.md#history-and-reactivation) the selected revision, for new and cold lanes as a save is
 - move running lanes onto the live revision, by [widening](../routing/revisions.md#widening-an-activation) its activation
-- trace a described request under the selected revision
+- trace a request under the selected revision
 
 A move that would lose a warm cache MUST ask for a second confirmation, and the first MUST name the lanes whose cache it would lose.
 
@@ -251,7 +273,7 @@ A move that would lose a warm cache MUST ask for a second confirmation, and the 
 
 The models tab MUST show the classifiers, the upgrade policies with the move each would make now, the compaction target, and the offers in each binding's catalogue.
 
-It MUST be able to [promote](../routing/models.md) a learned model.
+It MUST be able to [promote](../routing/models.md#promotion) a learned model.
 
 ## The configuration pages
 
@@ -271,9 +293,9 @@ Where the service is not answering, both pages MUST report that rather than offe
 
 The providers page MUST show every provider Toker knows, enabled or not, with the endpoint it is reached at and which source supplies its credential.
 
-The page MUST open on a provider that is enabled but not configured, where there is one.
+The page MUST open on a provider that is enabled but not configured, being one whose credential does not resolve as [DCONF](../service/config.md#configuration-never-refuses-a-start) specifies, where there is one.
 
-The page MUST show what in routing depends on each provider, counting the rewrites, defaults and routes that reach it through any candidate, a fallback included.
+The page MUST show what in routing depends on each provider, counting the presentations, rewrites, defaults and routes that reach it through any offer or candidate, a fallback included.
 
 > [!NOTE]
 > Counting only the routes a provider comes first in understates what turning it off would change.
@@ -294,7 +316,7 @@ The page MUST be able to clear that mark, as [WSAFE](../wire/safeguards.md#a-rej
 
 The settings page MUST show and edit the gate settings, the notice style of each frontend profile, the session and ping header names, whether the idle-sleep lock is held, and the extra transcript roots.
 
-A token count MUST be accepted in the same shorthand the dashboard displays it in.
+A token count MUST be accepted in full, and in the same shorthand the dashboard displays it in.
 
 A setting left unset MUST say what it falls back to.
 

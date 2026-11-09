@@ -43,9 +43,9 @@ Such a request on a lane with no pin MUST set none and MUST resolve as a new lan
 
 ## Provider prefixes
 
-Where a model identifier carries a provider prefix that policy recognises, the request MUST resolve to that provider.
-A prefixed identifier naming a disabled provider MUST be answered as having no available route.
-A prefixed identifier naming a disabled provider MUST NOT be sent to a default binding with the prefix still attached.
+Where a model identifier carries a provider prefix that policy recognises, the request MUST resolve through the rewrite that recognises it, and that rewrite's route MUST be walked like any other.
+A prefixed identifier naming a disabled provider MUST skip that provider's candidate, and MAY be served by a later candidate the route falls back to.
+Where no candidate on that route serves, the request MUST be answered as having no available route, and MUST NOT be sent to a default binding with the prefix still attached.
 A prefix policy does not recognise MUST be treated as part of the provider's own model identifier and MUST be left intact.
 
 ## Lookup order

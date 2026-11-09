@@ -17,11 +17,17 @@ Each row of a policy-routed request MUST carry all of these.
 | --- |
 | the policy revision |
 | the route's identifier and fingerprint |
-| the presentation or rewrite that matched |
+| the presentation, rewrite or default that matched, with the scope it matched in |
+| the facts the resolver was given, as [RSOLV](resolver.md#facts-in) lists them |
 | the candidate and the binding |
 | the model at each stage of its shaping |
 | the [served model](models.md#served-model) |
 | the attempt group, the index within it, and the reason for the attempt |
+
+> [!NOTE]
+> Those facts are what let a recorded request be replayed against another revision, as [RREV](revisions.md#preview) specifies, and they are content-free by the same rule the resolver's inputs are.
+
+A row written before a field of that table was recorded MUST read as lacking it, and MUST NOT have it filled in from the rows around it or from the policy.
 
 A routing trace MUST be a bounded structure recording how the route was found, each candidate with its binding and either its availability or a closed reason for skipping it, and each upgrade and alias from and to.
 

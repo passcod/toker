@@ -18,10 +18,11 @@ Toker turns those into a provider and a model by walking a fixed chain, and stop
    If the requested name is exactly one of the published slugs, that presentation decides the route.
 2. **Rewrites.**
    An ordered list of rules for each protocol, read top to bottom like a firewall table.
+   A profile can have rules of its own, tried before its protocol's.
    Each rule matches the model name (by prefix, glob or regex), says which route takes it, and says what model name to send on: usually `${model}`, the part the match captured, so `anthropic_sub/claude-sonnet-5` is sent on as `claude-sonnet-5`.
 3. **Defaults.**
-   If no rule caught the name, the protocol's default route takes it.
-   On a protocol with no default, Toker refuses the request: the client gets an error saying no route is available, and the ledger records the refusal.
+   If no rule caught the name, the profile's default route takes it, or failing that the protocol's.
+   Where neither has one, Toker refuses the request: the client gets an error saying no route is available, and the ledger records the refusal.
    The screens mark that gap as `refused · no route`.
 4. **The route.**
    A route is a named, ordered list of candidates, each one a provider endpoint (a binding, such as `openrouter.openrouter_messages`).
@@ -170,8 +171,14 @@ That's the one place on the page with explanations, which is what lets everythin
 The redesign is mostly presentation, but a few changes to how Toker works make it simpler to use, and the mockups assume them.
 
 - **No draft and no apply.**
-  Saving a valid form makes a revision and activates it for new and cold lanes.
-  The separate validate key and the apply step go away, since an invalid form can't be saved in the first place.
+  Saving a valid form makes a revision and activates it for new and cold lanes, and that is the only way policy changes.
+  The draft, the separate validate key and the apply step go away, since an invalid form can't be saved in the first place.
+  Importing `toker.toml` from the routing page goes too; first-run setup still reads it.
+- **Recent requests replay.**
+  Each request's ledger row records what routing was given, so a trace or an edit's preview can rerun it.
+  Rows written before that are shown as not replayable rather than guessed at.
+- **A provider prefix walks its route.**
+  `codex_sub/${model}` with codex switched off falls to the route's fallback, billed, when the route has one, and is refused when it doesn't.
 - **Consent only where something is lost.**
   The one confirmation is moving warm lanes, which costs their cache.
 - **Authored names everywhere.**
