@@ -163,6 +163,11 @@ An empty bucket is a dim `·` so a quiet stretch reads as quiet rather than as a
 A quota bar is at most 22 cells and shrinks as the panel narrows.
 Below 10 cells it stops reading as a share, so the line sheds a clause instead — the reset clock is the meter's other answer.
 
+Where one meter is drawn once per account across the width, **the bar's width carries the comparison**: every bar in that row is drawn at one width, set by the longest verdict any of the accounts shown carries, and the row sheds its clauses together so they stay that way.
+Showing accounts side by side is for reading one window across them, which a bar sized to its own column's spare room defeats: the account with the longer verdict would read as the smaller share.
+An account whose reading does not carry that meter gets a dim `-` rather than an empty bar, which would read as a window with nothing spent on it.
+A column is dropped before its bar is squeezed under 10 cells, and the accounts not shown are counted at the edge that hides them.
+
 ## Chrome
 
 **A panel title is upper case and inside the border**, run straight into the rule with no padding: `┌SESSIONS────────┐`, `┌DETAIL────┐`, `┌LEGEND────┐`.
