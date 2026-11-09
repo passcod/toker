@@ -154,8 +154,8 @@
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 presentations 15</span><span class="d"> → </span><span class="d">2 rewrites 14</span><span class="d"> → </span><span class="b r">3 defaults 4</span><span class="d"> → </span><span class="d">4 routes 7</span><span class="d"> · </span><span class="d">5 models 11</span><span class="d"> · </span><span class="d">6 history 9</span>             rev 9 live 
 ┌DEFAULTS──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │   <span class="d">default for</span>                          <span class="d">route</span>                   <span class="d">reach</span>                                            <span class="d">hits</span> │
-│<span class="r">   anthropic_messages                 → claude-sub              no cred                                            ≥3 </span>│
-│   unprefixed/anthropic_messages      → claude-sub              <span class="yellow">no cred</span>                                             <span class="d">-</span> │
+│<span class="r">   anthropic_messages                 → claude-sub              no cred · billed fallback                          ≥3 </span>│
+│   unprefixed/anthropic_messages      → claude-sub              <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>                           <span class="d">-</span> │
 │   openai_chat                        → openrouter-chat         ok                                                  <span class="d">-</span> │
 │   unprefixed/openai_chat             → openrouter-chat         ok                                                  <span class="d">-</span> │
 │   openai_responses  <span class="d">no default</span>       → <span class="yellow">nothing catches it</span>                                                          <span class="d">-</span> │
@@ -163,7 +163,7 @@
 ┌DEFAULT───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">anthropic_messages</span>                                                                                                   │
 │ <span class="d">sends to</span>  claude-sub<span class="d">  2 candidates · anthropic_sub → openrouter</span>                                                      │
-│ <span class="d">reach</span>     <span class="yellow">no cred</span>  anthropic_sub is on with no credential                                                            │
+│ <span class="d">reach</span>     <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>  anthropic_sub has no credential, so openrouter serves it, billed                │
 │ <span class="d">recent</span>    claude-sonnet-5<span class="d">  ≥3 in 24h</span>                                                                                 │
 │ [e] edit   [n] new   [space] turn off   [d] delete   [t] trace   [enter] open route                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -203,15 +203,15 @@
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌UPGRADES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">newest</span>  5 upgrades                                                                                                   │
-│<span class="r"> newest on claude-sub             claude-opus-4-7               → claude-opus-5                                       </span>│
-│ newest on claude-api             claude-sonnet-4-5             → claude-sonnet-5                                     │
-│ newest on openrouter-messages    anthropic/claude-sonnet-4-5   → anthropic/claude-sonnet-5                           │
-│ newest on openrouter-responses   openai/gpt-5.5-sol            → openai/gpt-5.6-sol                                  │
-│ newest on codex                  gpt-5.5-terra                 → gpt-5.6-terra                                       │
+│<span class="r"> claude-sub            claude-opus-4-7              → claude-opus-5                                                   </span>│
+│ claude-api            claude-sonnet-4-5            → claude-sonnet-5                                                 │
+│ openrouter-messages   anthropic/claude-sonnet-4-5  → anthropic/claude-sonnet-5                                       │
+│ openrouter-responses  openai/gpt-5.5-sol           → openai/gpt-5.6-sol                                              │
+│ codex                 gpt-5.5-terra                → gpt-5.6-terra                                                   │
 │ [e] edit   [n] new   [d] delete   [p] promote                                                                        │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌COMPACTION────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ a cold compaction                any model                     → sonnet        <span class="d">cache</span> allowed when cold               │
+│ cold compactions      → sonnet                     <span class="d">cache</span> allowed when cold                                           │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌OFFERS────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">openrouter.openrouter_chat_completions</span>  440 offers                                                                   │
@@ -245,14 +245,14 @@
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌UPGRADES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">newest</span>  5 upgrades                                                                                                   │
-│ newest on claude-sub             claude-opus-4-7               → claude-opus-5                                       │
-│ newest on claude-api             claude-sonnet-4-5             → claude-sonnet-5                                     │
-│ newest on openrouter-messages    anthropic/claude-sonnet-4-5   → anthropic/claude-sonnet-5                           │
-│ newest on openrouter-responses   openai/gpt-5.5-sol            → openai/gpt-5.6-sol                                  │
-│ newest on codex                  gpt-5.5-terra                 → gpt-5.6-terra                                       │
+│ claude-sub            claude-opus-4-7              → claude-opus-5                                                   │
+│ claude-api            claude-sonnet-4-5            → claude-sonnet-5                                                 │
+│ openrouter-messages   anthropic/claude-sonnet-4-5  → anthropic/claude-sonnet-5                                       │
+│ openrouter-responses  openai/gpt-5.5-sol           → openai/gpt-5.6-sol                                              │
+│ codex                 gpt-5.5-terra                → gpt-5.6-terra                                                   │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌COMPACTION────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ a cold compaction                any model                     → sonnet        <span class="d">cache</span> allowed when cold               │
+│ cold compactions      → sonnet                     <span class="d">cache</span> allowed when cold                                           │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌OFFERS────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">openrouter.openrouter_chat_completions</span>  440 offers                                                                   │

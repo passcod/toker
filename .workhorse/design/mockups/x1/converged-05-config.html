@@ -154,28 +154,28 @@
                                                                                                                         
                                                                                                                         </pre>
 <h2>Settings, a field refusing a value &mdash; 120&times;40</h2>
-<pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 providers 5 · </span><span class="b r">2 settings</span>                                                                                        
+<pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 providers 5 · </span><span class="b r">2 settings</span>                                                               editing · 2 providers on 
 ┌SETTINGS──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │   setting               value                                                                                        │
 │ <span class="d">┌─ </span><span class="b">gates</span><span class="d">  5 ────────────────────────────────────────────────────────────────────────────────────────────────────────</span> │
-│ <span class="d">│</span> quota gate            <span class="d">on</span>                                                                                           │
-│ <span class="d">│</span> cold gate             <span class="d">on</span>                                                                                           │
-│ <span class="d">│</span> cold outlook          <span class="d">on</span>                                                                                           │
+│ <span class="d">│</span> quota gate            on                                                                                           │
+│ <span class="d">│</span> cold gate             on                                                                                           │
+│ <span class="d">│</span> cold outlook          on                                                                                           │
 │ <span class="d">│</span> <span class="b">cold min tokens</span>       <span class="r b">175k_</span><span class="r">       </span>                    <span class="red">not a number: whole tokens, 175000 not 175k</span>                  │
-│ <span class="d">│</span> cold idle minutes     <span class="d">lane TTL</span>                                                                                     │
+│ <span class="d">│</span> cold idle minutes     lane TTL                                                                                     │
 │ <span class="d">┌─ </span><span class="b">session</span><span class="d">  4 ──────────────────────────────────────────────────────────────────────────────────────────────────────</span> │
-│ <span class="d">│</span> session headers       <span class="d">x-toker-session · x-claude-code-session-id · x-session-id</span>                                    │
-│ <span class="d">│</span> ping header           <span class="d">x-toker-ping</span>                                                                                 │
-│ <span class="d">│</span> idle-sleep lock       <span class="d">on</span>                                                                                           │
+│ <span class="d">│</span> session headers       x-toker-session · x-claude-code-session-id · x-session-id                                    │
+│ <span class="d">│</span> ping header           x-toker-ping                                                                                 │
+│ <span class="d">│</span> idle-sleep lock       on                                                                                           │
 │ <span class="d">│</span> transcript roots      <span class="d">none</span>                                                                                         │
 │ <span class="d">┌─ </span><span class="b">notices</span><span class="d">  4 ──────────────────────────────────────────────────────────────────────────────────────────────────────</span> │
-│ <span class="d">│</span> default notice style  <span class="d">built-in</span>                                                                                     │
-│ <span class="d">│</span> claude                <span class="d">built-in</span>                                                                                     │
-│ <span class="d">│</span> opencode              <span class="d">built-in</span>                                                                                     │
-│ <span class="d">│</span> codex                 <span class="d">built-in</span>                                                                                     │
+│ <span class="d">│</span> default notice style  built-in                                                                                     │
+│ <span class="d">│</span> claude                built-in                                                                                     │
+│ <span class="d">│</span> opencode              built-in                                                                                     │
+│ <span class="d">│</span> codex                 built-in                                                                                     │
 │ <span class="d">┌─ </span><span class="b">fixed here</span><span class="d">  2 ───────────────────────────────────────────────────────────────────────────────────────────────────</span> │
-│ <span class="d">│</span> <span class="d">listener port</span>         <span class="d">18123</span>                           <span class="d">set by toker setup</span>                                           │
-│ <span class="d">│</span> <span class="d">store</span>                 <span class="d">~/.local/share/toker/toker.db</span>   <span class="d">set by TOKER_DB</span>                                              │
+│ <span class="d">│</span> <span class="d">listener port</span>         18123                           <span class="d">set by toker setup</span>                                           │
+│ <span class="d">│</span> <span class="d">store</span>                 ~/.local/share/toker/toker.db   <span class="d">set by TOKER_DB</span>                                              │
 │ [ctrl+s] <span class="d">fix value to save</span>   [esc] cancel                                                                            │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
                                                                                                                         

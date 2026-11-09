@@ -86,3 +86,21 @@ All six frames are 120x40, built from a small generator (not in the repo) so eve
   The underlay's RULE first line is derived (`anthropic_sub/${model} → claude-sub`) with rows as in 01-01.
 - Checks re-run on all three files: every row of all six frames is 120 cells and the font stack is unchanged.
   All six frames were re-shot and viewed.
+
+## Round 3 fixes
+
+- **#3:** the overlay's reordering is one mechanism: `m  lift the row; ↑/↓ move it, m again drops it, esc puts it back` (on two lines); `alt+↑/↓` is cut.
+- **#2:** ON A ROUTE lists `←/→  previous or next route` in place of `1-7 switch route`.
+- **#4:** settings values are plain; dim only on `none` (transcript roots) and the two `fixed here` rows.
+- **#5:** the providers table draws `none` yellow on any on-provider that is not the selected row.
+  No such row exists today, so the frame is unchanged; the detail's yellow `none` for `anthropic_sub` stays.
+- **#12:** `2 providers on` shows on both config tabs, and the settings edit reads `editing · 2 providers on`.
+- **#14:** `p  trust the newest model now, without waiting for evidence`.
+- **#16:** MARKS gains `as asked  the name is sent unchanged`.
+- **#1:** the 07-02 underlay's reach column now reads `no cred · billed fallback` on rules and else rows ending at claude-sub, and `off · billed fallback` on rules ending at codex, with `billed fallback` yellow (plain in the reversed row).
+  `off` stays plain dim for claude-api and openai-chat.
+  MARKS gains `billed fallback  the first choice can't serve, so a billed fallback does`.
+  The overlay now covers rows 4 to 36, so the reach column of the rules is hidden behind it; only the header rows of the table show.
+- The popup is two columns of 50 and 62 cells, 33 rows tall, still 118 wide at column 1.
+- Width check (120 cells on every row of all six frames) and font stack re-run; 05 and 07 re-shot and viewed.
+  04 is unchanged this round.

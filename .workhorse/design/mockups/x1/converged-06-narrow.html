@@ -114,26 +114,26 @@
 <span class="b">REWRITES</span> <span class="d">──────────────────────────────────────────────────────────────────────────────────────────</span> 
        <span class="d">match</span>                              <span class="d">route</span>                   <span class="d">reach</span>                        <span class="d">hits</span> 
  <span class="d">┌─ </span><span class="b">anthropic_messages</span>  5 rules · prefix → ${model} <span class="d">───────────────────────────────────────────────</span> 
- <span class="d">│</span> <span class="d"> 1</span>  anthropic/${model}               → claude-sub              <span class="yellow">no cred</span>                         <span class="d">-</span> 
-<span class="r"> │  2  anthropic_sub/${model}           → claude-sub              no cred                        ≥1 </span>
+ <span class="d">│</span> <span class="d"> 1</span>  anthropic/${model}               → claude-sub              <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>       <span class="d">-</span> 
+<span class="r"> │  2  anthropic_sub/${model}           → claude-sub              no cred · billed fallback      ≥1 </span>
  <span class="d">│</span> <span class="d"> 3</span>  anthropic_api/${model}           → claude-api              <span class="d">off</span>                             <span class="d">-</span> 
  <span class="d">│</span> <span class="d"> 4</span>  openrouter/${model}              → openrouter-messages     ok                             41 
- <span class="d">│</span> <span class="d"> 5</span>  codex_sub/${model}               → codex                   <span class="d">off</span>                             <span class="d">-</span> 
- <span class="d">└─</span> <span class="d">else</span>  default                       → claude-sub              <span class="yellow">no cred</span>                        ≥3 
+ <span class="d">│</span> <span class="d"> 5</span>  codex_sub/${model}               → codex                   <span class="d">off</span> · <span class="yellow">billed fallback</span>           <span class="d">-</span> 
+ <span class="d">└─</span> <span class="d">else</span>  default                       → claude-sub              <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>      ≥3 
  <span class="d">┌─ </span><span class="b">openai_chat</span>  5 rules · prefix → ${model} <span class="d">──────────────────────────────────────────────────────</span> 
  <span class="d">│</span> <span class="d"> 1</span>  openrouter/${model}              → openrouter-chat         ok                              9 
  <span class="d">│</span> <span class="d"> 2</span>  openai_api/${model}              → openai-chat             <span class="d">off</span>                             <span class="d">-</span> 
- <span class="d">│</span> <span class="d"> 3</span>  codex_sub/${model}               → codex                   <span class="d">off</span>                             <span class="d">-</span> 
+ <span class="d">│</span> <span class="d"> 3</span>  codex_sub/${model}               → codex                   <span class="d">off</span> · <span class="yellow">billed fallback</span>           <span class="d">-</span> 
  <span class="d">│</span> <span class="d"> 4</span>  anthropic_api/${model}           → claude-api              <span class="d">off</span>                             <span class="d">-</span> 
- <span class="d">│</span> <span class="d"> 5</span>  anthropic_sub/${model}           → claude-sub              <span class="yellow">no cred</span>                         <span class="d">-</span> 
+ <span class="d">│</span> <span class="d"> 5</span>  anthropic_sub/${model}           → claude-sub              <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>       <span class="d">-</span> 
  <span class="d">└─</span> <span class="d">else</span>  default                       → openrouter-chat         ok                              <span class="d">-</span> 
  <span class="d">┌─ </span><span class="b">openai_responses</span>  4 rules · prefix → ${model} <span class="d">─────────────────────────────────────────────────</span> 
- <span class="d">│</span> <span class="d"> 1</span>  codex_sub/${model}               → codex                   <span class="d">off</span>                            ≥2 
+ <span class="d">│</span> <span class="d"> 1</span>  codex_sub/${model}               → codex                   <span class="d">off</span> · <span class="yellow">billed fallback</span>          ≥2 
  <span class="d">│</span> <span class="d"> 2</span>  anthropic_api/${model}           → claude-api              <span class="d">off</span>                             <span class="d">-</span> 
- <span class="d">│</span> <span class="d"> 3</span>  anthropic_sub/${model}           → claude-sub              <span class="yellow">no cred</span>                         <span class="d">-</span> 
+ <span class="d">│</span> <span class="d"> 3</span>  anthropic_sub/${model}           → claude-sub              <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>       <span class="d">-</span> 
  <span class="d">│</span> <span class="d"> 4</span>  openrouter/${model}              → openrouter-responses    ok                              <span class="d">-</span> 
  <span class="d">└─</span> <span class="d">else</span>  no default                    → <span class="yellow">nothing catches it</span>                                      <span class="d">-</span> 
- <span class="yellow">no cred</span>  anthropic_sub is on with no credential   [pgdn] more   [enter] open route                 </pre>
+ <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>  anthropic_sub has no credential   [pgdn] more   [enter] open route      </pre>
 <h2>Rewrites &mdash; 80&times;24</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1</span><span class="d"> → </span><span class="b r">2 rewrites 14</span><span class="d"> → </span><span class="d">3</span><span class="d"> → </span><span class="d">4</span><span class="d"> · </span><span class="d">5</span><span class="d"> · </span><span class="d">6</span>                              rev 9 live 
 <span class="b">REWRITES</span> <span class="d">──────────────────────────────────────────────────────────────────────</span> 
@@ -162,7 +162,7 @@
 <h2>The claude-sub route page &mdash; 100&times;24</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1</span><span class="d"> → </span><span class="d">2</span><span class="d"> → </span><span class="d">3</span><span class="d"> → </span><span class="b r">4 routes 7</span><span class="d"> · </span><span class="d">5</span><span class="d"> · </span><span class="d">6</span>                                                     rev 9 live 
 <span class="b">ROUTE</span> <span class="d">─────────────────────────────────────────────────────────────────────────────────────────────</span> 
- <span class="b">claude-sub</span>                                                                   <span class="b r"> 1 </span><span class="d"> 2 </span><span class="d"> 3 </span><span class="d"> 4 </span><span class="d"> 5 </span><span class="d"> 6 </span><span class="d"> 7 </span> 
+ <span class="b">claude-sub</span>                                                                                  <span class="d">1 of 7</span> 
                                                                                                     
  <span class="b">sent to</span>  2 candidates                                                                              
 <span class="r"> 1  anthropic_sub.anthropic_messages  subscription as asked                              no cred    </span>
@@ -182,22 +182,22 @@
    rewrite  openai_responses 3              anthropic_sub/${model}                                  
    default  anthropic_messages                                                                      
    default  unprefixed/anthropic_messages                                                           
- [e] edit   [n] add fallback   [m] move   [t] trace   [esc] back                                    
+ [e] edit   [n] add fallback   [m] move   [t] trace   [←/→] other routes   [esc] back               
                                                                                                     </pre>
 <h2>Providers, opened on the problem &mdash; 80&times;24</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="b r">1 providers 5</span><span class="d"> · 2 settings</span>                                 2 providers on 
 <span class="b">PROVIDERS</span> <span class="d">─────────────────────────────────────────────────────────────────────</span> 
  <span class="d">provider</span>       <span class="d">state</span>  <span class="d">credential</span>         <span class="d">used by</span>                               
- anthropic_api  <span class="d">off</span>    none               3 rewrites · 1 route                  
+<span class="d"> anthropic_api  off    none               3 rewrites · 1 route                  </span>
 <span class="r"> anthropic_sub  on     none               4 rewrites · 2 defaults · 1 route     </span>
- codex_sub      <span class="d">off</span>    codex's own login  3 rewrites · 1 route                  
- openai_api     <span class="d">off</span>    none               1 rewrite · 1 route                   
+<span class="d"> codex_sub      off    codex's own login  3 rewrites · 1 route                  </span>
+<span class="d"> openai_api     off    none               1 rewrite · 1 route                   </span>
  openrouter     on     keyring            3 rewrites · 2 defaults · 5 routes    
 <span class="b">PROVIDER</span> <span class="d">──────────────────────────────────────────────────────────────────────</span> 
  <span class="b">anthropic_sub</span>                                                                  
  <span class="d">state</span>        on                                                                
  <span class="d">credential</span>   <span class="yellow">none</span>                                                              
- <span class="d">refresh url</span>  (the built-in one)                                                
+ <span class="d">refresh url</span>  built-in                                                          
  <span class="d">bindings</span>     anthropic_sub.anthropic_messages · subscription                   
  <span class="d">rewrites</span>     4  anthropic_messages 2 · openai_chat 1 · openai_responses 1      
  <span class="d">defaults</span>     2  anthropic_messages · unprefixed/anthropic_messages             
