@@ -46,7 +46,7 @@ A document using a feature of a later version than it declares MUST be refused.
 A document's fingerprint MUST be a cryptographic hash over a version-specific domain tag and a canonical encoding, with object keys sorted and arrays in their semantic order.
 Each format version MUST have its own domain tag, so that one fingerprint never means two things.
 
-A route fingerprint MUST cover one route's semantics alone: its candidates, edges, alias policies, health circuits, upgrade policies, classifiers and lane transition policy.
+A route fingerprint MUST cover one route's semantics alone: its candidates, edges, alias policies, health circuits, upgrade policies, classifiers, lane transition policy and whether it honours server safeguards.
 Labels, descriptions and the offer an inventory happens to select MUST NOT take part.
 
 > [!NOTE]
@@ -55,6 +55,7 @@ Labels, descriptions and the offer an inventory happens to select MUST NOT take 
 ## Routes and candidates
 
 A route declares its parameters, a first candidate, and steps that each pair an edge with the candidate it leads to.
+A route MAY declare that it honours server safeguards, as [RSOLV](resolver.md#honouring-server-safeguards) specifies.
 One parameter name is reserved for the model the client requested.
 
 Every reference to a route MUST supply one value for each declared parameter, being a literal, the requested model, or a capture from the matcher that selected the route.

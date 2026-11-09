@@ -37,10 +37,11 @@ These are the only transformations that may change a canonical request's meaning
 | strip message effort | removes the reasoning effort a mid-conversation system message carries | where the binding's model refuses it |
 | thinking between tools | turns a disabled thinking mode into the between-tools mode | on the single retry that follows an upstream refusal naming it |
 | apply model alias | the candidate's model identifier | where policy compiled an alias for it |
+| withhold server safeguards | removes the `safeguards` field and the `anthropic-beta` value announcing it, together | where the binding does not receive them, and on the single retry that follows a rejection |
 
 Changing any other position of the body is a defect.
 
-Release markers are specified by [GQUOTA](../gates/quota.md), compaction by [GCOMP](../gates/compaction.md), and model selection by [RSOLV](../routing/resolver.md#shaping-the-model).
+Release markers are specified by [GQUOTA](../gates/quota.md), compaction by [GCOMP](../gates/compaction.md), model selection by [RSOLV](../routing/resolver.md#shaping-the-model), and server safeguards by [WSAFE](safeguards.md).
 
 Stripping release markers MUST happen on every Messages request regardless of whether the gate is enabled.
 
@@ -89,6 +90,8 @@ A request that asked for thinking to be disabled MUST have visible thinking, thi
 This MUST hold whether or not the binding can express the disabled mode.
 Accounting MUST still record the provider's reported reasoning tokens.
 
+That removal MUST take only reasoning, and MUST leave every other provider extension in the response in place.
+
 ## The canonical boundary
 
 A request Toker cannot parse MUST be refused locally with a typed 400, and MUST NOT reach an upstream.
@@ -123,6 +126,35 @@ The meters Toker records MUST be read from the provider's own headers, without t
 > Claude Code marks that field internal, so a later version may stop reading it, and the copy then does nothing.
 >
 > A response Toker answers itself has no provider reading behind it, and a stored one would present a past figure as current.
+
+## Provider extensions
+
+A provider extension is a value on a provider's wire that the canonical form does not model.
+Toker MUST carry provider extensions across the canonical boundary opaquely, in both directions.
+
+| where it sits | direction |
+| --- | --- |
+| an unmodelled field of a request or of a node within it | request |
+| an unmodelled field of a complete response or of a node within it | response |
+| an unmodelled field of a stream event Toker models | response |
+| a stream event of a kind Toker does not model | response |
+
+Each extension MUST be tagged with the dialect it came from, and MUST keep its wire position, so that a renderer can place it where it stood.
+A stream event's extensions MUST keep their order relative to the events around them.
+
+A renderer MUST replay an extension in its original position where the extension's dialect shares a replay domain with the renderer's.
+A renderer MUST omit an extension from any other dialect and report the omission as a translation loss, naming its wire position and reason without its contents.
+
+The `anthropic_messages` and `openrouter_messages` dialects share one replay domain.
+Every other dialect is a replay domain of its own.
+
+> [!NOTE]
+> A same-dialect route then returns a newer response shape, such as a field added to an event, without Toker being taught it.
+> A feature that pairs a request field with a response field works only where both halves cross, so carrying requests alone is not enough.
+
+What the canonical form models MUST remain authoritative, so an extension MUST NOT overwrite modelled text, reasoning, tool calls, errors, stop reasons or usage.
+
+An extension's contents MUST NOT be written to a log, the ledger or a translation-loss report.
 
 ## Output limits
 

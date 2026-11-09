@@ -18,6 +18,7 @@ The key words MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD, SHOULD NOT, RE
 | [Anthropic rate limit headers](https://docs.anthropic.com/en/api/rate-limits) | The meters a subscription reports, and the representative claim. |
 | [OpenAI Chat Completions API](https://platform.openai.com/docs/api-reference/chat) | The Chat protocol and its streaming chunks. |
 | [OpenAI Responses API](https://platform.openai.com/docs/api-reference/responses) | The Responses protocol and its event stream. |
+| [Claude Code gateway compatibility](https://code.claude.com/docs/en/llm-gateway-protocol#feature-pass-through) | What Claude Code expects a gateway to pass through, and the beta header and body field pairs. |
 | [OpenRouter API](https://openrouter.ai/docs/api-reference/overview) | OpenRouter's dialects of Messages, Chat and Responses, and its reported cost. |
 | [HTML Living Standard, server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html) | The `text/event-stream` framing every streamed protocol uses. |
 

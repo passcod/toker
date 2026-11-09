@@ -182,6 +182,9 @@ The page MUST show whether a credential is set and MUST NOT show what it is, as 
 
 The page MUST show a provider whose credential does not resolve as not configured, naming the source that did not supply one.
 
+The page MUST show, for each of a provider's Messages bindings, its declared support for server safeguards and whether a rejection mark is held against it.
+The page MUST be able to clear that mark, as [WSAFE](../wire/safeguards.md#a-rejection-mark) specifies.
+
 > [!NOTE]
 > That is the answer a request reaching the provider gets, so a page showing anything else would disagree with what the proxy does.
 

@@ -30,6 +30,7 @@ The facts the resolver receives MUST be content-free.
 | an upper bound on the prompt size |
 | the message and tool counts |
 | the capabilities the request needs |
+| whether the request asks for server safeguards |
 | a binding affinity |
 | the request's class |
 | the present moment |
@@ -82,6 +83,7 @@ Only positive absence MUST skip a candidate.
 | the provider is unconfigured or disabled |
 | a credential is known to be missing or expired |
 | the binding cannot represent a required capability |
+| the route honours server safeguards, the request asks for them, and the binding's effective support for them is unsupported |
 | the binding is not the request's affinity |
 | the candidate is disabled |
 | a fresh catalogue positively lacks the model |
@@ -96,6 +98,19 @@ A model from a template, from the requested model or from a default MUST stay an
 > An incomplete listing must not become an allowlist against the upstream.
 
 A candidate whose target has an open circuit MUST be skipped.
+
+### Honouring server safeguards
+
+A route that honours server safeguards, walked for a request that asks for them, MUST treat them as a required capability of each candidate, with the effective support [WSAFE](../wire/safeguards.md#which-bindings-receive-it) specifies.
+An unknown effective support MUST NOT skip a candidate.
+
+Where such a walk ends without a candidate, the resolver MUST walk the route again as though it did not honour server safeguards.
+A fall after send MUST continue under the same rule.
+
+> [!NOTE]
+> A turn served without the review costs the client its own review requests, while a turn refused mid-session costs the session.
+
+The trace MUST record each candidate skipped for lacking server safeguards, and whether the second walk was taken.
 
 ## Shaping the model
 

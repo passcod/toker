@@ -70,8 +70,9 @@ A binding MUST NOT be inferred from an endpoint's spelling.
 The set of bindings is fixed topology and MUST NOT depend on configuration or on policy.
 
 A capability MUST be read from the binding that will serve the request.
+A provider's error or a response's content MUST NOT change a binding's declared capability.
+Observed evidence MAY narrow an unknown capability to unsupported where a spec names that evidence, as [WSAFE](../wire/safeguards.md#a-rejection-mark) does.
 A frontend MUST NOT decide at parse time which semantics a provider will refuse.
-
 
 ## Frontend scope
 

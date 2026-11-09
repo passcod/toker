@@ -28,6 +28,9 @@ Preview resolves an invented request against the draft using the same resolver i
 
 Preview MUST use the snapshot's availability without per-request credential evidence and without open circuits.
 
+An invented request MAY ask for server safeguards.
+The outcome MUST then show, for each candidate, whether its binding's effective support for them is supported, unsupported or unknown, as [WSAFE](../wire/safeguards.md#which-bindings-receive-it) specifies.
+
 > [!NOTE]
 > It therefore shows what the policy says rather than what one request's headers would make of it.
 
