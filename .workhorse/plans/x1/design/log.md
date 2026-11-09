@@ -137,10 +137,11 @@ Converged in structure; the five suggestions are meaning-level (a `reach` readin
 Not clean by the stop rule's count (at most three suggestions), so the count of clean rounds is still zero.
 All 18 are being applied.
 
-## In flight
+## Where it stands
 
-- round 3's fixes, by the two drawing agents
+- round 3's fixes applied and checked by eye; the round 4 critic was cut off when its session ended and wrote nothing
+- the user judged the converged set good, and asked for a prose walkthrough instead: `how-it-works.md`, linked to each frame (frame captions now carry ids)
 
 ## Next
 
-- round 4: a fresh critic on the fixed set; the stop rule wants it and the round after it clean (no criticals, at most three suggestions), the second by a critic who has seen neither
+- if the loop resumes: round 4 with a fresh critic, needing it and the round after clean to stop

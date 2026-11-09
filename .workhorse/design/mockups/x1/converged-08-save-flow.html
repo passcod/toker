@@ -123,7 +123,7 @@
 </head>
 <body>
 <h1>Converged: the save flow</h1>
-<h2>Edit, refuse, fix, save &mdash; animated, 3 seconds a state, 120&times;40</h2>
+<h2 id="animated">Edit, refuse, fix, save &mdash; animated, 3 seconds a state, 120&times;40</h2>
 <div class="labels"><span>state 1 open</span><span>state 2 refused</span><span>state 3 fixed</span><span>state 4 saved</span></div>
 <div class="cycle">
 <div><pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 presentations 15</span><span class="d"> → </span><span class="b r">2 rewrites 14</span><span class="d"> → </span><span class="d">3 defaults 4</span><span class="d"> → </span><span class="d">4 routes 7</span><span class="d"> · </span><span class="d">5 models 11</span><span class="d"> · </span><span class="d">6 history 9</span>   editing · rev 9 live 
@@ -287,8 +287,8 @@
                                                                                                                         
                                                                                                                         </pre></div>
 </div>
-<h2>The four states, for review</h2>
-<h2>State 1 open</h2>
+<h2 id="states">The four states, for review</h2>
+<h2 id="state-1-open">State 1 open</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 presentations 15</span><span class="d"> → </span><span class="b r">2 rewrites 14</span><span class="d"> → </span><span class="d">3 defaults 4</span><span class="d"> → </span><span class="d">4 routes 7</span><span class="d"> · </span><span class="d">5 models 11</span><span class="d"> · </span><span class="d">6 history 9</span>   editing · rev 9 live 
 ┌REWRITES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │       <span class="d">kind</span>   <span class="d">match</span>                       <span class="d">route</span>                                     <span class="d">reach</span>                        <span class="d">hits</span> │
@@ -329,7 +329,7 @@
                                                                                                                         
                                                                                                                         
                                                                                                                         </pre>
-<h2>State 2 refused</h2>
+<h2 id="state-2-refused">State 2 refused</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 presentations 15</span><span class="d"> → </span><span class="b r">2 rewrites 14</span><span class="d"> → </span><span class="d">3 defaults 4</span><span class="d"> → </span><span class="d">4 routes 7</span><span class="d"> · </span><span class="d">5 models 11</span><span class="d"> · </span><span class="d">6 history 9</span>   editing · rev 9 live 
 ┌REWRITES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │       <span class="d">kind</span>   <span class="d">match</span>                       <span class="d">route</span>                                     <span class="d">reach</span>                        <span class="d">hits</span> │
@@ -370,7 +370,7 @@
 │<span class="d"> anthropic_sub/claude-sonnet-5    rule 2 → claude-sub             rule 2 → claude-sub                                 </span>│
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
                                                                                                                         </pre>
-<h2>State 3 fixed</h2>
+<h2 id="state-3-fixed">State 3 fixed</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 presentations 15</span><span class="d"> → </span><span class="b r">2 rewrites 14</span><span class="d"> → </span><span class="d">3 defaults 4</span><span class="d"> → </span><span class="d">4 routes 7</span><span class="d"> · </span><span class="d">5 models 11</span><span class="d"> · </span><span class="d">6 history 9</span>   editing · rev 9 live 
 ┌REWRITES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │       <span class="d">kind</span>   <span class="d">match</span>                       <span class="d">route</span>                                     <span class="d">reach</span>                        <span class="d">hits</span> │
@@ -411,7 +411,7 @@
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
                                                                                                                         
                                                                                                                         </pre>
-<h2>State 4 saved</h2>
+<h2 id="state-4-saved">State 4 saved</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1</span><span class="d"> → </span><span class="b r">2 rewrites 15</span><span class="d"> → </span><span class="d">3</span><span class="d"> → </span><span class="d">4</span><span class="d"> · </span><span class="d">5</span><span class="d"> · </span><span class="d">6</span>                                          <span class="b">saved</span> · rev 10 live<span class="d"> · 2 lanes on rev 9</span> 
 ┌REWRITES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │       <span class="d">kind</span>   <span class="d">match</span>                       <span class="d">route</span>                   <span class="d">sends</span>             <span class="d">reach</span>                        <span class="d">hits</span> │
