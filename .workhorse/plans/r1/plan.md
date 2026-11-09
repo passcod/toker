@@ -29,4 +29,4 @@ The four pages (dashboard, routing, config, accounts) move to one convention for
 - [x] Loop: chips and `?` on every page, `⇄` as next page, colour stripped on every page
 - [x] UTUI: shedding and the key overlay apply to every page
 - [x] Design guide: chrome, copy and interaction describe the settled convention; S1 references gone
-- [ ] Tests and snapshots; test cases ticked
+- [x] Tests and snapshots; test cases ticked

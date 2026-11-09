@@ -256,6 +256,7 @@ Every list records the rectangle of each row it drew, so a click names the row i
 
 **Keys are taught by the `?` overlay, and no page carries a footer.**
 Each page's overlay lists its own keys, a key in bold then what it does; the dashboard's lists its marks above them as LEGEND, and the other pages title theirs KEYS.
+How to close it, `? or esc close`, rides in the overlay's bottom border, and rows that do not fit are counted with `… N more`.
 A modal or a text entry takes every key, `?` included, so it says its keys itself on its last line.
 
 **A key hint reads `e edit · n new`:** the key, the bare verb, lower case, `·` between hints, arrows as glyphs, and `y/enter` where two keys do one thing.
