@@ -31,12 +31,31 @@ No browser rig: Toker is a terminal app. Captures come from running the real TUI
 | # | call | reason | before | after | verdict |
 | --- | --- | --- | --- | --- | --- |
 
+## Step 1 continued — the live instance
+
+The user gave access to their running `toker tui` in tmux pane 4:0.0 at 135x50, to drive without killing or misconfiguring the proxy.
+Driven read-only: `Tab`, `←/→` and `?` only, never a key that could mutate the policy, and restored to the dashboard afterwards.
+Captures are in the card's rig work directory under `live/`, plain and ANSI.
+`current-state.md` beside this file is what they show.
+
+The real store makes the screens far worse than the committed snapshots do, because the snapshot fixtures hold a handful of rows and the real one holds 1,416.
+
+## Step 2 — direction
+
+Three directions briefed separately from `brief.md`, which carries the common context so the stances are the only difference:
+
+| direction | stance | structure |
+| --- | --- | --- |
+| A | faithful to the reference | keep the pages, views and master/detail; make every part as good as the dashboard |
+| B | the most minimal | delete the two pages and six tabs for one configuration tree |
+| C | fastest at the main task | lead with the resolution chain that answers "where does this go, and why"; records are reached through it |
+
 ## In flight
 
-- capture rig + current-state matrix (agent `capture`)
-- domain and UI survey (agent `survey`)
+- capture rig: ANSI to HTML to PNG, plus form and empty-state captures from a sandbox
+- directions A, B and C
 
 ## Next
 
-- critique the current pages against the protocol
-- three directions, mocked at 100x24 and 120x40
+- critique the three side by side with a fresh critic, choose one, record why in the ledger
+- refine the chosen mockup through a few UI-loop iterations before anything is built
