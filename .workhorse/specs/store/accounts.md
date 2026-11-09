@@ -153,7 +153,10 @@ An interrupted move MUST be repaired by running setup again.
 
 Setup MUST verify that the unattributed rows carry the meter windows of a single account, and MUST refuse to attribute them to one account where they do not.
 
+Only a reading naming a window still open when it was taken, and no further ahead than that window is long, counts as evidence of one.
+
 > [!NOTE]
-> One account's windows form a single series, each starting where the last one reset, so two accounts' windows overlap in time and show up as two series.
+> One account's window only moves forward, rolling to the next period or being re-anchored while traffic keeps arriving, so two accounts' windows overlap in time and show up as a series stepping back to a window it had already left.
 > That makes the check a single pass over rows Toker already holds, and without it attributing a mixed history to one account would assert something nothing ever recorded.
 > Nothing can separate such a history afterwards, so refusing says as much rather than choosing quietly.
+> The restriction to live windows is what keeps a stale copy, which the proxy writes onto its own blocked and error rows, from reading as a second account.

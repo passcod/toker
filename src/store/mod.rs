@@ -1862,12 +1862,50 @@ mod tests {
     }
 
     #[test]
-    fn one_accounts_windows_read_as_one_series_and_two_accounts_do_not() {
+    fn one_accounts_windows_read_as_one_series() {
         let store = mem_store();
         let reset = |hours: i64| hours * 3_600;
-        // One series: each window's rows report its own reset, and the next
-        // window starts where the last one ended.
-        for (at_h, reset_h) in [(1, 5), (3, 5), (6, 10), (9, 10)] {
+        let minutes = |m: i64| m * 60;
+        // One series, in the three shapes a real store holds it. Each
+        // window's rows report its own reset; the next window starts
+        // where the last one ended; and a window still open is
+        // re-anchored forward in ten-minute steps while traffic keeps
+        // arriving, which is what a live store does all day.
+        for (at_h, reset_s) in [
+            (1, reset(5)),
+            (3, reset(5)),
+            (4, reset(5) + minutes(10)),
+            (4, reset(5) + minutes(20)),
+            (6, reset(10)),
+            (9, reset(10)),
+        ] {
+            store
+                .record_request(&window_row(at_h * HOUR_MS, "anthropic_sub", reset_s))
+                .expect("record");
+        }
+        // A reading naming a window that had already ended when it was
+        // served is a stale copy, not a second account's window.
+        store
+            .record_request(&window_row(7 * HOUR_MS, "anthropic_sub", reset(5)))
+            .expect("record");
+        assert_eq!(
+            store
+                .unattributed_window_conflict("anthropic_sub")
+                .expect("walk"),
+            None
+        );
+    }
+
+    #[test]
+    fn two_accounts_windows_overlap_and_are_refused() {
+        let store = mem_store();
+        let reset = |hours: i64| hours * 3_600;
+        // Two logins taking turns: each row names a window still ahead of
+        // it, and the series steps back to the earlier one while the later
+        // one is still open. One account's window only moves forward.
+        // Each reset is within five hours of the row reporting it, as a
+        // five-hour window's always is.
+        for (at_h, reset_h) in [(1, 5), (2, 6), (3, 5)] {
             store
                 .record_request(&window_row(at_h * HOUR_MS, "anthropic_sub", reset(reset_h)))
                 .expect("record");
@@ -1876,23 +1914,10 @@ mod tests {
             store
                 .unattributed_window_conflict("anthropic_sub")
                 .expect("walk"),
-            None
-        );
-
-        // A second account's window overlaps the first's: a row logged at
-        // hour 4, while the window resetting at hour 5 is still open, reports
-        // a reset of hour 8 instead.
-        store
-            .record_request(&window_row(4 * HOUR_MS, "anthropic_sub", reset(8)))
-            .expect("record");
-        assert_eq!(
-            store
-                .unattributed_window_conflict("anthropic_sub")
-                .expect("walk"),
             Some(crate::store::MixedHistory {
-                at_ms: 4 * HOUR_MS,
-                open_reset_s: reset(5),
-                row_reset_s: reset(8),
+                at_ms: 3 * HOUR_MS,
+                open_reset_s: reset(6),
+                row_reset_s: reset(5),
             })
         );
     }

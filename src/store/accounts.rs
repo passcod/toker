@@ -324,17 +324,27 @@ pub struct MixedHistory {
     pub row_reset_s: i64,
 }
 
-/// Whether a provider's pre-account rows carry the meter windows of a single
-/// account (spec: ACCT#moving-a-machine-onto-accounts).
+/// Whether a provider's pre-account rows carry the meter windows of a
+/// single account (spec: ACCT#moving-a-machine-onto-accounts).
 ///
-/// One account's windows form a series, each starting where the last one
-/// reset, so a row logged while a window is still open can only report that
-/// window's own reset. A row that reports a different one was served on a
-/// second account, whose window overlaps the first's in time.
+/// Two accounts' windows overlap in time and show up as two series, so
+/// the evidence is a series that goes back to a window it had already
+/// left while a later one is still open. One account's window only ever
+/// moves forward: it rolls to the next five hours, or is re-anchored
+/// forward in ten-minute steps while traffic keeps arriving.
+///
+/// Only live windows are read. A reading whose reset had already passed
+/// when it was served names no open window at all — it is a stale copy,
+/// which the proxy writes onto its own blocked and error rows — and one
+/// more than five hours ahead cannot be a five-hour window's. Both were
+/// found by running an earlier, stricter form of this check against a
+/// copy of a real store, where they made a one-account history read as
+/// two.
 pub(super) fn unattributed_window_conflict(
     conn: &Connection,
     provider: &str,
 ) -> Result<Option<MixedHistory>> {
+    const WINDOW_MS: i64 = 5 * 60 * 60 * 1000;
     let mut statement = conn.prepare(
         "SELECT ts_ms, CAST(json_extract(rate_limits, '$.reset5h') AS INTEGER) AS reset5h
          FROM requests
@@ -344,17 +354,19 @@ pub(super) fn unattributed_window_conflict(
          ORDER BY ts_ms, id",
     )?;
     let mut rows = statement.query([provider])?;
-    // The window the walk believes is open, and the moment it last saw a row
-    // reporting it. A window ends at its reset, so a later row inside it that
-    // names another reset is the contradiction being looked for.
-    let mut open: Option<i64> = None;
+    // The furthest window any earlier row named. The walk compares
+    // against this rather than the row before, so a single step back is
+    // caught however many rows the series ran forward first.
+    let mut furthest: Option<i64> = None;
     while let Some(row) = rows.next()? {
         let at_ms: i64 = row.get("ts_ms")?;
         let reset_s: i64 = row.get("reset5h")?;
-        // Still inside the window the rows before it reported, yet naming a
-        // different one: the two cannot both be one account's.
-        if let Some(open_reset_s) = open
-            && open_reset_s != reset_s
+        let reset_ms = reset_s.saturating_mul(1000);
+        if reset_ms <= at_ms || reset_ms > at_ms.saturating_add(WINDOW_MS) {
+            continue;
+        }
+        if let Some(open_reset_s) = furthest
+            && reset_s < open_reset_s
             && at_ms < open_reset_s.saturating_mul(1000)
         {
             return Ok(Some(MixedHistory {
@@ -363,7 +375,7 @@ pub(super) fn unattributed_window_conflict(
                 row_reset_s: reset_s,
             }));
         }
-        open = Some(reset_s);
+        furthest = Some(furthest.map_or(reset_s, |open| open.max(reset_s)));
     }
     Ok(None)
 }
