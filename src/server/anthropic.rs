@@ -728,7 +728,11 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         // release is made of.
         let gate_armed = path == "/v1/messages" && super::quota_gate::armed(&server, backend.id());
         if gate_armed {
-            meters_snapshot = super::quota_gate::load_meters(&server, backend.id());
+            meters_snapshot = super::quota_gate::load_meters_for(
+                &server,
+                backend.id(),
+                super::quota_gate::gate_account(&server, backend.id(), session_id.as_deref()),
+            );
         }
         if path == "/v1/messages" {
             match translate::from_anthropic(ir.value()) {
@@ -749,12 +753,27 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 let meters = meters_snapshot.as_ref().map(Meters::over);
                 let now = now_ms();
                 let fresh = grant_for(meters, now);
-                if let Err(error) =
-                    crate::release::record_grant(&server.store, session, release, &fresh)
+                // A release spends one account's window, so a marker on a
+                // session Toker cannot place yet records nothing.
+                let account_number =
+                    super::quota_gate::gate_account(&server, backend.id(), Some(session));
+                if let Some(account_number) = account_number
+                    && let Err(error) = crate::release::record_grant(
+                        &server.store,
+                        session,
+                        account_number,
+                        release,
+                        &fresh,
+                    )
                 {
                     tracing::error!(%error, "allowance record failed");
                 }
-                let merged = crate::release::merged(&server.store, session, &fresh, now);
+                let merged = match account_number {
+                    Some(account_number) => {
+                        crate::release::merged(&server.store, session, account_number, &fresh, now)
+                    }
+                    None => fresh,
+                };
                 record_anthropic_released(
                     &server,
                     session,
@@ -817,6 +836,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             requested_model: model,
             effective_model,
             backend: backend.clone(),
+            credential_digest: None,
+            account_number: None,
             binding_id: target.binding().id().clone(),
             attempt: None,
             policy_routing: None,
@@ -858,7 +879,11 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         if meters_snapshot.is_none() {
             // The unparseable-body case: the release/strip section above
             // never ran, so the snapshot was never loaded.
-            meters_snapshot = super::quota_gate::load_meters(&server, backend.id());
+            meters_snapshot = super::quota_gate::load_meters_for(
+                &server,
+                backend.id(),
+                super::quota_gate::gate_account(&server, backend.id(), session_id.as_deref()),
+            );
         }
         if let Some(block) = super::quota_gate::decide_block(
             &server,
@@ -1327,7 +1352,14 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         server.borrow_catalog_credential(backend.as_ref(), &parts.headers);
         return match send_upstream(&server, backend.as_ref(), &parts, forward, &[]).await {
             Ok(upstream) => {
-                forward_administrative_response(server, backend, upstream, record, in_flight).await
+                forward_administrative_response(
+                    server,
+                    backend,
+                    upstream.response,
+                    record,
+                    in_flight,
+                )
+                .await
             }
             Err(error) => {
                 tracing::warn!(%error, "upstream request failed");
@@ -1422,7 +1454,21 @@ pub(crate) fn required_capabilities(request: &CanonicalRequest) -> crate::policy
 /// a meter-source backend has meters to report (the sub; the API's RPM
 /// headers are not quota meters and must not overwrite the gate's
 /// snapshot).
-pub(crate) fn note_meters(server: &Server, backend: &dyn Provider, headers: &HeaderMap) {
+/// Keep the account's latest meter reading. A reading belongs to the
+/// account that reported it, so it lands in that account's slot and never
+/// overwrites another's.
+///
+/// A reading whose credential resolved to no account is kept nowhere: it
+/// must feed no account's reading or fit (spec: ACCT#an-account-not-yet-known),
+/// and there is no slot for it to feed. The row the request writes still
+/// carries the snapshot verbatim, so nothing is lost as history — only the
+/// live reading the gate reads is withheld, which is the point.
+pub(crate) fn note_meters(
+    server: &Server,
+    backend: &dyn Provider,
+    account_number: Option<i64>,
+    headers: &HeaderMap,
+) {
     let Some(meters) = backend.meters(headers) else {
         return;
     };
@@ -1431,7 +1477,21 @@ pub(crate) fn note_meters(server: &Server, backend: &dyn Provider, headers: &Hea
         updated_ms: now_ms(),
         snapshot: meters,
     };
-    if let Err(error) = server.store.save_meters(backend.id(), &snapshot) {
+    // A reading belongs to the account that spent it, where the account is
+    // known (spec: ACCT#what-is-attributed-to-an-account). A provider whose
+    // accounts toker cannot tell apart holds none, and keeps its reading
+    // against the provider — which is also where a reading lands while a
+    // credential's identity is still unresolved, so a window is never
+    // unreadable merely because nothing has named the login yet.
+    let saved = match account_number {
+        Some(account_number) => {
+            server
+                .store
+                .save_account_meters(backend.id(), account_number, &snapshot)
+        }
+        None => server.store.save_meters(backend.id(), &snapshot),
+    };
+    if let Err(error) = saved {
         tracing::error!(%error, "meter snapshot save failed");
     }
 }
@@ -1536,7 +1596,7 @@ pub(crate) async fn retry_thinking_off(
     }
     send_upstream(server, backend, parts, retry, &[])
         .await
-        .map(ThinkingRetry::Retried)
+        .map(|upstream| ThinkingRetry::Retried(upstream.response))
         .map_err(|error| {
             tracing::warn!(%error, "upstream request failed");
             let class = if error.is_connect() {
@@ -1742,7 +1802,7 @@ async fn transparent_to(server: Server, request: Request, target: ModelTarget) -
     };
     match send_upstream(&server, backend.as_ref(), &parts, body, &[]).await {
         Ok(upstream) => {
-            forward_administrative_response(server, backend, upstream, None, None).await
+            forward_administrative_response(server, backend, upstream.response, None, None).await
         }
         Err(error) => {
             tracing::warn!(%error, "upstream request failed");
@@ -2178,7 +2238,12 @@ async fn forward_administrative_response(
     let status = upstream.status();
     let upstream_headers = upstream.headers().clone();
 
-    note_meters(&server, backend.as_ref(), &upstream_headers);
+    note_meters(
+        &server,
+        backend.as_ref(),
+        record.as_ref().and_then(|ctx| ctx.account_number),
+        &upstream_headers,
+    );
     // The row's own copy — this response's headers, parsed, for the
     // measurement row and the error row alike (a failure's meters are the
     // only evidence of throttling); the meters_state table took the

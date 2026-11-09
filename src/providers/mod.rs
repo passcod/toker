@@ -23,8 +23,24 @@ pub use openrouter::OpenRouter;
 use axum::http::{HeaderMap, header};
 use reqwest::Url;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::routing::{BackendBinding, ProtocolId};
+use crate::store::CredentialDigest;
+
+/// Digest a credential value before it crosses into durable account state.
+/// Every provider's credential digests the same way, so this sits beside
+/// the trait rather than inside any one backend.
+///
+/// The full digest, deliberately: the truncated digests elsewhere are
+/// diagnostic values, where this one is what an account is recognised by.
+pub fn credential_digest(value: &str) -> CredentialDigest {
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(value.as_bytes()) {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    CredentialDigest::new(hex).expect("sha256 is 64 lower-case hexadecimal characters")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialAvailability {

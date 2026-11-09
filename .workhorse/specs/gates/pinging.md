@@ -39,7 +39,7 @@ Toker MUST NOT identify a ping by the size of its request or of its usage.
 > [!NOTE]
 > Most real requests consume less of a window than any threshold that would exclude a ping, so a size test silently reclassifies real traffic.
 
-Toker MUST skip a ping while any measurement in the ledger reports a five-hour reset still ahead.
+Toker MUST skip a ping while any measurement in the ledger reports a five-hour reset still ahead on the account being pinged.
 Where the ledger cannot answer, Toker MUST send the ping.
 
 > [!NOTE]
@@ -51,11 +51,25 @@ Toker MUST refuse a ping that fires more than ten minutes after its scheduled ti
 > [!NOTE]
 > Suppressing a timer's catch-up across a restart does not suppress a realtime elapse that passed while the machine was suspended, which fires the moment the machine wakes and would place the day's boundary wherever that happened to be.
 
+## A window belongs to an account
+
+A rate limit window is an account's, as [ACCT](../store/accounts.md#what-is-attributed-to-an-account) specifies, so a ping opens the window of one account and leaves every other account's unopened.
+
+Toker MUST schedule a ping for each account it knows on a provider that anchors windows.
+
+Toker MUST send a ping with the credential of the account it is pinging.
+
+> [!NOTE]
+> Choosing which account a ping opens a window for is not routing, which decides where a model goes and never whose window pays for it.
+> It is Toker's own request with no client behind it, so the credential it carries is Toker's to choose, which is the one place that choice exists.
+
+A ping run MUST record the account it was sent for.
+
 ## A ping is routed like any other request
 
 A ping names a model, and the active policy revision decides where that model goes.
 
-Only a ping-tagged row served by the subscription provider counts as having opened a window.
+Only a ping-tagged row served by the subscription provider, on the account the ping was sent for, counts as having opened a window.
 A ping the policy sent to another provider, or that failed over from the subscription, MUST be recorded as having observed no boundary.
 
 ## Recording a run

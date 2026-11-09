@@ -275,6 +275,8 @@ mod tests {
             route: None,
             session_id: Some(session.to_owned()),
             ping: None,
+            credential_digest: None,
+            account_number: None,
             model: Some(model.to_owned()),
             raw_model: Some(model.to_owned()),
             requested_model: None,

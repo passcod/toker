@@ -63,6 +63,13 @@ pub struct LanePin {
     pub route_fingerprint: RouteFingerprint,
     pub candidate_id: CandidateId,
     pub binding_id: BindingId,
+    /// The account that served. Part of the cache identity: a prompt cache
+    /// belongs to the account that wrote it, so a lane that moved account
+    /// reads nothing of the cache under its new one. `None` where the
+    /// provider has no accounts Toker can tell apart, and on a pin written
+    /// before accounts were recorded; such a pin claims no cache identity
+    /// beyond its binding and model.
+    pub account_number: Option<i64>,
     pub baseline_model: String,
     pub effective_model: String,
 }
@@ -422,6 +429,9 @@ pub struct ModelEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Allowance {
     pub session_id: String,
+    /// The account whose window this releases. A release spends one
+    /// account's quota and never another's (spec: ACCT#what-is-attributed-to-an-account).
+    pub account_number: i64,
     pub meter: String,
     pub reset_value: i64,
     /// What the release covers: overage, or only the plan's own room.
@@ -461,6 +471,12 @@ pub struct PingRecord {
     /// The decision to ping was taken for want of any meter reading,
     /// not because one showed no window open.
     pub assumed: Option<bool>,
+    /// The account whose window this run opened, or found already open.
+    /// Read off the rows the ping produced rather than chosen in advance,
+    /// because the account a ping lands on is the one its credential
+    /// belongs to. `None` when nothing landed, when the row named no
+    /// account, or on a run recorded before accounts were.
+    pub account_number: Option<i64>,
 }
 
 /// What one ping run did.
@@ -568,8 +584,8 @@ pub(super) fn upsert_lane(conn: &Connection, lane: &Lane) -> Result<()> {
 
 const LANE_COLUMNS: &str = "key, session_id, tools_hash, updated_ms, prompt_tokens, ttl, ping,
     noticed_at, forced_from, forced_to, pin_generation, policy_revision_id,
-    policy_route_id, route_fingerprint, candidate_id, binding_id, baseline_model,
-    effective_model";
+    policy_route_id, route_fingerprint, candidate_id, binding_id, account_number,
+    baseline_model, effective_model";
 
 pub(super) fn load_lane(conn: &Connection, key: &str) -> Result<Option<Lane>> {
     row_of(
@@ -636,6 +652,7 @@ fn read_lane(row: &rusqlite::Row<'_>) -> Result<Lane> {
             route_fingerprint: parse_id("lanes.route_fingerprint", fingerprint)?,
             candidate_id: parse_id("lanes.candidate_id", candidate)?,
             binding_id: parse_id("lanes.binding_id", binding)?,
+            account_number: row.get("account_number")?,
             baseline_model,
             effective_model,
         }),
@@ -684,19 +701,20 @@ pub(super) fn compare_and_swap_lane_pin(
     let changed = conn.execute(
         "UPDATE lanes SET pin_generation = pin_generation + 1,
              policy_revision_id = ?1, policy_route_id = ?2, route_fingerprint = ?3,
-             candidate_id = ?4, binding_id = ?5, baseline_model = ?6,
-             effective_model = ?7
-         WHERE key = ?8 AND pin_generation = ?9
-           AND policy_revision_id IS ?10 AND policy_route_id IS ?11
-           AND route_fingerprint IS ?12 AND candidate_id IS ?13
-           AND binding_id IS ?14 AND baseline_model IS ?15
-           AND effective_model IS ?16",
+             candidate_id = ?4, binding_id = ?5, account_number = ?6,
+             baseline_model = ?7, effective_model = ?8
+         WHERE key = ?9 AND pin_generation = ?10
+           AND policy_revision_id IS ?11 AND policy_route_id IS ?12
+           AND route_fingerprint IS ?13 AND candidate_id IS ?14
+           AND binding_id IS ?15 AND account_number IS ?16
+           AND baseline_model IS ?17 AND effective_model IS ?18",
         rusqlite::params![
             new.revision,
             new.route,
             new.fingerprint,
             new.candidate,
             new.binding,
+            new.account,
             new.baseline,
             new.effective,
             key,
@@ -706,6 +724,7 @@ pub(super) fn compare_and_swap_lane_pin(
             expected_pin.map(|p| p.route_fingerprint.to_string()),
             expected_pin.map(|p| p.candidate_id.as_str()),
             expected_pin.map(|p| p.binding_id.as_str()),
+            expected_pin.and_then(|p| p.account_number),
             expected_pin.map(|p| p.baseline_model.as_str()),
             expected_pin.map(|p| p.effective_model.as_str()),
         ],
@@ -725,6 +744,9 @@ struct StoredPinParts<'a> {
     fingerprint: Option<String>,
     candidate: Option<&'a str>,
     binding: Option<&'a str>,
+    /// Already flat: a pin that names no account and no pin at all both
+    /// store NULL here.
+    account: Option<i64>,
     baseline: Option<&'a str>,
     effective: Option<&'a str>,
 }
@@ -738,6 +760,7 @@ impl<'a> From<Option<&'a LanePin>> for StoredPinParts<'a> {
                 fingerprint: Some(pin.route_fingerprint.to_string()),
                 candidate: Some(pin.candidate_id.as_str()),
                 binding: Some(pin.binding_id.as_str()),
+                account: pin.account_number,
                 baseline: Some(&pin.baseline_model),
                 effective: Some(&pin.effective_model),
             },
@@ -747,6 +770,7 @@ impl<'a> From<Option<&'a LanePin>> for StoredPinParts<'a> {
                 fingerprint: None,
                 candidate: None,
                 binding: None,
+                account: None,
                 baseline: None,
                 effective: None,
             },
@@ -1892,13 +1916,14 @@ pub(super) fn prune_lanes(
 /// overage was fine for this window.
 pub(super) fn record_allowance(conn: &Connection, allowance: &Allowance) -> Result<()> {
     conn.execute(
-        "INSERT INTO allowances (session_id, meter, reset_value, release)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT (session_id, meter, reset_value) DO UPDATE SET
+        "INSERT INTO allowances (session_id, account_number, meter, reset_value, release)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (session_id, account_number, meter, reset_value) DO UPDATE SET
            release = CASE WHEN excluded.release = 'overage' THEN 'overage'
                           ELSE allowances.release END",
         (
             &allowance.session_id,
+            allowance.account_number,
             &allowance.meter,
             allowance.reset_value,
             release_name(allowance.release),
@@ -1910,8 +1935,8 @@ pub(super) fn record_allowance(conn: &Connection, allowance: &Allowance) -> Resu
 pub(super) fn load_allowances(conn: &Connection) -> Result<Vec<Allowance>> {
     rows_of(
         conn,
-        "SELECT session_id, meter, reset_value, release FROM allowances
-         ORDER BY session_id, meter, reset_value",
+        "SELECT session_id, account_number, meter, reset_value, release FROM allowances
+         ORDER BY session_id, account_number, meter, reset_value",
         [],
         read_allowance,
     )
@@ -1927,9 +1952,9 @@ pub(super) fn load_session_allowances(
 ) -> Result<Vec<Allowance>> {
     rows_of(
         conn,
-        "SELECT session_id, meter, reset_value, release FROM allowances
+        "SELECT session_id, account_number, meter, reset_value, release FROM allowances
          WHERE session_id = ?1
-         ORDER BY meter, reset_value",
+         ORDER BY account_number, meter, reset_value",
         [session_id],
         read_allowance,
     )
@@ -1969,6 +1994,7 @@ fn read_allowance(row: &rusqlite::Row<'_>) -> Result<Allowance> {
     let release: String = row.get("release")?;
     Ok(Allowance {
         session_id: row.get("session_id")?,
+        account_number: row.get("account_number")?,
         meter: row.get("meter")?,
         reset_value: row.get("reset_value")?,
         // A spelling this binary does not know reads as the narrower
@@ -1984,8 +2010,9 @@ fn read_allowance(row: &rusqlite::Row<'_>) -> Result<Allowance> {
 pub(super) fn record_ping(conn: &Connection, ping: &PingRecord) -> Result<()> {
     conn.execute(
         "INSERT INTO pings (ts_ms, exit_code, duration_ms, boundary_ms,
-                            slot, action, observed_ms, verified, assumed)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                            slot, action, observed_ms, verified, assumed,
+                            account_number)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         (
             ping.ts_ms,
             ping.exit_code,
@@ -1996,6 +2023,7 @@ pub(super) fn record_ping(conn: &Connection, ping: &PingRecord) -> Result<()> {
             ping.observed_ms,
             ping.verified,
             ping.assumed,
+            ping.account_number,
         ),
     )?;
     Ok(())
@@ -2033,6 +2061,7 @@ fn read_ping(row: &rusqlite::Row<'_>) -> Result<PingRecord> {
         observed_ms: row.get("observed_ms")?,
         verified: row.get("verified")?,
         assumed: row.get("assumed")?,
+        account_number: row.get("account_number")?,
     })
 }
 
@@ -2058,6 +2087,61 @@ pub(super) fn load_meters(conn: &Connection, provider_id: &str) -> Result<Option
         "SELECT updated_ms, snapshot FROM meters_by_provider WHERE provider_id = ?1",
         [provider_id],
         read_meters,
+    )
+}
+
+/// One account's latest meter snapshot on a provider. A reading belongs to
+/// the account that reported it, so one account's never replaces another's
+/// (spec: ACCT#what-is-attributed-to-an-account).
+pub(super) fn save_account_meters(
+    conn: &Connection,
+    provider_id: &str,
+    account_number: i64,
+    snapshot: &MetersSnapshot,
+) -> Result<()> {
+    let snapshot_json = serde_json::to_string(&snapshot.snapshot)?;
+    conn.execute(
+        "INSERT INTO meters_by_account (provider_id, account_number, updated_ms, snapshot)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (provider_id, account_number) DO UPDATE SET
+             updated_ms = excluded.updated_ms,
+             snapshot = excluded.snapshot",
+        (
+            provider_id,
+            account_number,
+            snapshot.updated_ms,
+            snapshot_json,
+        ),
+    )?;
+    Ok(())
+}
+
+pub(super) fn load_account_meters(
+    conn: &Connection,
+    provider_id: &str,
+    account_number: i64,
+) -> Result<Option<MetersSnapshot>> {
+    row_of(
+        conn,
+        "SELECT updated_ms, snapshot FROM meters_by_account
+         WHERE provider_id = ?1 AND account_number = ?2",
+        (provider_id, account_number),
+        read_meters,
+    )
+}
+
+/// Every account's latest snapshot on a provider, by account number: the
+/// dashboard's strip reads them together to lay them out side by side.
+pub(super) fn load_meters_by_account(
+    conn: &Connection,
+    provider_id: &str,
+) -> Result<Vec<(i64, MetersSnapshot)>> {
+    rows_of(
+        conn,
+        "SELECT account_number, updated_ms, snapshot FROM meters_by_account
+         WHERE provider_id = ?1 ORDER BY account_number",
+        [provider_id],
+        |row| Ok((row.get("account_number")?, read_meters(row)?)),
     )
 }
 

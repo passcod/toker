@@ -247,6 +247,12 @@ pub struct AttemptPlan {
     pub policy_revision: Option<i64>,
     pub route_id: Option<RouteId>,
     pub route_fingerprint: Option<RouteFingerprint>,
+    /// The account this attempt is expected to serve on, attached by the
+    /// server after resolution. Routing does not select an account
+    /// (spec: ACCT#routing-does-not-select-an-account), so the resolver
+    /// never fills this. `None` where the provider has no accounts Toker can
+    /// tell apart, which is why it is not required for a plan to be pinnable.
+    pub account_number: Option<i64>,
     pub provenance: RouteProvenance,
     pub candidate_id: Option<CandidateId>,
     pub binding_id: BindingId,
@@ -316,6 +322,7 @@ impl AttemptPlan {
             route_fingerprint: self.route_fingerprint.clone()?,
             candidate_id: self.candidate_id.clone()?,
             binding_id: self.binding_id.clone(),
+            account_number: self.account_number,
             baseline_model: self.baseline_model.clone(),
             effective_model: self.effective_model.clone(),
         })
@@ -616,6 +623,7 @@ fn resolve_selected<L: LearningView>(
             policy_revision: None,
             route_id: Some(route_id.clone()),
             route_fingerprint: Some(fingerprint.clone()),
+            account_number: None,
             provenance: selected.provenance.clone(),
             candidate_id: Some(candidate_id.clone()),
             binding_id: binding_id.clone(),
@@ -815,6 +823,7 @@ fn resolve_selected<L: LearningView>(
             policy_revision: None,
             route_id: Some(route.id().clone()),
             route_fingerprint: Some(route.fingerprint().clone()),
+            account_number: None,
             provenance: selected.provenance.clone(),
             candidate_id: Some(candidate.id().clone()),
             binding_id: candidate.binding_id().clone(),
@@ -3869,8 +3878,10 @@ mod tests {
         .unwrap();
         assert_eq!(plan.pin_identity(), None);
         plan.policy_revision = Some(7);
+        plan.account_number = Some(3);
         let pin = plan.pin_identity().expect("complete pin");
         assert_eq!(pin.policy_revision_id, 7);
+        assert_eq!(pin.account_number, Some(3));
         assert_eq!(pin.policy_route_id, plan.route_id.clone().unwrap());
         assert_eq!(
             pin.route_fingerprint,

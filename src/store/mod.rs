@@ -25,11 +25,15 @@
 //! Migrations: the `schema` submodule holds a numbered, append-only list
 //! gated by `PRAGMA user_version` — no external migration files.
 
+mod accounts;
 mod config;
 mod ledger;
 mod schema;
 mod state;
 
+pub use accounts::{
+    Account, AccountIdentity, AccountNameSource, CredentialAccount, CredentialDigest, MixedHistory,
+};
 pub use config::{Configuration, ProviderConfigRow, SettingsConfigRow};
 pub use ledger::{
     AttemptGroupId, AttemptIndex, AttemptProvenance, AttemptReason, ChildRole, CostKind,
@@ -77,6 +81,8 @@ pub enum Error {
     InvalidRoutingState(String),
     #[error("invalid policy document: {0}")]
     InvalidPolicyDocument(String),
+    #[error("invalid account state: {0}")]
+    InvalidAccountState(String),
 }
 
 /// Result type for all store operations.
@@ -206,6 +212,61 @@ impl Store {
         ledger::insert(&*self.conn()?, row)
     }
 
+    /// Observe a credential without persisting its value. A resolved identity
+    /// also backfills every older row carrying its digest in this transaction.
+    pub fn observe_credential(
+        &self,
+        provider: &str,
+        digest: &CredentialDigest,
+        at_ms: i64,
+        identity: Option<&AccountIdentity>,
+    ) -> Result<Option<i64>> {
+        let mut conn = self.conn()?;
+        accounts::observe(&mut conn, provider, digest, at_ms, identity)
+    }
+
+    /// Every learned account, including accounts that have not served in a
+    /// current dashboard window.
+    pub fn load_accounts(&self) -> Result<Vec<Account>> {
+        accounts::load_accounts(&*self.conn()?)
+    }
+
+    /// Every observed credential digest, including entries no source has named.
+    pub fn load_credential_accounts(&self) -> Result<Vec<CredentialAccount>> {
+        accounts::load_credentials(&*self.conn()?)
+    }
+
+    /// How many of a provider's rows carry `digest` — the requests held
+    /// against a credential no source has named yet.
+    pub fn rows_for_digest(&self, provider: &str, digest: &str) -> Result<i64> {
+        accounts::rows_for_digest(&*self.conn()?, provider, digest)
+    }
+
+    /// A credential digest that reaches an account, for naming it by hand.
+    pub fn credential_of(&self, account: i64) -> Result<Option<CredentialDigest>> {
+        accounts::credential_of(&*self.conn()?, account)
+    }
+
+    /// How many of a provider's rows predate accounts, carrying neither an
+    /// account nor a credential digest. Setup moves these onto an account,
+    /// and every other command refuses while any remain.
+    pub fn unattributed_row_count(&self, provider: &str) -> Result<i64> {
+        accounts::unattributed_row_count(&*self.conn()?, provider)
+    }
+
+    /// Where a provider's pre-account rows carry two accounts' windows, the
+    /// row that proves it. `None` when they read as one account's history.
+    pub fn unattributed_window_conflict(&self, provider: &str) -> Result<Option<MixedHistory>> {
+        accounts::unattributed_window_conflict(&*self.conn()?, provider)
+    }
+
+    /// Write `account` onto every one of a provider's pre-account rows, in
+    /// one transaction. Returns how many moved.
+    pub fn attribute_unattributed_rows(&self, provider: &str, account: i64) -> Result<usize> {
+        let mut conn = self.conn()?;
+        accounts::attribute_unattributed_rows(&mut conn, provider, account)
+    }
+
     /// Append many rows in one transaction — the import batch path (plan:
     /// `toker import`). Returns the first and last assigned row ids so the
     /// importer can checkpoint the id range its rows occupy; see
@@ -262,10 +323,17 @@ impl Store {
     pub fn furthest_reset5h(
         &self,
         provider: &str,
+        account: Option<i64>,
         ts_ms: i64,
         ping_only: bool,
     ) -> Result<Option<i64>> {
-        ledger::furthest_reset5h(&*self.conn()?, provider, ts_ms, ping_only)
+        ledger::furthest_reset5h(&*self.conn()?, provider, account, ts_ms, ping_only)
+    }
+
+    /// The account the ping that landed at or after `ts_ms` opened a window
+    /// for, read off the rows it produced.
+    pub fn ping_account(&self, provider: &str, ts_ms: i64) -> Result<Option<i64>> {
+        ledger::ping_account(&*self.conn()?, provider, ts_ms)
     }
 
     /// Whether a ping-tagged API-measured row from `provider` was logged
@@ -757,6 +825,110 @@ impl Store {
         state::load_meters(&*self.conn()?, provider_id)
     }
 
+    /// Overwrite one account's last snapshot on a provider. A reading from
+    /// an unresolved credential names no account and so reaches no slot
+    /// here, which is what keeps it out of every account's reading and fit
+    /// (spec: ACCT#an-account-not-yet-known).
+    pub fn save_account_meters(
+        &self,
+        provider_id: &str,
+        account_number: i64,
+        snapshot: &MetersSnapshot,
+    ) -> Result<()> {
+        state::save_account_meters(&*self.conn()?, provider_id, account_number, snapshot)
+    }
+
+    /// One account's last meter snapshot on a provider.
+    pub fn load_account_meters(
+        &self,
+        provider_id: &str,
+        account_number: i64,
+    ) -> Result<Option<MetersSnapshot>> {
+        state::load_account_meters(&*self.conn()?, provider_id, account_number)
+    }
+
+    /// Every account's last snapshot on a provider, by account number.
+    pub fn load_meters_by_account(&self, provider_id: &str) -> Result<Vec<(i64, MetersSnapshot)>> {
+        state::load_meters_by_account(&*self.conn()?, provider_id)
+    }
+
+    /// The account a request on this provider is about: the one the
+    /// session is already being served on, and for a session with no row
+    /// yet the one the provider served last.
+    ///
+    /// Every quota read takes its account from here, so the gate, a
+    /// release and a revoke all agree about whose window is in question.
+    /// `None` is the answer when nothing has been served yet or no source
+    /// has named the credential — an absence each caller handles, rather
+    /// than a zero it could spend against (spec: ACCT#an-account-not-yet-known).
+    ///
+    /// A machine with one account answers both ways the same. A machine
+    /// with several can answer a session's very first request with the
+    /// wrong one; that request writes the row that settles it, so the
+    /// window of error is one request and it does not recur.
+    pub fn account_for(&self, provider_id: &str, session_id: Option<&str>) -> Result<Option<i64>> {
+        if let Some(session_id) = session_id
+            && let Some(account) = self.session_account(provider_id, session_id)?
+        {
+            return Ok(Some(account));
+        }
+        if let Some(account) = self.provider_account(provider_id)? {
+            return Ok(Some(account));
+        }
+        // Nothing served yet. One account known is not a guess, so take it;
+        // several, and which one a request is on is exactly what nothing
+        // has said yet, so answer none rather than pick the nearest.
+        self.sole_account(provider_id)
+    }
+
+    /// The provider's only known account, or `None` where it holds none or
+    /// holds more than one.
+    pub fn sole_account(&self, provider_id: &str) -> Result<Option<i64>> {
+        let mut numbers = self.account_numbers(provider_id)?;
+        Ok(if numbers.len() == 1 {
+            numbers.pop()
+        } else {
+            None
+        })
+    }
+
+    /// Every account known on a provider, in discovery order. Callers that
+    /// need to tell "none" from "more than one" apart read this; the table
+    /// holds one row per login, so reading it whole costs nothing.
+    pub fn account_numbers(&self, provider_id: &str) -> Result<Vec<i64>> {
+        rows_of(
+            &*self.conn()?,
+            "SELECT number FROM accounts WHERE provider = ?1 ORDER BY number",
+            [provider_id],
+            |row| Ok(row.get("number")?),
+        )
+    }
+
+    /// The account a provider most recently served, whatever the session.
+    pub fn provider_account(&self, provider_id: &str) -> Result<Option<i64>> {
+        row_of(
+            &*self.conn()?,
+            "SELECT account_number FROM requests
+             WHERE provider = ?1 AND account_number IS NOT NULL
+             ORDER BY ts_ms DESC, id DESC LIMIT 1",
+            [provider_id],
+            |row| Ok(row.get("account_number")?),
+        )
+    }
+
+    /// The account a session is being served on: the newest row of that
+    /// session that names one.
+    pub fn session_account(&self, provider_id: &str, session_id: &str) -> Result<Option<i64>> {
+        row_of(
+            &*self.conn()?,
+            "SELECT account_number FROM requests
+             WHERE provider = ?1 AND session_id = ?2 AND account_number IS NOT NULL
+             ORDER BY ts_ms DESC, id DESC LIMIT 1",
+            (provider_id, session_id),
+            |row| Ok(row.get("account_number")?),
+        )
+    }
+
     /// Set a meta key/value.
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         state::set_meta(&*self.conn()?, key, value)
@@ -846,14 +1018,14 @@ where
 mod tests {
     use super::schema;
     use super::{
-        ActivatePolicyRevision, Allowance, AttemptGroupId, AttemptIndex, AttemptProvenance,
-        AttemptReason, BindingLearningUpdate, CostKind, DisplayRow, DraftCasResult, Error,
-        InitialPublication, Lane, LanePin, LanePinCasResult, MAX_ROUTING_TRACE_EVENTS,
-        MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction, PingRecord,
-        PolicyCompilerOrigin, PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome,
-        PublicationAdapter, PublicationCasResult, PublicationKey, PublicationResultUpdate,
-        PublicationState, RequestLookupProvenance, RequestRow, ResolvedRoute,
-        RevisionOneActivation, RowKind, SessionCostGroup, SessionLineage, Store,
+        AccountIdentity, AccountNameSource, ActivatePolicyRevision, Allowance, AttemptGroupId,
+        AttemptIndex, AttemptProvenance, AttemptReason, BindingLearningUpdate, CostKind,
+        CredentialDigest, DisplayRow, DraftCasResult, Error, InitialPublication, Lane, LanePin,
+        LanePinCasResult, MAX_ROUTING_TRACE_EVENTS, MetersSnapshot, ModelEntry, NewPolicyRevision,
+        PingAction, PingRecord, PolicyCompilerOrigin, PolicyRevisionSource, PolicyRouteProvenance,
+        PolicyRoutingOutcome, PublicationAdapter, PublicationCasResult, PublicationKey,
+        PublicationResultUpdate, PublicationState, RequestLookupProvenance, RequestRow,
+        ResolvedRoute, RevisionOneActivation, RowKind, SessionCostGroup, SessionLineage, Store,
         StoredCandidateState, StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason,
         is_api_measurement,
     };
@@ -1015,6 +1187,8 @@ mod tests {
             route: Some("openai_chat:openrouter".to_string()),
             session_id: Some("ses-abc".to_string()),
             ping: Some(false),
+            credential_digest: None,
+            account_number: None,
             model: Some("z-ai/glm-5.3".to_string()),
             raw_model: Some("z-ai/glm-5.3".to_string()),
             requested_model: Some("openrouter/z-ai/glm-5.3".to_string()),
@@ -1092,6 +1266,8 @@ mod tests {
             route: None,
             session_id: None,
             ping: None,
+            credential_digest: None,
+            account_number: None,
             model: None,
             raw_model: None,
             requested_model: None,
@@ -1212,6 +1388,81 @@ mod tests {
         );
         drop((reader, writer));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn learned_account_identity_stitches_refreshed_credentials() {
+        let store = mem_store();
+        let first = CredentialDigest::new("1".repeat(64)).expect("digest");
+        let refreshed = CredentialDigest::new("2".repeat(64)).expect("digest");
+        let identity = AccountIdentity {
+            upstream_id: None,
+            email: Some("agent@example.test".to_owned()),
+            named_by: AccountNameSource::Local,
+        };
+
+        assert_eq!(
+            store
+                .observe_credential("anthropic_sub", &first, 100, Some(&identity))
+                .expect("observe first"),
+            Some(1)
+        );
+        assert_eq!(
+            store
+                .observe_credential("anthropic_sub", &refreshed, 200, Some(&identity))
+                .expect("observe refresh"),
+            Some(1)
+        );
+        let accounts = store.load_accounts().expect("accounts");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].number, 1);
+        assert_eq!(accounts[0].email.as_deref(), Some("agent@example.test"));
+        assert_eq!(accounts[0].last_seen_ms, 200);
+        assert_eq!(
+            store
+                .load_credential_accounts()
+                .expect("credentials")
+                .into_iter()
+                .map(|credential| credential.account_number)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(1)]
+        );
+    }
+
+    #[test]
+    fn resolved_identity_backfills_earlier_digest_rows() {
+        let store = mem_store();
+        let digest = CredentialDigest::new("a".repeat(64)).expect("digest");
+        store
+            .execute_for_test(&format!(
+                "INSERT INTO requests (ts_ms, provider, credential_digest) \
+                 VALUES (1, 'anthropic_sub', '{}')",
+                digest.as_str()
+            ))
+            .expect("seed unresolved row");
+        assert_eq!(
+            store
+                .observe_credential("anthropic_sub", &digest, 100, None)
+                .expect("observe"),
+            None
+        );
+        let identity = AccountIdentity {
+            upstream_id: None,
+            email: Some("agent@example.test".to_owned()),
+            named_by: AccountNameSource::Operator,
+        };
+        assert_eq!(
+            store
+                .observe_credential("anthropic_sub", &digest, 200, Some(&identity))
+                .expect("resolve"),
+            Some(1)
+        );
+        let account_number: Option<i64> = store
+            .conn()
+            .expect("connection")
+            .query_row("SELECT account_number FROM requests", [], |row| row.get(0))
+            .expect("read backfill");
+        assert_eq!(account_number, Some(1));
     }
 
     #[test]
@@ -1528,6 +1779,187 @@ mod tests {
         }
     }
 
+    /// A measurement row on `provider` reporting a five-hour reset.
+    #[cfg(test)]
+    fn window_row(ts_ms: i64, provider: &str, reset_s: i64) -> RequestRow {
+        let mut row = bare_row(ts_ms);
+        row.provider = Some(provider.to_owned());
+        row.rate_limits = Some(json!({"util5h": 0.1, "reset5h": reset_s}));
+        row
+    }
+
+    const HOUR_MS: i64 = 60 * 60 * 1000;
+
+    #[test]
+    fn two_accounts_sharing_a_reset_hold_their_allowances_apart() {
+        let store = mem_store();
+        let one = crate::test_support::account(&store, "anthropic_sub", "one@example.test");
+        let two = crate::test_support::account(&store, "anthropic_sub", "two@example.test");
+        assert_ne!(one, two);
+        // A reset is a time, and nothing stops two accounts' windows
+        // landing on the same one. Keyed by the reset alone, a release
+        // granted on the spent account would carry a session on the
+        // account that was never stopped.
+        let allowance = |account, release| Allowance {
+            session_id: "ses-shared".to_owned(),
+            account_number: account,
+            meter: "5h".to_owned(),
+            reset_value: 1_700_000_000,
+            release,
+        };
+        store
+            .record_allowance(&allowance(one, Release::Plan))
+            .expect("record");
+        store
+            .record_allowance(&allowance(two, Release::Overage))
+            .expect("record");
+        let held = store.load_allowances().expect("allowances");
+        assert_eq!(held.len(), 2, "one row each, not one overwriting the other");
+        assert_eq!(
+            held.iter()
+                .find(|row| row.account_number == one)
+                .map(|row| row.release),
+            Some(Release::Plan)
+        );
+        assert_eq!(
+            held.iter()
+                .find(|row| row.account_number == two)
+                .map(|row| row.release),
+            Some(Release::Overage)
+        );
+    }
+
+    #[test]
+    fn rows_predating_accounts_are_counted_apart_from_rows_awaiting_resolution() {
+        let store = mem_store();
+        store
+            .record_request(&window_row(1_000, "anthropic_sub", 500))
+            .expect("record");
+        // Another provider's rows are not waiting on anything: it has no
+        // accounts to tell apart, so nothing could ever attribute them.
+        store
+            .record_request(&window_row(2_000, "openrouter", 500))
+            .expect("record");
+        // Served under a credential whose identity is not resolved yet. That
+        // row is attributed, to a digest, and resolving it backfills the
+        // account; setup has nothing to do for it.
+        let mut pending = window_row(3_000, "anthropic_sub", 500);
+        pending.credential_digest =
+            Some(CredentialDigest::new("ab".repeat(32)).expect("a well-formed digest"));
+        store.record_request(&pending).expect("record");
+
+        assert_eq!(
+            store
+                .unattributed_row_count("anthropic_sub")
+                .expect("count"),
+            1
+        );
+        assert_eq!(
+            store.unattributed_row_count("openrouter").expect("count"),
+            1,
+            "counted per provider, so a caller asks only about one that has accounts"
+        );
+    }
+
+    #[test]
+    fn one_accounts_windows_read_as_one_series() {
+        let store = mem_store();
+        let reset = |hours: i64| hours * 3_600;
+        let minutes = |m: i64| m * 60;
+        // One series, in the three shapes a real store holds it. Each
+        // window's rows report its own reset; the next window starts
+        // where the last one ended; and a window still open is
+        // re-anchored forward in ten-minute steps while traffic keeps
+        // arriving, which is what a live store does all day.
+        for (at_h, reset_s) in [
+            (1, reset(5)),
+            (3, reset(5)),
+            (4, reset(5) + minutes(10)),
+            (4, reset(5) + minutes(20)),
+            (6, reset(10)),
+            (9, reset(10)),
+        ] {
+            store
+                .record_request(&window_row(at_h * HOUR_MS, "anthropic_sub", reset_s))
+                .expect("record");
+        }
+        // A reading naming a window that had already ended when it was
+        // served is a stale copy, not a second account's window.
+        store
+            .record_request(&window_row(7 * HOUR_MS, "anthropic_sub", reset(5)))
+            .expect("record");
+        assert_eq!(
+            store
+                .unattributed_window_conflict("anthropic_sub")
+                .expect("walk"),
+            None
+        );
+    }
+
+    #[test]
+    fn two_accounts_windows_overlap_and_are_refused() {
+        let store = mem_store();
+        let reset = |hours: i64| hours * 3_600;
+        // Two logins taking turns: each row names a window still ahead of
+        // it, and the series steps back to the earlier one while the later
+        // one is still open. One account's window only moves forward.
+        // Each reset is within five hours of the row reporting it, as a
+        // five-hour window's always is.
+        for (at_h, reset_h) in [(1, 5), (2, 6), (3, 5)] {
+            store
+                .record_request(&window_row(at_h * HOUR_MS, "anthropic_sub", reset(reset_h)))
+                .expect("record");
+        }
+        assert_eq!(
+            store
+                .unattributed_window_conflict("anthropic_sub")
+                .expect("walk"),
+            Some(crate::store::MixedHistory {
+                at_ms: 3 * HOUR_MS,
+                open_reset_s: reset(6),
+                row_reset_s: reset(5),
+            })
+        );
+    }
+
+    #[test]
+    fn attributing_a_history_moves_every_row_once_and_repeats_harmlessly() {
+        let store = mem_store();
+        let account = crate::test_support::account(&store, "anthropic_sub", "one@example.test");
+        for at in [1_000, 2_000, 3_000] {
+            store
+                .record_request(&window_row(at, "anthropic_sub", 500))
+                .expect("record");
+        }
+        // A digest-bearing row is already attributed and must not be moved:
+        // whichever account its digest resolves to is not this one to choose.
+        let mut pending = window_row(4_000, "anthropic_sub", 500);
+        pending.credential_digest =
+            Some(CredentialDigest::new("ab".repeat(32)).expect("a well-formed digest"));
+        store.record_request(&pending).expect("record");
+
+        assert_eq!(
+            store
+                .attribute_unattributed_rows("anthropic_sub", account)
+                .expect("attribute"),
+            3
+        );
+        assert_eq!(
+            store
+                .unattributed_row_count("anthropic_sub")
+                .expect("count"),
+            0
+        );
+        // An interrupted move is repaired by running setup again, which finds
+        // nothing left to do rather than failing.
+        assert_eq!(
+            store
+                .attribute_unattributed_rows("anthropic_sub", account)
+                .expect("attribute"),
+            0
+        );
+    }
+
     #[test]
     fn the_furthest_reset_reads_only_measurements_from_the_provider() {
         let store = mem_store();
@@ -1562,26 +1994,28 @@ mod tests {
 
         assert_eq!(
             store
-                .furthest_reset5h("anthropic_sub", 0, false)
+                .furthest_reset5h("anthropic_sub", None, 0, false)
                 .expect("read"),
             Some(700)
         );
         assert_eq!(
             store
-                .furthest_reset5h("anthropic_sub", 2_500, false)
+                .furthest_reset5h("anthropic_sub", None, 2_500, false)
                 .expect("read"),
             Some(600),
             "the cutoff drops older rows"
         );
         assert_eq!(
             store
-                .furthest_reset5h("anthropic_sub", 2_500, true)
+                .furthest_reset5h("anthropic_sub", None, 2_500, true)
                 .expect("read"),
             None,
             "no ping-tagged reading after the cutoff"
         );
         assert_eq!(
-            store.furthest_reset5h("codex_sub", 0, false).expect("read"),
+            store
+                .furthest_reset5h("codex_sub", None, 0, false)
+                .expect("read"),
             None
         );
 
@@ -2521,8 +2955,10 @@ mod tests {
         assert_eq!(store.load_model("unknown/model").expect("missing"), None);
 
         // Allowances: idempotent per (session, meter, reset).
+        let account = crate::test_support::account(&store, "anthropic_sub", "one@example.test");
         let five_h = Allowance {
             session_id: "ses-1".to_string(),
+            account_number: account,
             meter: "5h".to_string(),
             reset_value: 1_769_100_000_000,
             release: Release::Overage,
@@ -2531,6 +2967,7 @@ mod tests {
         store.record_allowance(&five_h).expect("record again");
         let seven_d = Allowance {
             session_id: "ses-1".to_string(),
+            account_number: account,
             meter: "7d".to_string(),
             reset_value: 1_769_700_000_000,
             release: Release::Plan,
@@ -2579,6 +3016,7 @@ mod tests {
             observed_ms: Some(2_400),
             verified: Some(true),
             assumed: Some(false),
+            account_number: None,
         };
         store.record_ping(&ping).expect("record ping");
         let mut got = store.pings_since(0, 10).expect("pings");
@@ -2599,6 +3037,7 @@ mod tests {
             observed_ms: None,
             verified: None,
             assumed: None,
+            account_number: None,
         };
         store.record_ping(&late).expect("record ping");
         let ts: Vec<i64> = store
@@ -2808,8 +3247,10 @@ mod tests {
         // Epoch milliseconds now; resets are epoch seconds.
         let now = 1_790_000_000_500;
         let now_s = now / 1000;
+        let account = crate::test_support::account(&store, "anthropic_sub", "one@example.test");
         let allowance = |session: &str, meter: &str, reset_value: i64| Allowance {
             session_id: session.to_owned(),
+            account_number: account,
             meter: meter.to_owned(),
             reset_value,
             release: Release::Overage,
@@ -3601,12 +4042,14 @@ mod tests {
         let revision_id = revision(&store, "pin", None);
         let lane = unpinned_lane("session|tools");
         store.upsert_lane(&lane).unwrap();
+        let account = crate::test_support::account(&store, "openrouter", "pin@example.test");
         let pin = LanePin {
             policy_revision_id: revision_id,
             policy_route_id: RouteId::new("route").unwrap(),
             route_fingerprint: "11".repeat(32).parse::<RouteFingerprint>().unwrap(),
             candidate_id: CandidateId::new("candidate").unwrap(),
             binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+            account_number: Some(account),
             baseline_model: "base".to_owned(),
             effective_model: "effective".to_owned(),
         };
@@ -3655,6 +4098,7 @@ mod tests {
             route_fingerprint: "22".repeat(32).parse::<RouteFingerprint>().unwrap(),
             candidate_id: CandidateId::new("candidate").unwrap(),
             binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+            account_number: None,
             baseline_model: "base".to_owned(),
             effective_model: "effective".to_owned(),
         };
@@ -3711,6 +4155,7 @@ mod tests {
             route_fingerprint: "22".repeat(32).parse::<RouteFingerprint>().unwrap(),
             candidate_id: CandidateId::new("candidate").unwrap(),
             binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+            account_number: None,
             baseline_model: "base".to_owned(),
             effective_model: "effective".to_owned(),
         };
@@ -3780,6 +4225,7 @@ mod tests {
             route_fingerprint: fingerprint.parse::<RouteFingerprint>().unwrap(),
             candidate_id: CandidateId::new("candidate").unwrap(),
             binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+            account_number: None,
             baseline_model: "base".to_owned(),
             effective_model: "effective".to_owned(),
         };

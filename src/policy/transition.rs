@@ -24,13 +24,24 @@ pub struct PinIdentity {
     pub route_fingerprint: RouteFingerprint,
     pub candidate_id: CandidateId,
     pub binding_id: BindingId,
+    /// The account that served, part of the cache identity. `None` where the
+    /// provider has no accounts Toker can tell apart.
+    pub account_number: Option<i64>,
     pub baseline_model: String,
     pub effective_model: String,
 }
 
 impl PinIdentity {
+    /// The cache identity: the binding, the exact model sent upstream and the
+    /// account that served, together (spec: SLANE#cache-identity). The account
+    /// belongs here because a prompt cache is the account's, so the same
+    /// binding on the same model under another login reads none of it. Two
+    /// pins that name no account are the same cache: a provider whose
+    /// accounts Toker cannot tell apart has one cache to tell about.
     fn same_cache_as(&self, other: &Self) -> bool {
-        self.binding_id == other.binding_id && self.effective_model == other.effective_model
+        self.binding_id == other.binding_id
+            && self.effective_model == other.effective_model
+            && self.account_number == other.account_number
     }
 }
 
@@ -42,6 +53,7 @@ impl From<&crate::store::LanePin> for PinIdentity {
             route_fingerprint: pin.route_fingerprint.clone(),
             candidate_id: pin.candidate_id.clone(),
             binding_id: pin.binding_id.clone(),
+            account_number: pin.account_number,
             baseline_model: pin.baseline_model.clone(),
             effective_model: pin.effective_model.clone(),
         }
@@ -56,6 +68,7 @@ impl From<PinIdentity> for crate::store::LanePin {
             route_fingerprint: pin.route_fingerprint,
             candidate_id: pin.candidate_id,
             binding_id: pin.binding_id,
+            account_number: pin.account_number,
             baseline_model: pin.baseline_model,
             effective_model: pin.effective_model,
         }
@@ -320,6 +333,7 @@ mod tests {
                 .unwrap(),
             candidate_id: CandidateId::new("candidate").unwrap(),
             binding_id: BindingId::new(binding).unwrap(),
+            account_number: Some(1),
             baseline_model: "baseline".to_owned(),
             effective_model: effective.to_owned(),
         }

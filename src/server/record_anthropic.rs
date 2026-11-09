@@ -55,7 +55,8 @@ use crate::observe::AnthropicCapture;
 use crate::policy::BindingId;
 use crate::providers::Provider;
 use crate::store::{
-    AttemptProvenance, CostKind, PolicyRouteProvenance, RequestRow, RowKind, SessionLineage,
+    AttemptProvenance, CostKind, CredentialDigest, PolicyRouteProvenance, RequestRow, RowKind,
+    SessionLineage,
 };
 use crate::translate::TranslationReport;
 
@@ -82,6 +83,10 @@ pub(crate) struct AnthropicRecordCtx {
     pub(crate) effective_model: Option<String>,
     /// The selected backend — provider column, route, cost semantics.
     pub(crate) backend: Arc<dyn Provider>,
+    /// The actual credential sent upstream, reduced to its non-secret digest.
+    pub(crate) credential_digest: Option<CredentialDigest>,
+    /// Account discovery's current answer for that credential.
+    pub(crate) account_number: Option<i64>,
     /// The backend binding the send went to. This identifies the wire
     /// dialect without implying a candidate selection.
     pub(crate) binding_id: BindingId,
@@ -469,6 +474,8 @@ fn measurement_row(
         session_id: ctx.session_id.clone(),
         // Only a ping request says so, never a non-ping one.
         ping: ctx.ping.then_some(true),
+        credential_digest: ctx.credential_digest.clone(),
+        account_number: ctx.account_number,
         // `model` is the normalised identity, `raw_model` the wire
         // form the provider actually served.
         model: capture.model().and_then(normalise_model_id),
@@ -619,6 +626,8 @@ fn error_row(
         route: Some(route.to_owned()),
         session_id: ctx.session_id.clone(),
         ping: None,
+        credential_digest: ctx.credential_digest.clone(),
+        account_number: ctx.account_number,
         model: None,
         raw_model: None,
         requested_model: ctx.requested_model.clone(),
@@ -802,6 +811,8 @@ pub(crate) fn record_quota_blocked(record: QuotaBlockedRecord<'_>) {
         route: Some(format!("{frontend_protocol}:{backend_id}")),
         session_id: session_id.map(str::to_owned),
         ping: None,
+        credential_digest: None,
+        account_number: None,
         model: None,
         raw_model: None,
         requested_model: None,
@@ -935,6 +946,8 @@ fn write_cold_row(record: ColdRecord<'_>, kind: RowKind, verb: &str) {
         route: Some(format!("anthropic:{backend_id}")),
         session_id: session_id.map(str::to_owned),
         ping: None,
+        credential_digest: None,
+        account_number: None,
         model: None,
         raw_model: None,
         requested_model: None,
@@ -1095,6 +1108,8 @@ pub(crate) fn record_anthropic_cold_quiet(record: ColdRecord<'_>) {
         route: Some(format!("anthropic:{backend_id}")),
         session_id: session_id.map(str::to_owned),
         ping: None,
+        credential_digest: None,
+        account_number: None,
         model: None,
         raw_model: None,
         requested_model: None,
@@ -1281,6 +1296,8 @@ pub(crate) fn record_responses_measurement(
         route: Some(route),
         session_id: ctx.session_id.clone(),
         ping: ctx.ping.then_some(true),
+        credential_digest: ctx.credential_digest.clone(),
+        account_number: ctx.account_number,
         // Missing provider-reported identity remains absent; the attempted
         // target already has its own effective_model column. Keep the exact
         // wire identity beside the same normalised model identity used by
@@ -1446,6 +1463,8 @@ pub(crate) fn record_codex_error(
         route: Some(route),
         session_id: ctx.session_id.clone(),
         ping: ctx.ping.then_some(true),
+        credential_digest: ctx.credential_digest.clone(),
+        account_number: ctx.account_number,
         model: None,
         raw_model: None,
         requested_model: ctx.requested_model.clone(),

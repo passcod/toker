@@ -64,8 +64,10 @@ A notice quoting such a price MUST express it as an upper bound.
 
 ## Scope of a fit
 
-A fit MUST read each attempt's own row, and MUST read only the rows of the provider whose meters it prices.
-A fit MUST NOT read a total grouped across providers.
+A fit MUST read each attempt's own row, and MUST read only the rows of the provider and account whose meters it prices.
+A fit MUST NOT read a total grouped across providers, and MUST NOT read a total grouped across accounts.
+
+A row naming no account MUST feed no account's fit, as [ACCT](../store/accounts.md#an-account-not-yet-known) requires.
 
 A request that failed over from the subscription therefore contributes the attempts the subscription served and nothing another provider did.
 Attempts are specified by [SATT](../store/attempts.md).
@@ -112,8 +114,12 @@ The gate MUST NOT depend on being signalled that one was granted.
 
 ### Allowances expire with their window
 
-An allowance MUST be keyed by the reset its meter reported.
-An allowance MUST be honoured only while the meter still reports that reset.
+An allowance MUST be keyed by the account it was granted on together with the reset its meter reported.
+An allowance MUST be honoured only while that account's meter still reports that reset.
+
+> [!NOTE]
+> Two accounts' windows can carry the same reset, since a reset is a time and nothing stops two of them landing on one.
+> Keying by the reset alone would then let a release granted on an exhausted account carry a session on an account that was never stopped.
 
 Once that reset passes the meter is no longer exhausted and the next window reports a new reset, so the row can never match again.
 Enforcement therefore needs no pruning, and Toker MUST prune only to bound the table.

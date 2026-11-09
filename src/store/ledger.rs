@@ -901,7 +901,10 @@ impl PolicyRouteProvenance {
 /// so they are queryable; payloads whose shape is meter-source-dependent
 /// go in the JSON `extra` column instead — e.g. a `blocked` row's meter
 /// snapshot and context tokens, which mirror whatever source fed the gate.
-#[derive(Debug, Clone, PartialEq)]
+/// `Default` is every field absent, which is what a row carrying no
+/// observation is — including `ts_ms`, which defaults to the epoch and
+/// so is one a caller always sets.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RequestRow {
     /// Row id, assigned by SQLite on insert; `None` while inserting.
     pub id: Option<i64>,
@@ -921,6 +924,10 @@ pub struct RequestRow {
     pub session_id: Option<String>,
     /// Ping-lane marker; ping lanes never hold the sleep lock.
     pub ping: Option<bool>,
+    /// Non-secret digest of the credential that reached the provider.
+    pub credential_digest: Option<super::CredentialDigest>,
+    /// Stable account number once the digest was resolved.
+    pub account_number: Option<i64>,
     /// Model as reported back by the provider.
     pub model: Option<String>,
     /// Model string verbatim from the provider, pre-normalisation.
@@ -1265,6 +1272,7 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
     let mut stmt = conn.prepare_cached(
         "INSERT INTO requests (
             ts_ms, duration_ms, kind, frontend, provider, route, session_id, ping,
+            credential_digest, account_number,
             model, raw_model, requested_model, effective_model,
             input, cache_read, cache_write_total, cache_write_5m, cache_write_1h,
             output, reasoning, iterations, web_searches, code_execs, ttl_split_known,
@@ -1281,6 +1289,7 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
             parent_session_id, child_role, relation_source
         ) VALUES (
             :ts_ms, :duration_ms, :kind, :frontend, :provider, :route, :session_id, :ping,
+            :credential_digest, :account_number,
             :model, :raw_model, :requested_model, :effective_model,
             :input, :cache_read, :cache_write_total, :cache_write_5m, :cache_write_1h,
             :output, :reasoning, :iterations, :web_searches, :code_execs, :ttl_split_known,
@@ -1306,6 +1315,8 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
         ":route": row.route,
         ":session_id": row.session_id,
         ":ping": row.ping,
+        ":credential_digest": row.credential_digest.as_ref().map(super::CredentialDigest::as_str),
+        ":account_number": row.account_number,
         ":model": row.model,
         ":raw_model": row.raw_model,
         ":requested_model": row.requested_model,
@@ -1428,6 +1439,11 @@ pub struct MeterRow {
     /// gate-flag arm of the filter fetches. Parsed once here and never
     /// re-serialised.
     pub rate_limits: Option<Value>,
+    /// The account the row was served on. A reading belongs to the account
+    /// that spent it, so the dashboard groups by this rather than pooling
+    /// every login's windows into one set of bars. `None` on a row served
+    /// before accounts were recorded, or on a credential not yet resolved.
+    pub account_number: Option<i64>,
 }
 
 /// Rows with `ts_ms >= ts_ms`, oldest first. When the window holds more
@@ -1467,7 +1483,7 @@ pub(super) fn meter_rows_since(conn: &Connection, ts_ms: i64, limit: i64) -> Res
     rows_of(
         conn,
         "SELECT * FROM (
-            SELECT id, ts_ms, kind, gate_on, rate_limits FROM requests
+            SELECT id, ts_ms, kind, gate_on, rate_limits, account_number FROM requests
             WHERE ts_ms >= ?1 AND (rate_limits IS NOT NULL OR gate_on IS NOT NULL)
             ORDER BY ts_ms DESC, id DESC LIMIT ?2
         ) ORDER BY ts_ms ASC, id ASC",
@@ -1490,18 +1506,43 @@ pub(super) fn meter_rows_since(conn: &Connection, ts_ms: i64, limit: i64) -> Res
 pub(super) fn furthest_reset5h(
     conn: &Connection,
     provider: &str,
+    account: Option<i64>,
     ts_ms: i64,
     ping_only: bool,
 ) -> Result<Option<i64>> {
+    // A window belongs to an account (spec: GPING#a-window-belongs-to-an-account),
+    // so a named account reads only its own rows, and a row naming none feeds
+    // no account's answer. `account` is None only where the provider has no
+    // accounts Toker can tell apart, and then every row is the one answer.
     let furthest = conn.query_row(
         "SELECT MAX(CAST(json_extract(rate_limits, '$.reset5h') AS INTEGER)) FROM requests
          WHERE ts_ms >= ?1 AND kind IS NULL AND provider = ?2 AND rate_limits IS NOT NULL
            AND json_type(rate_limits, '$.reset5h') IN ('integer', 'real')
-           AND (?3 = 0 OR ping = 1)",
-        (ts_ms, provider, ping_only),
+           AND (?3 = 0 OR ping = 1)
+           AND (?4 IS NULL OR account_number = ?4)",
+        (ts_ms, provider, ping_only, account),
         |row| row.get::<_, Option<i64>>(0),
     )?;
     Ok(furthest)
+}
+
+/// The account the newest ping-tagged row from `provider` at or after
+/// `ts_ms` was served on, which is the account that ping opened a window
+/// for. `None` when no such row names one.
+pub(super) fn ping_account(conn: &Connection, provider: &str, ts_ms: i64) -> Result<Option<i64>> {
+    let account = conn.query_row(
+        "SELECT account_number FROM requests
+         WHERE ts_ms >= ?1 AND kind IS NULL AND provider = ?2 AND ping = 1
+           AND account_number IS NOT NULL
+         ORDER BY ts_ms DESC, id DESC LIMIT 1",
+        (ts_ms, provider),
+        |row| row.get::<_, Option<i64>>("account_number"),
+    );
+    match account {
+        Ok(account) => Ok(account),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Whether any API-measured row from `provider` logged at or after
@@ -1532,6 +1573,7 @@ fn read_meter_row(row: &rusqlite::Row<'_>) -> Result<MeterRow> {
         )?,
         gate_on: row.get("gate_on")?,
         rate_limits: super::opt_json_from_text(row.get("rate_limits")?)?,
+        account_number: row.get("account_number")?,
     })
 }
 
@@ -2346,6 +2388,12 @@ fn read_row(row: &rusqlite::Row<'_>) -> Result<RequestRow> {
         route: row.get("route")?,
         session_id: row.get("session_id")?,
         ping: row.get("ping")?,
+        credential_digest: row
+            .get::<_, Option<String>>("credential_digest")?
+            .map(super::CredentialDigest::new)
+            .transpose()
+            .map_err(Error::InvalidAccountState)?,
+        account_number: row.get("account_number")?,
         model: row.get("model")?,
         raw_model: row.get("raw_model")?,
         requested_model: row.get("requested_model")?,
@@ -2727,6 +2775,10 @@ impl RequestFilter {
 /// ledger; the export re-serialises it compactly (same values, same key
 /// order, possibly different whitespace), because a pretty-printed
 /// provider body would otherwise break the one-row-per-line contract.
+/// How much of a credential digest an export carries, matching the width
+/// of the ledger's other digests (`tools_hash`, `system_hash`).
+const EXPORTED_DIGEST_CHARS: usize = 12;
+
 pub const JSON_TEXT_COLUMNS: &[&str] = &[
     "usage_presence",
     "usage_raw",
@@ -2787,6 +2839,15 @@ pub(super) fn for_each_export(
                     let text = String::from_utf8_lossy(bytes);
                     if JSON_TEXT_COLUMNS.contains(&name.as_str()) {
                         serde_json::from_str(&text).unwrap_or(Value::String(text.into_owned()))
+                    } else if name == "credential_digest" {
+                        // A prefix, the width of the ledger's other digests.
+                        // Whole, it verifies a guessed token against a live
+                        // credential, and an export is the file most likely
+                        // to leave the machine. A prefix still tells one
+                        // credential from another, and still tells a row
+                        // carrying a digest from one written before accounts
+                        // were recorded (spec: ACCT#an-account-not-yet-known).
+                        Value::String(text.chars().take(EXPORTED_DIGEST_CHARS).collect())
                     } else {
                         Value::String(text.into_owned())
                     }

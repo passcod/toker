@@ -194,6 +194,8 @@ mod tests {
             route: None,
             session_id: None,
             ping: None,
+            credential_digest: None,
+            account_number: None,
             model: None,
             raw_model: None,
             requested_model: None,
@@ -263,6 +265,10 @@ mod tests {
             route: Some("anthropic:anthropic_sub".to_owned()),
             session_id: Some("5a1e0c2d-0000-4000-8000-000000000001".to_owned()),
             ping: Some(false),
+            credential_digest: Some(
+                crate::store::CredentialDigest::new("a".repeat(64)).expect("digest"),
+            ),
+            account_number: None,
             model: Some("claude-opus-5".to_owned()),
             raw_model: Some("claude-opus-5-20261001".to_owned()),
             requested_model: Some("claude-sonnet-4-5".to_owned()),
@@ -442,8 +448,27 @@ mod tests {
         let dir = crate::test_support::tempdir("toker-export-cols-");
         let path = dir.join("toker.db");
         let store = store_with_revision(&path);
-        store.record_request(&full(T0)).expect("presentation row");
+        let mut presentation = full(T0);
+        presentation.account_number = Some(
+            store
+                .observe_credential(
+                    "anthropic_sub",
+                    presentation.credential_digest.as_ref().expect("digest"),
+                    T0,
+                    Some(&crate::store::AccountIdentity {
+                        upstream_id: None,
+                        email: Some("export@example.test".to_owned()),
+                        named_by: crate::store::AccountNameSource::Local,
+                    }),
+                )
+                .expect("observe credential")
+                .expect("account"),
+        );
+        store
+            .record_request(&presentation)
+            .expect("presentation row");
         let mut rewrite = full(T0 + 1);
+        rewrite.account_number = presentation.account_number;
         let Some(routing) = rewrite.policy_routing.as_mut() else {
             panic!("fixture provenance")
         };

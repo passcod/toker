@@ -569,6 +569,8 @@ mod tests {
             route: None,
             session_id: None,
             ping: None,
+            credential_digest: None,
+            account_number: None,
             model: None,
             raw_model: None,
             requested_model: None,

@@ -26,13 +26,51 @@ pub(crate) fn armed(server: &Server, backend_id: &str) -> bool {
     server.config().gates.quota_enabled && backend_id == crate::release::GATED_BACKEND
 }
 
-pub(crate) fn load_meters(server: &Server, backend_id: &str) -> Option<Value> {
+/// The account a gate decision is about. The gate runs before the request
+/// is sent, so it cannot read the account off a response: it takes the one
+/// the session is already being served on, and for a session with no row
+/// yet the one this provider served last.
+///
+/// A machine with one account answers both the same way. A machine with
+/// several can gate a session's very first request against the wrong
+/// account's windows; that request then writes the row that settles it, so
+/// the window of error is one request and it does not recur.
+pub(crate) fn gate_account(
+    server: &Server,
+    backend_id: &str,
+    session_id: Option<&str>,
+) -> Option<i64> {
+    server
+        .store
+        .account_for(backend_id, session_id)
+        .unwrap_or_else(|error| {
+            tracing::error!(%error, "account lookup failed");
+            None
+        })
+}
+
+/// One account's meters for the gate. With no account known there is no
+/// reading: an unresolved credential's meters feed no account's fit, and
+/// pooling every account's into one is the conflation this card exists to
+/// end (spec: ACCT#what-is-attributed-to-an-account).
+pub(crate) fn load_meters_for(
+    server: &Server,
+    backend_id: &str,
+    account_number: Option<i64>,
+) -> Option<Value> {
     if !armed(server, backend_id) {
         return None;
     }
+    // Only the account's own reading. A gate with no account to read has no
+    // evidence and does not fire: the provider's slot pools every account
+    // that ever served through it, and gating one account's session on
+    // another's spend is exactly what this card exists to stop. It would
+    // also stop a session the release marker could not then free, because
+    // an allowance is keyed by the account it was granted on
+    // (spec: GQUOTA#an-allowance-belongs-to-an-account).
     server
         .store
-        .load_meters(backend_id)
+        .load_account_meters(backend_id, account_number?)
         .map(|snapshot| snapshot.map(|snapshot| snapshot.snapshot))
         .unwrap_or_else(|error| {
             tracing::error!(%error, "meter snapshot load failed");
@@ -51,14 +89,18 @@ pub(crate) fn grant_release(
         return None;
     }
     let (session, release) = session_id.zip(release)?;
+    // No account, no window to release against, so nothing is recorded.
+    let account_number = gate_account(server, backend_id, Some(session))?;
     let now = now_ms();
     let fresh = grant_for(stale_meters.map(Meters::over), now);
-    if let Err(error) = crate::release::record_grant(&server.store, session, release, &fresh) {
+    if let Err(error) =
+        crate::release::record_grant(&server.store, session, account_number, release, &fresh)
+    {
         tracing::error!(%error, "allowance record failed");
     }
     Some((
         release,
-        crate::release::merged(&server.store, session, &fresh, now),
+        crate::release::merged(&server.store, session, account_number, &fresh, now),
     ))
 }
 
@@ -72,7 +114,11 @@ pub(crate) fn decide_block(
     if !armed(server, backend_id) {
         return None;
     }
-    let allowances = allowances_for_session(server, session_id);
+    let allowances = allowances_for_session(
+        server,
+        session_id,
+        gate_account(server, backend_id, session_id),
+    );
     let GateDecision::Block { meter, resets_at } = decide(
         stale_meters.as_ref().map(Meters::over),
         &allowances,
@@ -107,16 +153,27 @@ pub(crate) fn decide_block(
     })
 }
 
+/// A session's allowances on one account. An allowance releases the window
+/// it was granted against and no other, so one account's never un-gates
+/// another's (spec: ACCT#what-is-attributed-to-an-account). With no account
+/// known there is no window to have been released, so none apply.
 fn allowances_for_session(
     server: &Server,
     session_id: Option<&str>,
+    account_number: Option<i64>,
 ) -> Vec<crate::store::Allowance> {
-    let Some(session) = session_id else {
+    let Some((session, account_number)) = session_id.zip(account_number) else {
         return Vec::new();
     };
     server
         .store
         .load_session_allowances(session)
+        .map(|allowances| {
+            allowances
+                .into_iter()
+                .filter(|allowance| allowance.account_number == account_number)
+                .collect()
+        })
         .unwrap_or_else(|error| {
             tracing::error!(%error, "allowances load failed");
             Vec::new()

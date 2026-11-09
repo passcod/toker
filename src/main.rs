@@ -198,6 +198,11 @@ fn main() -> anyhow::Result<()> {
     // (spec: UCLI#before-anything-runs).
     if !matches!(cli.command, Command::Setup) {
         toker::config::refuse_while_config_file_exists()?;
+        // Same shape, one move later: setup is also the only command that may
+        // run while the ledger holds rows from before accounts were recorded,
+        // because setup is what attributes them
+        // (spec: ACCT#moving-a-machine-onto-accounts).
+        toker::accounts::refuse_while_rows_are_unattributed()?;
     }
     match cli.command {
         Command::Serve => {

@@ -68,15 +68,30 @@ impl Detail {
             .map_err(|error| keep("latest request", error))
             .ok()
             .flatten();
+        // The account this session is served on: its meters, and the
+        // allowances granted against its windows. Another account's
+        // release never shows as this session's (spec:
+        // ACCT#what-is-attributed-to-an-account).
+        let account = store
+            .account_for(GATED_BACKEND, Some(session))
+            .map_err(|error| keep("account", error))
+            .ok()
+            .flatten();
         let allowances = store
             .load_session_allowances(session)
             .map_err(|error| keep("allowances", error))
-            .unwrap_or_default();
-        let meters = store
-            .load_meters(GATED_BACKEND)
-            .map_err(|error| keep("meters", error))
-            .ok()
-            .flatten()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|allowance| Some(allowance.account_number) == account)
+            .collect();
+        let meters = account
+            .and_then(|account| {
+                store
+                    .load_account_meters(GATED_BACKEND, account)
+                    .map_err(|error| keep("meters", error))
+                    .ok()
+                    .flatten()
+            })
             .map(|meters| meters.snapshot);
         Detail {
             session: session.to_owned(),
@@ -626,8 +641,9 @@ mod tests {
         }
         if let Some(meters) = meters {
             store
-                .save_meters(
+                .save_account_meters(
                     "anthropic_sub",
+                    crate::test_support::account(&store, "anthropic_sub", "one@example.test"),
                     &MetersSnapshot {
                         updated_ms: NOW,
                         snapshot: meters,

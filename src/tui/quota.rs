@@ -85,6 +85,41 @@ const PANEL_METERS: [PanelMeter; 3] = [
 /// rather than zeros (spec: STORE#not-recorded-is-not-zero's per-backend panel rule).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct QuotaAgg {
+    /// One entry per account that has a reading in the lookback, in
+    /// account order, with rows naming no account last. Several entries
+    /// where several logins served: a window belongs to an account, so
+    /// pooling their readings would read every bar wrong
+    /// (spec: ACCT#what-is-attributed-to-an-account).
+    pub accounts: Vec<AccountQuota>,
+    /// Whether the quota gate is armed: the newest `gate_on` reading,
+    /// or armed by default when no row carries one.
+    pub gate_on: bool,
+    /// No row in the lookback carries `gate_on`: the state above was
+    /// assumed, not observed, and a gate-aware countdown renders `?`.
+    pub gate_assumed: bool,
+}
+
+/// One account's readings over the lookback.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AccountQuota {
+    /// The account these readings were spent on. `None` where the rows
+    /// name none, which is every row served before accounts were
+    /// recorded and every one on a credential not yet resolved.
+    pub account_number: Option<i64>,
+    /// How many readings this account produced over the lookback: rows
+    /// carrying a meter snapshot, not rows of any kind. The lookback is
+    /// read through a filter that keeps only rows carrying a snapshot or
+    /// a gate flag, so a count of rows of any kind would differ between
+    /// that read and a full-row one over the same ledger.
+    pub readings: usize,
+    /// How many of those fall inside the display window: what the
+    /// account's share of the window is ordered by, and what decides
+    /// whether it belongs on the panel at all.
+    pub window_readings: usize,
+    /// What to call the account on screen: the address where one is
+    /// known. Left unset by the aggregation, which reads rows and never
+    /// the accounts table; the dashboard fills it before rendering.
+    pub label: Option<String>,
     /// The meters the newest reading carries, in render order.
     /// A meter the reading does not carry is absent, not zero-filled.
     pub meters: Vec<MeterPanel>,
@@ -101,12 +136,8 @@ pub(crate) struct QuotaAgg {
     /// plan quota (`overageInUse`, read through the same typed view
     /// the gate decides on).
     pub overage_in_use: bool,
-    /// Whether the quota gate is armed: the newest `gate_on` reading,
-    /// or armed by default when no row carries one.
-    pub gate_on: bool,
-    /// No row in the lookback carries `gate_on`: the state above was
-    /// assumed, not observed, and a gate-aware countdown renders `?`.
-    pub gate_assumed: bool,
+    /// When this account's newest reading was taken.
+    pub last_reading_ms: i64,
 }
 
 /// One meter's line: the newest reading's figures plus the forecast.
@@ -171,6 +202,104 @@ pub(crate) fn aggregate(
     today_start_ms: i64,
     window_since_ms: i64,
 ) -> Option<QuotaAgg> {
+    // The gate's state is logged per row because it cannot be worked
+    // out here: the newest `gate_on` reading
+    // wins, and a lookback with none falls back to the default of
+    // armed — marked assumed, because a gate that is assumed must not
+    // read the same as one that was observed. It is the machine's state
+    // rather than an account's, so it is read over every row.
+    let mut sorted: Vec<&MeterRow> = rows.iter().collect();
+    sorted.sort_by_key(|row| row.ts_ms);
+    let gate_seen = sorted.iter().rev().find_map(|row| row.gate_on);
+    let gate_on = gate_seen.unwrap_or(true);
+    let gate_assumed = gate_seen.is_none();
+
+    // A window belongs to the account that spent it, so each account's
+    // rows are aggregated over on their own. Accounts in number order,
+    // with the rows naming none last: a number is assigned in discovery
+    // order, so that is also the order they were first seen in.
+    let mut numbers: Vec<Option<i64>> = rows.iter().map(|row| row.account_number).collect();
+    numbers.sort_unstable_by_key(|number| (number.is_none(), *number));
+    numbers.dedup();
+    let mut accounts: Vec<AccountQuota> = numbers
+        .into_iter()
+        .filter_map(|number| {
+            let own: Vec<MeterRow> = rows
+                .iter()
+                .filter(|row| row.account_number == number)
+                .cloned()
+                .collect();
+            aggregate_account(
+                number,
+                &own,
+                gate_on,
+                now_ms,
+                today_start_ms,
+                window_since_ms,
+            )
+        })
+        .collect();
+    if accounts.is_empty() {
+        return None;
+    }
+
+    // The panel is about the window, the same rule the session rows
+    // follow, so an account the operator stopped using does not hold
+    // space forever. Where none served within it, the one that served
+    // most recently stands alone: a machine left alone for longer than
+    // its window would otherwise blank the panel, which reads as a quota
+    // toker has stopped measuring rather than one nothing has spent.
+    if accounts.iter().any(|account| account.window_readings > 0) {
+        accounts.retain(|account| account.window_readings > 0);
+    } else {
+        let newest = accounts
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, account)| account.last_reading_ms)
+            .map_or(0, |(index, _)| index);
+        accounts = vec![accounts.swap_remove(newest)];
+    }
+
+    // The busiest first, by share of the window. Compared in tenths
+    // rather than exactly: two accounts taking turns otherwise swap
+    // places under the operator's eye each time the lead changes hands,
+    // and a coarse comparison keeps a close pair in a stable order
+    // without carrying anything between refreshes. Within a tenth the
+    // tie-break is the account number, which never changes.
+    let busiest = accounts
+        .iter()
+        .map(|account| account.window_readings)
+        .max()
+        .unwrap_or(0);
+    accounts.sort_by_key(|account| {
+        let tenths = (account.window_readings * 10)
+            .checked_div(busiest)
+            .unwrap_or(0);
+        (
+            std::cmp::Reverse(tenths),
+            account.account_number.is_none(),
+            account.account_number,
+        )
+    });
+
+    Some(QuotaAgg {
+        accounts,
+        gate_on,
+        gate_assumed,
+    })
+}
+
+/// One account's section of the lookback. `None` when none of its rows
+/// carries a meter snapshot, which is what keeps an account that only
+/// ever produced gate flags off the panel entirely.
+fn aggregate_account(
+    account_number: Option<i64>,
+    rows: &[MeterRow],
+    gate_on: bool,
+    now_ms: i64,
+    today_start_ms: i64,
+    window_since_ms: i64,
+) -> Option<AccountQuota> {
     // Latest-by-timestamp, as everywhere in the model: the ledger is
     // insert-only and rows arrive slightly out of order.
     let mut sorted: Vec<&MeterRow> = rows.iter().collect();
@@ -187,15 +316,6 @@ pub(crate) fn aggregate(
         .iter()
         .rev()
         .find_map(|row| row.rate_limits.as_ref())?;
-
-    // The gate's state is logged per row because it cannot be worked
-    // out here: the newest `gate_on` reading
-    // wins, and a lookback with none falls back to the default of
-    // armed — marked assumed, because a gate that is assumed must not
-    // read the same as one that was observed.
-    let gate_seen = sorted.iter().rev().find_map(|row| row.gate_on);
-    let gate_on = gate_seen.unwrap_or(true);
-    let gate_assumed = gate_seen.is_none();
 
     // Which meters the gate counts as exhausted right now, gate armed
     // only (`gone = gateOn ? exhaustedMeters(...) : []`).
@@ -265,7 +385,14 @@ pub(crate) fn aggregate(
         (None, None)
     };
 
-    Some(QuotaAgg {
+    Some(AccountQuota {
+        account_number,
+        readings: rows.iter().filter(|row| row.rate_limits.is_some()).count(),
+        window_readings: rows
+            .iter()
+            .filter(|row| row.rate_limits.is_some() && row.ts_ms >= window_since_ms)
+            .count(),
+        label: None,
         meters,
         spent_today,
         spent_window,
@@ -274,8 +401,11 @@ pub(crate) fn aggregate(
             .and_then(Value::as_str)
             .map(str::to_owned),
         overage_in_use: Meters::over(last_rl).overage_in_use(),
-        gate_on,
-        gate_assumed,
+        last_reading_ms: sorted
+            .iter()
+            .rev()
+            .find(|row| row.rate_limits.is_some())
+            .map_or(0, |row| row.ts_ms),
     })
 }
 
@@ -533,6 +663,108 @@ mod tests {
         aggregate(rows, NOW, TODAY, WINDOW_SINCE)
     }
 
+    /// The lookback's single account. Every fixture here serves one, so a
+    /// test reading more than the first entry would be asserting about a
+    /// fixture it did not write.
+    fn one(agg: &QuotaAgg) -> &super::AccountQuota {
+        assert_eq!(agg.accounts.len(), 1, "the fixture serves one account");
+        &agg.accounts[0]
+    }
+
+    /// A reading on `account` at `ts_ms`.
+    fn owned(ts_ms: i64, account: i64, util: f64) -> MeterRow {
+        let mut row = metered(
+            ts_ms,
+            json!({"util5h": util, "reset5h": (NOW + HOUR) / 1000}),
+        );
+        row.account_number = Some(account);
+        row
+    }
+
+    #[test]
+    fn each_account_is_aggregated_on_its_own() {
+        let agg = quota(&[
+            owned(NOW - 20 * MIN, 1, 0.30),
+            owned(NOW - 10 * MIN, 1, 0.40),
+            owned(NOW - 5 * MIN, 2, 0.90),
+        ])
+        .expect("readings exist");
+        assert_eq!(agg.accounts.len(), 2, "one entry per account");
+        let util = |number: i64| {
+            agg.accounts
+                .iter()
+                .find(|account| account.account_number == Some(number))
+                .expect("the account")
+                .meters
+                .iter()
+                .find(|meter| meter.key == "5h")
+                .expect("5h")
+                .util
+        };
+        // Account 2's single reading is not dragged down by account 1's
+        // newer one, nor the other way about: a window belongs to the
+        // account that spent it.
+        assert!((util(1) - 0.40).abs() < 1e-9);
+        assert!((util(2) - 0.90).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_panel_is_about_the_window_and_the_busiest_account_leads() {
+        // Account 2 served most of the window, account 1 a little, and
+        // account 3 only before it began.
+        let mut rows = vec![
+            owned(NOW - 10 * HOUR, 3, 0.50),
+            owned(NOW - 20 * MIN, 1, 0.30),
+        ];
+        for minute in 1..=4 {
+            rows.push(owned(NOW - minute * MIN, 2, 0.90));
+        }
+        let agg = quota(&rows).expect("readings exist");
+        assert_eq!(
+            agg.accounts
+                .iter()
+                .map(|account| account.account_number)
+                .collect::<Vec<_>>(),
+            vec![Some(2), Some(1)],
+            "the busiest leads, and an account that served none of the window is not shown"
+        );
+
+        // Two accounts within a tenth of each other keep their number
+        // order, so a lead changing hands does not swap them on screen.
+        let close = quota(&[
+            owned(NOW - 3 * MIN, 1, 0.30),
+            owned(NOW - 2 * MIN, 2, 0.90),
+            owned(NOW - MIN, 2, 0.91),
+            owned(NOW - MIN, 1, 0.31),
+        ])
+        .expect("readings exist");
+        assert_eq!(
+            close
+                .accounts
+                .iter()
+                .map(|account| account.account_number)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2)]
+        );
+    }
+
+    #[test]
+    fn a_window_nothing_served_shows_the_account_that_served_last() {
+        let agg = quota(&[
+            owned(NOW - 10 * HOUR, 1, 0.30),
+            owned(NOW - 2 * HOUR, 2, 0.90),
+        ])
+        .expect("readings exist");
+        assert_eq!(
+            agg.accounts
+                .iter()
+                .map(|account| account.account_number)
+                .collect::<Vec<_>>(),
+            vec![Some(2)],
+            "a machine idle longer than its window still shows a reading"
+        );
+    }
+
     /// Spent comparisons with float tolerance: the deltas are sums of
     /// binary floats (0.30 − 0.10 is 0.19999999999999998), so exact
     /// equality would test the arithmetic, not the aggregation.
@@ -565,9 +797,9 @@ mod tests {
         // present (the reading exists) but empty, and `spent`/`binding`
         // stay absent with it.
         let snap = quota(&[metered(NOW - MIN, json!({}))]).expect("the reading exists");
-        assert!(snap.meters.is_empty());
-        assert_eq!(snap.spent_today, None);
-        assert_eq!(snap.binding, None);
+        assert!(one(&snap).meters.is_empty());
+        assert_eq!(one(&snap).spent_today, None);
+        assert_eq!(one(&snap).binding, None);
     }
 
     #[test]
@@ -601,17 +833,29 @@ mod tests {
         ];
         let snap = quota(&rows).expect("rows carry meter snapshots");
         // Every figure comes from the NEWEST reading, not the max.
-        let five = snap.meters.iter().find(|m| m.key == "5h").expect("5h");
+        let five = one(&snap)
+            .meters
+            .iter()
+            .find(|m| m.key == "5h")
+            .expect("5h");
         assert!((five.util - 0.10).abs() < 1e-9);
         assert_eq!(five.reset_s, Some((NOW + 3 * HOUR) / 1000));
         assert_eq!(five.status.as_deref(), Some("allowed"));
-        let seven = snap.meters.iter().find(|m| m.key == "7d").expect("7d");
+        let seven = one(&snap)
+            .meters
+            .iter()
+            .find(|m| m.key == "7d")
+            .expect("7d");
         assert!((seven.util - 0.22).abs() < 1e-9);
         // The overage meter renders only where the reading carries it.
-        assert!(snap.meters.iter().all(|m| m.key != "overage"));
-        assert_eq!(snap.spent_today, None, "spent is the overage meter's line");
-        assert_eq!(snap.binding.as_deref(), Some("five_hour"));
-        assert!(snap.overage_in_use);
+        assert!(one(&snap).meters.iter().all(|m| m.key != "overage"));
+        assert_eq!(
+            one(&snap).spent_today,
+            None,
+            "spent is the overage meter's line"
+        );
+        assert_eq!(one(&snap).binding.as_deref(), Some("five_hour"));
+        assert!(one(&snap).overage_in_use);
         assert!(snap.gate_on);
         assert!(!snap.gate_assumed);
         // overageInUse with both plan windows healthy counts as the 5h
@@ -638,7 +882,7 @@ mod tests {
         );
         row.gate_on = Some(true);
         let snap = quota(&[row]).expect("reading exists");
-        let five = &snap.meters[0];
+        let five = &one(&snap).meters[0];
         assert_eq!(five.verdict, Verdict::Stale);
         assert!(
             !five.exhausted,
@@ -666,7 +910,7 @@ mod tests {
                 row.gate_on = gate_on;
             }
             let snap = quota(&rows).expect("readings exist");
-            let five = snap
+            let five = one(&snap)
                 .meters
                 .iter()
                 .find(|m| m.key == "5h")
@@ -723,7 +967,11 @@ mod tests {
             row.gate_on = Some(true);
         }
         let snap = quota(&rows).expect("readings exist");
-        let five = snap.meters.iter().find(|m| m.key == "5h").expect("5h");
+        let five = one(&snap)
+            .meters
+            .iter()
+            .find(|m| m.key == "5h")
+            .expect("5h");
         assert_eq!(five.target, THRESHOLD);
         assert_eq!(
             five.verdict,
@@ -744,7 +992,11 @@ mod tests {
         let snap = quota(&rows).expect("reading exists");
         assert!(snap.gate_on, "the default is armed");
         assert!(snap.gate_assumed);
-        let five = snap.meters.iter().find(|m| m.key == "5h").expect("5h");
+        let five = one(&snap)
+            .meters
+            .iter()
+            .find(|m| m.key == "5h")
+            .expect("5h");
         assert!(five.gated && five.target < 1.0);
 
         // One row carrying the flag clears the assumption — even when
@@ -769,7 +1021,11 @@ mod tests {
         );
         row.gate_on = Some(true);
         let snap = quota(&[row]).expect("reading exists");
-        let five = snap.meters.iter().find(|m| m.key == "5h").expect("5h");
+        let five = one(&snap)
+            .meters
+            .iter()
+            .find(|m| m.key == "5h")
+            .expect("5h");
         assert!(five.exhausted);
         assert_eq!(five.target, 1.0);
         assert_eq!(five.verdict, Verdict::Reached);
@@ -1036,14 +1292,14 @@ mod tests {
         // panel's own rule — its reset value is what says whether the window
         // is still live.
         let snap = quota(&rows).expect("rows carry snapshots");
-        let overage = snap
+        let overage = one(&snap)
             .meters
             .iter()
             .find(|m| m.key == "overage")
             .expect("overage");
         assert!((overage.util - 0.99).abs() < 1e-9);
         assert_spent(
-            snap.spent_today.expect("the overage meter renders"),
+            one(&snap).spent_today.expect("the overage meter renders"),
             0.02,
             true,
         );
@@ -1175,7 +1431,7 @@ mod tests {
             "the gate flag was read off the meter-less cold row — a \
              rate_limits-only filter would flip it to the assumed default"
         );
-        let overage = agg
+        let overage = one(&agg)
             .meters
             .iter()
             .find(|meter| meter.key == "overage")
@@ -1184,18 +1440,18 @@ mod tests {
             (overage.util - 0.99).abs() < 1e-9,
             "the blocked stale copy is the newest reading"
         );
-        assert_eq!(agg.binding.as_deref(), Some("five_hour"));
+        assert_eq!(one(&agg).binding.as_deref(), Some("five_hour"));
         // The span totals: the second period opened inside the today
         // span (anchored at zero, +0.15) on top of the first period's
         // +0.10 floor; the window span baselines off the reading before
         // it. Proxy kinds never baseline either total.
         assert_spent(
-            agg.spent_today.expect("the overage meter renders"),
+            one(&agg).spent_today.expect("the overage meter renders"),
             0.25,
             true,
         );
         assert_spent(
-            agg.spent_window.expect("the overage meter renders"),
+            one(&agg).spent_window.expect("the overage meter renders"),
             0.10,
             false,
         );
@@ -1288,7 +1544,7 @@ mod tests {
             );
             return;
         };
-        if let Some(seven) = quota.meters.iter().find(|m| m.key == "7d") {
+        if let Some(seven) = one(&quota).meters.iter().find(|m| m.key == "7d") {
             assert!(seven.reset_s.unwrap_or(0) > 0, "a 7-day reset is an epoch");
             assert!(
                 (0.0..=1.5).contains(&seven.util),
@@ -1296,7 +1552,7 @@ mod tests {
                 seven.util
             );
         }
-        for meter in &quota.meters {
+        for meter in &one(&quota).meters {
             assert!(
                 (-1e-9..=1.5).contains(&meter.util),
                 "{}: util out of range {}",

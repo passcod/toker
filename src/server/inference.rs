@@ -290,13 +290,26 @@ impl ReadyMessagesAttempt {
                 };
             }
         };
-        super::anthropic::note_meters(server, self.backend.as_ref(), upstream.headers());
+        if let Some(ctx) = self.record.as_mut() {
+            ctx.credential_digest = upstream.credential_digest.clone();
+            ctx.account_number = upstream
+                .credential_digest
+                .as_ref()
+                .and_then(|digest| server.observe_credential(self.backend.id(), digest));
+        }
+        let account_number = self.record.as_ref().and_then(|ctx| ctx.account_number);
+        super::anthropic::note_meters(
+            server,
+            self.backend.as_ref(),
+            account_number,
+            upstream.response.headers(),
+        );
         let retry = match super::anthropic::retry_thinking_off(
             server,
             self.backend.as_ref(),
             &self.parts,
             sent,
-            upstream,
+            upstream.response,
             &mut self.record,
             &mut cancellation,
         )
@@ -336,7 +349,12 @@ impl ReadyMessagesAttempt {
                 )
             }
             super::anthropic::ThinkingRetry::Retried(upstream) => {
-                super::anthropic::note_meters(server, self.backend.as_ref(), upstream.headers());
+                super::anthropic::note_meters(
+                    server,
+                    self.backend.as_ref(),
+                    account_number,
+                    upstream.headers(),
+                );
                 let status = upstream.status();
                 let rate_limits = parse_rate_limits(upstream.headers());
                 (
@@ -869,8 +887,8 @@ impl ReadyChatAttempt {
                 };
             }
         };
-        let response_status = upstream.status();
-        match super::attempt::precommit_openai_chat(upstream).await {
+        let response_status = upstream.response.status();
+        match super::attempt::precommit_openai_chat(upstream.response).await {
             Ok(super::attempt::PrecommitOutcome::Accepted { response, .. }) => {
                 ReadyChatOutcome::Accepted {
                     upstream: response,

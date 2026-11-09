@@ -96,10 +96,10 @@ use crate::providers::{AnthropicApi, AnthropicSub, CodexSub, OpenAiApi, OpenRout
 use crate::routing::{FrontendProfile, ModelTarget, ProtocolId, RouteRegistry};
 use crate::secrets::{self, KEYRING_READ_TIMEOUT, OsKeyring, SecretStore};
 use crate::store::{
-    ActivatePolicyRevision, ActivatedPolicyRevision, BindingLearning, DraftCasResult,
-    PolicyCompilerOrigin, PolicyRevision, PolicyRevisionSource, PublicationCasResult,
-    PublicationKey, PublicationResultUpdate, PublicationState, RoutingPolicyState,
-    RoutingPublication, Store,
+    ActivatePolicyRevision, ActivatedPolicyRevision, BindingLearning, CredentialDigest,
+    DraftCasResult, PolicyCompilerOrigin, PolicyRevision, PolicyRevisionSource,
+    PublicationCasResult, PublicationKey, PublicationResultUpdate, PublicationState,
+    RoutingPolicyState, RoutingPublication, Store,
 };
 
 use record::now_ms;
@@ -412,6 +412,10 @@ pub struct Server {
     /// timeouts only — no overall deadline, so a stream lives as long as
     /// its upstream keeps talking (see [`UPSTREAM_IDLE_TIMEOUT`]).
     pub(crate) http: reqwest::Client,
+    /// The local multi-account identity source, keyed only by credential
+    /// digest. Re-read when it cannot answer, because another program
+    /// rewrites it on every token refresh. Token values do not survive it.
+    pub(crate) local_accounts: Arc<crate::accounts::LocalAccounts>,
     /// The enabled provider bindings and implemented frontend-to-backend
     /// routes. Policy picks the binding; handlers turn it into a concrete
     /// model target here.
@@ -486,6 +490,7 @@ impl Server {
         // one, which validates them itself.
         config.validate_retained()?;
         let http = upstream_client(UPSTREAM_IDLE_TIMEOUT)?;
+        let local_accounts = crate::accounts::LocalAccounts::at_home(now_ms());
         let openrouter = config.openrouter.as_ref().map(|openrouter| {
             Arc::new(OpenRouter::new(
                 openrouter.upstream.clone(),
@@ -617,6 +622,7 @@ impl Server {
             store,
             config: Arc::new(ConfigCell::new(config)),
             http,
+            local_accounts: Arc::new(local_accounts),
             registry,
             codex_turn,
             binding_learning,
@@ -638,6 +644,28 @@ impl Server {
 
     /// Mark one selected binding and effective target immediately before an
     /// actual inference transport starts.
+    /// Resolve an outbound credential from the startup's local account facts,
+    /// then record and backfill the durable digest binding. A failure loses
+    /// attribution only: requests are already in flight and must continue.
+    pub(crate) fn observe_credential(
+        &self,
+        provider: &str,
+        digest: &CredentialDigest,
+    ) -> Option<i64> {
+        let now = now_ms();
+        let identity = self.local_accounts.get(digest, now);
+        match self
+            .store
+            .observe_credential(provider, digest, now, identity.as_ref())
+        {
+            Ok(account_number) => account_number,
+            Err(error) => {
+                tracing::error!(%error, "credential account observation failed");
+                None
+            }
+        }
+    }
+
     pub(crate) fn note_binding_sent(
         &self,
         binding_id: &crate::policy::BindingId,
@@ -1157,7 +1185,7 @@ impl Server {
             // known. A still-live pinned lane with a binding no longer in the
             // current topology is conservatively warm for activation consent:
             // unknown never proves cold.
-            match cache_temperature(&lane, self.registry.binding(&pin.binding_id), now) {
+            match cache_temperature(&lane, self.registry.binding(&pin.binding_id), None, now) {
                 crate::policy::CacheTemperature::Warm => impacts.warm += 1,
                 crate::policy::CacheTemperature::Cold => impacts.cold += 1,
                 crate::policy::CacheTemperature::Unknown => {
@@ -1187,7 +1215,7 @@ impl Server {
             };
             let impacts = by_route.entry(pin.policy_route_id.clone()).or_default();
             impacts.total += 1;
-            match cache_temperature(&lane, self.registry.binding(&pin.binding_id), now) {
+            match cache_temperature(&lane, self.registry.binding(&pin.binding_id), None, now) {
                 crate::policy::CacheTemperature::Warm => impacts.warm += 1,
                 crate::policy::CacheTemperature::Cold => impacts.cold += 1,
                 crate::policy::CacheTemperature::Unknown => impacts.unknown += 1,
@@ -1416,6 +1444,8 @@ impl Server {
             }
             Err(error) => return Err(error),
         };
+        let session_id = stored_lane.and_then(|lane| lane.session_id.as_deref());
+        self.attach_plan_account(&mut resolved.plan, session_id);
         let mut decision = policy_transition(
             &lane_state,
             &resolved.plan,
@@ -1437,6 +1467,7 @@ impl Server {
             let pinned = runtime.capture_revision_with_evidence(revision_id, &evidence)?;
             resolved =
                 self.resolve_policy_snapshot(runtime, &pinned, facts, credentials, lane, false)?;
+            self.attach_plan_account(&mut resolved.plan, session_id);
             decision = policy_transition(&lane_state, &resolved.plan, scope, false);
         }
         if let crate::policy::LaneTransitionDecision::Denied(reason) = decision {
@@ -1561,8 +1592,17 @@ impl Server {
             revision_id,
             failure,
         })?;
-        let Some(plan) = plan else {
+        let Some(mut plan) = plan else {
             return Ok(None);
+        };
+        // A fallback that stayed on the provider keeps the account the first
+        // attempt resolved with its session. One that crossed to another
+        // provider must ask again, and has no session to ask with here, so
+        // it takes what that provider is known to be on, or none.
+        plan.account_number = if plan.provider == failed.plan.provider {
+            failed.plan.account_number
+        } else {
+            self.plan_account(&plan.provider, None)
         };
         let decision = policy_transition(
             &failed.continuation.lane_state,
@@ -1689,6 +1729,32 @@ impl Server {
         }
     }
 
+    /// The account a plan is expected to serve on. Routing does not select an
+    /// account (spec: ACCT#routing-does-not-select-an-account), so this is
+    /// evidence the server holds rather than a routing input.
+    fn plan_account(&self, provider: &str, session_id: Option<&str>) -> Option<i64> {
+        match self.store.account_for(provider, session_id) {
+            Ok(account) => account,
+            Err(error) => {
+                // A store that cannot be read is no evidence of no account.
+                // Answering none leaves the plan unpinnable, which costs one
+                // re-pin; answering a guess would attribute a cache to an
+                // account this request may not be on, and a wrong account
+                // reads the lane cold and rebuilds its whole prefix.
+                tracing::warn!(
+                    %provider,
+                    %error,
+                    "could not resolve the account to pin; leaving the lane unpinned"
+                );
+                None
+            }
+        }
+    }
+
+    fn attach_plan_account(&self, plan: &mut crate::policy::AttemptPlan, session_id: Option<&str>) {
+        plan.account_number = self.plan_account(&plan.provider, session_id);
+    }
+
     pub(crate) fn lane_facts(
         &self,
         lane: Option<&crate::store::Lane>,
@@ -1719,7 +1785,21 @@ impl Server {
             // cache.
             crate::policy::CacheTemperature::Unknown
         } else {
-            cache_temperature(lane, binding, now)
+            // The account asked about is the one this lane would be served on
+            // now, which is what decides whether the cache the pin names is
+            // reachable at all. Only worth a store read when the pin names an
+            // account to compare it against: a lane pinned without one, which
+            // is every lane on a provider whose accounts Toker cannot tell
+            // apart, has nothing this could answer.
+            let account = lane
+                .pin
+                .as_ref()
+                .and_then(|pin| pin.account_number)
+                .and(binding)
+                .and_then(|binding| {
+                    self.plan_account(binding.provider(), lane.session_id.as_deref())
+                });
+            cache_temperature(lane, binding, account, now)
         };
         Some(LaneFacts {
             temperature,
@@ -2737,13 +2817,28 @@ fn policy_transition(
     crate::policy::decide_transition(lane, prospective, cause)
 }
 
+/// Cache temperature for one lane, as the table in SLANE#cache-temperature
+/// gives it. `account` is the account being asked about, and is `None` where
+/// the caller asks about no account in particular, such as activation consent
+/// over every lane at once.
 fn cache_temperature(
     lane: &crate::store::Lane,
     binding: Option<&crate::routing::BackendBinding>,
+    account: Option<i64>,
     now_ms: i64,
 ) -> crate::policy::CacheTemperature {
     use crate::policy::CacheTemperature;
 
+    // The one row of the table answering cold from knowledge rather than from
+    // a clock: the cache was written under another account and cannot be read
+    // under this one, so unknown here would hand every consumer a warm verdict.
+    if let (Some(account), Some(pinned)) = (
+        account,
+        lane.pin.as_ref().and_then(|pin| pin.account_number),
+    ) && pinned != account
+    {
+        return CacheTemperature::Cold;
+    }
     let Some(binding) = binding else {
         return CacheTemperature::Unknown;
     };
@@ -4207,6 +4302,7 @@ api_key = "sk-proj-test"
                     .expect("fingerprint"),
                 candidate_id: CandidateId::new(format!("candidate-{session}")).expect("candidate"),
                 binding_id: binding_id.clone(),
+                account_number: None,
                 baseline_model: model.to_owned(),
                 effective_model: model.to_owned(),
             };
@@ -4921,7 +5017,7 @@ api_key = "ak-literal-test"
             pin: None,
         };
         assert_eq!(
-            super::cache_temperature(&lane, Some(binding), now),
+            super::cache_temperature(&lane, Some(binding), None, now),
             CacheTemperature::Unknown,
             "an unattributed legacy lane cannot borrow a binding TTL"
         );
@@ -4931,21 +5027,32 @@ api_key = "ak-literal-test"
             route_fingerprint: "11".repeat(32).parse().unwrap(),
             candidate_id: crate::policy::CandidateId::new("candidate").unwrap(),
             binding_id: binding.id().clone(),
+            account_number: Some(1),
             baseline_model: "model".to_owned(),
             effective_model: "model".to_owned(),
         });
         assert_eq!(
-            super::cache_temperature(&lane, Some(binding), now),
+            super::cache_temperature(&lane, Some(binding), None, now),
             CacheTemperature::Warm
+        );
+        assert_eq!(
+            super::cache_temperature(&lane, Some(binding), Some(1), now),
+            CacheTemperature::Warm,
+            "the account asked about is the one the lane is pinned to"
+        );
+        assert_eq!(
+            super::cache_temperature(&lane, Some(binding), Some(2), now),
+            CacheTemperature::Cold,
+            "the cache was written under another account, so it cannot be read"
         );
         lane.updated_ms = now - 10 * 60 * 1000;
         assert_eq!(
-            super::cache_temperature(&lane, Some(binding), now),
+            super::cache_temperature(&lane, Some(binding), None, now),
             CacheTemperature::Cold
         );
         lane.updated_ms = now + 1;
         assert_eq!(
-            super::cache_temperature(&lane, Some(binding), now),
+            super::cache_temperature(&lane, Some(binding), None, now),
             CacheTemperature::Unknown
         );
         let no_ttl = server
@@ -4956,7 +5063,7 @@ api_key = "ak-literal-test"
         lane.pin.as_mut().unwrap().binding_id = no_ttl.id().clone();
         lane.updated_ms = now - 5 * 60 * 1000;
         assert_eq!(
-            super::cache_temperature(&lane, Some(no_ttl), now),
+            super::cache_temperature(&lane, Some(no_ttl), None, now),
             CacheTemperature::Unknown,
             "a binding with no cache domain and a lane that recorded no TTL \
              has no clock, and an unknown clock is never cold"
@@ -4965,25 +5072,25 @@ api_key = "ak-literal-test"
         // is the clock, as it is for the cold gate.
         lane.ttl = Some(300_000);
         assert_eq!(
-            super::cache_temperature(&lane, Some(no_ttl), now),
+            super::cache_temperature(&lane, Some(no_ttl), None, now),
             CacheTemperature::Cold,
             "idle for exactly the recorded five-minute TTL"
         );
         lane.updated_ms = now - 60 * 1000;
         assert_eq!(
-            super::cache_temperature(&lane, Some(no_ttl), now),
+            super::cache_temperature(&lane, Some(no_ttl), None, now),
             CacheTemperature::Warm
         );
         lane.ttl = Some(3_600_000);
         lane.updated_ms = now - 20 * 60 * 1000;
         assert_eq!(
-            super::cache_temperature(&lane, Some(no_ttl), now),
+            super::cache_temperature(&lane, Some(no_ttl), None, now),
             CacheTemperature::Warm,
             "the one-hour TTL outlasts twenty idle minutes"
         );
         lane.pin = None;
         assert_eq!(
-            super::cache_temperature(&lane, Some(no_ttl), now),
+            super::cache_temperature(&lane, Some(no_ttl), None, now),
             CacheTemperature::Unknown,
             "an unattributed lane cannot borrow a binding's TTL"
         );
@@ -5188,6 +5295,8 @@ api_key = "ak-literal-test"
             requested_model: Some("claude-opus-5".to_owned()),
             effective_model: Some("claude-opus-5".to_owned()),
             backend: target.provider().clone(),
+            credential_digest: None,
+            account_number: None,
             binding_id: target.binding().id().clone(),
             attempt: None,
             policy_routing: None,

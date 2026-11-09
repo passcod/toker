@@ -58,8 +58,9 @@ use crate::middleware::cold;
 use crate::middleware::lanes;
 use crate::observe::{SseEvent, SseSplitter, UsageObserver};
 use crate::policy::force_newest;
-use crate::providers::Provider;
+use crate::providers::{Provider, credential_digest};
 use crate::routing::ProtocolId;
+use crate::store::CredentialDigest;
 use crate::translate::{self, OpenAiChatRenderer};
 
 use super::InFlightGuard;
@@ -299,7 +300,11 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     };
     let gate_model = Some(policy_attempt.plan.effective_model.clone());
     let backend = target.provider().clone();
-    let meters = super::quota_gate::load_meters(&server, backend.id());
+    let meters = super::quota_gate::load_meters_for(
+        &server,
+        backend.id(),
+        super::quota_gate::gate_account(&server, backend.id(), session_id.as_deref()),
+    );
     let release = crate::middleware::canonical::release_marker(&inference.canonical());
     if let Some((release, grant)) = super::quota_gate::grant_release(
         &server,
@@ -577,13 +582,18 @@ fn catalog_unavailable(message: &str) -> Response {
 /// passes the configured attribution headers, the anthropic path passes
 /// an empty slice (the predecessor forwarded claude's session header
 /// verbatim).
+pub(crate) struct UpstreamResponse {
+    pub(crate) response: reqwest::Response,
+    pub(crate) credential_digest: Option<CredentialDigest>,
+}
+
 pub(crate) async fn send_upstream(
     server: &Server,
     provider: &dyn Provider,
     parts: &Parts,
     body: Bytes,
     session_header_names: &[String],
-) -> Result<reqwest::Response, reqwest::Error> {
+) -> Result<UpstreamResponse, reqwest::Error> {
     let path = parts
         .uri
         .path_and_query()
@@ -612,7 +622,7 @@ pub(crate) async fn send_upstream_to(
     session_header_names: &[String],
     frontend: ProtocolId,
     path: &str,
-) -> Result<reqwest::Response, reqwest::Error> {
+) -> Result<UpstreamResponse, reqwest::Error> {
     let url = provider.endpoint(path);
     // Pass-through-when-present: a frontend that
     // brings its own credential keeps it verbatim; the stored credential
@@ -627,13 +637,30 @@ pub(crate) async fn send_upstream_to(
         provider.inject_auth(&mut headers);
     }
     provider.prepare_protocol_headers(&mut headers);
-    server
+    let credential_digest = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|token| !token.is_empty())
+        .map(credential_digest)
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                .filter(|key| !key.is_empty())
+                .map(credential_digest)
+        });
+    let response = server
         .http
         .request(parts.method.clone(), url)
         .headers(headers)
         .body(body)
         .send()
-        .await
+        .await?;
+    Ok(UpstreamResponse {
+        response,
+        credential_digest,
+    })
 }
 
 /// A Chat binding's live universal-canonical response path. Accounting
@@ -1015,6 +1042,8 @@ pub(crate) fn chat_cross_record(ctx: RecordCtx, backend: Arc<dyn Provider>) -> A
         requested_model: ctx.requested_model,
         effective_model: ctx.effective_model,
         backend,
+        credential_digest: None,
+        account_number: None,
         binding_id: ctx.binding_id,
         attempt: ctx.attempt,
         policy_routing: ctx.policy_routing,

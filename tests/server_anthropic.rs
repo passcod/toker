@@ -2537,9 +2537,13 @@ fn poison_meters(store: &Store, util5h: f64, offset_secs: i64) -> (i64, Value) {
         "claim": Value::Null, "overageInUse": false, "fallbackPct": Value::Null,
         "other": {},
     });
+    // Meters belong to an account, so the fixture learns one first. It is
+    // the only account here, which is what every allowance below names.
+    let account = fixture_account(store);
     store
-        .save_meters(
+        .save_account_meters(
             "anthropic_sub",
+            account,
             &MetersSnapshot {
                 updated_ms: now_ms,
                 snapshot: snapshot.clone(),
@@ -2547,6 +2551,25 @@ fn poison_meters(store: &Store, util5h: f64, offset_secs: i64) -> (i64, Value) {
         )
         .expect("poison meters");
     (reset5h, snapshot)
+}
+
+/// The one account these tests are served on, learned the way the proxy
+/// learns one: a credential digest named by a local identity.
+fn fixture_account(store: &Store) -> i64 {
+    let digest = toker::providers::credential_digest("fixture-credential");
+    store
+        .observe_credential(
+            "anthropic_sub",
+            &digest,
+            jiff::Timestamp::now().as_millisecond(),
+            Some(&toker::store::AccountIdentity {
+                upstream_id: None,
+                email: Some("fixture@example.test".to_owned()),
+                named_by: toker::store::AccountNameSource::Local,
+            }),
+        )
+        .expect("observe the fixture credential")
+        .expect("the identity names an account")
 }
 
 /// A Messages body without a `stream` field. Anthropic defines omission as
@@ -2984,6 +3007,7 @@ async fn a_release_marker_grants_an_allowance_records_a_released_row_and_strips(
         store.load_allowances().expect("allowances"),
         vec![Allowance {
             session_id: "ccses-42".to_owned(),
+            account_number: fixture_account(&store),
             meter: "5h".to_owned(),
             reset_value: reset5h,
             release: Release::Overage,
@@ -3036,12 +3060,16 @@ async fn the_over_marker_spends_the_plan_and_stops_before_overage() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
     let (reset5h, snapshot) = poison_meters(&store, 0.99, 3600);
+    // The gate reads the account's own slot, which is where `poison_meters`
+    // put the first reading, so every later one has to land there too.
+    let account = fixture_account(&store);
     let reading = |util: f64| {
         let mut reading = snapshot.clone();
         reading["util5h"] = json!(util);
         store
-            .save_meters(
+            .save_account_meters(
                 "anthropic_sub",
+                account,
                 &MetersSnapshot {
                     updated_ms: jiff::Timestamp::now().as_millisecond(),
                     snapshot: reading,
@@ -3080,6 +3108,7 @@ async fn the_over_marker_spends_the_plan_and_stops_before_overage() {
     );
     let allowance = Allowance {
         session_id: "ccses-42".to_owned(),
+        account_number: fixture_account(&store),
         meter: "5h".to_owned(),
         reset_value: reset5h,
         release: Release::Plan,
@@ -3134,8 +3163,10 @@ async fn the_gate_reads_only_the_session_s_own_allowances_and_survives_the_prune
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
     let (reset5h, _snapshot) = poison_meters(&store, 1.0, 3600);
+    let account = fixture_account(&store);
     let held = |session: &str, reset_value: i64| Allowance {
         session_id: session.to_owned(),
+        account_number: account,
         meter: "5h".to_owned(),
         reset_value,
         release: Release::Overage,
@@ -3330,7 +3361,7 @@ async fn count_tokens_and_the_api_backend_never_gate() {
     assert_eq!(rows[0].kind, None, "a measurement, not a blocked row");
     assert_eq!(rows[0].provider.as_deref(), Some("anthropic_api"));
     let meters = store
-        .load_meters("anthropic_sub")
+        .load_account_meters("anthropic_sub", fixture_account(&store))
         .expect("meters")
         .expect("still poisoned");
     assert_eq!(

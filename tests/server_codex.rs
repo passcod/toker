@@ -1618,9 +1618,18 @@ async fn responses_to_anthropic_subscription_prefers_held_token_then_local_login
             .expect("toker answers");
         assert_eq!(response.status(), StatusCode::OK);
         let _ = response.bytes().await.unwrap();
+        let row = wait_for_rows(&store, 1).await.remove(0);
+        assert_eq!(row.route.as_deref(), Some("openai_responses:anthropic_sub"));
         assert_eq!(
-            wait_for_rows(&store, 1).await[0].route.as_deref(),
-            Some("openai_responses:anthropic_sub")
+            row.credential_digest,
+            Some(toker::providers::credential_digest(
+                held.unwrap_or("local-token")
+            )),
+            "the row follows the injected subscription token, never Codex's bearer"
+        );
+        assert_eq!(
+            row.account_number, None,
+            "unresolved credentials remain serviceable"
         );
     }
     let requests = mock.requests.lock().unwrap().clone();
@@ -1682,9 +1691,11 @@ async fn chat_to_subscription_obeys_the_request_global_quota_gate() {
     fixture.config.gates.quota_enabled = true;
     let (addr, store) = spawn_toker(fixture).await;
     let reset = jiff::Timestamp::now().as_second() + 3600;
+    let account = gate_account(&store);
     store
-        .save_meters(
+        .save_account_meters(
             "anthropic_sub",
+            account,
             &toker::store::MetersSnapshot {
                 updated_ms: jiff::Timestamp::now().as_millisecond(),
                 snapshot: json!({
@@ -1736,9 +1747,11 @@ async fn chat_subscription_release_marker_grants_strips_and_forwards() {
     fixture.config.gates.quota_enabled = true;
     let (addr, store) = spawn_toker(fixture).await;
     let reset = jiff::Timestamp::now().as_second() + 3600;
+    let account = gate_account(&store);
     store
-        .save_meters(
+        .save_account_meters(
             "anthropic_sub",
+            account,
             &toker::store::MetersSnapshot {
                 updated_ms: jiff::Timestamp::now().as_millisecond(),
                 snapshot: json!({
@@ -3197,4 +3210,23 @@ async fn upstream_failure_mid_turn_aborts_and_records_each_attempt() {
     assert_eq!(rows[1].kind, Some(RowKind::Error));
     assert_eq!(rows[1].error_type.as_deref(), Some("response_protocol"));
     assert!(rows.iter().all(|row| row.attempt.is_some()));
+}
+
+/// The account these gate fixtures spend against. A reading belongs to the
+/// account that spent it, and so does any allowance granted on it, so a gate
+/// fixture has to learn one before it can pose as spent quota.
+fn gate_account(store: &Store) -> i64 {
+    store
+        .observe_credential(
+            "anthropic_sub",
+            &toker::providers::credential_digest("held-token"),
+            jiff::Timestamp::now().as_millisecond(),
+            Some(&toker::store::AccountIdentity {
+                upstream_id: None,
+                email: Some("fixture@example.test".to_owned()),
+                named_by: toker::store::AccountNameSource::Local,
+            }),
+        )
+        .expect("observe the fixture credential")
+        .expect("the identity names an account")
 }

@@ -124,7 +124,7 @@ impl ReadyAttempt {
         if let Some(ctx) = self.record.as_mut() {
             ctx.attempt = Some(provenance);
         }
-        let record = self.record.take();
+        let mut record = self.record.take();
         let in_flight = self.in_flight.take();
         let cancellation = super::cancel::PrecommitCancellationGuard::anthropic(record.as_ref());
         let upstream = match send_upstream_to(
@@ -166,9 +166,21 @@ impl ReadyAttempt {
                 };
             }
         };
-        super::anthropic::note_meters(server, self.backend.as_ref(), upstream.headers());
-        let response_status = upstream.status();
-        match super::attempt::precommit_anthropic(upstream).await {
+        if let Some(ctx) = record.as_mut() {
+            ctx.credential_digest = upstream.credential_digest.clone();
+            ctx.account_number = upstream
+                .credential_digest
+                .as_ref()
+                .and_then(|digest| server.observe_credential(self.backend.id(), digest));
+        }
+        super::anthropic::note_meters(
+            server,
+            self.backend.as_ref(),
+            record.as_ref().and_then(|ctx| ctx.account_number),
+            upstream.response.headers(),
+        );
+        let response_status = upstream.response.status();
+        match super::attempt::precommit_anthropic(upstream.response).await {
             Ok(super::attempt::PrecommitOutcome::Accepted { response, .. }) => {
                 ReadyOutcome::Accepted {
                     upstream: response,

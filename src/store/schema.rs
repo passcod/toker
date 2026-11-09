@@ -907,6 +907,91 @@ pub(super) const MIGRATIONS: &[&str] = &[
         style   TEXT NOT NULL CHECK (style IN ('gfm', 'toker', 'block', 'plain'))
     );
     "#,
+    // v19 — account identity is learned from credential digests, independently
+    // of the configured provider. Values never enter the store; resolution can
+    // later fill an account on every ledger row that carried its digest.
+    r#"
+    CREATE TABLE accounts (
+        number        INTEGER PRIMARY KEY AUTOINCREMENT,
+        provider      TEXT NOT NULL,
+        upstream_id   TEXT,
+        email         TEXT,
+        named_by      TEXT NOT NULL CHECK (named_by IN ('local', 'upstream', 'operator')),
+        first_seen_ms INTEGER NOT NULL,
+        last_seen_ms  INTEGER NOT NULL,
+        CHECK (upstream_id IS NOT NULL OR email IS NOT NULL)
+    );
+    CREATE UNIQUE INDEX accounts_provider_upstream_id_idx
+        ON accounts (provider, upstream_id) WHERE upstream_id IS NOT NULL;
+    CREATE UNIQUE INDEX accounts_provider_email_idx
+        ON accounts (provider, email) WHERE email IS NOT NULL;
+
+    CREATE TABLE credential_accounts (
+        digest         TEXT PRIMARY KEY CHECK (
+            length(digest) = 64 AND digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        provider       TEXT NOT NULL,
+        account_number INTEGER REFERENCES accounts(number),
+        first_seen_ms  INTEGER NOT NULL,
+        last_seen_ms   INTEGER NOT NULL
+    );
+    CREATE INDEX credential_accounts_provider_account_idx
+        ON credential_accounts (provider, account_number);
+
+    ALTER TABLE requests ADD COLUMN credential_digest TEXT CHECK (
+        credential_digest IS NULL OR (
+            length(credential_digest) = 64
+            AND credential_digest NOT GLOB '*[^0-9a-f]*'
+        )
+    );
+    ALTER TABLE requests ADD COLUMN account_number INTEGER REFERENCES accounts(number);
+    CREATE INDEX requests_provider_account_idx
+        ON requests (provider, account_number, ts_ms);
+    "#,
+    // v20 — quota state belongs to the account that spent it rather than to
+    // the provider it was spent through (spec: ACCT#what-is-attributed-to-an-account).
+    // A provider whose accounts Toker cannot tell apart holds none, and keeps
+    // reading and writing `meters_by_provider`.
+    //
+    // Allowances rebuild rather than widen: the key gains the account, and a
+    // row that names none could not be honoured under the new rule anyway.
+    // Nothing is lost that the ledger needs — this table is live state, and
+    // every row in it prunes when its own window ends.
+    r#"
+    CREATE TABLE meters_by_account (
+        provider_id    TEXT NOT NULL,
+        account_number INTEGER NOT NULL REFERENCES accounts(number),
+        updated_ms     INTEGER NOT NULL,
+        snapshot       TEXT NOT NULL,
+        PRIMARY KEY (provider_id, account_number)
+    );
+
+    CREATE TABLE allowances_v20 (
+        session_id     TEXT NOT NULL,
+        account_number INTEGER NOT NULL REFERENCES accounts(number),
+        meter          TEXT NOT NULL,
+        reset_value    INTEGER NOT NULL,
+        release        TEXT NOT NULL DEFAULT 'overage',
+        PRIMARY KEY (session_id, account_number, meter, reset_value)
+    );
+    DROP TABLE allowances;
+    ALTER TABLE allowances_v20 RENAME TO allowances;
+
+    ALTER TABLE pings ADD COLUMN account_number INTEGER REFERENCES accounts(number);
+    -- `requests_provider_account_idx` orders by account before time, so the
+    -- newest attributed row for a provider could only be found by sorting
+    -- every attributed row it has: ~96,700 of them on the machine this was
+    -- written against. This index seeks the provider and walks time backwards
+    -- instead, stopping at the first row that names an account.
+    CREATE INDEX requests_provider_ts_idx ON requests (provider, ts_ms);
+
+    -- The account that served, part of the lane's cache identity
+    -- (spec: SLANE#cache-identity). Null where the provider has no accounts
+    -- Toker can tell apart, and on every pin written before this column, so
+    -- it stays outside the pin's all-present-or-all-absent rule.
+    ALTER TABLE lanes ADD COLUMN account_number INTEGER REFERENCES accounts(number);
+
+    "#,
 ];
 
 fn validate_v10_history(conn: &Connection) -> Result<()> {
