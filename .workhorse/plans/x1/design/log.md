@@ -136,13 +136,28 @@ The mockup findings are not filed as issues: the Workhorse run for this loop had
 A second fresh critic, who had not seen round 2 (`critique-round-3.md`): no criticals, 5 suggestions, 13 nits.
 Converged in structure; the five suggestions are meaning-level (a `reach` reading that called serving rules dead, digits with two meanings, two reorder mechanisms, settings values all dim, the providers table not colouring its fault).
 Not clean by the stop rule's count (at most three suggestions), so the count of clean rounds is still zero.
-All 18 are being applied.
+All 18 were applied and checked by eye.
+
+## Round 4
+
+A fresh critic (Fable), who read no earlier round, judged all 30 frames: 0 critical, 6 suggestions, 8 nits (`critique-round-4.md`).
+Not clean, so the clean count stays at 0.
+Structure, colour, widths and recurring counts held; the findings are wording and teaching:
+
+- the glob refusal named a fix on a different field from the one the control line names
+- the route page's four off handlers were unreachable from anything the screens teach
+- `warm`, `cold`, `pinned` and `slug` were missing from MARKS
+- the route page's upgrade line was a per-request reading
+- the 80-column table dropped the spend clause first
+- the presentations else row pointed at `2 rewrites`, which reads as a count
+
+All six are being fixed, along with the nits on `claude-sonnet` naming, `promote` in the overlay, `needed` beside empty fields, `5 rules · 1 new`, and `set in toker.toml`.
+Skipped: the history lanes column shape, because lanes on the live revision are a mix of warm and cold, so the bare count is the right reading; `published no` stays plain, because it's a presentation's setting rather than a sync fault; and the focus-dependent control line is how every panel behaves.
 
 ## Where it stands
 
-- round 3's fixes applied and checked by eye; the round 4 critic was cut off when its session ended and wrote nothing
-- the user judged the converged set good, and asked for a prose walkthrough instead: `how-it-works.md`, linked to each frame (frame captions now carry ids)
+- round 4's fixes, by the two drawing agents
 
 ## Next
 
-- round 4: a fresh critic, launched after the relabel; it and the round after must be clean to stop
+- round 5: a fresh critic on the fixed set; it and the round after must be clean to stop, and round 6 is the cap
