@@ -44,6 +44,9 @@ No browser rig: Toker is a terminal app. Captures come from running the real TUI
 | 12 | Rules are not named; a rule reads as `match → route` everywhere | The form has no name field and call 5 retired generated names, so a name could only be derived; deriving it for every rule keeps one shape | `strip anthropic_sub/` beside a derived `claude-* → openrouter-messages` | round-2 fixes | kept |
 | 13 | History and the after-save frame show the same moment: rev 10 live, two warm lanes left on rev 9 | The lane counts disagreed between three frames; one moment drawn everywhere makes every count checkable | `critique-round-2.md` #10 | round-2 fixes | kept |
 | 14 | Every form saves with `ctrl+s`; `enter` opens the route and nothing else | One key per meaning: settings saved with `enter` and the 24-row summary opened the detail with it | `critique-round-2.md` #3, #4 | round-2 fixes | kept; the detail at 24 rows opens with `pgdn` |
+| 15 | `reach` says what a request gets, not whether the first candidate is up | A rule whose first candidate is off but whose fallback serves read as dead in dim `off` while it carried hits; the routes table already said `off · billed fallback` | `critique-round-3.md` #1 | round-3 fixes | kept |
+| 16 | Digits always mean tabs; the route page steps between routes with `←/→` and shows `1 of 7` | A second strip of digit chips gave `1`-`6` two meanings on one screen | the route switcher `1 2 3 4 5 6 7` | round-3 fixes | kept |
+| 17 | One way to reorder: `m` lifts, `↑/↓` move, `m` drops, `esc` puts it back | Two mechanisms, one of which dropped with `enter`, which call 14 reserves | `m … enter drops it` and `alt+↑/↓` | round-3 fixes | kept |
 
 Observations held for the critique rather than settled here:
 
@@ -127,10 +130,17 @@ The structure held; what stood in the way was disagreement between frames (focus
 All 24 are being applied (calls 12 to 14 settle the ones that needed a decision).
 The mockup findings are not filed as issues: the Workhorse run for this loop had already ended when round 1 tried to report, so they live here and in the critique.
 
+## Round 3
+
+A second fresh critic, who had not seen round 2 (`critique-round-3.md`): no criticals, 5 suggestions, 13 nits.
+Converged in structure; the five suggestions are meaning-level (a `reach` reading that called serving rules dead, digits with two meanings, two reorder mechanisms, settings values all dim, the providers table not colouring its fault).
+Not clean by the stop rule's count (at most three suggestions), so the count of clean rounds is still zero.
+All 18 are being applied.
+
 ## In flight
 
-- round 2's fixes, by the two drawing agents
+- round 3's fixes, by the two drawing agents
 
 ## Next
 
-- round 3: a fresh critic on the fixed set; the stop rule wants it and the round after it clean (no criticals, at most three suggestions), the second by a critic who has seen neither
+- round 4: a fresh critic on the fixed set; the stop rule wants it and the round after it clean (no criticals, at most three suggestions), the second by a critic who has seen neither
