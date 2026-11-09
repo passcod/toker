@@ -60,3 +60,29 @@ All six frames are 120x40, built from a small generator (not in the repo) so eve
   In the overlay `r` is plain `refresh` and `IN HISTORY` lists `a  make this revision live`.
 - **Provider counts:** `anthropic_sub` is `4 rewrites · 2 defaults · 1 route` (detail `4  anthropic_messages 2 · openai_chat 1 · openai_responses 1`); `openrouter` is `3 rewrites · 2 defaults · 5 routes`.
 - Width check (120 cells on every row of all six frames), font stack and screenshots re-run on all three files.
+
+## Round 2 fixes
+
+- **#3 save key:** settings saves with `[ctrl+s] fix value to save   [esc] cancel`.
+- **#7 parentheses:** gone from all three files.
+  Settings values are plain dim words: `on`, `built-in`, `lane TTL`, `none`; `refresh url  built-in` on the provider detail; the armed prompt in history reads `lose their cache: ses-hot, ses-crow`.
+- **#10 and #23 history, redrawn at the after-save state:**
+  - Ten revisions with rev 10 live, `6 history 10`, `2 rewrites 15`, header `rev 10 live`.
+  - Rev 10 is `add rewrite claude-* → openrouter-messages`.
+  - Its detail is the single `+ rewrite anthropic_messages 6  claude-* → openrouter-messages  as asked` line, then `8 lanes on rev 10 · 2 warm lanes still on rev 9`.
+  - The `lanes` column reads `8` on rev 10, `2 warm` on rev 9 and dim `none` elsewhere.
+  - Rev 9 stays `add a fallback to claude-sub`.
+  - Rev 4 is `retry openrouter-chat on 5xx`.
+  - Rev 1 is `setup: 7 routes, 4 defaults, 13 rewrites, 14 presentations, 4 families, 4 upgrades`, with revs 2, 3, 5 and 6 adding the 14th rewrite, 15th presentation, 5th family and 5th upgrade.
+  - I tightened the `when` and `lanes` columns so rev 1's sentence fits without clipping.
+  - The armed frame moves the 2 warm lanes from rev 9 to rev 10.
+- **#11:** the fresh install has no `-` row; each rail runs from the head to the else row.
+- **#12:** else rows read `else  no default  → nothing catches it`; in the overlay's underlay they read `else  default  → claude-sub`.
+- **#21:** the overlay popup is 118 wide at column 1, so no RULE text shows at its edges.
+- **#22:** the rewrites grid in 07-01 and 07-02 matches `converged-01-rewrites.html` frame 1: match at 6, arrow at 39, `route` at 41, `reach` at 83, `hits` against the box.
+  Row 2's hits read `≥1` and the else rows carry the same hits as 01-01.
+- **Overlay additions:** `p  promote the selected upgrade's newest model`; `↑/↓  past a panel's edge: next panel`; `pgdn  open the detail when it has no room` beside `pgup/pgdn  scroll the detail`.
+  `↑` was never in MARKS, so there was nothing to remove.
+  The underlay's RULE first line is derived (`anthropic_sub/${model} → claude-sub`) with rows as in 01-01.
+- Checks re-run on all three files: every row of all six frames is 120 cells and the font stack is unchanged.
+  All six frames were re-shot and viewed.
