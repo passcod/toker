@@ -101,7 +101,7 @@ pub fn grant_from_tui(
 ) -> anyhow::Result<Grant> {
     // A release spends one account's window, so there is nothing to grant
     // until Toker knows whose window this session is on.
-    let Some(account_number) = store.account_for(GATED_BACKEND, Some(session_id))? else {
+    let Some(account_number) = store.session_account(GATED_BACKEND, session_id)? else {
         bail!("no account is known for this session yet");
     };
     let meters = store
@@ -143,7 +143,7 @@ pub fn revoke_from_tui(
     // The revoke itself needs no account — it closes the session's gate
     // whatever it was released against. The row beside it carries the
     // reading it was revoked against, where one is known.
-    let meters = match store.account_for(GATED_BACKEND, Some(session_id))? {
+    let meters = match store.session_account(GATED_BACKEND, session_id)? {
         Some(account_number) => store.load_account_meters(GATED_BACKEND, account_number)?,
         None => None,
     }
@@ -292,7 +292,7 @@ fn gate_row(
 
 #[cfg(test)]
 mod tests {
-    use super::{GATED_BACKEND, grant_from_tui, revoke_from_tui};
+    use super::{GATED_BACKEND, gate_row, grant_from_tui, revoke_from_tui};
     use crate::config::GatesConfig;
     use crate::ir::Release;
     use crate::store::{Allowance, MetersSnapshot, RowKind, Store};
@@ -304,9 +304,14 @@ mod tests {
 
     fn store_with(util5h: f64, util7d: f64) -> Store {
         let store = Store::open(":memory:").expect("store");
-        // The only account on this provider, so it is the one every
-        // session here is served on.
         let account = crate::test_support::account(&store, GATED_BACKEND, "one@example.test");
+        // A session's account is the one its newest row names, so each
+        // session here has been served once on that account.
+        for session in ["ses-a", "ses-b"] {
+            let mut row = gate_row(RowKind::Cold, session, GATED_BACKEND, None, &gates(), NOW);
+            row.account_number = Some(account);
+            store.record_request(&row).expect("a served row");
+        }
         store
             .save_account_meters(
                 GATED_BACKEND,
@@ -350,13 +355,16 @@ mod tests {
             }]
         );
         let rows = store.requests_since(0, 10).expect("rows");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind, Some(RowKind::Released));
-        let extra = rows[0].extra.as_ref().expect("extra");
+        let released: Vec<_> = rows
+            .iter()
+            .filter(|row| row.kind == Some(RowKind::Released))
+            .collect();
+        assert_eq!(released.len(), 1);
+        let extra = released[0].extra.as_ref().expect("extra");
         assert_eq!(extra["via"], "tui");
         assert_eq!(extra["release"], "plan");
         assert_eq!(extra["fiveHour"], RESET5H);
-        assert_eq!(rows[0].gate_on, Some(true));
+        assert_eq!(released[0].gate_on, Some(true));
     }
 
     /// An exhausted 7-day window is granted too.
@@ -369,6 +377,17 @@ mod tests {
     }
 
     /// No meter reading: nothing to grant for, nothing written.
+    #[test]
+    fn a_tui_grant_for_a_session_never_served_fails_and_writes_nothing() {
+        // An account is known and has meters, but this session has no row
+        // naming it, and another session's account is not borrowed.
+        let store = store_with(0.40, 0.20);
+        let before = store.requests_since(0, 10).expect("rows").len();
+        assert!(grant_from_tui(&store, "ses-new", Release::Plan, &gates(), NOW).is_err());
+        assert!(store.load_allowances().expect("allowances").is_empty());
+        assert_eq!(store.requests_since(0, 10).expect("rows").len(), before);
+    }
+
     #[test]
     fn a_tui_grant_without_meters_fails_and_writes_nothing() {
         let store = Store::open(":memory:").expect("store");

@@ -583,6 +583,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 class,
             );
             facts.asks_server_safeguards = translate::asks_server_safeguards(request);
+            facts.accounts = server.request_accounts(&parts.headers, ProtocolId::AnthropicMessages);
             if class == crate::policy::RequestClass::Compaction {
                 facts.legacy_compaction = Some(legacy_compaction_facts(
                     &server,
@@ -605,6 +606,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 pinned_binding
                     .as_ref()
                     .and_then(|binding| server.registry.binding(binding)),
+                &facts.accounts,
                 facts.now_ms,
                 class == crate::policy::RequestClass::Compaction,
             );
@@ -1826,7 +1828,7 @@ fn cold_compaction_target(
     let pinned = lane
         .and_then(|lane| lane.pin.as_ref())
         .and_then(|pin| server.registry.binding(&pin.binding_id));
-    let lane_facts = server.lane_facts(lane, pinned, facts.now_ms, true);
+    let lane_facts = server.lane_facts(lane, pinned, &facts.accounts, facts.now_ms, true);
     server
         .resolve_policy_attempt(&facts, credentials, lane, lane_facts.as_ref())
         .ok()?

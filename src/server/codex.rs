@@ -197,7 +197,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         let binding_affinity = pinned_binding
             .clone()
             .filter(|_| canonical_request.requires_binding_affinity());
-        let facts = server.request_facts(
+        let mut facts = server.request_facts(
             ProtocolId::OpenAiResponses,
             frontend.as_deref(),
             Some(requested_model.clone()),
@@ -209,6 +209,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
             binding_affinity,
             crate::policy::RequestClass::Inference,
         );
+        facts.accounts = server.request_accounts(&parts.headers, ProtocolId::OpenAiResponses);
         let credentials =
             server.credential_snapshot(&parts.headers, ProtocolId::OpenAiResponses, facts.now_ms);
         let lane = server.lane_facts(
@@ -216,6 +217,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
             pinned_binding
                 .as_ref()
                 .and_then(|binding| server.registry.binding(binding)),
+            &facts.accounts,
             facts.now_ms,
             false,
         );

@@ -203,7 +203,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     // refusing instead would never recover, since the client replays the
     // same history on every retry and only a served response pins the lane.
     let binding_affinity = pinned_binding_id.filter(|_| canonical.requires_binding_affinity());
-    let facts = server.request_facts(
+    let mut facts = server.request_facts(
         ProtocolId::OpenAiChat,
         frontend.as_deref(),
         Some(model.clone()),
@@ -215,9 +215,16 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         binding_affinity,
         crate::policy::RequestClass::Inference,
     );
+    facts.accounts = server.request_accounts(&parts.headers, ProtocolId::OpenAiChat);
     let credentials =
         server.credential_snapshot(&parts.headers, ProtocolId::OpenAiChat, facts.now_ms);
-    let lane = server.lane_facts(cold_lane.as_ref(), affinity_binding, facts.now_ms, false);
+    let lane = server.lane_facts(
+        cold_lane.as_ref(),
+        affinity_binding,
+        &facts.accounts,
+        facts.now_ms,
+        false,
+    );
     let (target, policy_attempt) = match server.resolve_policy_attempt(
         &facts,
         &credentials,

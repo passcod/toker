@@ -74,6 +74,7 @@ pub(crate) mod quota_gate;
 mod record;
 mod record_anthropic;
 
+use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -274,6 +275,7 @@ struct PolicyContinuation {
     lane_state: crate::policy::LaneState,
     activation_scope: crate::policy::ActivationScope,
     request_native_credentials: std::collections::BTreeSet<crate::policy::BindingId>,
+    accounts: BTreeMap<String, i64>,
 }
 
 struct ResolvedPolicySnapshot {
@@ -1015,6 +1017,7 @@ impl Server {
                     lane.pin
                         .as_ref()
                         .and_then(|pin| self.registry.binding(&pin.binding_id)),
+                    &Default::default(),
                     now,
                     false,
                 )
@@ -1033,6 +1036,9 @@ impl Server {
             binding_affinity: request.binding_affinity,
             class: RequestClass::Inference,
             legacy_compaction: None,
+            // A dry run has no request behind it, so no credential to
+            // name an account.
+            accounts: Default::default(),
             now_ms: now,
         };
         let availability = snapshot
@@ -1511,8 +1517,7 @@ impl Server {
             }
             Err(error) => return Err(error),
         };
-        let session_id = stored_lane.and_then(|lane| lane.session_id.as_deref());
-        self.attach_plan_account(&mut resolved.plan, session_id);
+        Self::attach_plan_account(&mut resolved.plan, &facts.accounts);
         let mut decision = policy_transition(
             &lane_state,
             &resolved.plan,
@@ -1534,7 +1539,7 @@ impl Server {
             let pinned = runtime.capture_revision_with_evidence(revision_id, &evidence)?;
             resolved =
                 self.resolve_policy_snapshot(runtime, &pinned, facts, credentials, lane, false)?;
-            self.attach_plan_account(&mut resolved.plan, session_id);
+            Self::attach_plan_account(&mut resolved.plan, &facts.accounts);
             decision = policy_transition(&lane_state, &resolved.plan, scope, false);
         }
         if let crate::policy::LaneTransitionDecision::Denied(reason) = decision {
@@ -1559,6 +1564,7 @@ impl Server {
                 .filter(|(_, evidence)| matches!(evidence, Evidence::Positive("passing_native")))
                 .map(|(binding, _)| binding.clone())
                 .collect(),
+            accounts: facts.accounts.clone(),
         };
         Ok(PolicyAttempt {
             plan: resolved.plan,
@@ -1662,15 +1668,9 @@ impl Server {
         let Some(mut plan) = plan else {
             return Ok(None);
         };
-        // A fallback that stayed on the provider keeps the account the first
-        // attempt resolved with its session. One that crossed to another
-        // provider must ask again, and has no session to ask with here, so
-        // it takes what that provider is known to be on, or none.
-        plan.account_number = if plan.provider == failed.plan.provider {
-            failed.plan.account_number
-        } else {
-            self.plan_account(&plan.provider, None)
-        };
+        // The request's own credential for the provider it fell back to
+        // names the account, or none does.
+        Self::attach_plan_account(&mut plan, &failed.continuation.accounts);
         let decision = policy_transition(
             &failed.continuation.lane_state,
             &plan,
@@ -1794,40 +1794,57 @@ impl Server {
             binding_affinity,
             class,
             legacy_compaction: None,
+            accounts: Default::default(),
             now_ms: now_ms(),
         }
     }
 
-    /// The account a plan is expected to serve on. Routing does not select an
-    /// account (spec: ACCT#routing-does-not-select-an-account), so this is
-    /// evidence the server holds rather than a routing input.
-    fn plan_account(&self, provider: &str, session_id: Option<&str>) -> Option<i64> {
-        match self.store.account_for(provider, session_id) {
-            Ok(account) => account,
-            Err(error) => {
-                // A store that cannot be read is no evidence of no account.
-                // Answering none leaves the plan unpinnable, which costs one
-                // re-pin; answering a guess would attribute a cache to an
-                // account this request may not be on, and a wrong account
-                // reads the lane cold and rebuilds its whole prefix.
-                tracing::warn!(
-                    %provider,
-                    %error,
-                    "could not resolve the account to pin; leaving the lane unpinned"
-                );
-                None
-            }
-        }
+    /// The account each provider's credential names for a request carrying
+    /// `headers`, read off the credential the request will be sent with
+    /// rather than guessed from earlier traffic
+    /// (spec: ACCT#routing-does-not-select-an-account).
+    ///
+    /// Only the providers that have accounts are asked. A credential no
+    /// source has named yet has no entry, which every reader takes to mean
+    /// there is no account to speak of.
+    pub(crate) fn request_accounts(
+        &self,
+        headers: &HeaderMap,
+        frontend: ProtocolId,
+    ) -> std::collections::BTreeMap<String, i64> {
+        let provider = crate::accounts::ACCOUNTED_PROVIDER;
+        let Some(backend) = self.registry.provider(provider) else {
+            return Default::default();
+        };
+        let credential = quota_gate::request_credential(self, backend.as_ref(), headers, frontend);
+        credential
+            .account_number
+            .map(|account| (provider.to_owned(), account))
+            .into_iter()
+            .collect()
     }
 
-    fn attach_plan_account(&self, plan: &mut crate::policy::AttemptPlan, session_id: Option<&str>) {
-        plan.account_number = self.plan_account(&plan.provider, session_id);
+    /// The account a plan serves on is the one the request's credential names
+    /// for the plan's provider, or none. Routing does not select an account
+    /// (spec: ACCT#routing-does-not-select-an-account), so this is evidence the
+    /// request holds rather than a routing input.
+    ///
+    /// None leaves the plan unpinnable on an account, which costs one re-pin;
+    /// a guess would attribute a cache to an account this request may not be
+    /// on, and a wrong account reads the lane cold and rebuilds its whole
+    /// prefix.
+    fn attach_plan_account(
+        plan: &mut crate::policy::AttemptPlan,
+        accounts: &BTreeMap<String, i64>,
+    ) {
+        plan.account_number = accounts.get(&plan.provider).copied();
     }
 
     pub(crate) fn lane_facts(
         &self,
         lane: Option<&crate::store::Lane>,
         binding: Option<&crate::routing::BackendBinding>,
+        accounts: &BTreeMap<String, i64>,
         now: i64,
         compaction: bool,
     ) -> Option<LaneFacts> {
@@ -1854,8 +1871,8 @@ impl Server {
             // cache.
             crate::policy::CacheTemperature::Unknown
         } else {
-            // The account asked about is the one this lane would be served on
-            // now, which is what decides whether the cache the pin names is
+            // The account asked about is the one this request names, which is
+            // what decides whether the cache the pin names is
             // reachable at all. Only worth a store read when the pin names an
             // account to compare it against: a lane pinned without one, which
             // is every lane on a provider whose accounts Toker cannot tell
@@ -1865,9 +1882,7 @@ impl Server {
                 .as_ref()
                 .and_then(|pin| pin.account_number)
                 .and(binding)
-                .and_then(|binding| {
-                    self.plan_account(binding.provider(), lane.session_id.as_deref())
-                });
+                .and_then(|binding| accounts.get(binding.provider()).copied());
             cache_temperature(lane, binding, account, now)
         };
         Some(LaneFacts {
@@ -5157,7 +5172,7 @@ api_key = "ak-literal-test"
 
         assert_eq!(
             server
-                .lane_facts(Some(&lane), Some(binding), now, true)
+                .lane_facts(Some(&lane), Some(binding), &Default::default(), now, true)
                 .unwrap()
                 .temperature,
             CacheTemperature::Cold
@@ -5165,7 +5180,7 @@ api_key = "ak-literal-test"
         lane.updated_ms = now - 1_000;
         assert_eq!(
             server
-                .lane_facts(Some(&lane), Some(binding), now, true)
+                .lane_facts(Some(&lane), Some(binding), &Default::default(), now, true)
                 .unwrap()
                 .temperature,
             CacheTemperature::Unknown,
@@ -5175,7 +5190,7 @@ api_key = "ak-literal-test"
         lane.updated_ms = 0;
         assert_eq!(
             server
-                .lane_facts(Some(&lane), Some(binding), now, true)
+                .lane_facts(Some(&lane), Some(binding), &Default::default(), now, true)
                 .unwrap()
                 .temperature,
             CacheTemperature::Unknown,

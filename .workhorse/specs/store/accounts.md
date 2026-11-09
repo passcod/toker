@@ -134,8 +134,11 @@ Toker MUST NOT move a client's request to another account.
 > [!NOTE]
 > An account is an identity the ledger and the gates are keyed on, and a candidate choosing between accounts is a separate thing that nothing yet does.
 
-A gate that decides on a request before it is sent MUST read the account named by the credential that request will be sent with.
+Anything that decides on a request before it is sent, a quota gate and the account a lane is pinned to among them, MUST read the account named by the credential that request will be sent with.
 It MUST NOT read the account off the session's earlier rows or off the provider's most recent traffic.
+
+A view or control acting on a session with no request in hand, such as the dashboard granting it a release, MUST use the account its newest served row names, and MUST NOT borrow another session's or the provider's.
+A session with no served row has no account to act on.
 
 > [!NOTE]
 > A login switched partway through a session leaves the session's earlier rows on the account it left.
