@@ -169,6 +169,28 @@ fn expected_rate_limits(util5h: &str) -> Value {
     })
 }
 
+const OVERAGE_PERIOD_MONTHLY: &str =
+    "anthropic-ratelimit-unified-overage-period-monthly-utilization";
+
+/// `metered()` sends the overage utilisation and no monthly figure, so a
+/// forwarded response must carry the former's value in the latter.
+fn assert_monthly_copied(response: &reqwest::Response) {
+    assert_eq!(
+        response
+            .headers()
+            .get("anthropic-ratelimit-unified-overage-utilization")
+            .expect("the provider's own header still arrives"),
+        "0.0004"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(OVERAGE_PERIOD_MONTHLY)
+            .expect("the monthly overage utilisation is copied in"),
+        "0.0004"
+    );
+}
+
 /// A non-streaming Messages response echoing the request's model, with
 /// every usage field the observer models.
 fn non_stream_body(model: &str) -> Vec<u8> {
@@ -948,6 +970,8 @@ async fn sse_messages_cross_canonical_adapters_and_ledger() {
             .is_some_and(|ct| ct.starts_with("text/event-stream")),
         "SSE content type passes through"
     );
+    // spec: WCANON#response-headers
+    assert_monthly_copied(&response);
 
     let bytes = response.bytes().await.expect("sse bytes");
     let rendered = String::from_utf8(bytes.to_vec()).expect("rendered SSE is UTF-8");
@@ -1090,6 +1114,8 @@ async fn non_streaming_messages_ledger_with_estimated_cost_for_the_api_backend()
     let body = messages_body("anthropic_api/claude-sonnet-5", false);
     let response = post_messages(addr, "/v1/messages", &[], &body).await;
     assert_eq!(response.status(), StatusCode::OK);
+    // spec: WCANON#response-headers
+    assert_monthly_copied(&response);
     let bytes = response.bytes().await.expect("body bytes");
     let rendered: Value = serde_json::from_slice(&bytes).expect("canonical response JSON");
     assert_eq!(rendered["model"], "anthropic_api/claude-sonnet-5");
@@ -1510,6 +1536,8 @@ async fn non_2xx_forwards_the_body_and_records_an_unpriced_error_row_with_its_me
     let body = messages_body("err-401", false);
     let response = post_messages(addr, "/v1/messages", &[], &body).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // spec: WCANON#response-headers
+    assert_monthly_copied(&response);
     let bytes = response.bytes().await.expect("error bytes");
     assert_eq!(
         bytes.as_ref(),
@@ -1778,6 +1806,8 @@ async fn count_tokens_forwards_unledgered_but_feeds_the_meters() {
     let body = messages_body("claude-opus-5", false);
     let response = post_messages(addr, "/v1/messages/count_tokens", &[], &body).await;
     assert_eq!(response.status(), StatusCode::OK);
+    // spec: WCANON#response-headers
+    assert_monthly_copied(&response);
     let bytes = response.bytes().await.expect("count_tokens bytes");
     assert_eq!(
         bytes.as_ref(),
@@ -2599,6 +2629,14 @@ async fn a_spent_meter_blocks_with_a_synthetic_200_and_never_reaches_upstream() 
     let response = post_messages(addr, "/v1/messages", &[], &body).await;
     assert_eq!(response.status(), StatusCode::OK, "never an error status");
     assert_eq!(content_type(&response), "application/json");
+    // spec: WCANON#response-headers
+    assert!(
+        !response.headers().keys().any(|name| name
+            .as_str()
+            .starts_with("anthropic-ratelimit-unified-overage")),
+        "Toker's own answer carries no provider reading: {:?}",
+        response.headers()
+    );
     let bytes = response.bytes().await.expect("blocked bytes");
     let tz = jiff::tz::TimeZone::system();
     // GatesConfig::default() above → the notice renders in the default

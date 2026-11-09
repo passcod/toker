@@ -383,15 +383,33 @@ async fn mock_anthropic_messages(State(mock): State<MockState>, request: Request
                 );
                 response
             } else {
-                raw_response(StatusCode::OK, "text/event-stream", Bytes::from(body))
+                let mut response =
+                    raw_response(StatusCode::OK, "text/event-stream", Bytes::from(body));
+                overage_metered(&mut response);
+                response
             }
         }
-        _ => raw_response(
-            StatusCode::OK,
-            "application/json",
-            Bytes::from_static(br#"{"id":"msg_api","type":"message","model":"claude-sonnet-5","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","usage":{"input_tokens":7,"output_tokens":3}}"#),
-        ),
+        _ => {
+            let mut response = raw_response(
+                StatusCode::OK,
+                "application/json",
+                Bytes::from_static(br#"{"id":"msg_api","type":"message","model":"claude-sonnet-5","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","usage":{"input_tokens":7,"output_tokens":3}}"#),
+            );
+            overage_metered(&mut response);
+            response
+        }
     }
+}
+
+/// What the Anthropic API sends while credits are on: the overage
+/// utilisation, and not the monthly overage period one.
+fn overage_metered(response: &mut Response) {
+    response.headers_mut().insert(
+        "anthropic-ratelimit-unified-overage-utilization"
+            .parse::<HeaderName>()
+            .expect("header name"),
+        HeaderValue::from_static("0.0004"),
+    );
 }
 
 async fn mock_openrouter_chat(State(mock): State<MockState>, request: Request) -> Response {
@@ -1811,6 +1829,14 @@ async fn chat_to_anthropic_bindings_renders_complete_and_streaming_turns() {
         .await
         .expect("chat request answers");
     assert_eq!(complete.status(), StatusCode::OK);
+    // spec: WCANON#response-headers: the copy reaches a Chat client too.
+    assert_eq!(
+        complete
+            .headers()
+            .get("anthropic-ratelimit-unified-overage-period-monthly-utilization")
+            .expect("the monthly header is copied onto a translated response"),
+        "0.0004"
+    );
     let body: Value = complete.json().await.unwrap();
     assert_eq!(body["model"], "anthropic_api/claude-sonnet-5");
     assert_eq!(body["choices"][0]["message"]["content"], "hello");
@@ -1833,6 +1859,13 @@ async fn chat_to_anthropic_bindings_renders_complete_and_streaming_turns() {
         .await
         .expect("chat stream answers");
     assert_eq!(streaming.status(), StatusCode::OK);
+    assert_eq!(
+        streaming
+            .headers()
+            .get("anthropic-ratelimit-unified-overage-period-monthly-utilization")
+            .expect("the monthly header is copied onto a translated stream"),
+        "0.0004"
+    );
     let sse = streaming.text().await.unwrap();
     assert!(sse.contains(r#""model":"anthropic_sub/stream""#), "{sse}");
     assert!(sse.contains("tool_calls"), "{sse}");
