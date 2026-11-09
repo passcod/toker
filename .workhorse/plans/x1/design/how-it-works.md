@@ -185,4 +185,4 @@ The redesign is mostly presentation, but a few changes to how Toker works make i
 ## The alternatives
 
 The converged design is direction D (rule tables), with the route page from direction E and the trace from direction C.
-The five directions it was chosen from are still in the card's mockups for comparison, as the `a-`, `b-`, `c-`, `d-` and `e-` files beside the converged ones, and each is described in its own `direction-*.md` alongside this guide.
+The five directions it was chosen from are described in the `direction-*.md` files alongside this guide; their mockups have been removed, and remain in the branch's history.

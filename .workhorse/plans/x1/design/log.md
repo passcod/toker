@@ -172,5 +172,6 @@ Not applied: the explanation of off handlers in the overlay, which belongs to th
 
 ## Where it stands
 
+- the five direction mockups (a to e) are removed at the user's request; the converged set is the only one left, and the directions survive in `direction-*.md` and git history
 - loop finished: rounds 5 and 6 clean, from fresh critics; round 6's polish applied by the drawing agents
 - the user flagged that the presentations `as` tiers were treated as Claude's; the guide now says tiers are the client's own, and the wider problem (Toker hardcodes tiers and families in code) is card Y1
