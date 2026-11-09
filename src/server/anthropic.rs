@@ -2216,6 +2216,7 @@ struct CanonicalMessagesStream {
 }
 
 impl CanonicalMessagesStream {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         response: reqwest::Response,
         status: u16,
