@@ -112,7 +112,7 @@
 <h2 id="routes">Routes, with the selected route&rsquo;s candidates &mdash; 120&times;40</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 presentations 15</span><span class="d"> → </span><span class="d">2 rewrites 14</span><span class="d"> → </span><span class="d">3 defaults 4</span><span class="d"> → </span><span class="b r">4 routes 7</span><span class="d"> · </span><span class="d">5 models 11</span><span class="d"> · </span><span class="d">6 history 9</span>             rev 9 live 
 ┌ROUTES────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ <span class="d">route</span>                 <span class="d">sent to</span>                     <span class="d">matched by</span>            <span class="d">lanes</span>            <span class="d">now</span>                         │
+│ <span class="d">route</span>                 <span class="d">sent to</span>                     <span class="d">matched by</span>            <span class="d">lanes</span>            <span class="d">reach</span>                       │
 │<span class="r"> claude-sub            anthropic_sub → openrouter  4 rules · 2 defaults  2 warm · 5 cold  no cred · billed fallback   </span>│
 │ claude-api            anthropic_api               3 rules               <span class="d">none</span>             <span class="d">off</span>                         │
 │ openrouter-messages   openrouter                  1 rule                <span class="d">none</span>             ok                          │
@@ -196,7 +196,7 @@
 ┌ROUTE─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">claude-sub</span>                                                                                                    <span class="d">1 of 7</span> │
 │                                                                                                                      │
-│ <span class="b">sent to</span>  2 candidates                                                                                                │
+│ <span class="b">sent to</span>  2 candidates · 1 new                                                                                        │
 │ 1  anthropic_sub.anthropic_messages  subscription    as asked                                <span class="yellow">no cred</span>                 │
 │    ↓ when unavailable before send · overloaded · 5xx   <span class="d">billed:</span> <span class="yellow">allow</span>   <span class="d">ambiguous retry:</span> deny   <span class="d">cache:</span> preserve warm  │
 │ 2  openrouter.openrouter_messages    <span class="yellow">billed</span>          alias claude-* → anthropic/claude-*     ok                      │

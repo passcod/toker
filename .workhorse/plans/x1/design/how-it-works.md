@@ -61,7 +61,7 @@ Two columns tell you whether things actually work:
   `ok` means the route's first choice serves it.
   `no cred · billed fallback` means the first choice is a provider that's on but has no credential, so a billed provider ends up serving it.
   `off` means the route leads only to providers that are turned off.
-- **hits** counts recent requests the row caught.
+- **hits 24h** counts the requests the row caught in the last 24 hours.
   `-` means not recorded, which isn't the same as zero, and `≥3` is a floor where some rows predate the counter.
 
 Colour only ever draws the eye to a problem: `no cred`, `billed` and `refused · no route` are yellow, a refusal is red, `off` is dim, and everything healthy is plain.
@@ -78,7 +78,7 @@ Each row includes a pattern of provider models, excludes some, says which tier o
 The tiers are the client's own, so they come with the scope: Claude Code's are `opus`, `sonnet`, `haiku` and `fable`, and a codex scope would offer `luna`, `terra`, `sol` and `astra`.
 Any model can be listed under any tier, which is how `openai/gpt-*-sol` comes to sit in Claude Code's `opus` slot.
 The group's `else` row (`no slug equals it → rewrites`) is where the chain continues when a request names something that isn't published.
-The detail panel calls out overlaps with other rows, and whether the presentation has reached the client's settings yet.
+The detail panel calls out overlaps with other rows, and whether the scope's presentations have been written into the client's settings.
 
 ### Defaults
 
@@ -87,7 +87,7 @@ The `openai_responses  no default → refused · no route` row is yellow because
 
 ### Routes and the route page
 
-[The routes tab](../../../design/mockups/x1/converged-02-routes.html#routes) lists every route with the chain of providers it sends to (`anthropic_sub → openrouter`), what points at it (`4 rules · 2 defaults`), how many lanes are pinned to it, and how it fares right now.
+[The routes tab](../../../design/mockups/x1/converged-02-routes.html#routes) lists every route with the chain of providers it sends to (`anthropic_sub → openrouter`), what points at it (`4 rules · 2 defaults`), how many lanes it holds, and its reach.
 The detail below is the candidate list, with the fallback conditions written on the line between each pair of candidates.
 
 `enter` opens [the route page](../../../design/mockups/x1/converged-02-routes.html#route-page), a full-height view of one route.

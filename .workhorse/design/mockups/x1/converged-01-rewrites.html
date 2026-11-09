@@ -112,7 +112,7 @@
 <h2 id="rewrites-at-rest">Rewrites at rest &mdash; 120&times;40</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 presentations 15</span><span class="d"> → </span><span class="b r">2 rewrites 14</span><span class="d"> → </span><span class="d">3 defaults 4</span><span class="d"> → </span><span class="d">4 routes 7</span><span class="d"> · </span><span class="d">5 models 11</span><span class="d"> · </span><span class="d">6 history 9</span>             rev 9 live 
 ┌REWRITES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│       <span class="d">match</span>                              <span class="d">route</span>                                     <span class="d">reach</span>                        <span class="d">hits</span> │
+│       <span class="d">match</span>                              <span class="d">route</span>                                     <span class="d">reach</span>                    <span class="d">hits 24h</span> │
 │ <span class="d">┌─ </span><span class="b">anthropic_messages</span>  5 rules · prefix · sends ${model} <span class="d">───────────────────────────────────────────────────────────</span> │
 │ <span class="d">│</span> <span class="d"> 1</span>  anthropic/${model}               → claude-sub                                <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>       <span class="d">-</span> │
 │<span class="r"> │  2  anthropic_sub/${model}           → claude-sub                                no cred · billed fallback      ≥1 </span>│
@@ -137,6 +137,7 @@
 ┌RULE──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">anthropic_sub/${model} → claude-sub</span>                                                                                  │
 │ <span class="d">match</span>     prefix  anthropic_sub/${model}                                                                             │
+│ <span class="d">sends</span>     ${model}                                                                                                   │
 │ <span class="d">example</span>   anthropic_sub/claude-sonnet-5 → claude-sonnet-5                                                            │
 │ <span class="d">sends to</span>  claude-sub<span class="d">  2 candidates · anthropic_sub → openrouter</span>                                                      │
 │ <span class="d">reach</span>     <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>  anthropic_sub has no credential, so openrouter serves it, billed                │
@@ -148,12 +149,11 @@
                                                                                                                         
                                                                                                                         
                                                                                                                         
-                                                                                                                        
                                                                                                                         </pre>
 <h2 id="rewrites-135x50">Rewrites at rest, the operator&rsquo;s terminal &mdash; 135&times;50</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 presentations 15</span><span class="d"> → </span><span class="b r">2 rewrites 14</span><span class="d"> → </span><span class="d">3 defaults 4</span><span class="d"> → </span><span class="d">4 routes 7</span><span class="d"> · </span><span class="d">5 models 11</span><span class="d"> · </span><span class="d">6 history 9</span>                            rev 9 live 
 ┌REWRITES─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│       <span class="d">match</span>                                    <span class="d">route</span>                                             <span class="d">reach</span>                         <span class="d">hits</span> │
+│       <span class="d">match</span>                                    <span class="d">route</span>                                             <span class="d">reach</span>                     <span class="d">hits 24h</span> │
 │ <span class="d">┌─ </span><span class="b">anthropic_messages</span>  5 rules · prefix · sends ${model} <span class="d">──────────────────────────────────────────────────────────────────────────</span> │
 │ <span class="d">│</span> <span class="d"> 1</span>  anthropic/${model}                     → claude-sub                                        <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>        <span class="d">-</span> │
 │<span class="r"> │  2  anthropic_sub/${model}                 → claude-sub                                        no cred · billed fallback       ≥1 </span>│
@@ -178,6 +178,7 @@
 ┌RULE─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">anthropic_sub/${model} → claude-sub</span>                                                                                                 │
 │ <span class="d">match</span>     prefix  anthropic_sub/${model}                                                                                            │
+│ <span class="d">sends</span>     ${model}                                                                                                                  │
 │ <span class="d">example</span>   anthropic_sub/claude-sonnet-5 → claude-sonnet-5                                                                           │
 │ <span class="d">sends to</span>  claude-sub<span class="d">  2 candidates · anthropic_sub → openrouter</span>                                                                     │
 │ <span class="d">reach</span>     <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>  anthropic_sub has no credential, so openrouter serves it, billed                               │
@@ -199,12 +200,11 @@
                                                                                                                                        
                                                                                                                                        
                                                                                                                                        
-                                                                                                                                       
                                                                                                                                        </pre>
 <h2 id="trace">Trace of claude/anthropic_messages, anthropic_sub/claude-sonnet-5 &mdash; 120&times;40</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 presentations 15</span><span class="d"> → </span><span class="b r">2 rewrites 14</span><span class="d"> → </span><span class="d">3 defaults 4</span><span class="d"> → </span><span class="d">4 routes 7</span><span class="d"> · </span><span class="d">5 models 11</span><span class="d"> · </span><span class="d">6 history 9</span>             rev 9 live 
 ┌REWRITES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│       <span class="d">match</span>                              <span class="d">route</span>                                     <span class="d">reach</span>                        <span class="d">hits</span> │
+│       <span class="d">match</span>                              <span class="d">route</span>                                     <span class="d">reach</span>                    <span class="d">hits 24h</span> │
 │ <span class="d">┌─ </span><span class="b">anthropic_messages</span>  5 rules · prefix · sends ${model} <span class="d">───────────────────────────────────────────────────────────</span> │
 │ ↓ <span class="d"> 1</span>  anthropic/${model}               → claude-sub                                <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>       <span class="d">-</span> │
 │<span class="b"> </span><span class="b b">&gt;</span><span class="b"> </span><span class="d b"> 2</span><span class="b">  anthropic_sub/${model}           → claude-sub                                </span><span class="yellow b">no cred</span><span class="b"> · </span><span class="yellow b">billed fallback</span><span class="b">      ≥1 </span>│
@@ -245,7 +245,7 @@
 <h2 id="editing">Editing a rule, live refusal &mdash; 120&times;40</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 presentations 15</span><span class="d"> → </span><span class="b r">2 rewrites 14</span><span class="d"> → </span><span class="d">3 defaults 4</span><span class="d"> → </span><span class="d">4 routes 7</span><span class="d"> · </span><span class="d">5 models 11</span><span class="d"> · </span><span class="d">6 history 9</span>   editing · rev 9 live 
 ┌REWRITES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│       <span class="d">kind</span>   <span class="d">match</span>                       <span class="d">route</span>                                     <span class="d">reach</span>                        <span class="d">hits</span> │
+│       <span class="d">kind</span>   <span class="d">match</span>                       <span class="d">route</span>                                     <span class="d">reach</span>                    <span class="d">hits 24h</span> │
 │ <span class="d">┌─ </span><span class="b">anthropic_messages</span>  5 rules · 1 new · sends ${model} <span class="d">────────────────────────────────────────────────────────────</span> │
 │ <span class="d">│</span> <span class="d"> 1</span>  <span class="d">prefix</span> anthropic/${model}        → claude-sub                                <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>       <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 2</span>  <span class="d">prefix</span> anthropic_sub/${model}    → claude-sub                                <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>      ≥1 │
@@ -275,18 +275,18 @@
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌PREVIEW───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">3 of 5 recent requests would change route</span>                                                                            │
-│ <span class="d">request</span>                          <span class="d">now</span>                             <span class="d">with this rule</span>                                      │
-│ claude-sonnet-5  <span class="d">ses-free</span>        default → claude-sub            <span class="b">rule 6 → openrouter-messages</span>                        │
-│ claude-opus-5  <span class="d">ses-hot</span>           default → claude-sub            <span class="b">rule 6 → openrouter-messages</span>                        │
-│ claude-haiku-4-5  <span class="d">ses-crow</span>       default → claude-sub            <span class="b">rule 6 → openrouter-messages</span>                        │
-│<span class="d"> openrouter/qwen3-coder           rule 4 → openrouter-messages    rule 4 → openrouter-messages                        </span>│
-│<span class="d"> anthropic_sub/claude-sonnet-5    rule 2 → claude-sub             rule 2 → claude-sub                                 </span>│
+│ <span class="d">request</span>                        <span class="d">session</span>   <span class="d">now</span>                             <span class="d">with this rule</span>                              │
+│ claude-sonnet-5                <span class="d">ses-free</span>  default → claude-sub            <span class="b">rule 6 → openrouter-messages</span>                │
+│ claude-opus-5                  <span class="d">ses-hot</span>   default → claude-sub            <span class="b">rule 6 → openrouter-messages</span>                │
+│ claude-haiku-4-5               <span class="d">ses-crow</span>  default → claude-sub            <span class="b">rule 6 → openrouter-messages</span>                │
+│<span class="d"> openrouter/qwen3-coder         </span><span class="d">ses-moth</span><span class="d">  rule 4 → openrouter-messages    rule 4 → openrouter-messages                </span>│
+│<span class="d"> anthropic_sub/claude-sonnet-5  </span><span class="d">ses-wren</span><span class="d">  rule 2 → claude-sub             rule 2 → claude-sub                         </span>│
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
                                                                                                                         </pre>
 <h2 id="after-save">After save, warm lanes left on rev 9 &mdash; 120&times;40</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1</span><span class="d"> → </span><span class="b r">2 rewrites 15</span><span class="d"> → </span><span class="d">3</span><span class="d"> → </span><span class="d">4</span><span class="d"> · </span><span class="d">5</span><span class="d"> · </span><span class="d">6</span>             <span class="b">saved</span> · rev 10 live<span class="d"> · 2 lanes on rev 9</span><span class="yellow"> · claude settings not synced</span> 
 ┌REWRITES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│       <span class="d">kind</span>   <span class="d">match</span>                       <span class="d">route</span>                   <span class="d">sends</span>             <span class="d">reach</span>                        <span class="d">hits</span> │
+│       <span class="d">kind</span>   <span class="d">match</span>                       <span class="d">route</span>                   <span class="d">sends</span>             <span class="d">reach</span>                    <span class="d">hits 24h</span> │
 │ <span class="d">┌─ </span><span class="b">anthropic_messages</span>  6 rules <span class="d">─────────────────────────────────────────────────────────────────────────────────────</span> │
 │ <span class="d">│</span> <span class="d"> 1</span>  <span class="d">prefix</span> anthropic/${model}        → claude-sub              ${model}          <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>       <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 2</span>  <span class="d">prefix</span> anthropic_sub/${model}    → claude-sub              ${model}          <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>      ≥1 │
@@ -311,7 +311,8 @@
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌RULE──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">claude-* → openrouter-messages</span>                                                                                       │
-│ <span class="d">match</span>     glob  claude-*<span class="d"> · sends as asked</span>                                                                            │
+│ <span class="d">match</span>     glob  claude-*                                                                                             │
+│ <span class="d">sends</span>     as asked                                                                                                   │
 │ <span class="d">example</span>   claude-haiku-4-5 → claude-haiku-4-5                                                                        │
 │ <span class="d">sends to</span>  openrouter-messages<span class="d">  1 candidate · openrouter · </span><span class="yellow">billed</span>                                                     │
 │ <span class="d">reach</span>     ok                                                                                                         │
@@ -319,7 +320,6 @@
 │ <span class="d">recent</span>    <span class="d">-</span>                                                                                                          │
 │ [e] edit   [n] new   [m] move   [space] turn off   [d] delete   [t] trace   [enter] open route                       │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                                                                                                                        
                                                                                                                         
                                                                                                                         
                                                                                                                         

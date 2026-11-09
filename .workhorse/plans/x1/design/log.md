@@ -162,11 +162,15 @@ The suggestions: the overlay lacked `not synced`, `unprefixed`, `${model_id}`, `
 All three were fixed, with eleven of the nits, and checked by eye: the settings edit is now an inline form refusing `2M` against the largest context, the overlay is inset and carries the new marks, and openrouter's `used by` counts through its fallback routes (`10 rewrites · 4 defaults · 5 routes`).
 Skipped: nit 10, the shorter after-save header, because the full tab strip takes about 100 of 120 cells and no lifecycle clause fits beside it; the collapse is the design system's order.
 
+## Round 6
+
+A fresh critic (Fable), who read no earlier round, judged all 30 frames: 0 critical, 2 suggestions, 7 nits (`critique-round-6.md`).
+Clean, so the clean count is 2, the second from a fresh critic: the stop rule is met, at the cap.
+The two suggestions are applied as final polish, without another round: `hits` never said its window, so it's now `hits 24h` with a MARKS line; and a presentation's `published  no` contradicted the synced header, so it now reads `yes`, the scope's state.
+The nits applied: `· 1 new` on the fallback form, a `sends` row of its own in the RULE detail, session ids on every PREVIEW row, `reach` replacing `now` on the routes table, `pinned` dropped from MARKS since no frame draws it, and `follows lane TTL` dim in settings.
+Not applied: the explanation of off handlers in the overlay, which belongs to the handler picker that `enter` on `handled by` opens, which is in the backlog.
+
 ## Where it stands
 
-- round 6 critic (Fable, fresh) running
+- loop finished: rounds 5 and 6 clean, from fresh critics; round 6's polish applied by the drawing agents
 - the user flagged that the presentations `as` tiers were treated as Claude's; the guide now says tiers are the client's own, and the wider problem (Toker hardcodes tiers and families in code) is card Y1
-
-## Next
-
-- round 6, the cap: a fresh critic; clean means the stop rule is met
