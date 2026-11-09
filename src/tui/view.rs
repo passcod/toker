@@ -46,11 +46,12 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Cell, Paragraph, Row, Table},
+    widgets::{Cell, Paragraph, Row, Table},
 };
 
 use unicode_width::UnicodeWidthStr;
 
+use super::chrome::{self, Chrome, ListWindow, clip, clip_spans, list_window, panel};
 use super::labels::short_dir;
 use super::locale::Fmt;
 use super::model::{HitRate, NO_SESSION, SessionAgg, Snapshot};
@@ -88,10 +89,6 @@ const IDLE_SECS: i64 = 180;
 /// younger than this, and turns yellow past it (the predecessor's
 /// thresholds, kept so a glance reads the same).
 const FRESH_SECS: i64 = 30;
-
-/// A header action is a compact inverse-video chip. Keeping its width
-/// fixed leaves a predictable strip where more page actions can sit.
-const HEADER_ACTION_WIDTH: u16 = 3;
 
 /// Past this the proxy has been quiet long enough to look dead: the
 /// freshness turns red and counts in minutes.
@@ -257,9 +254,6 @@ const BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█
 /// formatter, resolved once at startup.
 pub(crate) struct Ui {
     pub fmt: Fmt,
-    /// `NO_COLOR` was set (see [`no_color`]): the frame renders without
-    /// colour.
-    pub no_color: bool,
     /// The `?` legend overlay is showing.
     pub legend: bool,
     /// How far each list is scrolled (the mouse wheel over it).
@@ -304,10 +298,9 @@ pub(crate) struct Scroll {
 /// for hit-testing the wheel, and how far it can scroll.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Drawn {
-    /// The inverse-video `?` in the header, which toggles the legend.
-    pub legend_button: Rect,
-    /// The `⇄` chip beside the legend, which opens the routing page.
-    pub routing_button: Rect,
+    /// The header's chips: `?` toggles the legend, `⇄` goes to the next
+    /// page.
+    pub header: chrome::Header,
     pub sessions: DrawnList,
     pub context: DrawnList,
     /// CACHE REBUILDS' causes and details; not clickable either.
@@ -351,12 +344,6 @@ impl DrawnList {
     }
 }
 
-/// Whether `NO_COLOR`'s value asks for no colour: set and non-empty, the
-/// convention's own rule (an empty value is the same as unset).
-pub(crate) fn no_color(value: Option<std::ffi::OsString>) -> bool {
-    value.is_some_and(|value| !value.is_empty())
-}
-
 /// The whole frame. `clock` is the preformatted HH:MM:SS string and
 /// `tz` the zone the quota labels render in, both passed in so tests
 /// stay deterministic.
@@ -386,11 +373,8 @@ pub(crate) fn render(
         height: layout.header.height.max(frame.area().height.min(1)),
         ..layout.header
     };
-    let (legend_button, routing_button, header) = header_actions(action_header);
-    render_header(frame, header, snap, clock);
-    // At narrow widths the existing status needs every cell; below 80 columns
-    // `Tab` remains the route action.
-    let visible_routing_button = (routing_button.width > 0).then_some(routing_button);
+    let header = chrome::header(action_header);
+    render_header(frame, header.rest, snap, clock);
     let (sessions_offset, sessions_rows) = render_sessions(
         frame,
         layout.sessions,
@@ -402,8 +386,7 @@ pub(crate) fn render(
     let (context_offset, context_rows) =
         render_context(frame, layout.context, chrome, snap, fmt, ui.scroll.context);
     let mut drawn = Drawn {
-        legend_button,
-        routing_button,
+        header,
         // Filled by the rate strip once it knows how many accounts fit.
         accounts_max_offset: 0,
         sessions: DrawnList {
@@ -453,11 +436,24 @@ pub(crate) fn render(
     );
     // Short layouts can make the bottom panel share the header row; keep the
     // discoverability controls above page data after that final render.
-    render_header_action(frame, legend_button, visible_routing_button);
+    chrome::chips(frame, &header);
     // The overlays are exclusive (the loop opens one by closing the
     // other); the legend wins if both are ever set.
     if ui.legend {
-        render_legend(frame);
+        chrome::overlay(
+            frame,
+            "LEGEND",
+            &[
+                chrome::Section {
+                    heading: None,
+                    rows: &LEGEND,
+                },
+                chrome::Section {
+                    heading: Some("KEYS"),
+                    rows: &KEYS,
+                },
+            ],
+        );
     } else if let Some(popup) = &ui.detail {
         drawn.popup = Some(super::detail::render(
             frame,
@@ -470,73 +466,7 @@ pub(crate) fn render(
             fmt,
         ));
     }
-    if ui.no_color {
-        strip_colour(frame);
-    }
     drawn
-}
-
-/// Header actions: the established `?` at the far left and a one-cell blue
-/// `⇄` in its old gutter. The dashboard status keeps its exact responsive
-/// layout; the action overpaints only that gutter, and yields before the
-/// legend's one-cell escape on tiny terminals.
-fn header_actions(area: Rect) -> (Rect, Rect, Rect) {
-    let legend_width = area.width.min(HEADER_ACTION_WIDTH);
-    let legend = Rect::new(area.x, area.y, legend_width, area.height.min(1));
-    // One cell in the gutter after the legend; below 80 columns the status
-    // needs every cell and `Tab` is the way across.
-    let routing_width = u16::from(area.width >= 80);
-    let routing = Rect::new(
-        area.x + legend_width,
-        area.y,
-        routing_width,
-        area.height.min(1),
-    );
-    let header_x = area.x + legend_width + (area.width > legend_width) as u16;
-    let header = Rect::new(
-        header_x,
-        area.y,
-        area.width.saturating_sub(header_x - area.x),
-        area.height,
-    );
-    (legend, routing, header)
-}
-
-fn render_header_action(frame: &mut Frame, legend: Rect, routing: Option<Rect>) {
-    let legend_label = if legend.width >= HEADER_ACTION_WIDTH {
-        " ? "
-    } else {
-        "?"
-    };
-    frame.render_widget(
-        Paragraph::new(legend_label).style(
-            Style::new()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::REVERSED),
-        ),
-        legend,
-    );
-    if let Some(routing) = routing {
-        frame.render_widget(
-            Paragraph::new("⇄").style(
-                Style::new()
-                    .fg(Color::Blue)
-                    .add_modifier(Modifier::REVERSED),
-            ),
-            routing,
-        );
-    }
-}
-
-/// Every colour off the finished frame, modifiers kept: `NO_COLOR` is
-/// about colour, and bold and dim still carry meaning without it (a dim
-/// `-`, an idle age). Done once over the buffer rather than at each
-/// style site, so no panel can forget it.
-fn strip_colour(frame: &mut Frame) {
-    for cell in frame.buffer_mut().content.iter_mut() {
-        cell.fg = Color::Reset;
-        cell.bg = Color::Reset;
-    }
 }
 
 /// The legend's rows: a glyph or marker, and what it means.
@@ -585,94 +515,16 @@ const LEGEND: [(&str, &str); 21] = [
     ("idle", "dim once a session has been quiet 3m"),
 ];
 
-/// The `?` overlay: what the dashboard's glyphs and markers mean,
-/// centred over the frame and clipped to it.
-fn render_legend(frame: &mut Frame) {
-    let key_w = LEGEND.iter().map(|(key, _)| key.width()).max().unwrap_or(0);
-    let mut lines: Vec<Line> = LEGEND
-        .iter()
-        .map(|(key, meaning)| {
-            Line::from(vec![
-                Span::styled(format!("{key:<key_w$}"), Style::new().bold()),
-                Span::raw("  "),
-                Span::raw(*meaning),
-            ])
-        })
-        .collect();
-    lines.push(Line::styled("? or Esc closes", Style::new().dim()));
-    let text_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
-    let area = frame.area();
-    let width = (text_w + 4).min(area.width);
-    let height = (lines.len() as u16 + 2).min(area.height);
-    let popup = Rect {
-        x: area.x + (area.width - width) / 2,
-        y: area.y + (area.height - height) / 2,
-        width,
-        height,
-    };
-    frame.render_widget(ratatui::widgets::Clear, popup);
-    let block = Block::bordered()
-        .title_top("LEGEND")
-        .padding(ratatui::widgets::Padding::horizontal(1));
-    frame.render_widget(Paragraph::new(lines).block(block), popup);
-}
-
-/// How the panels are framed. Boxed panels cost two rows each (the
-/// borders); a short terminal drops them for a `TITLE ───` rule that
-/// costs one, because a border is the cheapest thing on the page to
-/// lose — data goes only after every border has.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Chrome {
-    Boxed,
-    Ruled,
-}
-
-impl Chrome {
-    /// The rows a panel's frame takes.
-    fn cost(self) -> u16 {
-        match self {
-            Chrome::Boxed => 2,
-            Chrome::Ruled => 1,
-        }
-    }
-}
-
-/// Draw a panel's frame — a bordered box, or the title rule — and
-/// return the area its content goes in. The ruled form insets the
-/// content by a column a side like the box does, so every width-driven
-/// choice (column shedding, bar budgets) is the same in both.
-fn panel(frame: &mut Frame, area: Rect, title: &str, chrome: Chrome) -> Rect {
-    match chrome {
-        Chrome::Boxed => {
-            let block = Block::bordered().title_top(title.to_owned());
-            let inner = block.inner(area);
-            frame.render_widget(block, area);
-            inner
-        }
-        Chrome::Ruled => {
-            if area.height == 0 {
-                return area;
-            }
-            // The rule stops a cell short of the edge, so side-by-side
-            // panels' titles never run into each other's rules.
-            let rule = area.width.saturating_sub(title.width() as u16 + 2).into();
-            frame.render_widget(
-                Line::from(vec![
-                    Span::styled(title.to_owned(), Style::new().bold()),
-                    Span::raw(" "),
-                    Span::styled("─".repeat(rule), Style::new().dim()),
-                ]),
-                Rect { height: 1, ..area },
-            );
-            Rect {
-                x: area.x + 1.min(area.width),
-                y: area.y + 1,
-                width: area.width.saturating_sub(2),
-                height: area.height - 1,
-            }
-        }
-    }
-}
+/// The dashboard's keys, under its marks in the same overlay: with no
+/// footer on any page, the overlay is where a page teaches what it takes.
+const KEYS: [(&str, &str); 6] = [
+    ("click", "open a session's detail"),
+    ("wheel", "scroll the list under the pointer"),
+    ("←/→ h/l", "scroll the accounts in rate & quota"),
+    ("r", "refresh now"),
+    ("tab or ⇄", "next page"),
+    ("q", "quit"),
+];
 
 /// Where everything goes: the panel areas and the framing they share.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -828,65 +680,6 @@ fn share_rows(need_s: u16, need_c: u16, avail: u16) -> (u16, u16) {
     let rows_c = need_c.min(avail - rows_s);
     rows_s = need_s.min(avail - rows_c);
     (rows_s, rows_c)
-}
-
-/// Which of a list's `total` entries show in `room` rows, scrolled
-/// `offset` entries down: all of them when they fit; one entry alone at
-/// one row (a row is better spent on an entry than on a count of none
-/// shown); otherwise the entries from `offset`, under an "above" count
-/// once scrolled and over a "more" count while any are left below. The
-/// offset is clamped so the last entry, once reached, sits on the last
-/// row. At two rows a scrolled list in the middle drops the "above"
-/// count: an entry and the "more" line are worth more than two counts.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ListWindow {
-    /// The furthest offset that still changes what shows.
-    max_offset: usize,
-    /// The count line over the entries, when it renders.
-    above: Option<usize>,
-    /// The entries that render.
-    shown: std::ops::Range<usize>,
-    /// The count line under the entries, when it renders.
-    below: Option<usize>,
-}
-
-fn list_window(total: usize, room: usize, offset: usize) -> ListWindow {
-    if total <= room || room == 0 {
-        return ListWindow {
-            max_offset: 0,
-            above: None,
-            shown: 0..total.min(room),
-            below: None,
-        };
-    }
-    if room == 1 {
-        let offset = offset.min(total - 1);
-        return ListWindow {
-            max_offset: total - 1,
-            above: None,
-            shown: offset..offset + 1,
-            below: None,
-        };
-    }
-    let max_offset = total - (room - 1);
-    let offset = offset.min(max_offset);
-    let above = (offset > 0 && (room >= 3 || offset == max_offset)).then_some(offset);
-    let rows = room - usize::from(above.is_some());
-    if offset + rows >= total {
-        return ListWindow {
-            max_offset,
-            above,
-            shown: offset..total,
-            below: None,
-        };
-    }
-    let end = offset + rows - 1;
-    ListWindow {
-        max_offset,
-        above,
-        shown: offset..end,
-        below: Some(total - end),
-    }
 }
 
 /// The CONTEXT list's entries: sessions whose main lane has enough
@@ -1363,32 +1156,6 @@ fn session_name_or_id(session: &SessionAgg) -> Vec<Span<'static>> {
 /// The cells [`session_name_or_id`] takes, unclipped.
 fn session_name_width(session: &SessionAgg) -> usize {
     session_name_or_id(session).iter().map(Span::width).sum()
-}
-
-/// `spans` cut to `width` cells with an ellipsis when anything had to
-/// go, each surviving span keeping its style — the directory stays
-/// cyan up to the cut.
-fn clip_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
-    let total: usize = spans.iter().map(Span::width).sum();
-    if total <= width {
-        return spans;
-    }
-    let mut room = width.saturating_sub(1); // the ellipsis
-    let mut out = Vec::with_capacity(spans.len() + 1);
-    let mut style = Style::new();
-    for span in spans {
-        if room == 0 {
-            break;
-        }
-        let text = clip(&span.content, room);
-        room -= text.width();
-        style = span.style;
-        out.push(Span::styled(text, span.style));
-    }
-    if width > 0 {
-        out.push(Span::styled("…", style));
-    }
-    out
 }
 
 /// The label cell: the shared name clipped to the column (with an
@@ -2884,22 +2651,6 @@ fn binding_line(claim: &str, overage_in_use: bool) -> Line<'static> {
     Line::from(spans)
 }
 
-/// `text` cut to at most `width` cells, whole characters only — a wide
-/// character that would straddle the edge goes rather than half-renders.
-fn clip(text: &str, width: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in text.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + w > width {
-            break;
-        }
-        used += w;
-        out.push(ch);
-    }
-    out
-}
-
 /// The meter bar: fill to `round(frac × w)`, pad with `░`.
 fn bar(frac: f64, w: u16) -> String {
     let w = w as usize;
@@ -2952,6 +2703,7 @@ mod short_tokens_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::super::chrome;
     use super::super::model;
     use super::super::quota::Spent;
     use super::super::testrows::{
@@ -2993,7 +2745,6 @@ mod tests {
     fn plain() -> super::Ui {
         super::Ui {
             fmt: Fmt::fixed(),
-            no_color: false,
             legend: false,
             scroll: super::Scroll::default(),
             gate_armed: true,
@@ -3536,7 +3287,7 @@ mod tests {
             .expect("draw");
         let buffer = terminal.backend().buffer();
 
-        assert_eq!(drawn.legend_button, ratatui::layout::Rect::new(0, 0, 3, 1));
+        assert_eq!(drawn.header.keys, ratatui::layout::Rect::new(0, 0, 3, 1));
         assert_eq!(
             (0..3).map(|x| buffer[(x, 0)].symbol()).collect::<String>(),
             " ? "
@@ -3547,12 +3298,13 @@ mod tests {
             assert!(cell.modifier.contains(Modifier::REVERSED));
             assert!(
                 drawn
-                    .legend_button
+                    .header
+                    .keys
                     .contains(ratatui::layout::Position::new(x, 0))
             );
         }
         assert_eq!(
-            drawn.routing_button,
+            drawn.header.switch,
             ratatui::layout::Rect::new(3, 0, 1, 1),
             "the routing chip fills the gutter"
         );
@@ -3575,7 +3327,7 @@ mod tests {
                     drawn = super::render(frame, &snap, "12:34:56", &utc(), &plain());
                 })
                 .expect("draw");
-            assert_eq!(drawn.legend_button.width, width);
+            assert_eq!(drawn.header.keys.width, width);
             assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "?");
         }
     }
@@ -4842,9 +4594,9 @@ mod tests {
 
     #[test]
     fn no_color_strips_every_colour_and_keeps_the_modifiers() {
-        assert!(super::no_color(Some("1".into())));
-        assert!(!super::no_color(Some("".into())), "empty is unset");
-        assert!(!super::no_color(None));
+        assert!(chrome::no_color(Some("1".into())));
+        assert!(!chrome::no_color(Some("".into())), "empty is unset");
+        assert!(!chrome::no_color(None));
 
         let snap = full_snapshot();
         let coloured = buffer_with(&snap, 120, 40, &plain());
@@ -4852,11 +4604,14 @@ mod tests {
             coloured.content.iter().any(|cell| cell.fg != Color::Reset),
             "the fixture renders colour"
         );
-        let ui = super::Ui {
-            no_color: true,
-            ..plain()
-        };
-        let plain_buffer = buffer_with(&snap, 120, 40, &ui);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                super::render(frame, &snap, "12:34:56", &utc(), &plain());
+                chrome::strip_colour(frame);
+            })
+            .expect("draw");
+        let plain_buffer = terminal.backend().buffer().clone();
         assert!(
             plain_buffer
                 .content
@@ -4899,7 +4654,9 @@ mod tests {
             "<1%",
             "estimating",
             "green under 30s",
-            "? or Esc closes",
+            "KEYS",
+            "next page",
+            "? or esc close",
         ] {
             assert!(on.contains(expected), "{expected:?} in:\n{on}");
         }
@@ -5113,35 +4870,6 @@ mod tests {
     }
 
     #[test]
-    fn a_list_window_counts_what_it_scrolled_past() {
-        let window = |above, shown, below, max_offset| super::ListWindow {
-            max_offset,
-            above,
-            shown,
-            below,
-        };
-        // Fits: everything, nothing to scroll.
-        assert_eq!(super::list_window(2, 3, 5), window(None, 0..2, None, 0));
-        // Cut, at the top: the "more" count closes it.
-        assert_eq!(super::list_window(5, 3, 0), window(None, 0..2, Some(3), 3));
-        // Scrolled into the middle: a count on each side.
-        assert_eq!(
-            super::list_window(5, 3, 1),
-            window(Some(1), 1..2, Some(3), 3)
-        );
-        // At the end, and past it: the last entry on the last row.
-        assert_eq!(super::list_window(5, 3, 3), window(Some(3), 3..5, None, 3));
-        assert_eq!(super::list_window(5, 3, 9), window(Some(3), 3..5, None, 3));
-        // One row: an entry, not a count of none shown.
-        assert_eq!(super::list_window(5, 1, 0), window(None, 0..1, None, 4));
-        assert_eq!(super::list_window(5, 1, 2), window(None, 2..3, None, 4));
-        // Two rows in the middle: the entry and the "more" line.
-        assert_eq!(super::list_window(5, 2, 2), window(None, 2..3, Some(2), 4));
-        // No rows: nothing, and nothing to scroll.
-        assert_eq!(super::list_window(5, 0, 2), window(None, 0..0, None, 0));
-    }
-
-    #[test]
     fn the_lists_scroll_to_their_offsets() {
         let snap = full_snapshot();
         let draw = |scroll: super::Scroll| {
@@ -5304,21 +5032,11 @@ mod tests {
     }
 
     #[test]
-    fn the_routing_chip_sits_in_the_legend_gutter_from_80_columns() {
-        let wide = super::header_actions(ratatui::layout::Rect::new(0, 0, 100, 24));
-        assert_eq!(wide.1, ratatui::layout::Rect::new(3, 0, 1, 1));
-        assert_eq!(wide.2.x, 4, "the status starts after the gutter");
-        assert_eq!(
-            super::header_actions(ratatui::layout::Rect::new(0, 0, 80, 24))
-                .1
-                .width,
-            1
-        );
-        assert_eq!(
-            super::header_actions(ratatui::layout::Rect::new(0, 0, 79, 24))
-                .1
-                .width,
-            0
-        );
+    fn the_switch_chip_sits_in_the_legend_gutter_from_80_columns() {
+        let header = |width| chrome::header(ratatui::layout::Rect::new(0, 0, width, 24));
+        assert_eq!(header(100).switch, ratatui::layout::Rect::new(3, 0, 1, 1));
+        assert_eq!(header(100).rest.x, 4, "the status starts after the gutter");
+        assert_eq!(header(80).switch.width, 1);
+        assert_eq!(header(79).switch.width, 0);
     }
 }

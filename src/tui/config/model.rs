@@ -266,12 +266,20 @@ impl State {
             return self.edit_key(key);
         }
         match key.code {
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('k') => {
                 self.move_selection(-1);
                 None
             }
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Char('j') => {
                 self.move_selection(1);
+                None
+            }
+            // Two views, so either way is the other one.
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l') => {
+                self.set_view(match self.view {
+                    View::Providers => View::Settings,
+                    View::Settings => View::Providers,
+                });
                 None
             }
             KeyCode::Char('1') => {

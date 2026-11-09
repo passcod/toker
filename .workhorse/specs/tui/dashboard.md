@@ -6,6 +6,7 @@ id: UTUI
 
 The dashboard is where an operator reads what Toker has recorded and edits the policy.
 This spec covers the views it renders, the controls it offers, and the rules its readings follow.
+It renders as pages: the dashboard proper, routing, configuration and accounts.
 
 ## Rendering
 
@@ -19,12 +20,13 @@ That formatting MUST NOT reach a gate notice, as [GNOTE](../gates/notices.md#a-n
 
 ### What is shed first
 
-The dashboard MUST render into whatever terminal size it is given, shedding in a fixed order rather than clipping.
+Every page MUST render into whatever terminal size it is given, shedding in a fixed order rather than clipping.
 
 Panel framing MUST be shed before any content is.
 A table MUST shed columns before its content is truncated.
 A panel MUST shed its own rows down to the reading it exists to give before any panel is dropped whole.
 The quota block MUST NOT be shed.
+A list cut short MUST say how many of its entries it left out, on each side that hides any.
 
 > [!NOTE]
 > A border is the cheapest thing on the page to lose and the quota block is the part worth watching, so the order is a statement of what the dashboard is for, written as what it gives up last.
@@ -45,7 +47,7 @@ A forecast that reaches an armed gate MUST read as distinct from one that reache
 A reading taken from a window that has rolled over, or one there is too little data to make, MUST say so in words rather than render a figure that looks measured.
 
 A reading MUST NOT be distinguished by colour alone.
-The dashboard MUST honour `NO_COLOR`, and MUST remain readable with every colour removed.
+Every page MUST honour `NO_COLOR`, and MUST remain readable with every colour removed.
 
 > [!NOTE]
 > Rendering without colour is a supported mode, so a distinction carried by hue alone vanishes in it. This spec therefore names no colour and no threshold; which hue carries which reading, and where each band falls, are design decisions recorded in [the design guide](../../design/design-system.md).
@@ -61,6 +63,18 @@ Every mark the dashboard renders MUST be explained in the legend, and the legend
 
 > [!NOTE]
 > The legend is the operator's dictionary. A mark missing from it is undocumented, and an entry with nothing behind it is a claim about a screen that does not exist. Which glyph carries which mark is a design decision, recorded in the design guide.
+
+### Finding the keys
+
+Every page MUST offer an overlay listing the keys it acts on, opened by the same key on every page.
+The header of every page MUST carry a control that opens that overlay, at every terminal size.
+
+> [!NOTE]
+> Hints held on screen cost a row on every frame of a page an operator long since learned, and the pages that need the most keys have the least room for them. The overlay keeps them a key away instead.
+
+A modal or a text entry that takes every key MUST say the keys it acts on itself, since the overlay cannot open over it.
+
+Every page MUST be able to move to the next page by the same key.
 
 ## The views
 

@@ -5,93 +5,116 @@
 //! (spec: UTUI#rendering).
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use super::model::{Provider, Row, Settings, Snapshot, State, View};
+use crate::tui::chrome::{self, Chrome, Noun, RowHit};
 
 /// Where the last frame put things, for the mouse.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Drawn {
-    pub(super) entries: Rect,
+    pub(super) header: chrome::Header,
+    pub(super) tabs: Vec<Rect>,
+    pub(super) rows: Vec<RowHit>,
 }
 
-pub(super) fn render(frame: &mut Frame, state: &State) -> Drawn {
-    let area = frame.area();
-    let [header, body, footer] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(3),
-        Constraint::Length(2),
-    ])
-    .areas(area);
+/// The tabs, in the order `1` and `2` name them.
+const TABS: [&str; 2] = ["providers", "settings"];
 
-    frame.render_widget(Paragraph::new(tabs(state)), header);
+/// The page's keys, in its `?` overlay.
+const KEYS: [(&str, &str); 8] = [
+    ("↑/↓ j/k", "select"),
+    ("←/→ h/l 1 2", "switch view"),
+    ("space", "toggle"),
+    ("e", "edit"),
+    ("r", "refresh"),
+    ("esc", "back to the dashboard"),
+    ("tab or ⇄", "next page"),
+    ("q", "quit"),
+];
 
-    let drawn = match state.snapshot() {
-        _ if !state.reachable() => {
-            // The service is the only writer, so a form the operator can
-            // fill in while it is down is a form whose edits go nowhere
-            // (spec: UTUI#the-configuration-pages).
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from(""),
-                    Line::from("  the service is not answering"),
-                    Line::from("  configuration is edited through it, so there is nothing to show"),
-                ])
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("CONFIGURATION"),
-                ),
-                body,
-            );
-            Drawn::default()
-        }
-        None => Drawn::default(),
-        Some(snapshot) => {
-            let rows = state.rows();
-            let items: Vec<ListItem> = rows
-                .iter()
-                .map(|row| ListItem::new(line_for(*row, snapshot)))
-                .collect();
-            let mut list_state = ListState::default();
-            list_state.select(Some(state.selected()));
-            frame.render_stateful_widget(
-                List::new(items)
-                    .block(Block::default().borders(Borders::ALL).title(title(state)))
-                    .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
-                body,
-                &mut list_state,
-            );
-            Drawn { entries: body }
-        }
+pub(super) fn render(frame: &mut Frame, state: &State, overlay: bool) -> Drawn {
+    // A refused value is reported on the page, under the header, for as
+    // many rows as it takes (spec: UTUI#the-configuration-pages).
+    let (header, body) = chrome::page(frame, state.error());
+    let current = match state.view() {
+        View::Providers => 0,
+        View::Settings => 1,
+    };
+    let tabs = chrome::tabs(frame, header.rest, &TABS, current);
+
+    let rows = if !state.reachable() {
+        // The service is the only writer, so a form the operator can
+        // fill in while it is down is a form whose edits go nowhere
+        // (spec: UTUI#the-configuration-pages).
+        let lines = vec![
+            Line::from("the service is not answering"),
+            Line::from("configuration is edited through it, so there is nothing to show").dim(),
+        ];
+        let inner = chrome::panel(
+            frame,
+            body,
+            "CONFIGURATION",
+            Chrome::fitting(lines.len(), body.height),
+        );
+        chrome::list(
+            frame,
+            inner,
+            lines.into_iter().map(|line| vec![line]).collect(),
+            None,
+            NOUNS[current],
+        );
+        Vec::new()
+    } else if let Some(snapshot) = state.snapshot() {
+        let entries: Vec<Vec<Line<'static>>> = state
+            .rows()
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let mut lines = vec![line_for(row, snapshot)];
+                if index == state.selected() {
+                    lines.extend(entry_lines(state));
+                }
+                lines
+            })
+            .collect();
+        let need = entries.iter().map(Vec::len).sum();
+        let inner = chrome::panel(frame, body, title(state), Chrome::fitting(need, body.height));
+        chrome::list(frame, inner, entries, Some(state.selected()), NOUNS[current])
+    } else {
+        Vec::new()
     };
 
-    frame.render_widget(Paragraph::new(footer_lines(state)), footer);
-    drawn
+    chrome::chips(frame, &header);
+    if overlay {
+        chrome::overlay(
+            frame,
+            "KEYS",
+            &[chrome::Section {
+                heading: None,
+                rows: &KEYS,
+            }],
+        );
+    }
+    Drawn { header, tabs, rows }
 }
 
-fn tabs(state: &State) -> Line<'static> {
-    let mark = |view: View, label: &'static str| {
-        let style = if state.view() == view {
-            Style::default().add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        Span::styled(label, style)
-    };
-    Line::from(vec![
-        Span::raw(" "),
-        mark(View::Providers, "1 providers"),
-        Span::raw("   "),
-        mark(View::Settings, "2 settings"),
-    ])
-}
+/// What each view's counts call what they leave out.
+const NOUNS: [Noun; 2] = [
+    Noun {
+        one: "row",
+        many: "rows",
+    },
+    Noun {
+        one: "setting",
+        many: "settings",
+    },
+];
 
-/// The panel title, upper case and unspaced against its rule, as the
-/// dashboard and the routing page both render theirs.
+/// The panel title, upper case and unspaced against its rule, as every
+/// other page renders its own.
 fn title(state: &State) -> &'static str {
     match state.view() {
         View::Providers => "PROVIDERS",
@@ -99,28 +122,34 @@ fn title(state: &State) -> &'static str {
     }
 }
 
-fn footer_lines(state: &State) -> Vec<Line<'static>> {
-    if let Some(editing) = state.editing() {
-        let shown = if editing.secret {
-            // A credential is never echoed, here or anywhere
-            // (spec: SEC#a-credential-is-never-logged-or-displayed).
-            "·".repeat(editing.buffer.chars().count())
-        } else {
-            editing.buffer.clone()
-        };
-        return vec![
-            Line::from(format!("  > {shown}")),
-            Line::from("  enter accepts, empty clears, esc cancels"),
-        ];
-    }
-    let mut lines = vec![Line::from(
-        "  space toggles  e edits  1/2 switches  q quits",
-    )];
-    lines.push(Line::from(match state.error() {
-        Some(error) => format!("  {error}"),
-        None => String::new(),
-    }));
-    lines
+/// The open text entry, under the row it edits: what has been typed, then
+/// the keys it takes. It takes every key, `?` included, so it says them
+/// itself rather than leaving them to the overlay.
+fn entry_lines(state: &State) -> Vec<Line<'static>> {
+    let Some(editing) = state.editing() else {
+        return Vec::new();
+    };
+    let shown = if editing.secret {
+        // A credential is never echoed, here or anywhere
+        // (spec: SEC#a-credential-is-never-logged-or-displayed).
+        "·".repeat(editing.buffer.chars().count())
+    } else {
+        editing.buffer.clone()
+    };
+    vec![
+        Line::from(vec![
+            Span::raw(format!("    {:<18} {shown}", "new value")),
+            Span::styled("▏", Style::new().fg(Color::Cyan)),
+        ]),
+        Line::styled(
+            format!(
+                "    {:<18} {}",
+                "",
+                chrome::hints(&[("enter", "save, empty clears"), ("esc", "cancel")])
+            ),
+            Style::new().dim(),
+        ),
+    ]
 }
 
 fn line_for(row: Row, snapshot: &Snapshot) -> Line<'static> {
@@ -237,7 +266,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
         terminal
             .draw(|f| {
-                super::render(f, state);
+                super::render(f, state, false);
             })
             .expect("draw");
         let buffer = terminal.backend().buffer();

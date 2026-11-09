@@ -529,11 +529,11 @@ impl Purpose {
     fn help(self) -> &'static str {
         match self {
             Purpose::Record { .. } => {
-                "Up/Down field · Left/Right change · Tab complete · Ctrl+S saves · Esc cancels"
+                "↑/↓ field · ←/→ change · tab complete · ctrl+s save · esc cancel"
             }
-            Purpose::Description => "Enter saves · Esc cancels",
-            Purpose::Promote => "Tab completes from a daemon offer · Enter records · Esc cancels",
-            Purpose::Preview => "Content-free request facts only · Enter previews · Esc cancels",
+            Purpose::Description => "enter save · esc cancel",
+            Purpose::Promote => "tab complete from a daemon offer · enter record · esc cancel",
+            Purpose::Preview => "content-free request facts only · enter preview · esc cancel",
         }
     }
 }

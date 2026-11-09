@@ -20,7 +20,7 @@ pub(super) enum View {
 }
 
 impl View {
-    const ALL: [View; 4] = [
+    pub(super) const ALL: [View; 4] = [
         View::Presentations,
         View::Routes,
         View::Rewrites,
@@ -33,6 +33,17 @@ impl View {
             View::Routes => "ROUTES, CANDIDATES & DEFAULTS",
             View::Rewrites => "REWRITES, FAMILIES, UPGRADES & COMPACTION",
             View::Status => "PREVIEW, REVISIONS & ACTIVATION",
+        }
+    }
+
+    /// The view's tab label: its title, in lower case like every other
+    /// tab.
+    pub(super) fn tab(self) -> &'static str {
+        match self {
+            View::Presentations => "presentations",
+            View::Routes => "routes, candidates & defaults",
+            View::Rewrites => "rewrites, families, upgrades & compaction",
+            View::Status => "preview, revisions & activation",
         }
     }
 
