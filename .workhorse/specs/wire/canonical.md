@@ -5,7 +5,7 @@ id: WCANON
 # Canonical rendering
 
 Toker parses every inference request into a canonical request and renders the outgoing body from it, rather than forwarding the client's bytes.
-This spec covers the guarantees rendering makes, which transformations may change a request's meaning, and how a body that cannot cross the canonical boundary is answered.
+This spec covers the guarantees rendering makes, which transformations may change a request's meaning, how a body that cannot cross the canonical boundary is answered, and which response headers reach the client.
 Administrative paths keep the client's bytes instead, as [ROUTE](../routing/overview.md) specifies.
 
 ## Rendering
@@ -104,6 +104,25 @@ A malformed body MUST retain a wire-shaped view for the quota decision and for p
 A malformed body MUST NOT have that view used for inference or for extracting the request's shape.
 
 Toker MUST observe a provider's response bytes before translating them, so that reported usage, billed cost and the serving provider remain the provider's own evidence.
+
+## Response headers
+
+A response Toker forwards from a provider MUST carry the provider's response headers, except those describing the connection and those describing the encoding or framing of a body Toker re-frames.
+
+Where a provider's response carries `anthropic-ratelimit-unified-overage-utilization` and no `anthropic-ratelimit-unified-overage-period-monthly-utilization`, Toker MUST add the latter to the forwarded response with the former's value, byte for byte.
+Toker MUST NOT replace an `anthropic-ratelimit-unified-overage-period-monthly-utilization` the provider sent.
+This MUST hold on every forwarded response, whatever its path, status, streaming mode or client protocol.
+Toker MUST NOT add either header to a response it answers itself.
+
+The meters Toker records MUST be read from the provider's own headers, without the added one, as [SLEDGR](../store/ledger.md#fields-that-need-care) requires of a meter snapshot.
+
+> [!NOTE]
+> Claude Code reports rate limit state to its host from these headers.
+> While overage is drawn, its report names the exhausted plan window and leaves out the overage utilisation, but it passes the monthly overage period utilisation through in every state.
+> Copying the one into the other gives a host the share of the month's overage allowance spent on every turn.
+> Claude Code marks that field internal, so a later version may stop reading it, and the copy then does nothing.
+>
+> A response Toker answers itself has no provider reading behind it, and a stored one would present a past figure as current.
 
 ## Output limits
 
