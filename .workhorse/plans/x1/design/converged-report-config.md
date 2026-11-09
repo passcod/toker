@@ -104,3 +104,14 @@ All six frames are 120x40, built from a small generator (not in the repo) so eve
 - The popup is two columns of 50 and 62 cells, 33 rows tall, still 118 wide at column 1.
 - Width check (120 cells on every row of all six frames) and font stack re-run; 05 and 07 re-shot and viewed.
   04 is unchanged this round.
+
+## Round 4 fixes
+
+- **Overlay MARKS:** added `warm · cold`, `pinned` and `slug`; `refused · no route` now reads `no rule or default: Toker refuses it`.
+  Everything fit once the popup grew to 36 rows (rows 2 to 37), so no existing key or mark was merged or moved.
+- **ON A ROUTE:** added `enter  on handled by: turn one on`.
+- **`p`:** reads `promote: trust the newest model now, without waiting for evidence`.
+- **Settings:** `set by TOKER_DB` is now `set in toker.toml`; `idle-sleep lock` kept.
+- **History:** lanes column untouched.
+- The frame captions keep their ids (`history`, `armed`, `providers`, `settings`, `empty`, `keys`); my generator now writes them, so regenerating does not drop them.
+- Checks: `/tmp/x1gen/check.py` reports 120 cells x 40 rows on every frame of the three files and the Iosevka Term stack; all three re-shot, and the overlay frame viewed.
