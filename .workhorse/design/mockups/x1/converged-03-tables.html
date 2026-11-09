@@ -139,7 +139,7 @@
 │ <span class="d">as</span>        sonnet<span class="d">  shown as glm-5.1</span>                                                                                   │
 │ <span class="d">overlaps</span>  row 6 z-ai/glm-*-flash<span class="d">  kept apart by except *-flash*</span>                                                      │
 │ <span class="d">published</span> no                                                                                                         │
-│ [e] edit   [m] move   [n] new   [space] turn off   [d] delete   [enter] open route                                   │
+│ [e] edit   [n] new   [m] move   [space] turn off   [d] delete   [t] trace   [enter] open route                       │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
                                                                                                                         
                                                                                                                         
@@ -162,12 +162,12 @@
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌DEFAULT───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">anthropic_messages</span>                                                                                                   │
-│ <span class="d">for</span>       names no presentation or rewrite caught                                                                    │
 │ <span class="d">sends to</span>  claude-sub<span class="d">  2 candidates · anthropic_sub → openrouter</span>                                                      │
 │ <span class="d">reach</span>     <span class="yellow">no cred</span>  anthropic_sub is on with no credential                                                            │
-│ <span class="d">recent</span>    ≥3 in 24h                                                                                                  │
-│ [e] edit   [n] new   [space] turn off   [d] delete   [enter] open route                                              │
+│ <span class="d">recent</span>    claude-sonnet-5<span class="d">  ≥3 in 24h</span>                                                                                 │
+│ [e] edit   [n] new   [space] turn off   [d] delete   [t] trace   [enter] open route                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                                                                                        
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -191,7 +191,7 @@
                                                                                                                         
                                                                                                                         
                                                                                                                         </pre>
-<h2>Models &mdash; 120&times;40</h2>
+<h2>Models, focus in UPGRADES &mdash; 120&times;40</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 presentations 15</span><span class="d"> → </span><span class="d">2 rewrites 14</span><span class="d"> → </span><span class="d">3 defaults 4</span><span class="d"> → </span><span class="d">4 routes 7</span><span class="d"> · </span><span class="b r">5 models 11</span><span class="d"> · </span><span class="d">6 history 9</span>             rev 9 live 
 ┌FAMILIES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="d">family</span>           <span class="d">matches</span>                         <span class="d">example</span>                       <span class="d">reads as</span>                              │
@@ -202,16 +202,57 @@
 │ qwen             qwen/qwen*                      qwen/qwen3.5-max              max · 3.5                             │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌UPGRADES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ <span class="b">newest</span>  5 upgrades · evidence none                                                                                   │
-│<span class="r"> newest on claude-sub             claude-opus-4-7               → claude-opus-5 ↑                                     </span>│
-│ newest on claude-api             claude-sonnet-4-5             → claude-sonnet-5 ↑                                   │
-│ newest on openrouter-messages    anthropic/claude-sonnet-4-5   → anthropic/claude-sonnet-5 ↑                         │
-│ newest on openrouter-responses   openai/gpt-5.5-sol            → openai/gpt-5.6-sol ↑                                │
-│ newest on codex                  gpt-5.5-terra                 → gpt-5.6-terra ↑                                     │
+│ <span class="b">newest</span>  5 upgrades                                                                                                   │
+│<span class="r"> newest on claude-sub             claude-opus-4-7               → claude-opus-5                                       </span>│
+│ newest on claude-api             claude-sonnet-4-5             → claude-sonnet-5                                     │
+│ newest on openrouter-messages    anthropic/claude-sonnet-4-5   → anthropic/claude-sonnet-5                           │
+│ newest on openrouter-responses   openai/gpt-5.5-sol            → openai/gpt-5.6-sol                                  │
+│ newest on codex                  gpt-5.5-terra                 → gpt-5.6-terra                                       │
 │ [e] edit   [n] new   [d] delete   [p] promote                                                                        │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌COMPACTION────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ a cold compaction                any model                     → sonnet        <span class="d">cache</span> allow_when_cold                 │
+│ a cold compaction                any model                     → sonnet        <span class="d">cache</span> allowed when cold               │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌OFFERS────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ <span class="b">openrouter.openrouter_chat_completions</span>  440 offers                                                                   │
+│ <span class="d">… 180 above</span>                                                                                                          │
+│ openai/gpt-4-turbo-preview                   <span class="d">128k</span>   <span class="d">2024-01</span>                                                          │
+│ openai/gpt-4.1                                 <span class="d">1M</span>   <span class="d">2025-04</span>                                                          │
+│ openai/gpt-4.1-mini                            <span class="d">1M</span>   <span class="d">2025-04</span>                                                          │
+│ openai/gpt-4.1-nano                            <span class="d">1M</span>   <span class="d">2025-04</span>                                                          │
+│ openai/gpt-4o                                <span class="d">128k</span>   <span class="d">2024-05</span>                                                          │
+│ openai/gpt-4o-2024-05-13                     <span class="d">128k</span>   <span class="d">2024-05</span>                                                          │
+│ openai/gpt-4o-2024-08-06                     <span class="d">128k</span>   <span class="d">2024-08</span>                                                          │
+│ openai/gpt-4o-2024-11-20                     <span class="d">128k</span>   <span class="d">2024-11</span>                                                          │
+│ openai/gpt-4o-audio-preview                  <span class="d">128k</span>   <span class="d">2024-10</span>                                                          │
+│ openai/gpt-4o-mini                           <span class="d">128k</span>   <span class="d">2024-07</span>                                                          │
+│ openai/gpt-4o-mini-2024-07-18                <span class="d">128k</span>   <span class="d">2024-07</span>                                                          │
+│ openai/gpt-4o-mini-search-preview            <span class="d">128k</span>   <span class="d">2025-03</span>                                                          │
+│ openai/gpt-4o-search-preview                 <span class="d">128k</span>   <span class="d">2025-03</span>                                                          │
+│ openai/gpt-4o:extended                       <span class="d">128k</span>   <span class="d">2024-05</span>                                                          │
+│ <span class="d">… 246 more</span>                                                                                                           │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</pre>
+<h2>Models, focus in FAMILIES: <code>&uarr;</code> past the top edge of UPGRADES moved it here &mdash; 120&times;40</h2>
+<pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 presentations 15</span><span class="d"> → </span><span class="d">2 rewrites 14</span><span class="d"> → </span><span class="d">3 defaults 4</span><span class="d"> → </span><span class="d">4 routes 7</span><span class="d"> · </span><span class="b r">5 models 11</span><span class="d"> · </span><span class="d">6 history 9</span>             rev 9 live 
+┌FAMILIES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ <span class="d">family</span>           <span class="d">matches</span>                         <span class="d">example</span>                       <span class="d">reads as</span>                              │
+│<span class="r"> claude-opus      claude-opus-*                   claude-opus-4-7               opus · 4.7                            </span>│
+│ claude-sonnet    claude-sonnet-*                 claude-sonnet-4-5             sonnet · 4.5                          │
+│ claude-haiku     claude-haiku-*                  claude-haiku-4-5              haiku · 4.5                           │
+│ gpt              gpt-* · openai/gpt-*            openai/gpt-5.6-sol            sol · 5.6                             │
+│ qwen             qwen/qwen*                      qwen/qwen3.5-max              max · 3.5                             │
+│ [e] edit   [n] new   [d] delete                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌UPGRADES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ <span class="b">newest</span>  5 upgrades                                                                                                   │
+│ newest on claude-sub             claude-opus-4-7               → claude-opus-5                                       │
+│ newest on claude-api             claude-sonnet-4-5             → claude-sonnet-5                                     │
+│ newest on openrouter-messages    anthropic/claude-sonnet-4-5   → anthropic/claude-sonnet-5                           │
+│ newest on openrouter-responses   openai/gpt-5.5-sol            → openai/gpt-5.6-sol                                  │
+│ newest on codex                  gpt-5.5-terra                 → gpt-5.6-terra                                       │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌COMPACTION────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ a cold compaction                any model                     → sonnet        <span class="d">cache</span> allowed when cold               │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌OFFERS────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">openrouter.openrouter_chat_completions</span>  440 offers                                                                   │

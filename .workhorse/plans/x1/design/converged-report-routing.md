@@ -46,7 +46,7 @@ Every frame is 120x40 except the 135x50 one.
 
 - **`sends` is `as asked` for the new rule.** In the edit frame and in all four states of 08, `←/→` on `sends` cycles `${model}` and `as asked`: the refused state shows `${model}  ←/→` and the fixed state shows `as asked  ←/→` with the reading `the name is sent unchanged`. After save the row's sends cell reads `as asked`; RULE `example` is `claude-haiku-4-5 → claude-haiku-4-5` and `overlaps` is `none: no rule above catches claude-*`. (01 frames 4 and 5, 08 states 2 to 4; state 1 only gained the arrows hint.)
 - **Models has one selection.** UPGRADES keeps the reversed row; OFFERS has none, and its head reads `440 offers` instead of the position.
-- **Routes `matched by`.** `rules` and `defaults` are merged into one `matched by` column (`4 rules · 2 defaults`, `3 rules`, `1 rule · 2 defaults`, zero part dropped). With the full `now` text this table does not fit in 120 cells (about 127 needed), so the routes-table frame is now **135x40**, with three or more spaces before `matched by`. The route page and add-fallback frames stay 120x40.
+- **Routes `matched by`.** `rules` and `defaults` are merged into one `matched by` column (`4 rules · 2 defaults`, `3 rules`, `1 rule · 2 defaults`, zero part dropped). With the full `now` text this table does not fit in 120 cells (about 127 needed), so the routes-table frame was drawn at 135x40 (superseded: see Round 2 fixes, it is back at 120x40).
 
 ## converged-06-narrow.html
 
@@ -55,3 +55,25 @@ Every frame is 120x40 except the 135x50 one.
 - The `claude-sub` route page at 100x24: everything fits (23 of 24 rows), so nothing is counted with a `…` line. The consent clause of the edge wraps to its own line under the edge so the grid fits.
 - Providers at 80x24 opens on `anthropic_sub`. The `bindings` count column is shed (the detail carries it), and every PROVIDER line is kept. Numbers match `converged-05-config.html` (4 rewrites, 2 defaults, 1 route).
 - Same checks as above: every row is exactly the claimed width (100 or 80) and 24 rows; font stack unchanged; screenshots looked at.
+
+## Round 2 fixes
+
+Applied from `critique-round-2.md` section 4 with the coordinator's rulings. Width and font checks re-run on 01, 02, 03, 06 and 08 (all rows exactly the claimed width, Iosevka Term only); every touched frame re-shot and looked at.
+
+- **#1 focus in the rule form.** Only the focused field is reversed. State 1 focuses `match` (`prefix  ▏` with `←/→`); states 2 and 3 focus `sends` (`${model}  ←/→`, then `as asked  ←/→`). Unfocused fields are plain, with no caret and no bold `glob`.
+- **#2.** Save-flow state 1 (match and route empty) has no PREVIEW panel.
+- **#4.** At 24 rows the summary line ends `[pgdn] more   [enter] open route`. At 80 the reason text is shed, leaving `no cred   [pgdn] more   [enter] open route`; at 100 the reason stays.
+- **#5.** In the trace, link 2 is the reversed selection; the table row is bold only, with the bold `>`.
+- **#6.** New fourth frame in 03: Models with focus in FAMILIES (reversed row, own `[e] edit   [n] new   [d] delete`; UPGRADES has no selection and no control line). The caption says `↑` past the top of UPGRADES moved focus there, not `↓` as the message said, because FAMILIES is the panel above UPGRADES in the stack. Change the caption if `↓` was meant for some other order.
+- **#8, #20.** DEFAULT has no `for` row; `recent` reads `claude-sonnet-5  ≥3 in 24h`.
+- **#9.** No rule names: the first line of RULE is `match → route` for every rule (`anthropic_sub/${model} → claude-sub`, `claude-* → openrouter-messages`).
+- **#12.** The else row reads `else  default  → claude-sub` (01, 06, 08); `else  no default  → nothing catches it` is unchanged. At 80 columns the route column moved six cells left as a result.
+- **#13.** RULE, PRESENTATION and DEFAULT share one control line (`[e] edit   [n] new   [m] move   [space] turn off   [d] delete   [t] trace   [enter] open route`); DEFAULT omits `[m] move`.
+- **#14.** `[p] promote` kept on UPGRADES (when UPGRADES holds focus).
+- **#15, #16.** No `↑` on the upgrade rows; the head reads `newest  5 upgrades`.
+- **#17.** While `kind` is a column the scope head reads `6 rules · sends ${model}`; once `sends` is a column the clause goes. At rest it still reads `prefix → ${model}`, as the brief gave it.
+- **#18.** Trace link 4 reads `4 route  →  claude-sub`; link 8 reads `8 provider  on  openrouter · credential in keyring`.
+- **#19.** `moves when cold`, `cache allowed when cold` on the route pages, the narrow route page and COMPACTION.
+- **#24.** `[m] move` is dropped from the ROUTES detail line; the route page keeps it.
+- **Routes table width.** Back to 120x40. `now` is `no cred · billed fallback` for claude-sub and `off · billed fallback` for codex, with `billed fallback` yellow outside the reversed row. Columns are tighter, with two spaces between each pair.
+- **Lanes (#10).** The 01-05 header `saved · rev 10 live · 2 lanes on rev 9` stands. The strip in that frame cannot read `6 history 10`: the long status forces the non-current tabs to collapse to numbers, so it shows `6`. At 120 columns the full strip (90 cells) and that status (38) do not fit together. Everywhere else it is `6 history 9` and `rev 9 live`.

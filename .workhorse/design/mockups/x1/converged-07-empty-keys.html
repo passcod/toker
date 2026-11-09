@@ -115,18 +115,18 @@
 <h2>A fresh install: rewrites with no rules &mdash; 120&times;40</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 presentations 0 → </span><span class="b r">2 rewrites 0</span><span class="d"> → 3 defaults 0 → 4 routes 0 · 5 models 0 · 6 history 0</span>             no policy yet 
 ┌REWRITES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│       match                           route                                                           reach     hits │
+│       match                              route                                     reach                        hits │
 │ <span class="d">┌─ </span><span class="b">anthropic_messages</span><span class="d">  0 rules ─────────────────────────────────────────────────────────────────────────────────────</span> │
-│ <span class="d">│</span>  <span class="d">-</span>                                                                                                                 │
-│ <span class="d">└─ else</span>  <span class="d">no default</span>                 <span class="d">→ </span><span class="yellow">nothing catches it</span>                                                             │
+│ <span class="d">└─ else</span>  <span class="d">no default</span>                    <span class="d">→ </span><span class="yellow">nothing catches it</span>                                                        <span class="d">-</span> │
 │ <span class="d">┌─ </span><span class="b">openai_chat</span><span class="d">  0 rules ────────────────────────────────────────────────────────────────────────────────────────────</span> │
-│ <span class="d">│</span>  <span class="d">-</span>                                                                                                                 │
-│ <span class="d">└─ else</span>  <span class="d">no default</span>                 <span class="d">→ </span><span class="yellow">nothing catches it</span>                                                             │
+│ <span class="d">└─ else</span>  <span class="d">no default</span>                    <span class="d">→ </span><span class="yellow">nothing catches it</span>                                                        <span class="d">-</span> │
 │ <span class="d">┌─ </span><span class="b">openai_responses</span><span class="d">  0 rules ───────────────────────────────────────────────────────────────────────────────────────</span> │
-│ <span class="d">│</span>  <span class="d">-</span>                                                                                                                 │
-│ <span class="d">└─ else</span>  <span class="d">no default</span>                 <span class="d">→ </span><span class="yellow">nothing catches it</span>                                                             │
+│ <span class="d">└─ else</span>  <span class="d">no default</span>                    <span class="d">→ </span><span class="yellow">nothing catches it</span>                                                        <span class="d">-</span> │
 │ <span class="d">[n] needs a route first</span>   [4] go to routes                                                                           │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -156,40 +156,40 @@
 <h2>The ? overlay on the routing page &mdash; 120&times;40</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 presentations 15 → </span><span class="b r">2 rewrites 14</span><span class="d"> → 3 defaults 4 → 4 routes 7 · 5 models 11 · 6 history 9</span>             rev 9 live 
 ┌REWRITES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│       match                           route                                                           reach     hits │
+│       match                              route                                     reach                        hits │
 │ <span class="d">┌─ </span><span class="b">anthropic_messages</span><span class="d">  5 rules · prefix → ${model} ─────────────────────────────────────────────────────────────────</span> │
-│ <span class="d">│</span>  <span class="d">1</span>  anthropic/${model}            → claude-sub                                                      <span class="yellow">no cred</span>      <span class="d">-</span> │
-│<span class="r"> │  2  anthropic_sub/${model}        → claude-sub                                                      no cred      - </span>│
-│ <span class="d">│</span>┌KEYS────────────────────────────────────────────────────────────────────────────────────────────────────────────┐<span class="d">-</span> │
-│ <span class="d">│</span>│ <span class="b">↑/↓ j/k      </span>select a row                       <span class="b">MARKS</span>                                                          │<span class="d">1</span> │
-│ <span class="d">│</span>│ <span class="b">←/→ h/l      </span>previous or next tab               <span class="b">&gt;                   </span>caught here, or the candidate that serves  │<span class="d">-</span> │
-│ <span class="d">└</span>│ <span class="b">1–6          </span>jump to a tab                      <span class="b">↓                   </span>fell past this row                         │  │
-│ <span class="d">┌</span>│ <span class="b">pgup/pgdn    </span>scroll the detail                  <span class="b">+ ~ -               </span>added, changed or removed in a revision    │<span class="d">─</span> │
-│ <span class="d">│</span>│ <span class="b">e            </span>edit the row in place              <span class="b">${model}            </span>the name the match captured, sent on       │<span class="d">9</span> │
-│ <span class="d">│</span>│ <span class="b">n            </span>new row below the selection        <span class="b">no cred             </span>provider on with no credential             │<span class="d">-</span> │
-│ <span class="d">│</span>│ <span class="b">m            </span>lift; ↑/↓ move, enter drops it     <span class="b">off                 </span>provider or step turned off                │<span class="d">-</span> │
-│ <span class="d">│</span>│ <span class="b">alt+↑/↓      </span>move the row one place             <span class="b">nothing catches it  </span>no default: the name gets no route         │<span class="d">-</span> │
-│ <span class="d">│</span>│ <span class="b">space        </span>turn off or on                     <span class="b">billed              </span>paid per token, not by subscription        │<span class="d">-</span> │
-│ <span class="d">└</span>│ <span class="b">d            </span>delete; d again to confirm         <span class="b">≥                   </span>a floor: some rows unknown                 │  │
-│ <span class="d">┌</span>│ <span class="b">t            </span>trace a request                    <span class="b">-                   </span>not recorded, which is not zero            │<span class="d">─</span> │
-│ <span class="d">│</span>│ <span class="b">enter        </span>open the route                     <span class="b">…                   </span>clipped · … N more: a list cut short       │<span class="d">2</span> │
-│ <span class="d">│</span>│ <span class="b">r            </span>refresh                            <span class="b">live                </span>the revision serving new lanes             │<span class="d">-</span> │
-│ <span class="d">│</span>│ <span class="b">esc          </span>back to the dashboard              <span class="b">armed               </span>a reversed control fires on a second press │<span class="d">-</span> │
-│ <span class="d">│</span>│ <span class="b">tab or ⇄     </span>next page                                                                                         │<span class="d">-</span> │
-│ <span class="d">└</span>│ <span class="b">q            </span>quit                               <span class="b">ON A ROUTE</span>                                                     │  │
-└──│                                                 <span class="b">1–7                 </span>switch route                               │──┘
-┌RU│ <span class="b">IN HISTORY</span>                                      <span class="b">e                   </span>edit                                       │──┐
-│ <span class="b">s</span>│ <span class="b">a            </span>make this revision live            <span class="b">n                   </span>add fallback                               │  │
-│ <span class="d">m</span>│ <span class="b">m            </span>move running lanes, armed first    <span class="b">m                   </span>move a candidate                           │  │
-│ <span class="d">e</span>│ <span class="b">c            </span>compare a request                  <span class="b">t                   </span>trace                                      │  │
-│ <span class="d">s</span>│                                                 <span class="b">esc                 </span>back to the table                          │  │
-│ <span class="d">r</span>│ <span class="b">IN AN EDIT</span>                                                                                                     │  │
-│ <span class="d">o</span>│ <span class="b">tab          </span>next field, completing a name      <span class="b">IN A TRACE</span>                                                     │  │
-│ <span class="d">r</span>│ <span class="b">←/→          </span>change the value                   <span class="b">t                   </span>trace another                              │  │
-│ [│ <span class="b">ctrl+s       </span>save, once nothing is refused      <span class="b">enter               </span>open the link                              │  │
-└──│ <span class="b">esc          </span>cancel                             <span class="b">esc                 </span>close                                      │──┘
-   └──────────────────────────────────────────────────────────────────────────────────────────────────? or esc close┘   
-                                                                                                                        
+│┌KEYS────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+││ <span class="b">↑/↓ j/k    </span>select a row                                 <span class="b">MARKS</span>                                                      ││
+││ <span class="b">↑/↓        </span>past a panel's edge: next panel              <span class="b">&gt;                   </span>caught here, or the serving candidate  ││
+││ <span class="b">←/→ h/l    </span>previous or next tab                         <span class="b">↓                   </span>fell past this row                     ││
+││ <span class="b">1–6        </span>jump to a tab                                <span class="b">+ ~ -               </span>a record added, changed or removed     ││
+││ <span class="b">pgup/pgdn  </span>scroll the detail                            <span class="b">${model}            </span>the name the match captured, sent on   ││
+││ <span class="b">pgdn       </span>open the detail when it has no room          <span class="b">no cred             </span>provider on with no credential         ││
+││ <span class="b">e          </span>edit the row in place                        <span class="b">off                 </span>provider or step turned off            ││
+││ <span class="b">n          </span>new row below the selection                  <span class="b">nothing catches it  </span>no default: the name gets no route     ││
+││ <span class="b">m          </span>lift; ↑/↓ move, enter drops it               <span class="b">billed              </span>paid per token, not by subscription    ││
+││ <span class="b">alt+↑/↓    </span>move the row one place                       <span class="b">≥                   </span>a floor: some rows unknown             ││
+││ <span class="b">space      </span>turn off or on                               <span class="b">-                   </span>not recorded, which is not zero        ││
+││ <span class="b">d          </span>delete; d again to confirm                   <span class="b">…                   </span>clipped · … N more: a list cut short   ││
+││ <span class="b">t          </span>trace a request                              <span class="b">live                </span>the revision serving new lanes         ││
+││ <span class="b">p          </span>promote the selected upgrade's newest model  <span class="b">armed               </span>reversed: press again to fire          ││
+││ <span class="b">enter      </span>open the route                                                                                          ││
+││ <span class="b">r          </span>refresh                                      <span class="b">ON A ROUTE</span>                                                 ││
+││ <span class="b">esc        </span>back to the dashboard                        <span class="b">1–7                 </span>switch route                           ││
+││ <span class="b">tab or ⇄   </span>next page                                    <span class="b">e                   </span>edit                                   ││
+└│ <span class="b">q          </span>quit                                         <span class="b">n                   </span>add fallback                           │┘
+┌│                                                         <span class="b">m                   </span>move a candidate                       │┐
+││ <span class="b">IN HISTORY</span>                                              <span class="b">t                   </span>trace                                  ││
+││ <span class="b">a          </span>make this revision live                      <span class="b">esc                 </span>back to the table                      ││
+││ <span class="b">m          </span>move running lanes, armed first                                                                         ││
+││ <span class="b">c          </span>compare a request                            <span class="b">IN A TRACE</span>                                                 ││
+││                                                         <span class="b">t                   </span>trace another                          ││
+││ <span class="b">IN AN EDIT</span>                                              <span class="b">enter               </span>open the link                          ││
+││ <span class="b">tab        </span>next field, completing a name                <span class="b">esc                 </span>close                                  ││
+││ <span class="b">←/→        </span>change the value                                                                                        ││
+└│ <span class="b">ctrl+s     </span>save, once nothing is refused                                                                           │┘
+ │ <span class="b">esc        </span>cancel                                                                                                  │ 
+ └──────────────────────────────────────────────────────────────────────────────────────────────────────? or esc close┘ 
                                                                                                                         
                                                                                                                         
                                                                                                                         

@@ -126,7 +126,7 @@
 │ <span class="b">anthropic_sub</span>                                                                                                        │
 │ <span class="d">state        </span>on                                                                                                      │
 │ <span class="d">credential   </span><span class="yellow">none</span>                                                                                                    │
-│ <span class="d">refresh url  (the built-in one)</span>                                                                                      │
+│ <span class="d">refresh url  built-in</span>                                                                                                │
 │ <span class="d">bindings     </span>anthropic_sub.anthropic_messages · subscription                                                         │
 │ <span class="d">rewrites     </span>4  anthropic_messages 2 · openai_chat 1 · openai_responses 1                                            │
 │ <span class="d">defaults     </span>2  anthropic_messages · unprefixed/anthropic_messages                                                   │
@@ -158,25 +158,25 @@
 ┌SETTINGS──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │   setting               value                                                                                        │
 │ <span class="d">┌─ </span><span class="b">gates</span><span class="d">  5 ────────────────────────────────────────────────────────────────────────────────────────────────────────</span> │
-│ <span class="d">│</span> quota gate            <span class="d">on (default)</span>                                                                                 │
-│ <span class="d">│</span> cold gate             <span class="d">on (default)</span>                                                                                 │
-│ <span class="d">│</span> cold outlook          <span class="d">on (default)</span>                                                                                 │
+│ <span class="d">│</span> quota gate            <span class="d">on</span>                                                                                           │
+│ <span class="d">│</span> cold gate             <span class="d">on</span>                                                                                           │
+│ <span class="d">│</span> cold outlook          <span class="d">on</span>                                                                                           │
 │ <span class="d">│</span> <span class="b">cold min tokens</span>       <span class="r b">175k_</span><span class="r">       </span>                    <span class="red">not a number: whole tokens, 175000 not 175k</span>                  │
-│ <span class="d">│</span> cold idle minutes     <span class="d">(the lane's own TTL tier)</span>                                                                    │
+│ <span class="d">│</span> cold idle minutes     <span class="d">lane TTL</span>                                                                                     │
 │ <span class="d">┌─ </span><span class="b">session</span><span class="d">  4 ──────────────────────────────────────────────────────────────────────────────────────────────────────</span> │
-│ <span class="d">│</span> session headers       <span class="d">x-toker-session · x-claude-code-session-id · x-session-id (default)</span>                          │
-│ <span class="d">│</span> ping header           <span class="d">x-toker-ping (default)</span>                                                                       │
-│ <span class="d">│</span> idle-sleep lock       <span class="d">on (default)</span>                                                                                 │
+│ <span class="d">│</span> session headers       <span class="d">x-toker-session · x-claude-code-session-id · x-session-id</span>                                    │
+│ <span class="d">│</span> ping header           <span class="d">x-toker-ping</span>                                                                                 │
+│ <span class="d">│</span> idle-sleep lock       <span class="d">on</span>                                                                                           │
 │ <span class="d">│</span> transcript roots      <span class="d">none</span>                                                                                         │
 │ <span class="d">┌─ </span><span class="b">notices</span><span class="d">  4 ──────────────────────────────────────────────────────────────────────────────────────────────────────</span> │
-│ <span class="d">│</span> default notice style  <span class="d">(the built-in one)</span>                                                                           │
-│ <span class="d">│</span> claude                <span class="d">(default)</span>                                                                                    │
-│ <span class="d">│</span> opencode              <span class="d">(default)</span>                                                                                    │
-│ <span class="d">│</span> codex                 <span class="d">(default)</span>                                                                                    │
+│ <span class="d">│</span> default notice style  <span class="d">built-in</span>                                                                                     │
+│ <span class="d">│</span> claude                <span class="d">built-in</span>                                                                                     │
+│ <span class="d">│</span> opencode              <span class="d">built-in</span>                                                                                     │
+│ <span class="d">│</span> codex                 <span class="d">built-in</span>                                                                                     │
 │ <span class="d">┌─ </span><span class="b">fixed here</span><span class="d">  2 ───────────────────────────────────────────────────────────────────────────────────────────────────</span> │
 │ <span class="d">│</span> <span class="d">listener port</span>         <span class="d">18123</span>                           <span class="d">set by toker setup</span>                                           │
 │ <span class="d">│</span> <span class="d">store</span>                 <span class="d">~/.local/share/toker/toker.db</span>   <span class="d">set by TOKER_DB</span>                                              │
-│ [enter] <span class="d">fix value to save</span>   [esc] cancel                                                                             │
+│ [ctrl+s] <span class="d">fix value to save</span>   [esc] cancel                                                                            │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
                                                                                                                         
                                                                                                                         
