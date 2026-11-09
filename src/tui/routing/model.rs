@@ -2054,7 +2054,8 @@ mod tests {
     fn a_preview_that_does_not_ask_sends_no_such_fact() {
         let mut state = loaded(full_snapshot());
         press(&mut state, KeyCode::Char('v'));
-        let body = press(&mut state, KeyCode::Enter)
+        let body = state
+            .key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
             .expect("preview")
             .body
             .expect("body");

@@ -40,15 +40,15 @@
 - [x] A fall after send continues under the same rule (verifies spec: RSOLV)
 - [x] A route that never honours keeps its fingerprint across format versions, and one that does has its own (verifies spec: RDOC)
 - [x] Honouring needs format version 4, and the edit operation raises an older document (verifies spec: RDOC)
-- [ ] The preview shows each candidate's effective support (verifies spec: RREV)
+- [x] The preview shows each candidate's effective support (verifies spec: RREV)
 
 ## Ledger and operator surfaces
 
 - [x] A row records the ask, effective support, mark, results seen and replayed, skipped candidate and walked again, and none of their contents (verifies spec: SLEDGR)
 - [x] A request that did not ask records only that it did not
 - [ ] The export carries the columns and the import leaves them empty (verifies spec: SLEDGR)
-- [ ] The providers page shows each Messages binding's declared support and mark, and clears the mark (verifies spec: UTUI)
-- [ ] The routing page previews an asking request and sets or clears a route's flag (verifies spec: UTUI)
+- [x] The providers page shows each Messages binding's declared support and mark, and clears the mark (verifies spec: UTUI)
+- [x] The routing page previews an asking request and sets or clears a route's flag (verifies spec: UTUI)
 
 ## By hand
 

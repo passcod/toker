@@ -1,6 +1,5 @@
 ---
 source: src/tui/routing/view.rs
-assertion_line: 975
 expression: frame(&state)
 ---
  ? ⇄ 1  2  3  4 preview, revisions & activation                                                                  draft 4
@@ -12,6 +11,7 @@ expression: frame(&state)
 │open│  prompt bound: 0                                                                                           │    │
 │lane│  message count: (none)                                                                                     │    │
 │diag│  tool count: 0                                                                                             │    │
+│    │  [ ] asks for server safeguards                                                                            │    │
 │    │                                                                                                            │    │
 │    │                                                                                                            │    │
 │    │                                                                                                            │    │
@@ -30,8 +30,7 @@ expression: frame(&state)
 │    │                                                                                                            │    │
 │    │                                                                                                            │    │
 │    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │content-free request facts only · enter preview · esc cancel                                                │    │
+│    │content-free request facts only · space toggle · enter preview · esc cancel                                 │    │
 │    │                                                                                                            │    │
 │    └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
 └────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘

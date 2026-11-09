@@ -67,8 +67,8 @@ Check that `/status` in Claude Code reads the auto mode server as enabled throug
 - [x] `RequestFacts`: add the ask; in the walk, treat it as a required capability only on an honouring route, skipping on effective unsupported and never on unknown
 - [x] When that walk ends without a candidate, walk again without the requirement; carry the same rule into the post-send continuation
 - [x] Trace events: a skip reason for lacking server safeguards, and a marker for the second walk, stored through `StoredRoutingTrace`
-- [ ] Preview: accept the ask in `PreviewRequest` and `RoutingPreviewRequest`, and report each candidate's effective support in the preview result
-- [ ] Policy edit operations and the TUI route form: set and clear the route flag
+- [x] Preview: accept the ask in `PreviewRequest` and `RoutingPreviewRequest`, and report each candidate's effective support in the preview result
+- [x] Policy edit operations and the TUI route form: set and clear the route flag
 
 ### Ledger (SLEDGR)
 
@@ -79,12 +79,12 @@ Check that `/status` in Claude Code reads the auto mode server as enabled throug
 ### Operator surfaces (DCTRL, UTUI)
 
 - [x] Control: a `safeguards mark clear` mutation behind the usual operation, method and JSON checks, and the marks in the config snapshot
-- [ ] Providers page: each Messages binding's declared support and mark, with a key to clear the mark; update the page's key overlay and snapshots
-- [ ] Routing page: the ask as a preview input, and per-candidate support in the preview result
+- [x] Providers page: each Messages binding's declared support and mark, with a key to clear the mark; update the page's key overlay and snapshots
+- [x] Routing page: the ask as a preview input, and per-candidate support in the preview result
 
 ### Verification
 
 - [x] Server tests against mock upstreams: Anthropic binding round-trips the pair and results unchanged; an unknown binding forwards the pair; a rejection retries once without it, writes two rows in one attempt group and marks the binding; a marked binding withholds the pair; a codex route never receives it
-- [ ] Resolver tests: honouring route skips an unsupported candidate, keeps an unknown one, walks again when nothing capable is reachable through the edges, and leaves a non-honouring route untouched
-- [ ] A test that no log line, ledger column or translation-loss report carries the contents of the field or of a result
+- [x] Resolver tests: honouring route skips an unsupported candidate, keeps an unknown one, walks again when nothing capable is reachable through the edges, and leaves a non-honouring route untouched
+- [x] A test that no log line, ledger column or translation-loss report carries the contents of the field or of a result
 - [ ] Live check in Claude Code: `/status` reads the auto mode server as enabled through an Anthropic route and falls back through `codex_sub`

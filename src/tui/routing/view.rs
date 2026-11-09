@@ -290,7 +290,12 @@ fn render_modal(frame: &mut Frame, state: &State) -> Option<FormHit> {
     if let Modal::Form(form) = modal {
         return Some(render_form(frame, state, form));
     }
-    let lines = modal_text(state);
+    // A pretty-printed result is one string of many lines, and the popup is
+    // sized in lines drawn, not in strings.
+    let lines: Vec<String> = modal_text(state)
+        .iter()
+        .flat_map(|text| text.split('\n').map(str::to_owned))
+        .collect();
     let width = lines
         .iter()
         .map(|line| line.chars().count())
