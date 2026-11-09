@@ -52,7 +52,9 @@
 //! timers failure is non-fatal with manual commands printed — a
 //! machine that never sleeps-or-wakes still pings fine while up. A no
 //! removes whatever an earlier run installed, and a changed slot list
-//! retires the ping timers of the slots it dropped.
+//! retires the ping timers of the slots it dropped. Without the
+//! anthropic subscription enabled the question is not asked at all and
+//! any installed timers are removed as a no would.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -2676,15 +2678,27 @@ impl<'a> Wizard<'a> {
         // could not work, because the prompt hands back its default for
         // an empty answer — declining installed the default timers.
         let installed = InstalledTimers::read(&self.paths.units_dir);
-        let wanted = self.prompt.confirm(
-            "Wake the machine on weekdays to open quota windows on a schedule (wake/hold/ping timers)?",
-            installed.any(),
-        )?;
-        if wanted {
-            let slots = self.ask_slots(&installed)?;
-            self.timers_step(&slots, &installed, report)?;
-        } else if installed.any() {
-            self.remove_timers_step(&installed, report)?;
+        // Only the Anthropic subscription anchors a window to the request
+        // that opens it, so without it there is nothing a ping could
+        // place: the timers are not offered, and any an earlier run
+        // installed are retired like a dropped slot's.
+        // spec: GPING#scope
+        if current.anthropic_sub.is_none() {
+            if installed.any() {
+                self.say("  no configured provider anchors a quota window to its opening request")?;
+                self.remove_timers_step(&installed, report)?;
+            }
+        } else {
+            let wanted = self.prompt.confirm(
+                "Wake the machine on weekdays to open quota windows on a schedule (wake/hold/ping timers)?",
+                installed.any(),
+            )?;
+            if wanted {
+                let slots = self.ask_slots(&installed)?;
+                self.timers_step(&slots, &installed, report)?;
+            } else if installed.any() {
+                self.remove_timers_step(&installed, report)?;
+            }
         }
         if !detected.ctp_usage {
             self.say("  predecessor history: none to import")?;
@@ -4728,9 +4742,8 @@ default_backend_anthropic = "codex_sub"
                 select(0),   // its key: the frontend's own
                 confirm(true),
                 text(&port.to_string()),
-                confirm(true),  // opencode
-                confirm(true),  // the opencode plugin
-                confirm(false), // wake/hold/ping timers: no
+                confirm(true), // opencode
+                confirm(true), // the opencode plugin
             ],
             with_picker(vec![inactive(), ok_empty(), ok_empty()]),
         );
@@ -4832,7 +4845,6 @@ default_backend_anthropic = "codex_sub"
                 text(&port.to_string()), // the scratch port
                 confirm(true),           // claude
                 confirm(true),           // codex
-                confirm(false),          // wake/hold/ping timers: no
             ],
             with_picker(vec![active(), ok_empty(), ok_empty()]),
         );
@@ -4972,7 +4984,7 @@ default_backend_anthropic = "codex_sub"
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "owned-keep",
-            vec![select(0), confirm(false)], // keep it as is; no timers
+            vec![select(0)], // keep it as is
             vec![inactive(), ok_empty(), ok_empty()],
         );
         let seeded = format!("port = {port}\n{EXISTING_TOML}");
@@ -5057,7 +5069,6 @@ default_backend_anthropic = "codex_sub"
                 multi_defaults(),
                 confirm(true),
                 text(&port.to_string()),
-                confirm(false),
             ],
             vec![inactive(), ok_empty(), ok_empty()],
         );
@@ -5308,7 +5319,6 @@ default_backend_anthropic = "codex_sub"
                 select(0),      // openai_chat default: openrouter
                 confirm(true),  // awake
                 text(&port.to_string()),
-                confirm(false), // wake/hold/ping timers: no
             ],
             vec![inactive(), ok_empty(), ok_empty()],
         );
@@ -5353,7 +5363,6 @@ default_backend_anthropic = "codex_sub"
                 select(0),        // openrouter: the frontend's own
                 confirm(true),
                 text(&port.to_string()),
-                confirm(false),
             ],
             vec![inactive(), ok_empty(), ok_empty()],
         );
@@ -5383,7 +5392,6 @@ default_backend_anthropic = "codex_sub"
                 text(""),                // keep OPENAI_API_KEY
                 confirm(true),           // awake
                 text(&port.to_string()), // listener port
-                confirm(false),          // wake/hold/ping timers: no
             ],
             vec![inactive(), ok_empty(), ok_empty()],
         );
@@ -5685,7 +5693,7 @@ default_backend_anthropic = "codex_sub"
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "same-db",
-            vec![select(0), confirm(false)], // keep it as is; no timers
+            vec![select(0)], // keep it as is
             vec![inactive(), ok_empty(), ok_empty()],
         );
         let seeded = format!(
@@ -6149,7 +6157,6 @@ default_backend_anthropic = "codex_sub"
                 text(""),                // the default env var
                 confirm(true),           // awake
                 text(&port.to_string()), // the listener port
-                confirm(false),          // wake/hold/ping timers: no
             ],
             vec![inactive(), ok_empty(), ok_empty()],
         );
@@ -6257,6 +6264,102 @@ default_backend_anthropic = "codex_sub"
         );
         assert_eq!(calls[calls.len() - 3..], picker_calls());
         assert!(rig.runner.removed().is_empty());
+    }
+
+    /// With the subscription not among the providers, nothing anchors a
+    /// window to the request that opens it, so the timers are not offered
+    /// and none are installed.
+    #[tokio::test]
+    async fn the_timers_are_not_offered_without_the_subscription() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "timers-no-anchor",
+            vec![
+                multi(&[3]),             // backends: openrouter only
+                select(2),               // openrouter key: an env var
+                text(""),                // the default env var
+                confirm(true),           // awake
+                text(&port.to_string()), // the listener port
+            ],
+            vec![inactive(), ok_empty(), ok_empty()],
+        );
+
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+
+        assert!(
+            rig.prompt
+                .asked()
+                .iter()
+                .all(|asked| !asked.message.contains("wake/hold/ping timers")),
+            "{:?}",
+            rig.prompt.asked()
+        );
+        assert!(report.timer_slots.is_empty());
+        assert!(report.timers_installed.is_empty() && report.timers_removed.is_empty());
+        assert!(rig.runner.system_calls().is_empty());
+    }
+
+    /// Timers an earlier run installed are retired, unasked, once the
+    /// subscription has left the config.
+    #[tokio::test]
+    async fn dropping_the_subscription_retires_the_installed_timers() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "timers-retire-no-anchor",
+            vec![
+                multi(&[3]),             // backends: openrouter only
+                select(2),               // openrouter key: an env var
+                text(""),                // the default env var
+                confirm(true),           // awake
+                text(&port.to_string()), // the listener port
+            ],
+            vec![
+                inactive(),
+                ok_empty(), // daemon-reload (units)
+                ok_empty(), // enable --now socket
+                ok_empty(), // disable --now toker-hold.timer
+                ok_empty(), // disable --now toker-ping-0730.timer
+                ok_empty(), // daemon-reload (removal)
+            ],
+        )
+        .with_system(vec![ok_empty()]);
+        seed_units(
+            &rig,
+            &[
+                HOLD_TIMER_UNIT,
+                HOLD_SERVICE_UNIT,
+                "toker-ping-0730.timer",
+                "toker-ping-0730.service",
+                WAKE_TIMER_UNIT,
+            ],
+        );
+
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+
+        assert!(
+            rig.prompt
+                .asked()
+                .iter()
+                .all(|asked| !asked.message.contains("wake/hold/ping timers")),
+            "{:?}",
+            rig.prompt.asked()
+        );
+        assert!(report.timer_slots.is_empty());
+        assert_eq!(
+            report.timers_removed,
+            [
+                HOLD_TIMER_UNIT,
+                HOLD_SERVICE_UNIT,
+                "toker-ping-0730.timer",
+                "toker-ping-0730.service",
+                WAKE_TIMER_UNIT,
+            ]
+        );
+        assert_eq!(
+            rig.runner.system_calls(),
+            strings(vec![vec!["disable", "--now", WAKE_TIMER_UNIT]])
+        );
+        assert!(report.timers_ok);
     }
 
     /// A no while an earlier run's timers are installed takes them all
