@@ -21,7 +21,8 @@ Toker turns those into a provider and a model by walking a fixed chain, and stop
    Each rule matches the model name (by prefix, glob or regex), says which route takes it, and says what model name to send on: usually `${model}`, the part the match captured, so `anthropic_sub/claude-sonnet-5` is sent on as `claude-sonnet-5`.
 3. **Defaults.**
    If no rule caught the name, the protocol's default route takes it.
-   A protocol with no default leaves the name with nowhere to go, which the screens call `nothing catches it`.
+   On a protocol with no default, Toker refuses the request: the client gets an error saying no route is available, and the ledger records the refusal.
+   The screens mark that gap as `refused · no route`.
 4. **The route.**
    A route is a named, ordered list of candidates, each one a provider endpoint (a binding, such as `openrouter.openrouter_messages`).
    Toker tries the first candidate, and moves to the next only under the conditions written on the edge between them: unavailable before sending, overloaded, a 5xx, and whether it may fall to a billed provider or retry an ambiguous failure.
@@ -63,7 +64,7 @@ Two columns tell you whether things actually work:
 - **hits** counts recent requests the row caught.
   `-` means not recorded, which isn't the same as zero, and `≥3` is a floor where some rows predate the counter.
 
-Colour only ever draws the eye to a problem: `no cred`, `billed` and `nothing catches it` are yellow, a refusal is red, `off` is dim, and everything healthy is plain.
+Colour only ever draws the eye to a problem: `no cred`, `billed` and `refused · no route` are yellow, a refusal is red, `off` is dim, and everything healthy is plain.
 Nothing is green.
 
 The detail panel for a rule spells it out in words: the match, an example of a name going in and what comes out, where it sends, why its reach is what it is, whether it overlaps another rule, and recent hits.
@@ -80,7 +81,7 @@ The detail panel calls out overlaps with other rows, and whether the presentatio
 ### Defaults
 
 [Defaults](../../../design/mockups/x1/converged-03-tables.html#defaults) is the short list of last-resort routes, one per protocol and one per protocol for unprefixed clients.
-The `openai_responses  no default → nothing catches it` row is yellow because a request there that no rule matches gets an error.
+The `openai_responses  no default → refused · no route` row is yellow because Toker refuses any request there that no rule matches.
 
 ### Routes and the route page
 
@@ -157,7 +158,7 @@ At 100 or 80 columns the screens shed what is least needed first.
 Columns that are uniform go into the group head, then the non-current tabs collapse to their numbers and keep their arrows, so the chain is still visible.
 See [rewrites at 100×24](../../../design/mockups/x1/converged-06-narrow.html#rewrites-100x24), [rewrites at 80×24](../../../design/mockups/x1/converged-06-narrow.html#rewrites-80x24), [the route page at 100×24](../../../design/mockups/x1/converged-06-narrow.html#route-page-100x24) and [providers at 80×24](../../../design/mockups/x1/converged-06-narrow.html#providers-80x24).
 
-[A fresh install](../../../design/mockups/x1/converged-07-empty-keys.html#empty) shows the rewrites tab with no policy yet: each protocol's group is still drawn, its `else` row says `nothing catches it`, and the controls point to the first step, since a rule needs a route to send to (`[n] needs a route first   [4] go to routes`).
+[A fresh install](../../../design/mockups/x1/converged-07-empty-keys.html#empty) shows the rewrites tab with no policy yet: each protocol's group is still drawn, its `else` row says `refused · no route`, and the controls point to the first step, since a rule needs a route to send to (`[n] needs a route first   [4] go to routes`).
 
 [The `?` overlay](../../../design/mockups/x1/converged-07-empty-keys.html#keys) is where every key and mark is explained, grouped by where it applies (on a route, in history, in an edit, in a trace).
 That's the one place on the page with explanations, which is what lets everything else stay terse.

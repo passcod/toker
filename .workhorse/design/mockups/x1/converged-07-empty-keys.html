@@ -117,11 +117,11 @@
 ┌REWRITES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │       match                              route                                     reach                        hits │
 │ <span class="d">┌─ </span><span class="b">anthropic_messages</span><span class="d">  0 rules ─────────────────────────────────────────────────────────────────────────────────────</span> │
-│ <span class="d">└─ else</span>  <span class="d">no default</span>                    <span class="d">→ </span><span class="yellow">nothing catches it</span>                                                        <span class="d">-</span> │
+│ <span class="d">└─ else</span>  <span class="d">no default</span>                    <span class="d">→ </span><span class="yellow">refused · no route</span>                                                        <span class="d">-</span> │
 │ <span class="d">┌─ </span><span class="b">openai_chat</span><span class="d">  0 rules ────────────────────────────────────────────────────────────────────────────────────────────</span> │
-│ <span class="d">└─ else</span>  <span class="d">no default</span>                    <span class="d">→ </span><span class="yellow">nothing catches it</span>                                                        <span class="d">-</span> │
+│ <span class="d">└─ else</span>  <span class="d">no default</span>                    <span class="d">→ </span><span class="yellow">refused · no route</span>                                                        <span class="d">-</span> │
 │ <span class="d">┌─ </span><span class="b">openai_responses</span><span class="d">  0 rules ───────────────────────────────────────────────────────────────────────────────────────</span> │
-│ <span class="d">└─ else</span>  <span class="d">no default</span>                    <span class="d">→ </span><span class="yellow">nothing catches it</span>                                                        <span class="d">-</span> │
+│ <span class="d">└─ else</span>  <span class="d">no default</span>                    <span class="d">→ </span><span class="yellow">refused · no route</span>                                                        <span class="d">-</span> │
 │ <span class="d">[n] needs a route first</span>   [4] go to routes                                                                           │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
                                                                                                                         
@@ -167,7 +167,7 @@
 ││ <span class="b">pgdn       </span>open the detail when it has no room      <span class="b">as asked            </span>the name is sent unchanged                 ││
 ││ <span class="b">e          </span>edit the row in place                    <span class="b">no cred             </span>provider on with no credential             ││
 ││ <span class="b">n          </span>new row below the selection              <span class="b">off                 </span>provider or step turned off                ││
-││ <span class="b">m          </span>lift the row; ↑/↓ move it                <span class="b">nothing catches it  </span>no default: the name gets no route         ││
+││ <span class="b">m          </span>lift the row; ↑/↓ move it                <span class="b">refused · no route  </span>no rule or default: Toker refuses it       ││
 ││ <span class="b">           </span>m again drops it, esc puts it back       <span class="b">billed              </span>paid per token, not by subscription        ││
 ││ <span class="b">space      </span>turn off or on                           <span class="b">billed fallback     </span>the first choice can't serve, so a         ││
 ││ <span class="b">d          </span>delete; d again to confirm               <span class="b">                    </span>billed fallback does                       ││

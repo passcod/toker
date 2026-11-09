@@ -132,7 +132,7 @@
  <span class="d">│</span> <span class="d"> 2</span>  anthropic_api/${model}           → claude-api              <span class="d">off</span>                             <span class="d">-</span> 
  <span class="d">│</span> <span class="d"> 3</span>  anthropic_sub/${model}           → claude-sub              <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>       <span class="d">-</span> 
  <span class="d">│</span> <span class="d"> 4</span>  openrouter/${model}              → openrouter-responses    ok                              <span class="d">-</span> 
- <span class="d">└─</span> <span class="d">else</span>  no default                    → <span class="yellow">nothing catches it</span>                                      <span class="d">-</span> 
+ <span class="d">└─</span> <span class="d">else</span>  no default                    → <span class="yellow">refused · no route</span>                                      <span class="d">-</span> 
  <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>  anthropic_sub has no credential   [pgdn] more   [enter] open route      </pre>
 <h2 id="rewrites-80x24">Rewrites &mdash; 80&times;24</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1</span><span class="d"> → </span><span class="b r">2 rewrites 14</span><span class="d"> → </span><span class="d">3</span><span class="d"> → </span><span class="d">4</span><span class="d"> · </span><span class="d">5</span><span class="d"> · </span><span class="d">6</span>                              rev 9 live 
@@ -157,7 +157,7 @@
  <span class="d">│</span> <span class="d"> 2</span>  anthropic_api/${model}  → claude-api            <span class="d">off</span>                    <span class="d">-</span> 
  <span class="d">│</span> <span class="d"> 3</span>  anthropic_sub/${model}  → claude-sub            <span class="yellow">no cred</span>                <span class="d">-</span> 
  <span class="d">│</span> <span class="d"> 4</span>  openrouter/${model}     → openrouter-responses  ok                     <span class="d">-</span> 
- <span class="d">└─</span> <span class="d">else</span>  no default           → <span class="yellow">nothing catches it</span>                           <span class="d">-</span> 
+ <span class="d">└─</span> <span class="d">else</span>  no default           → <span class="yellow">refused · no route</span>                           <span class="d">-</span> 
  <span class="yellow">no cred</span>   [pgdn] more   [enter] open route                                     </pre>
 <h2 id="route-page-100x24">The claude-sub route page &mdash; 100&times;24</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1</span><span class="d"> → </span><span class="d">2</span><span class="d"> → </span><span class="d">3</span><span class="d"> → </span><span class="b r">4 routes 7</span><span class="d"> · </span><span class="d">5</span><span class="d"> · </span><span class="d">6</span>                                                     rev 9 live 

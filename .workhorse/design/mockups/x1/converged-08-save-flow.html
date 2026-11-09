@@ -153,7 +153,7 @@
 │ <span class="d">│</span> <span class="d"> 2</span>  <span class="d">prefix</span> anthropic_api/${model}    → claude-api                                <span class="d">off</span>                             <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 3</span>  <span class="d">prefix</span> anthropic_sub/${model}    → claude-sub                                <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>       <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 4</span>  <span class="d">prefix</span> openrouter/${model}       → openrouter-responses                      ok                              <span class="d">-</span> │
-│ <span class="d">└─</span> <span class="d">else</span>  no default                    → <span class="yellow">nothing catches it</span>                                                        <span class="d">-</span> │
+│ <span class="d">└─</span> <span class="d">else</span>  no default                    → <span class="yellow">refused · no route</span>                                                        <span class="d">-</span> │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
                                                                                                                         
                                                                                                                         
@@ -194,7 +194,7 @@
 │ <span class="d">│</span> <span class="d"> 2</span>  <span class="d">prefix</span> anthropic_api/${model}    → claude-api                                <span class="d">off</span>                             <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 3</span>  <span class="d">prefix</span> anthropic_sub/${model}    → claude-sub                                <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>       <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 4</span>  <span class="d">prefix</span> openrouter/${model}       → openrouter-responses                      ok                              <span class="d">-</span> │
-│ <span class="d">└─</span> <span class="d">else</span>  no default                    → <span class="yellow">nothing catches it</span>                                                        <span class="d">-</span> │
+│ <span class="d">└─</span> <span class="d">else</span>  no default                    → <span class="yellow">refused · no route</span>                                                        <span class="d">-</span> │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌PREVIEW───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">3 of 5 recent requests would change route</span>                                                                            │
@@ -233,7 +233,7 @@
 │ <span class="d">│</span> <span class="d"> 2</span>  <span class="d">prefix</span> anthropic_api/${model}    → claude-api                                <span class="d">off</span>                             <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 3</span>  <span class="d">prefix</span> anthropic_sub/${model}    → claude-sub                                <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>       <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 4</span>  <span class="d">prefix</span> openrouter/${model}       → openrouter-responses                      ok                              <span class="d">-</span> │
-│ <span class="d">└─</span> <span class="d">else</span>  no default                    → <span class="yellow">nothing catches it</span>                                                        <span class="d">-</span> │
+│ <span class="d">└─</span> <span class="d">else</span>  no default                    → <span class="yellow">refused · no route</span>                                                        <span class="d">-</span> │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌PREVIEW───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">3 of 5 recent requests would change route</span>                                                                            │
@@ -269,7 +269,7 @@
 │ <span class="d">│</span> <span class="d"> 2</span>  <span class="d">prefix</span> anthropic_api/${model}    → claude-api              ${model}          <span class="d">off</span>                             <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 3</span>  <span class="d">prefix</span> anthropic_sub/${model}    → claude-sub              ${model}          <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>       <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 4</span>  <span class="d">prefix</span> openrouter/${model}       → openrouter-responses    ${model}          ok                              <span class="d">-</span> │
-│ <span class="d">└─</span> <span class="d">else</span>  no default                    → <span class="yellow">nothing catches it</span>                                                        <span class="d">-</span> │
+│ <span class="d">└─</span> <span class="d">else</span>  no default                    → <span class="yellow">refused · no route</span>                                                        <span class="d">-</span> │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌RULE──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">claude-* → openrouter-messages</span>                                                                                       │
@@ -316,7 +316,7 @@
 │ <span class="d">│</span> <span class="d"> 2</span>  <span class="d">prefix</span> anthropic_api/${model}    → claude-api                                <span class="d">off</span>                             <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 3</span>  <span class="d">prefix</span> anthropic_sub/${model}    → claude-sub                                <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>       <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 4</span>  <span class="d">prefix</span> openrouter/${model}       → openrouter-responses                      ok                              <span class="d">-</span> │
-│ <span class="d">└─</span> <span class="d">else</span>  no default                    → <span class="yellow">nothing catches it</span>                                                        <span class="d">-</span> │
+│ <span class="d">└─</span> <span class="d">else</span>  no default                    → <span class="yellow">refused · no route</span>                                                        <span class="d">-</span> │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
                                                                                                                         
                                                                                                                         
@@ -358,7 +358,7 @@
 │ <span class="d">│</span> <span class="d"> 2</span>  <span class="d">prefix</span> anthropic_api/${model}    → claude-api                                <span class="d">off</span>                             <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 3</span>  <span class="d">prefix</span> anthropic_sub/${model}    → claude-sub                                <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>       <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 4</span>  <span class="d">prefix</span> openrouter/${model}       → openrouter-responses                      ok                              <span class="d">-</span> │
-│ <span class="d">└─</span> <span class="d">else</span>  no default                    → <span class="yellow">nothing catches it</span>                                                        <span class="d">-</span> │
+│ <span class="d">└─</span> <span class="d">else</span>  no default                    → <span class="yellow">refused · no route</span>                                                        <span class="d">-</span> │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌PREVIEW───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">3 of 5 recent requests would change route</span>                                                                            │
@@ -398,7 +398,7 @@
 │ <span class="d">│</span> <span class="d"> 2</span>  <span class="d">prefix</span> anthropic_api/${model}    → claude-api                                <span class="d">off</span>                             <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 3</span>  <span class="d">prefix</span> anthropic_sub/${model}    → claude-sub                                <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>       <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 4</span>  <span class="d">prefix</span> openrouter/${model}       → openrouter-responses                      ok                              <span class="d">-</span> │
-│ <span class="d">└─</span> <span class="d">else</span>  no default                    → <span class="yellow">nothing catches it</span>                                                        <span class="d">-</span> │
+│ <span class="d">└─</span> <span class="d">else</span>  no default                    → <span class="yellow">refused · no route</span>                                                        <span class="d">-</span> │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌PREVIEW───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">3 of 5 recent requests would change route</span>                                                                            │
@@ -435,7 +435,7 @@
 │ <span class="d">│</span> <span class="d"> 2</span>  <span class="d">prefix</span> anthropic_api/${model}    → claude-api              ${model}          <span class="d">off</span>                             <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 3</span>  <span class="d">prefix</span> anthropic_sub/${model}    → claude-sub              ${model}          <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>       <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 4</span>  <span class="d">prefix</span> openrouter/${model}       → openrouter-responses    ${model}          ok                              <span class="d">-</span> │
-│ <span class="d">└─</span> <span class="d">else</span>  no default                    → <span class="yellow">nothing catches it</span>                                                        <span class="d">-</span> │
+│ <span class="d">└─</span> <span class="d">else</span>  no default                    → <span class="yellow">refused · no route</span>                                                        <span class="d">-</span> │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌RULE──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">claude-* → openrouter-messages</span>                                                                                       │

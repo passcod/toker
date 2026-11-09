@@ -47,6 +47,7 @@ No browser rig: Toker is a terminal app. Captures come from running the real TUI
 | 15 | `reach` says what a request gets, not whether the first candidate is up | A rule whose first candidate is off but whose fallback serves read as dead in dim `off` while it carried hits; the routes table already said `off · billed fallback` | `critique-round-3.md` #1 | round-3 fixes | kept |
 | 16 | Digits always mean tabs; the route page steps between routes with `←/→` and shows `1 of 7` | A second strip of digit chips gave `1`-`6` two meanings on one screen | the route switcher `1 2 3 4 5 6 7` | round-3 fixes | kept |
 | 17 | One way to reorder: `m` lifts, `↑/↓` move, `m` drops, `esc` puts it back | Two mechanisms, one of which dropped with `enter`, which call 14 reserves | `m … enter drops it` and `alt+↑/↓` | round-3 fixes | kept |
+| 18 | A gap with no default reads `refused · no route`, not `nothing catches it` | The user asked for it to say plainly that Toker refuses the request | `→ nothing catches it` | `→ refused · no route`, still yellow: a standing condition like `no cred`, while red stays for a form refusing a value | user's call |
 
 Observations held for the critique rather than settled here:
 
@@ -144,4 +145,4 @@ All 18 are being applied.
 
 ## Next
 
-- if the loop resumes: round 4 with a fresh critic, needing it and the round after clean to stop
+- round 4: a fresh critic, launched after the relabel; it and the round after must be clean to stop

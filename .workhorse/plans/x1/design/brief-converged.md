@@ -16,7 +16,7 @@ Read first, in this order:
 - **No sentence on the page.** No narration row under a title, no subtitle in a title rule, no explanatory empty state, no second hint line. A panel title is the word alone: `┌REWRITES──`. Explanation belongs in the `?` overlay.
 - **Controls are written once, on the last content line of the panel that owns them.** No footers, no control line separated from the content by blank rows.
 - **Fixed panel titles.** `RULE`, `ROUTE`, `PROVIDER`, `TRACE`, never a record name in the title slot. The record's name is the first line inside, bold.
-- **Colour:** `no cred`, `nothing catches`, spends (`billed`) and publication not synced are yellow; a refusal is red; `off` is dim; `ok` is plain; nothing is green; identities are never coloured; no coloured backgrounds anywhere, and a selected row is plain reversed text.
+- **Colour:** `no cred`, `refused · no route`, spends (`billed`) and publication not synced are yellow; a refusal is red; `off` is dim; `ok` is plain; nothing is green; identities are never coloured; no coloured backgrounds anywhere, and a selected row is plain reversed text.
 - **Uniform columns are not columns.** When every row of a table has the same value in a column, the column goes and the value is said once in the scope head (`anthropic_messages  5 rules · prefix → ${model}`). Shed uniform columns before varying ones when narrowing.
 - **`hits`** right-aligns against the box; `-` where not recorded, `≥n` for a floor, never blank.
 - **No `legacy-` anything.** The generated-only semantics are to be retired, so the records carry authored names (data sheet below) and no record is marked as generated.
@@ -47,7 +47,7 @@ Each page opens on the tab holding a problem when there is one, else on its firs
 
 Three scope groups, each a rail `┌─` head, `│` rows, `└─ else` row naming the default and where it goes. Columns: position (dim), match, `→ route`, reach, hits. `kind` and `model` are uniform here and go to the scope heads.
 
-The `openai_responses` group's else row is `else  no default  → nothing catches it`, with `nothing catches it` yellow.
+The `openai_responses` group's else row is `else  no default  → refused · no route`, with `refused · no route` yellow.
 
 RULE detail, sized to content: bold rule name, then label/value rows `match`, `example`, `sends to`, `reach` (with the reason, e.g. `no cred  anthropic_sub is on with no credential`), `overlaps` (`none: the prefixes differ`), `recent`. Controls on the last line: `[e] edit  [n] new  [m] move  [space] turn off  [d] delete  [t] trace  [enter] open route`.
 
@@ -100,7 +100,7 @@ A second frame: adding a fallback, inline in `sent to`, with a refusal beside th
 ### Presentations, defaults, models
 
 - **Presentations:** A1's table fix applied to D3, with the rules above. PRESENTATION detail sized to content.
-- **Defaults:** four rows plus the `openai_responses  no default  nothing catches it` row (yellow). Detail sized to content.
+- **Defaults:** four rows plus the `openai_responses  no default  refused · no route` row (yellow). Detail sized to content.
 - **Models:** FAMILIES (5), UPGRADES (5), COMPACTION (one line) stacked and sized to content; then OFFERS, A3's windowed catalogue (`… 170 above`, model, ctx, date, `… 236 more`), which takes the remaining rows because it scrolls.
 
 ### History
