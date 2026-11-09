@@ -28,6 +28,9 @@ Check that `/status` in Claude Code reads the auto mode server as enabled throug
 - **Format version.** Gate the route field to format version 4 the way v2 and v3 features are gated in `src/policy/document.rs` and `src/policy/canonical.rs`, with its own route fingerprint domain tag. A v3 document stays v3 and keeps its fingerprints, so existing pins survive until a route actually opts in.
 - **Mark lifetime.** Clear on the same catalogue-change signal that clears circuits (`clear_binding_circuits` in `src/policy/runtime.rs`), on a credential edit for the provider, and from the control operation. The store row carries no generation, since generations are per process.
 
+- **Late events.** The renderer closes a turn at `message_delta` and writes `message_stop` with it, so an event the provider sends between the two follows a closed turn and only the fields modelled on `message_delta` survive. Revisit once the observed response shape shows where `safeguard_results` sits.
+- **Refusal naming the beta.** The refusal test accepts the beta value as well as the field name, since the API words a refused beta header differently from a refused body field; WSAFE says so.
+
 ## Checklist
 
 ### Response extensions (WCANON)
@@ -39,7 +42,7 @@ Check that `/status` in Claude Code reads the auto mode server as enabled throug
 - [x] `anthropic_from_canonical` and `AnthropicRenderer`: replay same-domain extensions in position, with block indices from the renderer's own counter; never let an extension overwrite a modelled key
 - [x] Chat and Responses frontends: omit Messages-domain extensions and report content-free losses (the Responses frontend already drops foreign `ProviderEvent`s; check it reports them)
 - [x] `ResponseProjection`: confirm `is_reasoning_wire` leaves non-reasoning Messages extensions alone, with a test that `thinking: disabled` keeps a `safeguard_results` extension
-- [ ] Insta snapshots for a complete and a streamed response carrying an unknown top-level field, an unknown field on `message_delta`, an unknown block kind and an unknown event kind, each byte-identical through a Messages to Messages route
+- [x] Complete and streamed responses carrying an unknown top-level field, an unknown field on `message_delta`, an unknown block kind and an unknown event kind pass a Messages to Messages route in place (asserted on the parsed events rather than snapshotted, since the renderer zeroes `message_start` usage and echoes its own model)
 
 ### The pair and the binding capability (WSAFE, ROUTE)
 

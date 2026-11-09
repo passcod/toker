@@ -1378,6 +1378,28 @@ mod tests {
         assert_eq!(user_version(&reopened), schema::MIGRATIONS.len() as i64);
     }
 
+    #[test]
+    fn a_safeguards_mark_survives_a_reopen_and_clears_by_binding() {
+        let dir = test_dir("safeguards-mark");
+        let db = dir.join("toker.db");
+        let binding = crate::policy::BindingId::new("openrouter.openrouter_messages").unwrap();
+        let other = crate::policy::BindingId::new("anthropic_sub.anthropic_messages").unwrap();
+        let store = Store::open(&db).expect("open");
+        store.set_safeguards_mark(&binding, 100).expect("mark");
+        store.set_safeguards_mark(&binding, 200).expect("marking again");
+        drop(store);
+
+        let store = Store::open(&db).expect("reopen");
+        let marks = store.load_safeguards_marks().expect("marks");
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].binding_id, binding);
+        assert_eq!(marks[0].marked_ms, 100, "the first time is kept");
+
+        assert_eq!(store.clear_safeguards_marks(&[&other]).expect("clear"), 0);
+        assert_eq!(store.clear_safeguards_marks(&[&binding]).expect("clear"), 1);
+        assert!(store.load_safeguards_marks().expect("marks").is_empty());
+    }
+
     /// The TUI's change check: `data_version` holds still with no
     /// writes, moves when another connection to the same file commits
     /// (the daemon is another process; a second store is the same

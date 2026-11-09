@@ -297,7 +297,7 @@ async fn read_and_capture(mock: &MockState, request: Request) -> (String, Header
 }
 
 async fn mock_messages(State(mock): State<MockState>, request: Request) -> Response {
-    let (_path, _headers, json, stream) = read_and_capture(&mock, request).await;
+    let (_path, headers, json, stream) = read_and_capture(&mock, request).await;
     let model = json
         .get("model")
         .and_then(Value::as_str)
@@ -358,6 +358,35 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
                 br#"{"type":"error","error":{"type":"invalid_request_error","message":"safeguards: Extra inputs are not permitted"}}"#,
             ),
         ),
+        // The same refusal the other way round: the API names the beta value
+        // rather than the body field.
+        "sg-beta-refuse"
+            if headers
+                .get_all("anthropic-beta")
+                .iter()
+                .any(|value| value.to_str().is_ok_and(|v| v.contains(SAFEGUARDS_BETA))) =>
+        {
+            raw_response(
+                StatusCode::BAD_REQUEST,
+                "application/json",
+                Bytes::from(format!(
+                    r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"Unexpected value(s) `{SAFEGUARDS_BETA}` for the `anthropic-beta` header."}}}}"#
+                )),
+            )
+        }
+        // One refusal naming both rewrites Toker can make.
+        "sg-and-thinking"
+            if json.get("safeguards").is_some()
+                || json.pointer("/thinking/type") == Some(&json!("disabled")) =>
+        {
+            raw_response(
+                StatusCode::BAD_REQUEST,
+                "application/json",
+                Bytes::from_static(
+                    br#"{"type":"error","error":{"type":"invalid_request_error","message":"send between_tools instead; safeguards: Extra inputs are not permitted"}}"#,
+                ),
+            )
+        }
         "sg-answer" if json.get("safeguards").is_some() && stream => raw_response(
             StatusCode::OK,
             "text/event-stream",
@@ -4545,4 +4574,128 @@ async fn an_unknown_binding_that_refuses_the_ask_is_retried_once_without_it_and_
         Some(toker::routing::CapabilityEvidence::Unsupported)
     );
     assert_eq!(rows[2].safeguards.marked, Some(true));
+}
+
+#[tokio::test]
+async fn a_refusal_naming_the_beta_is_retried_like_one_naming_the_field() {
+    let (_anthropic, anthropic_upstream) = spawn_mock().await;
+    let (openrouter, openrouter_upstream) = spawn_mock().await;
+    let (addr, store) =
+        spawn_toker(openrouter_config(anthropic_upstream, &openrouter_upstream)).await;
+    let body = safeguards_request_body("openrouter/sg-beta-refuse", false);
+    let response = post_messages(
+        addr,
+        "/v1/messages",
+        &[("anthropic-beta", SAFEGUARDS_BETA)],
+        &body,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let captured = openrouter.captured();
+    assert_eq!(captured.len(), 2);
+    assert!(upstream_betas(&captured[1]).is_empty(), "no beta header is left to send");
+    let second: Value = serde_json::from_slice(&captured[1].body).expect("retry JSON");
+    assert!(second.get("safeguards").is_none());
+    assert_eq!(store.load_safeguards_marks().expect("marks").len(), 1);
+}
+
+#[tokio::test]
+async fn one_refusal_naming_thinking_and_safeguards_earns_one_extra_send_with_both_rewrites() {
+    let (_anthropic, anthropic_upstream) = spawn_mock().await;
+    let (openrouter, openrouter_upstream) = spawn_mock().await;
+    let (addr, store) =
+        spawn_toker(openrouter_config(anthropic_upstream, &openrouter_upstream)).await;
+    let body = serde_json::to_vec(&json!({
+        "model": "openrouter/sg-and-thinking",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "thinking": {"type": "disabled"},
+        "safeguards": {"invented": true},
+    }))
+    .expect("serialise");
+    let response = post_messages(
+        addr,
+        "/v1/messages",
+        &[("anthropic-beta", SAFEGUARDS_BETA)],
+        &body,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let captured = openrouter.captured();
+    assert_eq!(captured.len(), 2, "one refusal, one retry");
+    let retry: Value = serde_json::from_slice(&captured[1].body).expect("retry JSON");
+    assert_eq!(retry.pointer("/thinking/type"), Some(&json!("between_tools")));
+    assert!(retry.get("safeguards").is_none());
+    let rows = wait_for_rows(&store, 2).await;
+    assert_eq!(
+        rows[1].attempt.as_ref().expect("retry attempt").reason,
+        toker::store::AttemptReason::SafeguardsNegotiation
+    );
+}
+
+#[tokio::test]
+async fn the_mark_is_shown_in_the_config_snapshot_and_cleared_by_the_control_operation() {
+    let (_anthropic, anthropic_upstream) = spawn_mock().await;
+    let (openrouter, openrouter_upstream) = spawn_mock().await;
+    let (addr, store) =
+        spawn_toker(openrouter_config(anthropic_upstream, &openrouter_upstream)).await;
+    let betas = [("anthropic-beta", SAFEGUARDS_BETA)];
+    let body = safeguards_request_body("openrouter/sg-refuse", false);
+    assert_eq!(
+        post_messages(addr, "/v1/messages", &betas, &body).await.status(),
+        StatusCode::OK
+    );
+
+    let snapshot: Value = client()
+        .get(toker_url(addr, "/_toker/config/snapshot"))
+        .header("x-toker-control", "config-snapshot")
+        .send()
+        .await
+        .expect("snapshot")
+        .json()
+        .await
+        .expect("snapshot JSON");
+    let entry = |binding: &str| {
+        snapshot["safeguards"]
+            .as_array()
+            .and_then(|entries| entries.iter().find(|entry| entry["binding_id"] == binding))
+            .cloned()
+            .unwrap_or_else(|| panic!("{binding} is listed: {snapshot}"))
+    };
+    assert_eq!(entry("openrouter.openrouter_messages")["declared"], json!("unknown"));
+    assert!(entry("openrouter.openrouter_messages")["marked_ms"].is_number());
+    assert_eq!(entry("anthropic_sub.anthropic_messages")["declared"], json!("supported"));
+    assert!(entry("anthropic_sub.anthropic_messages")["marked_ms"].is_null());
+
+    let clear = |binding: &str| {
+        client()
+            .post(toker_url(addr, "/_toker/safeguards/mark/clear"))
+            .header("x-toker-control", "safeguards-mark-clear")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json!({"binding_id": binding}).to_string())
+            .send()
+    };
+    let refused = client()
+        .post(toker_url(addr, "/_toker/safeguards/mark/clear"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("ungated clear");
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN, "the usual gate applies");
+    let cleared: Value = clear("openrouter.openrouter_messages")
+        .await
+        .expect("clear")
+        .json()
+        .await
+        .expect("clear JSON");
+    assert_eq!(cleared["cleared"], json!(true));
+    assert!(store.load_safeguards_marks().expect("marks").is_empty());
+
+    // Cleared, the next ask probes the upstream again: pair sent, refused.
+    let before = openrouter.captured().len();
+    post_messages(addr, "/v1/messages", &betas, &body).await;
+    let captured = openrouter.captured();
+    assert_eq!(captured.len(), before + 2);
+    let probe: Value = serde_json::from_slice(&captured[before].body).expect("probe JSON");
+    assert!(probe.get("safeguards").is_some());
 }

@@ -182,6 +182,13 @@ pub enum PolicyEditOperation {
         candidate_id: CandidateId,
         destination: CandidateMoveDestination,
     },
+    /// Sets whether a route requires server safeguards of its candidates for a
+    /// request that asks for them. Honouring them needs format version 4, so
+    /// setting the flag raises an older document to it.
+    SetRouteServerSafeguards {
+        route_id: RouteId,
+        honours: bool,
+    },
 }
 
 /// A candidate's new position in a route.
@@ -406,6 +413,12 @@ impl PolicyEditOperation {
             } => {
                 let route = find_route_mut(document, route_id)?;
                 move_candidate(route, route_id, candidate_id, destination)?;
+            }
+            Self::SetRouteServerSafeguards { route_id, honours } => {
+                find_route_mut(document, route_id)?.honours_server_safeguards = *honours;
+                if *honours {
+                    document.format_version = document.format_version.max(4);
+                }
             }
         }
         Ok(())
@@ -748,6 +761,32 @@ mod tests {
             version_parser: crate::policy::VersionParserSpec::Semver,
             legacy_hyphenated: false,
         }
+    }
+
+    #[test]
+    fn honouring_server_safeguards_is_set_and_cleared_and_raises_the_format_to_four() {
+        let mut older = document();
+        older.format_version = 3;
+        let on = PolicyEdit {
+            operations: vec![PolicyEditOperation::SetRouteServerSafeguards {
+                route_id: RouteId::new("first-route").unwrap(),
+                honours: true,
+            }],
+        };
+        let edited = on.apply(&older).unwrap();
+        assert!(edited.routes[0].honours_server_safeguards);
+        assert_eq!(edited.format_version, 4);
+        assert!(!older.routes[0].honours_server_safeguards);
+
+        let off = PolicyEdit {
+            operations: vec![PolicyEditOperation::SetRouteServerSafeguards {
+                route_id: RouteId::new("first-route").unwrap(),
+                honours: false,
+            }],
+        };
+        let cleared = off.apply(&edited).unwrap();
+        assert!(!cleared.routes[0].honours_server_safeguards);
+        assert_eq!(cleared.format_version, 4, "the version never moves back");
     }
 
     #[test]

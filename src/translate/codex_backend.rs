@@ -1207,6 +1207,29 @@ mod tests {
     }
 
     #[test]
+    fn a_server_safeguards_ask_is_a_content_free_loss_on_the_responses_wire() {
+        let canonical = crate::translate::from_anthropic(&json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "safeguards": {"invented": "secret-ask"},
+        }))
+        .expect("parses");
+        assert!(crate::translate::asks_server_safeguards(&canonical));
+        let rendered = render_codex(&canonical, KEY).expect("renders with report");
+        assert_eq!(
+            rendered.report.losses(),
+            &[TranslationLoss::new(
+                "$.safeguards",
+                TranslationLossReason::IncompatibleExtensionDialect,
+                1,
+            )]
+        );
+        let wire = serde_json::to_string(&rendered.value).expect("serialises");
+        assert!(!wire.contains("safeguards") && !wire.contains("secret-ask"));
+        assert!(!format!("{:?}", rendered.report).contains("secret-ask"));
+    }
+
+    #[test]
     fn system_metadata_and_opaque_parts_are_reported_but_not_rendered() {
         let canonical = CanonicalRequest {
             model: Some(MODEL.to_owned()),
