@@ -4357,6 +4357,45 @@ api_key = "sk-proj-test"
     }
 
     #[tokio::test]
+    async fn provider_state_on_an_unpinned_lane_resolves_and_pins_it() {
+        let (server, _upstream) = policy_chat_server().await;
+        let store = server.store.clone();
+        let address = serve(server).await;
+
+        // A lane with no pin has no recorded producer for this state, and a
+        // refusal could never recover: the client replays the same history on
+        // every retry, and only a served response pins the lane.
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/v1/chat/completions"))
+            .header("x-toker-session", "policy-unpinned-state")
+            .json(&serde_json::json!({
+                "model": "policy-alias",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": "hello",
+                        "reasoning_details": [{"type": "reasoning.encrypted", "data": "x"}]
+                    },
+                    {"role": "user", "content": "again"}
+                ],
+                "max_tokens": 16,
+                "stream": false
+            }))
+            .send()
+            .await
+            .expect("request succeeds");
+        assert_eq!(response.status(), StatusCode::OK);
+        let lane = store
+            .load_lanes()
+            .expect("lanes")
+            .into_iter()
+            .find(|lane| lane.session_id.as_deref() == Some("policy-unpinned-state"))
+            .expect("the served request created a lane");
+        assert!(lane.pin.is_some(), "the response pins the lane");
+    }
+
+    #[tokio::test]
     async fn failed_policy_chat_does_not_pin_its_lane() {
         let (server, upstream) = policy_chat_server().await;
         upstream
