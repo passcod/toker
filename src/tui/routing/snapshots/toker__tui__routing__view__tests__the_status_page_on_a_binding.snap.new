@@ -1,0 +1,37 @@
+---
+source: src/tui/routing/view.rs
+assertion_line: 763
+expression: frame(&state)
+---
+ ? ⇄ 1  2  3  4 preview, revisions & activation                                                                  draft 4
+┌PREVIEW, REVISIONS & ACTIVATION─────────────────┐┌DETAIL──────────────────────────────────────────────────────────────┐
+│3  {"revision_id":3,"policy":{}}                ││draft generation 4                                                  │
+│draft  {"policy":{"description":"example draft"…││codex_sub.codex_responses  codex_sub                                │
+│dynamic_responses_models  {"adapter":"dynamic_r…││cost class: subscription                                            │
+│codex_sub.codex_responses  {"binding_id":"codex…││configured: yes (configured)                                        │
+│openrouter.openrouter_responses  {"binding_id":…││enabled: yes (enabled)                                              │
+│lane_impacts  {"total":4,"unpinned":1,"warm":2,…││credential: unknown                                                 │
+│diagnostic  {"code":"virtual-presentation-unlis…││catalogue: fresh                                                    │
+│                                                ││                                                                    │
+│                                                ││CAPABILITIES                                                        │
+│                                                ││  sampling: supported                                               │
+│                                                ││  tools: supported                                                  │
+│                                                ││  images: unknown                                                   │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+└────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘

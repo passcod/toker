@@ -601,6 +601,13 @@ pub(super) mod testing {
         })
     }
 
+    impl State {
+        /// A refusal, as the service's reply to a write leaves one.
+        pub(crate) fn set_error(&mut self, error: &str) {
+            self.error = Some(error.to_owned());
+        }
+    }
+
     pub(crate) fn loaded() -> State {
         let mut state = State::default();
         let reply = Reply::Command(

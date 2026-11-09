@@ -474,8 +474,22 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(text.contains("e edit"));
-        assert!(text.contains("a activate"));
+        assert!(!text.contains("n new"), "no page carries a footer: {text}");
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &state, true);
+            })
+            .expect("draw");
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("edit the selected record"), "{text}");
+        assert!(text.contains("activate the draft"), "{text}");
     }
 
     #[test]
@@ -540,17 +554,38 @@ mod tests {
             text.lines()
                 .rev()
                 .nth(1)
-                .is_some_and(|line| line.contains("confirms")),
+                .is_some_and(|line| line.contains("y/enter confirm · n/esc cancel")),
             "the confirmation prompt stays above the refusal: {text}"
         );
     }
 
-    /// Every key the page acts on is named in the legend, so a key that was
-    /// added cannot stay undocumented.
+    /// Every key the page acts on is named in its overlay, so a key that
+    /// was added cannot stay undocumented (spec: UTUI#finding-the-keys).
     #[test]
-    fn the_legend_names_every_record_key() {
-        let backend = TestBackend::new(140, 30);
-        let mut terminal = Terminal::new(backend).expect("terminal");
+    fn the_overlay_names_every_key_the_page_takes() {
+        use crossterm::event::KeyCode;
+        let named = |key: &str| {
+            super::KEYS
+                .iter()
+                .any(|(keys, _)| keys.split([' ', '/']).any(|token| token == key))
+        };
+        for key in ['e', 'n', 'd', 'v', 'V', 'a', 'x', 'p', 'i', 'r', 'h', 'j', 'k', 'l'] {
+            assert!(
+                !super::super::owns_key(KeyCode::Char(key)) || named(&key.to_string()),
+                "{key} is taken but not named"
+            );
+        }
+        assert!(named("pgup") && named("pgdn"));
+        for key in ["tab", "alt+↑", "ctrl+d", "ctrl+s", "space"] {
+            assert!(
+                super::FORM_KEYS
+                    .iter()
+                    .any(|(keys, _)| keys.split([' ', '/']).any(|token| token == key)),
+                "{key} in a form"
+            );
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("terminal");
         terminal
             .draw(|frame| {
                 render(frame, &State::default(), true);
@@ -563,19 +598,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        for key_help in [
-            "n  add a record",
-            "e  edit typed record",
-            "d  confirm removal",
-            "defaults (routes view)",
-            "i  import",
-            "PgUp/PgDn scroll the detail",
-            "Ctrl+S saves",
-            "Tab complete",
-            "Alt+↑/↓ moves",
-            "the wheel scrolls",
-        ] {
-            assert!(text.contains(key_help), "{key_help}: {text}");
+        for heading in ["KEYS", "IN A FORM", "? or esc close"] {
+            assert!(text.contains(heading), "{heading}: {text}");
         }
     }
 
@@ -729,6 +753,67 @@ mod tests {
         ));
         state.set_view(view);
         state
+    }
+
+    /// The page at `width`×`height`, and where it put things.
+    fn drawn_at(state: &State, width: u16, height: u16) -> (String, super::Drawn) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        let mut drawn = super::Drawn::default();
+        terminal
+            .draw(|frame| drawn = render(frame, state, false))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let text = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (text, drawn)
+    }
+
+    /// Below 100 columns the list sits over the detail pane rather than
+    /// beside it, where both would be too narrow to read.
+    #[test]
+    fn a_narrow_page_stacks_the_list_over_the_detail() {
+        let state = page_in(super::View::Routes);
+        let (_, wide) = drawn_at(&state, 100, 32);
+        assert_eq!(wide.entries.y, wide.detail.y, "side by side from 100");
+        assert!(wide.entries.right() <= wide.detail.x);
+        let (text, narrow) = drawn_at(&state, 99, 32);
+        assert_eq!(narrow.entries.x, narrow.detail.x, "stacked below:\n{text}");
+        assert!(narrow.entries.bottom() <= narrow.detail.y, "{text}");
+        assert!(narrow.entries.height <= 32 / 3, "{text}");
+    }
+
+    /// The other tabs collapse to their number before the current label
+    /// clips, and every tab stays clickable.
+    #[test]
+    fn a_narrow_header_collapses_the_other_tabs() {
+        let state = page_in(super::View::Routes);
+        let (text, drawn) = drawn_at(&state, 90, 32);
+        let header = text.lines().next().unwrap_or_default();
+        assert!(
+            header.contains("1  2 routes, candidates & defaults  3  4"),
+            "{header}"
+        );
+        assert_eq!(drawn.tabs.len(), 4);
+    }
+
+    /// Too short for the detail boxed, both panes give up their borders
+    /// before any line of content (spec: UTUI#what-is-shed-first).
+    #[test]
+    fn a_short_page_goes_ruled() {
+        let state = page_in(super::View::Routes);
+        let (tall, _) = drawn_at(&state, 120, 40);
+        assert!(tall.contains("\u{250c}DETAIL"), "boxed while it fits:\n{tall}");
+        let (short, _) = drawn_at(&state, 120, 12);
+        assert!(short.contains("DETAIL \u{2500}"), "ruled:\n{short}");
+        assert!(!short.contains('\u{250c}'), "{short}");
     }
 
     #[test]

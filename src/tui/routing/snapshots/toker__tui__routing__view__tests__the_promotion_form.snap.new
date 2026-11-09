@@ -1,0 +1,37 @@
+---
+source: src/tui/routing/view.rs
+assertion_line: 887
+expression: frame(&state)
+---
+ ? ⇄ 1  2  3  4 preview, revisions & activation                                                                  draft 4
+┌PREV┌PROMOTE LEARNED MODEL───────────────────────────────────────────────────────────────────────────────────────┐────┐
+│3  {│> binding: ▏                                                                                                │    │
+│draf│    Tab: anthropic_sub.anthropic_messages | anthropic_api.anthropic_messages | openai_api.openai_chat_comple│    │
+│dyna│  model:                                                                                                    │    │
+│code│                                                                                                            │    │
+│open│                                                                                                            │    │
+│lane│                                                                                                            │    │
+│diag│                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │tab complete from a daemon offer · enter record · esc cancel                                                │    │
+│    │                                                                                                            │    │
+│    └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
+└────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘

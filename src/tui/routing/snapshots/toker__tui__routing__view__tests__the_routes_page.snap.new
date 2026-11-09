@@ -1,0 +1,37 @@
+---
+source: src/tui/routing/view.rs
+assertion_line: 741
+expression: "frame(&page_in(super::View::Routes))"
+---
+ ? ⇄ 1  2 routes, candidates & defaults  3  4                                                                    draft 4
+┌ROUTES, CANDIDATES & DEFAULTS───────────────────┐┌DETAIL──────────────────────────────────────────────────────────────┐
+│mixed  {"id":"mixed","display_name":"Subscripti…││draft generation 4                                                  │
+│default openai_responses  {"scope":{"kind":"pro…││mixed  Subscription then billed                                     │
+│                                                ││lane transition: move_when_cold                                     │
+│                                                ││pinned lanes: 2 warm, 1 cold, 0 unknown                             │
+│                                                ││                                                                    │
+│                                                ││CANDIDATES                                                          │
+│                                                ││1. sub  codex_sub.codex_responses  [subscription]                   │
+│                                                ││     model: exact gpt-example                                       │
+│                                                ││     now: available; catalogue fresh                                │
+│                                                ││     upgrade: gpt-example-1.0 -> gpt-example-1.2                    │
+│                                                ││   v fallback on; after send: rate_limit; cache: allow cache loss   │
+│                                                ││     $ COST BOUNDARY subscription -> billed, consent allow          │
+│                                                ││2. billed  openrouter.openrouter_responses  [billed]                │
+│                                                ││     model: the requested model                                     │
+│                                                ││     now: not configured; catalogue absent                          │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+└────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘

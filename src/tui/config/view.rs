@@ -261,6 +261,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+
     /// The frame as the screen reads it, trailing blanks trimmed.
     fn frame(state: &State, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
@@ -302,6 +303,86 @@ mod tests {
         let mut state = loaded();
         state.command_refused("config-snapshot");
         insta::assert_snapshot!("unreachable_100x24", frame(&state, 100, 24));
+    }
+
+    /// Too short for its rows boxed, the page sheds its border before any
+    /// row, then windows the list around the selection and counts the cut
+    /// (spec: UTUI#what-is-shed-first).
+    #[test]
+    fn a_short_page_goes_ruled_and_counts_what_it_cut() {
+        let mut state = loaded();
+        state.set_view(View::Settings);
+        let rows = state.rows().len();
+        let roomy = frame(&state, 100, rows as u16 + 3);
+        assert!(roomy.contains("\u{250c}SETTINGS"), "boxed while it fits:\n{roomy}");
+
+        let short = frame(&state, 100, 6);
+        assert!(short.contains("SETTINGS \u{2500}"), "ruled:\n{short}");
+        assert!(short.contains("more settings"), "the cut is counted:\n{short}");
+    }
+
+    /// A click names the row drawn where it lands, not one counted from
+    /// the top of a list that has scrolled.
+    #[test]
+    fn a_click_selects_the_row_drawn_there_once_the_list_has_scrolled() {
+        let mut state = loaded();
+        state.set_view(View::Settings);
+        let last = state.rows().len() - 1;
+        state.select(last);
+        let mut terminal = Terminal::new(TestBackend::new(100, 6)).expect("terminal");
+        let mut drawn = super::Drawn::default();
+        terminal
+            .draw(|f| drawn = super::render(f, &state, false))
+            .expect("draw");
+        let first = drawn.rows.first().cloned().expect("a row was drawn");
+        assert!(first.entry > 0, "the list scrolled: {:?}", drawn.rows);
+        let at = first.area.as_position();
+        assert_eq!(crate::tui::chrome::entry_at(&drawn.rows, at), Some(first.entry));
+    }
+
+    /// The page's keys are in its overlay, every key it takes named there,
+    /// and there is no footer (spec: UTUI#finding-the-keys).
+    #[test]
+    fn the_overlay_names_every_key_the_page_takes() {
+        use crossterm::event::KeyCode;
+        for key in ['e', ' ', '1', '2', 'h', 'j', 'k', 'l'] {
+            assert!(super::super::owns_key(KeyCode::Char(key)));
+            let token = if key == ' ' { "space".to_owned() } else { key.to_string() };
+            assert!(
+                super::KEYS
+                    .iter()
+                    .any(|(keys, _)| keys.split([' ', '/']).any(|t| t == token)),
+                "{token:?} is taken but not named"
+            );
+        }
+        let state = loaded();
+        assert!(!frame(&state, 100, 24).contains("quits"), "no footer");
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+        terminal
+            .draw(|f| {
+                super::render(f, &state, true);
+            })
+            .expect("draw");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("KEYS") && text.contains("switch view"), "{text}");
+    }
+
+    /// A refused value is said under the header, with the page still
+    /// standing below it (spec: UTUI#the-configuration-pages).
+    #[test]
+    fn a_message_sits_under_the_header_over_the_page() {
+        let mut state = loaded();
+        state.set_error("quota_enabled: refused by the service");
+        let text = frame(&state, 100, 24);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].contains("refused by the service"), "{text}");
+        assert!(lines[2].contains("PROVIDERS"), "{text}");
     }
 
     /// The panel title is upper case and runs into its rule, as the

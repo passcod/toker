@@ -65,9 +65,9 @@ A meter over 95%, or one whose verdict is `spent` or `out ~T`. A hit rate under 
 **Cyan — identity rather than judgement.**
 A session's working directory in its label, and the context occupancy bar at a share that is not yet a concern. Cyan never means good or bad; it distinguishes.
 
-**Blue — one use only.** The `⇄` page-switch chip on the dashboard header.
+**Blue — one use only.** The `⇄` page-switch chip in the header.
 
-**DarkGray — chrome that is not content.** The `?` legend chip.
+**DarkGray — chrome that is not content.** The `?` chip that opens a page's overlay.
 
 **Plain (`Reset`) — everything else**, which is most of the screen: labels, counts, names, the fields in a detail popup.
 
@@ -93,7 +93,7 @@ It marks the best case (a native 1M ceiling), the most urgent case (a stopped se
 
 **`DIM` means absent, inactive or subordinate.**
 It renders at half the foreground's opacity, so it keeps the colour underneath rather than flattening to grey — which matters, because a dim green `↑` is still a green `↑`.
-It marks an idle session and its bar, a `?` for an unknown ceiling, a proportion bar in TOKENS, a reset clock beside a verdict, the `estimating` and `window rolled over` verdicts, a rule in ruled chrome, an unavailable control in a popup, and a footer.
+It marks an idle session and its bar, a `?` for an unknown ceiling, a proportion bar in TOKENS, a reset clock beside a verdict, the `estimating` and `window rolled over` verdicts, a rule in ruled chrome, an unavailable control in a popup, a tab that is not the current one, a count of the entries a list left out, and the key prompt under a text entry.
 
 **`REVERSED` means a handle to press or a row in focus.**
 The header chips, and the selected row in a list.
@@ -141,7 +141,7 @@ The contract is that agreement and not the length of the list: a screen that gai
 `─ │ ┌ ┐ └ ┘` frame panels and popups.
 `·` separates clauses on a line as well as marking an empty bucket.
 `→` shows a transition (`claude → anthropic_sub`, a forced model rewrite, a byte count before and after).
-`←/→ ↑/↓` name arrow keys in a footer.
+`←/→ ↑/↓` name arrow keys in an overlay or a prompt.
 `…` marks a clipped name or a `… N more` list cut.
 `×` and `≠` appear in comparisons, `≈` in an approximation.
 
@@ -180,19 +180,24 @@ A boxed panel costs two rows; the ruled form is a bold title, a single space, th
 The ruled form still insets its content by a column each side, so every width-driven choice is the same in both.
 The rule stops a cell short of the edge, so two panels side by side never run their titles into each other.
 
-This degradation is the dashboard's.
-Routing and config do not have it yet and clip when narrowed; settling that is card S1's work.
+Every page frames this way, through one module, so every page sheds its borders before any content.
+A page with one framing for several panels picks it once: boxed only while no panel loses content to its border.
 
-**A page with views carries a numbered tab strip** above its body, the current view in bold: `1 providers   2 settings`.
-Config writes its tabs in lower case and routing writes them in capitals, which is the same divergence as the footers and goes to card S1 with them.
+**A page with views carries a numbered tab strip** in its header, after the chips: ` 1 providers  2 settings`.
+Tabs are lower case and two spaces apart, the current one bold and reversed, the others dim, and every tab is clickable.
+When the strip does not fit, the other tabs collapse to their number first, then the current label clips with `…`.
+A page status on the right of the header, such as routing's `draft 4 · working`, clips only once the tabs have collapsed.
+
+**A page's message sits under the header**, in red, wrapped across as many rows as it takes, and the page stays standing beneath it.
+It says what went wrong with the last thing the page tried: a refused value, a failed read.
 
 **A popup is centred, cleared behind, bordered, and padded a column each side.**
 It is as wide as its widest line within a floor and a ceiling, never wider than the frame.
 Overlays are exclusive: opening one closes the other.
 
 **The header carries its chips at the far left**, reversed: a `?` for the legend, then a `⇄` for the page switch.
-On the dashboard the `?` is three cells and `DarkGray`, the `⇄` is a single `Blue` cell in the gutter beside it, and the `⇄` disappears below 80 columns where the status needs every cell and `Tab` is the way across.
-On the routing page both are three cells and neither is coloured — a fourth divergence for card S1.
+Every page draws the same chips: the `?` is three cells and `DarkGray`, the `⇄` is a single `Blue` cell in the gutter beside it, and the `⇄` disappears below 80 columns where the header needs every cell and `Tab` is the way across.
+`⇄` and `Tab` both go to the next page, on every page.
 On a one-row terminal the `?` survives even when the header has given its row away, because it is the way out to the legend at any size.
 
 ## Layout and shedding
@@ -214,7 +219,6 @@ The table gives the label its leftover width and sheds a numeric column rather t
 
 **Lower case throughout**, except panel titles and the word Toker.
 Field labels, column headings, verdicts and key hints are all lower case.
-The routing page's tab labels are the one exception that is not meant to be one, and go to card S1 with the rest.
 
 **`·` separates clauses**, with a space each side: `last 30m · 2 sessions · 17 requests`.
 
@@ -234,7 +238,7 @@ A trailing `?` on a verdict means the gate's state was assumed rather than obser
 ## Interaction
 
 **Keys are global where they can be.**
-`q` quits from any page, though not from inside a modal, which takes every key. `Tab` cycles pages. `?` opens the legend and `?` or `Esc` closes it. `Esc` returns to the dashboard from another page. `r` refreshes. `↑`/`↓` move a selection, with `k`/`j` alongside them, and `←`/`→` with `h`/`l` move between views.
+`q` quits from any page, though not from inside a modal, which takes every key. `Tab` cycles pages. `?` opens the page's overlay and `?` or `Esc` closes it. `Esc` returns to the dashboard from another page. `r` refreshes. `↑`/`↓` move a selection, with `k`/`j` alongside them, and `←`/`→` with `h`/`l` move between views.
 
 **Focus is a reversed row**, and a list scrolls to keep its selection in sight.
 
@@ -245,10 +249,20 @@ The wider quota release needs a second confirmation, and an armed control invert
 An unavailable control stays visible and dim with the reason in place of its label, rather than disappearing.
 
 **A control is written `[key] label`**, three spaces between controls.
+A control is something drawn to be pressed, like the detail popup's `[o] over`; a hint is prose naming a key, and reads as above.
 
 **The mouse works where the keyboard does.**
 Every list records the rectangle of each row it drew, so a click names the row it landed on, and the header chips are clickable.
 
-**Keys are discoverable, but not yet consistently.**
-The dashboard teaches them through the `?` overlay and has no footer; config and routing each carry a footer in a different dialect.
-That divergence is card S1's work, and until it lands, follow the page you are mocking rather than inventing a fourth form.
+**Keys are taught by the `?` overlay, and no page carries a footer.**
+Each page's overlay lists its own keys, a key in bold then what it does; the dashboard's lists its marks above them as LEGEND, and the other pages title theirs KEYS.
+A modal or a text entry takes every key, `?` included, so it says its keys itself on its last line.
+
+**A key hint reads `e edit · n new`:** the key, the bare verb, lower case, `·` between hints, arrows as glyphs, and `y/enter` where two keys do one thing.
+This holds in the overlay's rows, a modal's prompt and a form's last line alike.
+
+**A list's rows are hand-built**, never a list widget.
+The selected row is reversed across the panel's width, every line clips with `…`, and a list cut short counts what it left out above and below.
+An entry with more than one line keeps them while the list fits and sheds to its first line once it does not, the selected entry keeping all of its own.
+
+**Routing stacks its list over its detail below 100 columns**, the list taking what it needs up to a third of the body, so that neither pane is too narrow to read.

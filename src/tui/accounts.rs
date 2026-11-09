@@ -444,7 +444,65 @@ mod tests {
         // assigned when an account becomes known.
         assert!(text.contains("not resolved"), "{text}");
         assert!(text.contains("?  "), "{text}");
-        assert!(text.contains("n names an account"), "{text}");
+        assert!(!text.contains("n names"), "no page carries a footer: {text}");
+    }
+
+    /// The page's keys are in its overlay rather than a footer
+    /// (spec: UTUI#finding-the-keys).
+    #[test]
+    fn the_overlay_names_the_page_keys() {
+        let store = store();
+        observe(&store, "ana-token", Some("ana@example.net"), NOW - 120_000);
+        let page = Page::new(&store);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                page.render(frame, NOW, true);
+            })
+            .expect("draw");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("KEYS"), "{text}");
+        assert!(text.contains("name the selected account"), "{text}");
+        assert!(text.contains("? or esc close"), "{text}");
+    }
+
+    /// Too short for every entry in full, the others shed to their head
+    /// line while the selected one keeps its fields, and a click lands on
+    /// the entry drawn where it falls (spec: UTUI#what-is-shed-first).
+    #[test]
+    fn a_short_page_sheds_the_other_entries_to_their_head_line() {
+        let store = store();
+        for (index, email) in ["ana", "ben", "cal", "dee", "eve"].iter().enumerate() {
+            observe(
+                &store,
+                &format!("{email}-token"),
+                Some(&format!("{email}@example.net")),
+                NOW - (index as i64 + 1) * 60_000,
+            );
+        }
+        let mut page = Page::new(&store);
+        page.move_selection(4);
+        let text = rendered(&page, 80, 7);
+        assert!(text.contains("ACCOUNTS ─"), "ruled, not boxed: {text}");
+        assert_eq!(
+            text.matches("provider").count(),
+            1,
+            "only the selected entry keeps its fields: {text}"
+        );
+        assert!(text.contains("above"), "the cut is counted: {text}");
+
+        // The first row drawn is not the first entry once the list has
+        // scrolled to the selection, so a click there names what it shows.
+        let first = page.rows.borrow().first().cloned().expect("a row was drawn");
+        assert!(first.entry > 0, "{:?}", page.rows.borrow());
+        page.click(first.area.as_position());
+        assert_eq!(page.selected, first.entry);
     }
 
     #[test]

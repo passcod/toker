@@ -21,12 +21,12 @@ The four pages (dashboard, routing, config, accounts) move to one convention for
 
 ## Checklist
 
-- [ ] Shared chrome module: `Chrome`, `panel`, header chips, tab strip, list window with selection, key overlay, `clip`, `strip_colour`
-- [ ] Dashboard draws through it; legend gains a keys section
-- [ ] Config: header and tabs, chrome switch, hand-built rows, inline entry, message line, overlay; `←/→`, `h/l`, `j/k`
-- [ ] Accounts: header, chrome switch, entries collapsing to their head line when short, selection window, message line, overlay; `j/k`
-- [ ] Routing: header with tabs and status, stacked layout below 100 columns, chrome switch, hand-built rows, overlay, modal and form prompts in the settled dialect
-- [ ] Loop: chips and `?` on every page, `⇄` as next page, colour stripped on every page
-- [ ] UTUI: shedding and the key overlay apply to every page
-- [ ] Design guide: chrome, copy and interaction describe the settled convention; S1 references gone
+- [x] Shared chrome module: `Chrome`, `panel`, header chips, tab strip, list window with selection, key overlay, `clip`, `strip_colour`
+- [x] Dashboard draws through it; legend gains a keys section
+- [x] Config: header and tabs, chrome switch, hand-built rows, inline entry, message line, overlay; `←/→`, `h/l`, `j/k`
+- [x] Accounts: header, chrome switch, entries collapsing to their head line when short, selection window, message line, overlay; `j/k`
+- [x] Routing: header with tabs and status, stacked layout below 100 columns, chrome switch, hand-built rows, overlay, modal and form prompts in the settled dialect
+- [x] Loop: chips and `?` on every page, `⇄` as next page, colour stripped on every page
+- [x] UTUI: shedding and the key overlay apply to every page
+- [x] Design guide: chrome, copy and interaction describe the settled convention; S1 references gone
 - [ ] Tests and snapshots; test cases ticked
