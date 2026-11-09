@@ -750,6 +750,7 @@ fn messages_fallback_policy_document(
         }],
         presentations,
         routes: vec![Route {
+            honours_server_safeguards: false,
             id: route_id,
             display_name: "Messages fallback".to_owned(),
             description: None,
@@ -4199,6 +4200,7 @@ async fn a_policy_rewrite_routes_bare_claude_models_to_openrouter() {
         defaults: vec![],
         presentations: vec![],
         routes: vec![Route {
+            honours_server_safeguards: false,
             id: route_id.clone(),
             display_name: "Auxiliary".to_owned(),
             description: None,

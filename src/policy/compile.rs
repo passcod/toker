@@ -319,6 +319,7 @@ pub struct CompiledRoute {
     edges: Vec<CandidateEdge>,
     fingerprint: RouteFingerprint,
     lane_transition: LaneTransitionPolicy,
+    honours_server_safeguards: bool,
 }
 
 impl CompiledRoute {
@@ -339,6 +340,11 @@ impl CompiledRoute {
     }
     pub fn lane_transition(&self) -> LaneTransitionPolicy {
         self.lane_transition
+    }
+    /// Whether a request that asks for server safeguards requires them of
+    /// this route's candidates.
+    pub fn honours_server_safeguards(&self) -> bool {
+        self.honours_server_safeguards
     }
 }
 
@@ -968,6 +974,7 @@ impl<'a> Compiler<'a> {
                         edges,
                         fingerprint,
                         lane_transition: route.lane_transition,
+                        honours_server_safeguards: route.honours_server_safeguards,
                     },
                 );
             }
@@ -2209,6 +2216,7 @@ mod tests {
                 metadata: None,
             }],
             routes: vec![Route {
+                honours_server_safeguards: false,
                 id: route_id("route"),
                 display_name: "Route".to_owned(),
                 description: None,

@@ -51,9 +51,9 @@ pub use resolve::{
     AttemptPlan, AvailabilitySnapshot, BindingAvailability, CandidateEvidence,
     CatalogueAvailability, CircuitSnapshot, CredentialSnapshot, Evidence, LaneFacts,
     LegacyCompactionFacts, NoLearning, OpenCircuitTarget, ProvisionalPin, RequestClass,
-    RequestFacts, ResolveFailure, RouteProvenance, SkipReason, TraceEvent, UpgradeElection,
-    UpgradeRejection, resolve, resolve_after_failure, resolve_first_candidate, resolve_model_free,
-    resolve_with_circuits, upgrade_standing,
+    RequestFacts, ResolveFailure, RouteProvenance, SafeguardsPlan, SkipReason, TraceEvent,
+    UpgradeElection, UpgradeRejection, resolve, resolve_after_failure, resolve_first_candidate,
+    resolve_model_free, resolve_with_circuits, upgrade_standing,
 };
 pub use runtime::{HealthCircuitKey, PolicyRuntime, PolicyRuntimeError, PolicySnapshot};
 pub use transition::{

@@ -43,7 +43,7 @@ Check that `/status` in Claude Code reads the auto mode server as enabled throug
 
 ### The pair and the binding capability (WSAFE, ROUTE)
 
-- [ ] Add `server_safeguards` to `Capabilities` in `src/routing.rs`: supported on the Anthropic sub and API Messages bindings, unknown on OpenRouter Messages, unsupported on every other protocol's binding; update the pinned-capability tests in `src/ir/canonical.rs`
+- [x] Add `server_safeguards` to `Capabilities` in `src/routing.rs`: supported on the Anthropic sub and API Messages bindings, unknown on OpenRouter Messages, unsupported on every other protocol's binding; update the pinned-capability tests in `src/ir/canonical.rs`
 - [ ] Capture and fixture the real response shape as described above, with the user's go-ahead before running a live turn, before flipping the Anthropic bindings to supported
 - [ ] Derive "asks for server safeguards" from the canonical request's `safeguards` extension, beside `required_capabilities` in `src/server/anthropic.rs`, as a separate fact rather than a `CapabilityFlags` member
 - [ ] Withhold the pair where effective support is unsupported: drop the `safeguards` extension in the licensed-transformation step and strip only the paired beta value from the outgoing `anthropic-beta` header, leaving the others
@@ -59,11 +59,11 @@ Check that `/status` in Claude Code reads the auto mode server as enabled throug
 
 ### Routing (RDOC, RSOLV, RREV)
 
-- [ ] `Route` in `src/policy/document.rs`: an `honours_server_safeguards` flag, gated to format version 4, included in route semantics and the route fingerprint under a v4 domain tag
-- [ ] Compile the flag into the compiled route in `src/policy/compile.rs`
-- [ ] `RequestFacts`: add the ask; in the walk, treat it as a required capability only on an honouring route, skipping on effective unsupported and never on unknown
-- [ ] When that walk ends without a candidate, walk again without the requirement; carry the same rule into the post-send continuation
-- [ ] Trace events: a skip reason for lacking server safeguards, and a marker for the second walk, stored through `StoredRoutingTrace`
+- [x] `Route` in `src/policy/document.rs`: an `honours_server_safeguards` flag, gated to format version 4, included in route semantics and the route fingerprint under a v4 domain tag
+- [x] Compile the flag into the compiled route in `src/policy/compile.rs`
+- [x] `RequestFacts`: add the ask; in the walk, treat it as a required capability only on an honouring route, skipping on effective unsupported and never on unknown
+- [x] When that walk ends without a candidate, walk again without the requirement; carry the same rule into the post-send continuation
+- [x] Trace events: a skip reason for lacking server safeguards, and a marker for the second walk, stored through `StoredRoutingTrace`
 - [ ] Preview: accept the ask in `PreviewRequest` and `RoutingPreviewRequest`, and report each candidate's effective support in the preview result
 - [ ] Policy edit operations and the TUI route form: set and clear the route flag
 

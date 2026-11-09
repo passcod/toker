@@ -1009,6 +1009,10 @@ mod tests {
             caps.images.is_supported(),
             "the backend takes input_image parts"
         );
+        assert!(
+            caps.server_safeguards.is_unsupported(),
+            "the Responses wire has no field for the ask"
+        );
     }
 
     #[test]
@@ -1018,6 +1022,16 @@ mod tests {
         assert!(caps.system_in_messages.is_supported());
         assert!(caps.thinking_replay.is_supported());
         assert!(caps.images.is_supported());
+        assert_eq!(
+            caps.server_safeguards,
+            crate::routing::CapabilityEvidence::Unknown,
+            "a Messages binding is unverified until it is observed"
+        );
+        assert!(
+            Capabilities::ANTHROPIC_MESSAGES
+                .server_safeguards
+                .is_supported()
+        );
     }
 
     #[test]
@@ -1027,6 +1041,7 @@ mod tests {
         assert!(caps.system_in_messages.is_supported());
         assert!(caps.thinking_replay.is_unsupported());
         assert!(caps.images.is_supported());
+        assert!(caps.server_safeguards.is_unsupported());
     }
 
     /// The wire values are the parse's inverse: the exact shapes the

@@ -967,6 +967,7 @@ impl Server {
             message_count: request.message_count,
             tool_count: request.tool_count,
             required_capabilities: request.required_capabilities,
+            asks_server_safeguards: false,
             binding_affinity: request.binding_affinity,
             class: RequestClass::Inference,
             legacy_compaction: None,
@@ -1722,6 +1723,7 @@ impl Server {
             message_count,
             tool_count,
             required_capabilities,
+            asks_server_safeguards: false,
             binding_affinity,
             class,
             legacy_compaction: None,
@@ -2639,6 +2641,9 @@ fn preview_trace_event(event: crate::policy::TraceEvent) -> serde_json::Value {
             "from": from,
             "to": to,
         }),
+        crate::policy::TraceEvent::SafeguardsWalkedAgain => {
+            serde_json::json!({"kind": "safeguards_walked_again"})
+        }
     }
 }
 
@@ -2737,6 +2742,7 @@ fn availability_for(registry: &RouteRegistry, catalogs: &FetchedCatalogs) -> Ava
                         .map_or(crate::routing::Capabilities::UNKNOWN, |canonical| {
                             canonical.capabilities()
                         }),
+                    safeguards_marked: false,
                     cost_class: binding.cost_class(),
                 },
             )

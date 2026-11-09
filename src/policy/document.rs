@@ -28,7 +28,7 @@ pub const MAX_MATCHER_BYTES: usize = 1_024;
 pub const MAX_TEMPLATE_BYTES: usize = 1_024;
 
 pub const MINIMUM_FORMAT_VERSION: u32 = 1;
-pub const CURRENT_FORMAT_VERSION: u32 = 3;
+pub const CURRENT_FORMAT_VERSION: u32 = 4;
 pub const REQUESTED_MODEL_PARAMETER: &str = "requested_model";
 
 /// A stable policy identity with a deliberately narrow spelling.
@@ -308,6 +308,17 @@ impl PolicyDocument {
             return Err(DocumentError::FeatureRequiresFormat {
                 path: "/compaction/target".to_owned(),
                 required: 3,
+            });
+        }
+        if self.format_version < 4
+            && self
+                .routes
+                .iter()
+                .any(|route| route.honours_server_safeguards)
+        {
+            return Err(DocumentError::FeatureRequiresFormat {
+                path: "/routes/*/honours_server_safeguards".to_owned(),
+                required: 4,
             });
         }
         check_optional_description(&self.description, "/description")?;
@@ -743,6 +754,11 @@ pub struct Route {
     pub parameters: Vec<StableId>,
     pub chain: RouteChain,
     pub lane_transition: LaneTransitionPolicy,
+    /// Whether a request asking for server safeguards requires them of this
+    /// route's candidates. Absent reads false, so a route that never opts in
+    /// keeps its fingerprint across format versions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub honours_server_safeguards: bool,
 }
 
 impl Identified for Route {
@@ -1392,6 +1408,7 @@ mod tests {
     #[test]
     fn route_chain_is_nonempty_and_pairs_edges_with_destinations() {
         let route = Route {
+            honours_server_safeguards: false,
             id: RouteId::new("route").unwrap(),
             display_name: "Route".to_owned(),
             description: None,
@@ -1407,6 +1424,39 @@ mod tests {
         };
         assert_eq!(route.chain.candidates().count(), 2);
         assert!(route.validate("/routes/0").is_ok());
+    }
+
+    #[test]
+    fn honouring_server_safeguards_needs_format_four() {
+        let mut route = Route {
+            honours_server_safeguards: true,
+            id: RouteId::new("route").unwrap(),
+            display_name: "Route".to_owned(),
+            description: None,
+            parameters: vec![],
+            chain: RouteChain {
+                first: candidate("one"),
+                steps: vec![],
+            },
+            lane_transition: LaneTransitionPolicy::PreservePinned,
+        };
+        let mut document = empty_document();
+        document.routes.push(route.clone());
+        assert!(document.validate().is_ok());
+        document.format_version = 3;
+        assert!(matches!(
+            document.validate(),
+            Err(DocumentError::FeatureRequiresFormat { required: 4, .. })
+        ));
+        route.honours_server_safeguards = false;
+        document.routes = vec![route];
+        assert!(document.validate().is_ok(), "a v3 document stays valid");
+        assert!(
+            !serde_json::to_string(&document)
+                .unwrap()
+                .contains("honours"),
+            "an unset flag is not written"
+        );
     }
 
     #[test]
@@ -1429,6 +1479,7 @@ mod tests {
     fn nested_string_errors_report_the_specific_path() {
         let mut document = empty_document();
         document.routes.push(Route {
+            honours_server_safeguards: false,
             id: RouteId::new("route").unwrap(),
             display_name: "Route".to_owned(),
             description: None,
@@ -1493,6 +1544,7 @@ mod tests {
         ];
         let mut document = empty_document();
         document.routes.push(Route {
+            honours_server_safeguards: false,
             id: RouteId::new("route").unwrap(),
             display_name: "route".to_owned(),
             description: None,

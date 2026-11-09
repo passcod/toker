@@ -282,6 +282,7 @@ pub enum StoredSkipReason {
     BindingDisabled,
     CredentialUnavailable,
     MissingRequiredCapability,
+    LacksServerSafeguards,
     BindingAffinity,
     ModelMissingFromFreshCatalogue,
     ModelUnknown,
@@ -318,6 +319,9 @@ pub enum StoredRoutingTraceEvent {
         from: String,
         to: String,
     },
+    /// The route honouring server safeguards left no candidate and was
+    /// walked again without them.
+    SafeguardsWalkedAgain,
     /// Terminal: no route matched the request, so there was no lookup to
     /// record. Only a route-unavailable row carries it, and then as its only
     /// event.
@@ -490,6 +494,9 @@ impl StoredRoutingTraceEvent {
                             SkipReason::MissingRequiredCapability => {
                                 StoredSkipReason::MissingRequiredCapability
                             }
+                            SkipReason::LacksServerSafeguards => {
+                                StoredSkipReason::LacksServerSafeguards
+                            }
                             SkipReason::BindingAffinity => StoredSkipReason::BindingAffinity,
                             SkipReason::ModelMissingFromFreshCatalogue => {
                                 StoredSkipReason::ModelMissingFromFreshCatalogue
@@ -536,6 +543,7 @@ impl StoredRoutingTraceEvent {
                     to: to.clone(),
                 }
             }
+            TraceEvent::SafeguardsWalkedAgain => Self::SafeguardsWalkedAgain,
             TraceEvent::Alias { from, to } => {
                 if from.len() > MAX_ROUTING_TRACE_MODEL_BYTES
                     || to.len() > MAX_ROUTING_TRACE_MODEL_BYTES
@@ -620,7 +628,7 @@ impl StoredRoutingTraceEvent {
                 bounded(from)?;
                 bounded(to)?;
             }
-            Self::NoRoute | Self::TransitionDenied { .. } => {}
+            Self::NoRoute | Self::SafeguardsWalkedAgain | Self::TransitionDenied { .. } => {}
         }
         Ok(())
     }

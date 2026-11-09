@@ -697,6 +697,7 @@ mod tests {
     fn route(id: &str, candidates: &[&str]) -> Route {
         let (first, rest) = candidates.split_first().unwrap();
         Route {
+            honours_server_safeguards: false,
             id: RouteId::new(id).unwrap(),
             display_name: id.to_owned(),
             description: None,
