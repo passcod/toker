@@ -156,8 +156,9 @@ Skipped: the history lanes column shape, because lanes on the live revision are 
 
 ## Where it stands
 
-- round 4's fixes, by the two drawing agents
+- round 4's fixes applied and checked by eye; the route page's fourth off handler was resolved by turning aliases on (`4 on · 3 off`), since candidate 2 carries one and a `classifier` off would contradict the upgrade
+- round 5 critic (Opus, fresh) running
 
 ## Next
 
-- round 5: a fresh critic on the fixed set; it and the round after must be clean to stop, and round 6 is the cap
+- if round 5 is clean, round 6 with another fresh critic decides the stop; round 6 is the cap either way

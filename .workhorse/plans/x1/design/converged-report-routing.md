@@ -106,3 +106,4 @@ Regenerated from `/tmp/x1gen` (which already carries the `refused · no route` l
 - **#6.** The presentations else row reads `→ rewrites`.
 - **#7.** In the edit states the head reads `5 rules · 1 new · sends ${model}` (01-04 and all four 08 states).
 - **#8.** In save-flow state 1 a dim `needed` sits beside the empty `match` and `route` fields.
+- **#2, revised: alias rules are on.** The route page head reads `handled by  4 on · 3 off: server safeguards · required capabilities · health circuits` (off names dim), replacing the `classifier` choice above. A fourth on line follows the other three: `alias  claude-* → anthropic/claude-* · on openrouter`. Applied in 02-02, 02-03 and 06-03. The 100x24 route page still fits, now using exactly 24 of 24 rows with nothing shed.
