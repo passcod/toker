@@ -1446,11 +1446,11 @@ mod tests {
             2,
         );
         let quota = snap.quota.expect("the lookback carries meter snapshots");
-        assert_eq!(quota.meters.len(), 1, "only the 5h meter is carried");
+        assert_eq!(one(&quota).meters.len(), 1, "only the 5h meter is carried");
         // Every figure is from the NEWEST reading, which lives in the
         // window here — and the claim from the same reading.
-        assert!((quota.meters[0].util - 0.42).abs() < 1e-9);
-        assert_eq!(quota.binding.as_deref(), Some("five_hour"));
+        assert!((one(&quota).meters[0].util - 0.42).abs() < 1e-9);
+        assert_eq!(one(&quota).binding.as_deref(), Some("five_hour"));
 
         // A lookback of rows without meters: no section at all.
         let meterless = [bare(mins_ago(90))];
@@ -1903,8 +1903,8 @@ mod tests {
             .quota
             .as_ref()
             .expect("the seeded meters make a section");
-        assert_eq!(quota.meters.len(), 1, "only the 5h meter is carried");
-        assert_eq!(quota.binding.as_deref(), Some("five_hour"));
+        assert_eq!(one(quota).meters.len(), 1, "only the 5h meter is carried");
+        assert_eq!(one(quota).binding.as_deref(), Some("five_hour"));
         assert!(quota.gate_on && !quota.gate_assumed);
 
         // The absent case is parity too: a window past every row reads
@@ -1939,6 +1939,14 @@ mod tests {
     /// The precomputed quota section over the scratch ledger, the way
     /// the loop's quota cadence builds it (the meter read, the 12 h
     /// lookback, the 30 m window anchor).
+    /// The lookback's single account. Every fixture here serves one, so a
+    /// test reading more than the first entry would be asserting about a
+    /// fixture it did not write.
+    fn one(agg: &super::super::quota::QuotaAgg) -> &super::super::quota::AccountQuota {
+        assert_eq!(agg.accounts.len(), 1, "the fixture serves one account");
+        &agg.accounts[0]
+    }
+
     fn quota_of(store: &crate::store::Store) -> Option<super::super::quota::QuotaAgg> {
         super::super::quota::aggregate(
             &store.meter_rows_since(0, 10_000).expect("meter lookback"),

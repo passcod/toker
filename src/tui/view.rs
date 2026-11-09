@@ -54,7 +54,7 @@ use unicode_width::UnicodeWidthStr;
 use super::labels::short_dir;
 use super::locale::Fmt;
 use super::model::{HitRate, NO_SESSION, SessionAgg, Snapshot};
-use super::quota::{MeterPanel, Spent};
+use super::quota::{AccountQuota, MeterPanel, QuotaAgg, Spent};
 use super::rebuilds::REBUILD_MIN;
 use crate::catalog::windows::ContextWindow;
 use crate::ir::Release;
@@ -295,6 +295,9 @@ pub(crate) struct Scroll {
     pub rebuilds: usize,
     /// SPEND's breakdown, under its pinned total and counter.
     pub spend: usize,
+    /// RATE & QUOTA's accounts, sideways: the leftmost account shown
+    /// when more of them are known than the width holds.
+    pub accounts: usize,
 }
 
 /// What a frame drew that the loop needs back: where each list landed,
@@ -314,6 +317,9 @@ pub(crate) struct Drawn {
     pub spend: DrawnList,
     /// Where the detail popup and its controls landed, when it showed.
     pub popup: Option<super::detail::DrawnPopup>,
+    /// The furthest RATE & QUOTA can be scrolled sideways and still
+    /// change which accounts show: zero while every account fits.
+    pub accounts_max_offset: usize,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -398,6 +404,8 @@ pub(crate) fn render(
     let mut drawn = Drawn {
         legend_button,
         routing_button,
+        // Filled by the rate strip once it knows how many accounts fit.
+        accounts_max_offset: 0,
         sessions: DrawnList {
             area: layout.sessions,
             max_offset: sessions_offset,
@@ -434,7 +442,15 @@ pub(crate) fn render(
             ui.scroll.rebuilds,
         );
     }
-    render_rate(frame, layout.bottom, chrome, snap, tz, fmt);
+    drawn.accounts_max_offset = render_rate(
+        frame,
+        layout.bottom,
+        chrome,
+        snap,
+        tz,
+        fmt,
+        ui.scroll.accounts,
+    );
     // Short layouts can make the bottom panel share the header row; keep the
     // discoverability controls above page data after that final render.
     render_header_action(frame, legend_button, visible_routing_button);
@@ -958,15 +974,50 @@ fn spend_lines(snap: &Snapshot) -> u16 {
 fn bottom_height(snap: &Snapshot, chrome: Chrome) -> u16 {
     let mut lines = 1; // the requests line
     if let Some(quota) = &snap.quota {
-        lines += quota.meters.len();
-        if quota.spent_today.is_some() {
+        // The union across accounts: a meter one account carries and
+        // another does not still needs its row, where the account
+        // without it reads as absent rather than as missing from the
+        // panel entirely.
+        lines += meter_keys(quota).len();
+        // One row naming the accounts, only where there is more than
+        // one to tell apart.
+        if quota.accounts.len() > 1 {
             lines += 1;
         }
-        if quota.binding.is_some() {
+        if quota
+            .accounts
+            .iter()
+            .any(|account| account.spent_today.is_some())
+        {
+            lines += 1;
+        }
+        if quota
+            .accounts
+            .iter()
+            .any(|account| account.binding.is_some())
+        {
             lines += 1;
         }
     }
     lines as u16 + chrome.cost()
+}
+
+/// Every meter key any account carries, in render order. The panel's
+/// rows are the union: an account missing one reads as absent in its
+/// own cell, which is not the same as the meter not being measured at
+/// all.
+fn meter_keys(quota: &QuotaAgg) -> Vec<&'static str> {
+    let mut keys = Vec::new();
+    for key in ["5h", "7d", "overage"] {
+        if quota
+            .accounts
+            .iter()
+            .any(|account| account.meters.iter().any(|meter| meter.key == key))
+        {
+            keys.push(key);
+        }
+    }
+    keys
 }
 
 /// Header line: the window summary on the left, the freshness and the
@@ -2153,10 +2204,12 @@ fn render_rate(
     snap: &Snapshot,
     tz: &TimeZone,
     fmt: &Fmt,
-) {
+    accounts_offset: usize,
+) -> usize {
     if area.height == 0 {
-        return;
+        return 0;
     }
+    let mut max_offset = 0;
     let inner = panel(frame, area, "RATE & QUOTA", chrome);
     let mut lines = vec![requests_line(snap, inner.width as usize)];
 
@@ -2164,24 +2217,303 @@ fn render_rate(
     // window has no quota meters and no quota lines (the per-backend
     // panel rule).
     if let Some(quota) = &snap.quota {
-        for meter in &quota.meters {
-            lines.push(meter_line(
-                meter,
-                quota.gate_assumed,
-                inner.width,
-                snap.now_ms,
-                tz,
-                fmt,
-            ));
-        }
-        if let (Some(today), Some(window)) = (quota.spent_today, quota.spent_window) {
-            lines.push(spent_line(today, window, snap.window_mins));
-        }
-        if let Some(binding) = &quota.binding {
-            lines.push(binding_line(binding, quota.overage_in_use));
+        if quota.accounts.len() == 1 {
+            // One account is the panel's ordinary shape: the reading is
+            // unambiguous, so naming whose it is would be a row of chrome
+            // on every frame.
+            let account = &quota.accounts[0];
+            for meter in &account.meters {
+                lines.push(meter_line(
+                    meter,
+                    quota.gate_assumed,
+                    inner.width,
+                    snap.now_ms,
+                    tz,
+                    fmt,
+                ));
+            }
+            if let (Some(today), Some(window)) = (account.spent_today, account.spent_window) {
+                lines.push(spent_line(today, window, snap.window_mins));
+            }
+            if let Some(binding) = &account.binding {
+                lines.push(binding_line(binding, account.overage_in_use));
+            }
+        } else {
+            let columns = account_columns(quota, snap, inner.width, accounts_offset, tz, fmt);
+            max_offset = columns.max_offset;
+            lines.extend(columns.lines);
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
+    max_offset
+}
+
+/// The label column every quota row starts with: two spaces and the
+/// nine-cell name, matching [`meter_line`]'s own.
+const METER_LABEL_WIDTH: usize = 11;
+
+/// The blank cells between one account's column and the next. Without
+/// it the account whose verdict is the row's longest runs straight into
+/// its neighbour's bar, because that account is the one the row's bar
+/// width was measured against.
+const ACCOUNT_GUTTER: usize = 2;
+
+/// The narrowest an account's cell may be and still say anything: the
+/// bar at its floor, the space and percentage, the two-space separator,
+/// room for the shortest verdict, and the gutter.
+const ACCOUNT_CELL_MIN: usize = BAR_MIN_WIDTH + 1 + 4 + 2 + 8 + ACCOUNT_GUTTER;
+
+/// The quota rows laid across the width, one column per account
+/// (spec: UTUI#meters-across-accounts).
+///
+/// Columns are whole accounts: a cell is never cut, because a bar cut
+/// partway along reads as a smaller share than it holds. Where not
+/// every account fits, the ones out of view are counted at the edge
+/// that hides them rather than quietly dropped.
+fn account_columns(
+    quota: &QuotaAgg,
+    snap: &Snapshot,
+    width: u16,
+    offset: usize,
+    tz: &TimeZone,
+    fmt: &Fmt,
+) -> AccountColumns {
+    let width = width as usize;
+    let avail = width.saturating_sub(METER_LABEL_WIDTH);
+    let total = quota.accounts.len();
+    let offset = offset.min(total.saturating_sub(1));
+
+    // How many whole cells the width holds. A cell has to carry a bar at
+    // its floor beside the longest verdict any of these readings will
+    // shed down to — a cell narrow enough to squeeze the bar below that
+    // floor is one account too many, not a narrower column.
+    let shortest = quota
+        .accounts
+        .iter()
+        .flat_map(|account| &account.meters)
+        .map(|meter| {
+            MeterText::of(meter, quota.gate_assumed, snap.now_ms, tz, fmt)
+                .right_text(false, false)
+                .width()
+        })
+        .max()
+        .unwrap_or(0);
+    let needed = BAR_MIN_WIDTH + 1 + 4 + 2 + shortest + ACCOUNT_GUTTER;
+    // One at least: a terminal too narrow even for that shows one
+    // cramped account rather than none, as every other panel here does.
+    let mut shown = (avail / needed.max(ACCOUNT_CELL_MIN)).clamp(1, total - offset);
+    // The marker only costs width when something is actually hidden, and
+    // what it costs can itself hide one more.
+    let marker_width = |shown: usize| {
+        let before = if offset > 0 { 4 } else { 0 };
+        let after = if total - offset - shown > 0 { 12 } else { 0 };
+        before + after
+    };
+    if shown > 1 && avail.saturating_sub(marker_width(shown)) / shown < needed {
+        shown -= 1;
+    }
+    let hidden_before = offset;
+    let hidden_after = total - offset - shown;
+    let before_marker = (hidden_before > 0).then(|| format!("‹{hidden_before} "));
+    let after_marker = (hidden_after > 0).then(|| format!(" … {hidden_after} more"));
+    let before_width = before_marker.as_ref().map_or(0, |m| m.width());
+    let after_width = after_marker.as_ref().map_or(0, |m| m.width());
+    let cell = avail.saturating_sub(before_width + after_width) / shown.max(1);
+    let accounts = &quota.accounts[offset..offset + shown];
+
+    // The markers are said once, on the row that names the accounts;
+    // every row below reserves their width so the columns stay aligned
+    // under it. Repeating them down the panel would be the same fact
+    // written five times.
+    let pad = |row: Vec<Span<'static>>, markers: bool| -> Line<'static> {
+        let mut spans = Vec::new();
+        match (&before_marker, markers) {
+            (Some(marker), true) => spans.push(Span::styled(marker.clone(), Style::new().dim())),
+            (Some(_), false) => spans.push(Span::raw(" ".repeat(before_width))),
+            (None, _) => {}
+        }
+        spans.extend(row);
+        if after_marker.is_some() {
+            let used: usize = spans.iter().map(Span::width).sum();
+            let gap = width.saturating_sub(used + after_width);
+            spans.push(Span::raw(" ".repeat(gap)));
+            match (&after_marker, markers) {
+                (Some(marker), true) => {
+                    spans.push(Span::styled(marker.clone(), Style::new().dim()))
+                }
+                _ => spans.push(Span::raw(" ".repeat(after_width))),
+            }
+        }
+        Line::from(spans)
+    };
+
+    let mut lines = Vec::new();
+
+    // Whose readings these are. The address where one is known, and the
+    // number otherwise: an account with no name still has a number, and
+    // a credential resolved to no account has neither.
+    let mut header = vec![Span::raw(" ".repeat(METER_LABEL_WIDTH))];
+    for account in accounts {
+        let name = match (&account.label, account.account_number) {
+            (Some(label), _) => label.clone(),
+            (None, Some(number)) => format!("acct {number}"),
+            (None, None) => "unattributed".to_owned(),
+        };
+        let count = format!(" · {} req", account.readings);
+        let used = name.width() + count.width();
+        header.push(Span::styled(
+            clip(&name, cell.saturating_sub(count.width())),
+            Style::new().fg(Color::Cyan),
+        ));
+        header.push(Span::styled(count, Style::new().dim()));
+        header.push(Span::raw(" ".repeat(cell.saturating_sub(used))));
+    }
+    lines.push(pad(header, true));
+
+    for key in meter_keys(quota) {
+        lines.push(pad(
+            meter_row(
+                key,
+                accounts,
+                quota.gate_assumed,
+                cell,
+                snap.now_ms,
+                tz,
+                fmt,
+            ),
+            false,
+        ));
+    }
+
+    if accounts.iter().any(|account| account.spent_today.is_some()) {
+        let mut row = vec![Span::raw(format!("  {:<9}", "spent"))];
+        for account in accounts {
+            let text = match (account.spent_today, account.spent_window) {
+                (Some(today), Some(window)) => {
+                    spent_line(today, window, snap.window_mins).spans[1..].to_vec()
+                }
+                _ => vec![Span::styled("-", Style::new().dim())],
+            };
+            let used: usize = text.iter().map(Span::width).sum();
+            row.extend(text);
+            row.push(Span::raw(" ".repeat(cell.saturating_sub(used))));
+        }
+        lines.push(pad(row, false));
+    }
+
+    if accounts.iter().any(|account| account.binding.is_some()) {
+        let mut row = vec![Span::raw(format!("  {:<9}", "binding"))];
+        for account in accounts {
+            let text = match &account.binding {
+                // The claim and its overage flag, without the line's
+                // own label: the row already carries one for every cell.
+                Some(binding) => {
+                    let mut spans = vec![Span::raw(binding.clone())];
+                    if account.overage_in_use {
+                        spans.push(Span::styled(
+                            "   overage IN USE",
+                            Style::new().fg(Color::Red),
+                        ));
+                    }
+                    spans
+                }
+                None => vec![Span::styled("-", Style::new().dim())],
+            };
+            let used: usize = text.iter().map(Span::width).sum();
+            row.extend(text);
+            row.push(Span::raw(" ".repeat(cell.saturating_sub(used))));
+        }
+        lines.push(pad(row, false));
+    }
+
+    AccountColumns {
+        lines,
+        // Scrolling stops once the last account is in view: a strip that
+        // kept scrolling past it would offer empty columns as though
+        // more were there.
+        max_offset: total - shown.min(total),
+    }
+}
+
+/// What one frame of the account strip drew.
+struct AccountColumns {
+    lines: Vec<Line<'static>>,
+    max_offset: usize,
+}
+
+/// One meter's row across the accounts shown: the shared label, then
+/// each account's bar and verdict in its own cell.
+///
+/// Every bar in the row is the same width, so the row can be read
+/// across. A bar drawn at a width answering to its own cell's spare
+/// room would make the longer verdict's account look like the smaller
+/// share, which is the comparison the row exists for read backwards.
+fn meter_row(
+    key: &'static str,
+    accounts: &[AccountQuota],
+    gate_assumed: bool,
+    cell: usize,
+    now_ms: i64,
+    tz: &TimeZone,
+    fmt: &Fmt,
+) -> Vec<Span<'static>> {
+    let label = accounts
+        .iter()
+        .find_map(|account| account.meters.iter().find(|meter| meter.key == key))
+        .map(|meter| meter.label)
+        .unwrap_or(key);
+    let found: Vec<Option<(&MeterPanel, MeterText)>> = accounts
+        .iter()
+        .map(|account| {
+            account
+                .meters
+                .iter()
+                .find(|meter| meter.key == key)
+                .map(|meter| (meter, MeterText::of(meter, gate_assumed, now_ms, tz, fmt)))
+        })
+        .collect();
+
+    // The row sheds together: the widest right side decides, so one
+    // account's long runout clock cannot leave its neighbour's bar wider
+    // than its own.
+    let room = |status: bool, resets: bool| {
+        let widest = found
+            .iter()
+            .flatten()
+            .map(|(_, text)| text.right_text(status, resets).width())
+            .max()
+            .unwrap_or(0);
+        cell.saturating_sub(1 + 4 + 2 + widest + ACCOUNT_GUTTER)
+    };
+    let (use_status, use_resets) = [(true, true), (false, true)]
+        .into_iter()
+        .find(|&(status, resets)| room(status, resets) >= BAR_MIN_WIDTH)
+        .unwrap_or((false, false));
+    let bar_width = room(use_status, use_resets).min(BAR_WIDTH as usize) as u16;
+
+    let mut row = vec![Span::raw(format!("  {label:<9}"))];
+    for found in &found {
+        let cells: Vec<Span<'static>> = match found {
+            // A meter this account's reading does not carry is absent,
+            // not zero: an empty bar would read as a window with nothing
+            // spent on it.
+            None => vec![Span::styled("-", Style::new().dim())],
+            Some((meter, text)) => {
+                let mut spans = vec![
+                    Span::styled(bar(meter.util, bar_width), text.bar_style),
+                    Span::raw(" "),
+                    Span::styled(text.pct.clone(), text.bar_style),
+                    Span::raw("  "),
+                ];
+                spans.extend(text.right_spans(use_status, use_resets));
+                spans
+            }
+        };
+        let used: usize = cells.iter().map(Span::width).sum();
+        row.extend(cells);
+        row.push(Span::raw(" ".repeat(cell.saturating_sub(used))));
+    }
+    row
 }
 
 /// The requests line: `requests ▁▂·▅█ 7.5/min`, then `N errors` (attempts),
@@ -2264,6 +2596,139 @@ fn fold_buckets(
     folded
 }
 
+/// Everything a meter line says but the bar, composed once. The
+/// single-account line and the per-account cells read the same meter
+/// the same way, so a change to a verdict's wording or a reset's
+/// label cannot reach one spelling and not the other.
+struct MeterText {
+    pct: String,
+    bar_style: Style,
+    status: Option<String>,
+    resets: Option<String>,
+    gated_prefix: &'static str,
+    verdict_text: String,
+    verdict_style: Style,
+    assumed_suffix: &'static str,
+    exhausted: bool,
+}
+
+impl MeterText {
+    fn of(
+        meter: &MeterPanel,
+        gate_assumed: bool,
+        now_ms: i64,
+        tz: &TimeZone,
+        fmt: &Fmt,
+    ) -> MeterText {
+        // The verdict, with its clock: a runout lands at `at`, labelled so
+        // it cannot be misread as belonging to the reset's day. The gate
+        // is recoverable — the release marker spends past it — where real
+        // exhaustion is not: different walls, different colours (`stops`
+        // yellow, `out` red).
+        let (verdict_text, verdict_style) = match meter.verdict {
+            Verdict::Runout { at_ms } => {
+                let other = meter
+                    .reset_s
+                    .map(|reset| reset as f64 * 1000.0)
+                    .unwrap_or(at_ms);
+                let label = fmt.alongside(at_ms, other, now_ms, tz);
+                if meter.target < 1.0 {
+                    (format!("stops ~{label}"), Style::new().fg(Color::Yellow))
+                } else {
+                    (format!("out ~{label}"), Style::new().fg(Color::Red))
+                }
+            }
+            Verdict::OnTrack => ("on track".to_owned(), Style::new().fg(Color::Green)),
+            Verdict::Reached => ("spent".to_owned(), Style::new().fg(Color::Red)),
+            // A rolled window and an unmeasurable one both say so in words
+            // — never a silent guess (spec: STORE#not-recorded-is-not-zero).
+            Verdict::Stale => ("window rolled over".to_owned(), Style::new().dim()),
+            Verdict::Unknown => ("estimating".to_owned(), Style::new().dim()),
+        };
+
+        // The resets clause goes with a live verdict only — "resets ?"
+        // beside "window rolled over" would assert a present tense the
+        // reading no longer has. An absent reset is named, never guessed.
+        let resets = match meter.verdict {
+            Verdict::Stale => None,
+            _ => Some(match meter.reset_s {
+                Some(reset) => format!(
+                    "resets {} · ",
+                    fmt.reset_label(reset as f64 * 1000.0, now_ms, tz)
+                ),
+                None => "resets ? · ".to_owned(),
+            }),
+        };
+
+        // A reading from a window that has rolled is dimmed along with its
+        // bar: the verdict says so in words, but a bright 95% next to it
+        // is the thing the eye actually reads.
+        let bar_style = match meter.verdict {
+            Verdict::Stale => Style::new().dim(),
+            _ if meter.util > 0.95 => Style::new().fg(Color::Red),
+            _ if meter.util > 0.8 => Style::new().fg(Color::Yellow),
+            _ => Style::new().fg(Color::Green),
+        };
+
+        MeterText {
+            pct: format!("{:>3}%", (meter.util * 100.0).round() as i64),
+            bar_style,
+            status: meter
+                .status
+                .as_deref()
+                .filter(|status| *status != "allowed")
+                .map(str::to_owned),
+            resets,
+            gated_prefix: if meter.exhausted { "gated · " } else { "" },
+            verdict_text,
+            verdict_style,
+            assumed_suffix: if meter.gated && gate_assumed { "?" } else { "" },
+            exhausted: meter.exhausted,
+        }
+    }
+
+    /// The right side as plain text, for measuring. `status` and `resets`
+    /// select which optional clauses survive the width.
+    fn right_text(&self, status: bool, resets: bool) -> String {
+        let mut right = String::new();
+        if status && let Some(status) = &self.status {
+            right.push_str(status);
+            right.push_str("  ");
+        }
+        if resets && let Some(resets) = &self.resets {
+            right.push_str(resets);
+        }
+        right.push_str(self.gated_prefix);
+        right.push_str(&self.verdict_text);
+        right.push_str(self.assumed_suffix);
+        right
+    }
+
+    /// The right side styled, kept whole: the verdict is the last thing
+    /// to go, so it is never the thing that gets clipped.
+    fn right_spans(&self, status: bool, resets: bool) -> Vec<Span<'static>> {
+        let mut spans = Vec::new();
+        if status && let Some(status) = &self.status {
+            spans.push(Span::styled(status.clone(), Style::new().fg(Color::Red)));
+            spans.push(Span::raw("  "));
+        }
+        if resets && let Some(resets) = &self.resets {
+            spans.push(Span::styled(resets.clone(), Style::new().dim()));
+        }
+        if self.exhausted {
+            spans.push(Span::styled(
+                self.gated_prefix,
+                Style::new().fg(Color::Yellow),
+            ));
+        }
+        spans.push(Span::styled(self.verdict_text.clone(), self.verdict_style));
+        if !self.assumed_suffix.is_empty() {
+            spans.push(Span::styled(self.assumed_suffix, Style::new().dim()));
+        }
+        spans
+    }
+}
+
 /// One meter line (the reference dashboard's exact line shape): the
 /// label, a utilisation bar coloured by how much is left, and — never
 /// wrapped — the status, the resets clock, and the forecast verdict.
@@ -2279,54 +2744,7 @@ fn meter_line(
     fmt: &Fmt,
 ) -> Line<'static> {
     let width = width as usize;
-
-    // The verdict, with its clock: a runout lands at `at`, labelled so
-    // it cannot be misread as belonging to the reset's day. The gate
-    // is recoverable — the release marker spends past it — where real
-    // exhaustion is not: different walls, different colours (`stops`
-    // yellow, `out` red).
-    let (verdict_text, verdict_style) = match meter.verdict {
-        Verdict::Runout { at_ms } => {
-            let other = meter
-                .reset_s
-                .map(|reset| reset as f64 * 1000.0)
-                .unwrap_or(at_ms);
-            let label = fmt.alongside(at_ms, other, now_ms, tz);
-            if meter.target < 1.0 {
-                (format!("stops ~{label}"), Style::new().fg(Color::Yellow))
-            } else {
-                (format!("out ~{label}"), Style::new().fg(Color::Red))
-            }
-        }
-        Verdict::OnTrack => ("on track".to_owned(), Style::new().fg(Color::Green)),
-        Verdict::Reached => ("spent".to_owned(), Style::new().fg(Color::Red)),
-        // A rolled window and an unmeasurable one both say so in words
-        // — never a silent guess (spec: STORE#not-recorded-is-not-zero).
-        Verdict::Stale => ("window rolled over".to_owned(), Style::new().dim()),
-        Verdict::Unknown => ("estimating".to_owned(), Style::new().dim()),
-    };
-    let gated_prefix = if meter.exhausted { "gated · " } else { "" };
-    let assumed_suffix = if meter.gated && gate_assumed { "?" } else { "" };
-    let verdict_full = format!("{gated_prefix}{verdict_text}{assumed_suffix}");
-
-    // The resets clause goes with a live verdict only — "resets ?"
-    // beside "window rolled over" would assert a present tense the
-    // reading no longer has. An absent reset is named, never guessed.
-    let resets = match meter.verdict {
-        Verdict::Stale => None,
-        _ => Some(match meter.reset_s {
-            Some(reset) => format!(
-                "resets {} · ",
-                fmt.reset_label(reset as f64 * 1000.0, now_ms, tz)
-            ),
-            None => "resets ? · ".to_owned(),
-        }),
-    };
-    let status = meter
-        .status
-        .as_deref()
-        .filter(|status| *status != "allowed")
-        .map(str::to_owned);
+    let text = MeterText::of(meter, gate_assumed, now_ms, tz, fmt);
 
     // Compose the right side, shedding as the panel narrows: the bar
     // shrinks to its floor first, then the status goes, then the
@@ -2338,19 +2756,7 @@ fn meter_line(
     // Cells, not chars: a locale's clock may carry a narrow no-break
     // space or wide digits, and the line is budgeted in columns.
     let len = |s: &str| s.width();
-    let with = |status: Option<&str>, resets: Option<&str>| {
-        let mut right = String::new();
-        if let Some(status) = status {
-            right.push_str(status);
-            right.push_str("  ");
-        }
-        if let Some(resets) = resets {
-            right.push_str(resets);
-        }
-        right.push_str(&verdict_full);
-        right
-    };
-    let pct = format!("{:>3}%", (meter.util * 100.0).round() as i64);
+    let pct = text.pct.clone();
     let label = format!("  {:<9}", meter.label);
     // Everything on the line but the bar and the right side: the label
     // column, the space before the percentage, the percentage, and the
@@ -2358,25 +2764,12 @@ fn meter_line(
     // once dropped that space and printed "11%on track".
     let fixed = len(&label) + 1 + len(&pct) + 1;
     let bar_room = |right: &str| width.saturating_sub(fixed + len(right));
-    let (use_status, use_resets) = [
-        (status.as_deref(), resets.as_deref()),
-        (None, resets.as_deref()),
-    ]
-    .into_iter()
-    .find(|&(status, resets)| bar_room(&with(status, resets)) >= BAR_MIN_WIDTH)
-    .unwrap_or((None, None));
-    let right = with(use_status, use_resets);
+    let (use_status, use_resets) = [(true, true), (false, true)]
+        .into_iter()
+        .find(|&(status, resets)| bar_room(&text.right_text(status, resets)) >= BAR_MIN_WIDTH)
+        .unwrap_or((false, false));
+    let right = text.right_text(use_status, use_resets);
     let bar_width = bar_room(&right).min(BAR_WIDTH as usize) as u16;
-
-    // A reading from a window that has rolled is dimmed along with its
-    // bar: the verdict says so in words, but a bright 95% next to it
-    // is the thing the eye actually reads.
-    let bar_style = match meter.verdict {
-        Verdict::Stale => Style::new().dim(),
-        _ if meter.util > 0.95 => Style::new().fg(Color::Red),
-        _ if meter.util > 0.8 => Style::new().fg(Color::Yellow),
-        _ => Style::new().fg(Color::Green),
-    };
     let left = format!("{label}{} {pct}", bar(meter.util, bar_width));
 
     // The styled left side: the label plain, the bar and its
@@ -2384,31 +2777,10 @@ fn meter_line(
     let left_spans = || -> Vec<Span<'static>> {
         vec![
             Span::raw(label.clone()),
-            Span::styled(bar(meter.util, bar_width), bar_style),
+            Span::styled(bar(meter.util, bar_width), text.bar_style),
             Span::raw(" "),
-            Span::styled(pct.clone(), bar_style),
+            Span::styled(pct.clone(), text.bar_style),
         ]
-    };
-
-    // The styled right side, kept whole: the verdict is the last thing
-    // to go, so it is never the thing that gets clipped.
-    let right_spans = || -> Vec<Span<'static>> {
-        let mut spans = Vec::new();
-        if let Some(status) = use_status {
-            spans.push(Span::styled(status.to_owned(), Style::new().fg(Color::Red)));
-            spans.push(Span::raw("  "));
-        }
-        if let Some(resets) = use_resets {
-            spans.push(Span::styled(resets.to_owned(), Style::new().dim()));
-        }
-        if meter.exhausted {
-            spans.push(Span::styled(gated_prefix, Style::new().fg(Color::Yellow)));
-        }
-        spans.push(Span::styled(verdict_text.clone(), verdict_style));
-        if !assumed_suffix.is_empty() {
-            spans.push(Span::styled(assumed_suffix, Style::new().dim()));
-        }
-        spans
     };
 
     if fixed + bar_width as usize + len(&right) <= width {
@@ -2416,7 +2788,7 @@ fn meter_line(
         let gap = width - (fixed - 1) - bar_width as usize - len(&right);
         let mut spans = left_spans();
         spans.push(Span::raw(" ".repeat(gap)));
-        spans.extend(right_spans());
+        spans.extend(text.right_spans(use_status, use_resets));
         Line::from(spans)
     } else {
         // Degenerate width: cut the left so the verdict survives —
@@ -2424,7 +2796,7 @@ fn meter_line(
         // the price of the cut portion's styling.
         let keep = width.saturating_sub(len(&right) + 1);
         let mut spans = vec![Span::raw(clip(&left, keep)), Span::raw(" ")];
-        spans.extend(right_spans());
+        spans.extend(text.right_spans(use_status, use_resets));
         Line::from(spans)
     }
 }
@@ -3443,6 +3815,98 @@ mod tests {
 
     // ── the rate & quota panel ────────────────────────────────────────
 
+    /// The quota fixture served across three accounts: the first is the
+    /// one-account fixture's own history, the second a login close to
+    /// spent, the third one with a single 7-day reading and no 5-hour
+    /// window measured at all.
+    fn multi_account_quota_snapshot() -> model::Snapshot {
+        let reset5h = (NOW + 3 * HOUR) / 1000;
+        let reset7d = (NOW + 4 * DAY) / 1000;
+        let mut rows = quota_rows(true);
+        for row in &mut rows {
+            row.account_number = Some(1);
+        }
+        let mut second = metered_full(
+            NOW - 20 * MIN,
+            json!({
+                "util5h": 0.96, "reset5h": reset5h - 2400,
+                "util7d": 0.18, "reset7d": reset7d,
+                "claim": "five_hour", "overageInUse": false,
+            }),
+        );
+        second.account_number = Some(2);
+        let mut third = metered_full(NOW - 5 * MIN, json!({"util7d": 0.44, "reset7d": reset7d}));
+        third.account_number = Some(3);
+        rows.push(second);
+        rows.push(third);
+
+        let mut quota = crate::tui::quota::aggregate(
+            &as_meter_rows(&rows),
+            NOW,
+            TODAY,
+            NOW.saturating_sub(30 * 60_000),
+        )
+        .expect("the fixture carries readings");
+        // The loop attaches the names from the accounts table; the third
+        // account has none, so the panel falls back to its number.
+        for account in &mut quota.accounts {
+            account.label = match account.account_number {
+                Some(1) => Some("ana@example.net".to_owned()),
+                Some(2) => Some("ben@example.net".to_owned()),
+                _ => None,
+            };
+        }
+        model::aggregate(
+            &as_display_rows(&rows),
+            Some(&quota),
+            &Released::new(),
+            &no_labels(),
+            &FetchedCatalogs::default(),
+            None,
+            30,
+            NOW,
+            523,
+        )
+    }
+
+    #[test]
+    fn the_quota_panel_lays_accounts_across_the_width() {
+        let snap = multi_account_quota_snapshot();
+        let quota = snap.quota.as_ref().expect("the fixture carries readings");
+        assert_eq!(quota.accounts.len(), 3, "one entry per account");
+        // A window belongs to an account, so no account's figures are
+        // mixed into another's.
+        let five = |number: i64| {
+            quota
+                .accounts
+                .iter()
+                .find(|account| account.account_number == Some(number))
+                .expect("the account")
+                .meters
+                .iter()
+                .find(|meter| meter.key == "5h")
+                .map(|meter| meter.util)
+        };
+        assert_eq!(five(1), Some(0.32));
+        assert_eq!(five(2), Some(0.96));
+        assert_eq!(
+            five(3),
+            None,
+            "an account whose readings carry no 5-hour window has no 5-hour meter"
+        );
+
+        let wide = rendered(&snap, 200, 30);
+        frame_snapshot("quota_accounts_200x30", &wide);
+        // Every account fits, so nothing is counted as hidden.
+        assert!(!wide.contains("more"), "{wide}");
+
+        // Narrow enough that only some fit: the rest are counted rather
+        // than dropped, and no account is shown in part.
+        let narrow = rendered(&snap, 80, 30);
+        frame_snapshot("quota_accounts_80x30", &narrow);
+        assert!(narrow.contains("more"), "{narrow}");
+    }
+
     #[test]
     fn quota_panel_renders_meters_spent_and_binding() {
         let snap = quota_snapshot();
@@ -3748,8 +4212,9 @@ mod tests {
     fn meter_text(snap: &model::Snapshot, label: &str, width: u16) -> String {
         let quota = snap.quota.as_ref().expect("the fixture has meters");
         let meter = quota
-            .meters
+            .accounts
             .iter()
+            .flat_map(|account| &account.meters)
             .find(|meter| meter.label == label)
             .expect("the fixture has this meter");
         super::meter_line(meter, quota.gate_assumed, width, NOW, &utc(), &Fmt::fixed())

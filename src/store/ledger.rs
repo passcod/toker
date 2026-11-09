@@ -1436,6 +1436,11 @@ pub struct MeterRow {
     /// gate-flag arm of the filter fetches. Parsed once here and never
     /// re-serialised.
     pub rate_limits: Option<Value>,
+    /// The account the row was served on. A reading belongs to the account
+    /// that spent it, so the dashboard groups by this rather than pooling
+    /// every login's windows into one set of bars. `None` on a row served
+    /// before accounts were recorded, or on a credential not yet resolved.
+    pub account_number: Option<i64>,
 }
 
 /// Rows with `ts_ms >= ts_ms`, oldest first. When the window holds more
@@ -1475,7 +1480,7 @@ pub(super) fn meter_rows_since(conn: &Connection, ts_ms: i64, limit: i64) -> Res
     rows_of(
         conn,
         "SELECT * FROM (
-            SELECT id, ts_ms, kind, gate_on, rate_limits FROM requests
+            SELECT id, ts_ms, kind, gate_on, rate_limits, account_number FROM requests
             WHERE ts_ms >= ?1 AND (rate_limits IS NOT NULL OR gate_on IS NOT NULL)
             ORDER BY ts_ms DESC, id DESC LIMIT ?2
         ) ORDER BY ts_ms ASC, id ASC",
@@ -1565,6 +1570,7 @@ fn read_meter_row(row: &rusqlite::Row<'_>) -> Result<MeterRow> {
         )?,
         gate_on: row.get("gate_on")?,
         rate_limits: super::opt_json_from_text(row.get("rate_limits")?)?,
+        account_number: row.get("account_number")?,
     })
 }
 

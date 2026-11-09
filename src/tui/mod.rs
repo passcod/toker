@@ -273,6 +273,9 @@ pub fn run(
         if page == Page::Dashboard {
             ui.scroll.sessions = ui.scroll.sessions.min(drawn.sessions.max_offset);
             ui.scroll.context = ui.scroll.context.min(drawn.context.max_offset);
+            // An account that stopped serving, or a wider terminal, can
+            // leave the strip scrolled past its last column.
+            ui.scroll.accounts = ui.scroll.accounts.min(drawn.accounts_max_offset);
             ui.scroll.rebuilds = ui.scroll.rebuilds.min(drawn.rebuilds.max_offset);
             ui.scroll.spend = ui.scroll.spend.min(drawn.spend.max_offset);
         }
@@ -441,6 +444,21 @@ pub fn run(
                 }
                 code if page == Page::Routing && routing::owns_key(code) => {
                     routing.key(key);
+                }
+                // RATE & QUOTA's accounts, sideways. Whole accounts, one
+                // at a time: a strip resting part-way through one would
+                // cut a bar, and a bar cut partway along reads as a
+                // smaller share than it holds
+                // (spec: UTUI#meters-across-accounts).
+                crossterm::event::KeyCode::Left | crossterm::event::KeyCode::Char('h')
+                    if page == Page::Dashboard =>
+                {
+                    ui.scroll.accounts = ui.scroll.accounts.saturating_sub(1)
+                }
+                crossterm::event::KeyCode::Right | crossterm::event::KeyCode::Char('l')
+                    if page == Page::Dashboard =>
+                {
+                    ui.scroll.accounts = (ui.scroll.accounts + 1).min(drawn.accounts_max_offset)
                 }
                 crossterm::event::KeyCode::Left | crossterm::event::KeyCode::Char('h')
                     if page == Page::Routing =>
@@ -910,14 +928,20 @@ fn released_sessions(
     if !quota.gate_on {
         return Ok(model::Released::new());
     }
-    // The resets the newest reading reports, per meter key — the
-    // windows a release can be live for.
-    let mut resets: Vec<(&str, i64)> = Vec::new();
-    for meter in &quota.meters {
-        if let Some(reset) = meter.reset_s
-            && matches!(meter.key, "5h" | "7d")
-        {
-            resets.push((meter.key, reset));
+    // The resets the newest reading reports, per account and meter key —
+    // the windows a release can be live for. Keyed by account because an
+    // allowance is: two accounts' windows can carry the same reset, and
+    // keying by the reset alone would show a session released on one of
+    // them as released on the other
+    // (spec: GQUOTA#an-allowance-belongs-to-an-account).
+    let mut resets: Vec<(Option<i64>, &str, i64)> = Vec::new();
+    for account in &quota.accounts {
+        for meter in &account.meters {
+            if let Some(reset) = meter.reset_s
+                && matches!(meter.key, "5h" | "7d")
+            {
+                resets.push((account.account_number, meter.key, reset));
+            }
         }
     }
     let mut released = model::Released::new();
@@ -925,10 +949,11 @@ fn released_sessions(
         return Ok(released);
     }
     for allowance in store.load_allowances()? {
-        if resets
-            .iter()
-            .any(|(meter, reset)| allowance.meter == *meter && allowance.reset_value == *reset)
-        {
+        if resets.iter().any(|(account, meter, reset)| {
+            *account == Some(allowance.account_number)
+                && allowance.meter == *meter
+                && allowance.reset_value == *reset
+        }) {
             // A session holding both kinds (one per meter) shows the
             // wider one: overage is what it may spend somewhere.
             let held = released
@@ -966,12 +991,27 @@ fn quota_snapshot(store: &Store, window_mins: u64) -> anyhow::Result<Option<quot
     let now_ms = jiff::Timestamp::now().as_millisecond();
     let quota_rows =
         store.meter_rows_since(now_ms.saturating_sub(OUTLOOK_LOOKBACK_MS), OUTLOOK_ROWS)?;
-    Ok(quota::aggregate(
+    let mut agg = quota::aggregate(
         &quota_rows,
         now_ms,
         local_day_start_ms(now_ms),
         now_ms.saturating_sub(window_mins.max(1) as i64 * 60_000),
-    ))
+    );
+    // The aggregation reads rows and never the accounts table, so the
+    // names are attached here. An account with no address keeps none:
+    // the panel calls it by its number rather than inventing one.
+    if let Some(agg) = agg.as_mut() {
+        let accounts = store.load_accounts()?;
+        for account in &mut agg.accounts {
+            account.label = account.account_number.and_then(|number| {
+                accounts
+                    .iter()
+                    .find(|known| known.number == number)
+                    .and_then(|known| known.email.clone())
+            });
+        }
+    }
+    Ok(agg)
 }
 
 /// The local day's start (midnight, the system zone) in epoch ms — the
@@ -1155,6 +1195,7 @@ pub(crate) mod testrows {
             kind: None,
             gate_on: None,
             rate_limits: None,
+            account_number: None,
         }
     }
 
@@ -1195,6 +1236,7 @@ pub(crate) mod testrows {
                 kind: row.kind,
                 gate_on: row.gate_on,
                 rate_limits: row.rate_limits.clone(),
+                account_number: row.account_number,
             })
             .collect()
     }
