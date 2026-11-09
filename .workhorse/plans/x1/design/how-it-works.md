@@ -21,7 +21,7 @@ Toker turns those into a provider and a model by walking a fixed chain, and stop
    Each rule matches the model name (by prefix, glob or regex), says which route takes it, and says what model name to send on: usually `${model}`, the part the match captured, so `anthropic_sub/claude-sonnet-5` is sent on as `claude-sonnet-5`.
 3. **Defaults.**
    If no rule caught the name, the protocol's default route takes it.
-   A protocol with no default leaves the name with nowhere to go, which the screens call `nothing catches it`.
+   A protocol with no default leaves the name with nowhere to go, which the screens call `nothing catches it`. 
 4. **The route.**
    A route is a named, ordered list of candidates, each one a provider endpoint (a binding, such as `openrouter.openrouter_messages`).
    Toker tries the first candidate, and moves to the next only under the conditions written on the edge between them: unavailable before sending, overloaded, a 5xx, and whether it may fall to a billed provider or retry an ambiguous failure.
