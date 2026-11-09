@@ -135,3 +135,11 @@ All six frames are 120x40, built from a small generator (not in the repo) so eve
   For the 80x24 providers frame (06-04) only the openrouter row changes, to `10 rewrites · 4 defaults · 5 routes`, clipped as needed.
 - **10:** the 07-02 underlay's scope heads read `5 rules · prefix · sends ${model}`; the 07-01 empty heads say `0 rules` with no clause, so they are unchanged.
 - Caption ids kept; `/tmp/x1gen/check.py` reports 120 cells by 40 rows on all six frames with the Iosevka Term stack; all six re-shot, and the overlay, settings, history, providers and empty frames viewed.
+
+## Round 6 polish
+
+- **`hits 24h`:** the column head reads `hits 24h` (dim, right-aligned against the box) in the empty rewrites table (07-01) and the overlay's underlay; MARKS gains `hits 24h  requests caught in the last 24h`.
+- **`pinned`:** dropped from MARKS.
+- **Settings:** `cold idle minutes` reads dim `follows lane TTL`.
+- **`published`:** reads `written to client settings, per scope`, kept on one line so the popup stays at 38 rows.
+- Caption ids kept; `/tmp/x1gen/check.py` reports 120 cells by 40 rows on all four frames of 05 and 07 with the Iosevka Term stack; both files re-shot, and the overlay frame viewed.
