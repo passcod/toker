@@ -47,9 +47,11 @@ A control path added later MUST require a JSON body where it mutates.
 | routing revisions | the revision history, without documents |
 | routing draft replace | replace the draft with a complete document |
 | routing draft edit | apply typed edit operations to the draft |
-| routing validate | compile the draft and report diagnostics |
-| routing preview | resolve a described request against the draft |
+| routing save | apply typed edit operations to the active revision and activate the result for new and cold lanes |
+| routing validate | compile the draft, or an edit not yet saved, and report diagnostics |
+| routing preview | resolve a described or recorded request against the active revision, the draft, an unsaved edit or a kept revision |
 | routing activate | make the draft the active revision |
+| routing widen | widen the active revision's activation scope |
 | routing reactivate | copy a historical revision into a new active one |
 | routing promote | mark a learned model eligible for upgrades |
 | routing publication | record a failed or unsupported publication |

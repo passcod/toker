@@ -104,7 +104,7 @@ A slug equal to a native model identifier reachable from that profile MUST be re
 
 ## Validation
 
-Validation compiles a draft against one captured inventory and returns diagnostics, each carrying a code, a severity, the record's identifier and a path.
+Validation compiles a document, being the draft or the result of an edit not yet saved, against one captured inventory and returns diagnostics, each carrying a code, a severity, the record's identifier and a path.
 
 A diagnostic's path MUST be built only from static field names and bounded indices, so that a request or a model string can never appear in one.
 

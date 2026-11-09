@@ -151,13 +151,107 @@ The dashboard MUST be able to revoke a session's releases.
 
 ## The routing page
 
-The routing page MUST show the active revision, the draft, the revision history and the publication state.
+The routing page shows the active revision and edits it.
 
-The page MUST be able to validate, preview, activate and reactivate, through the control operations [DCTRL](../service/control.md) specifies.
+It MUST present the policy as tabs in the order a request is resolved, as [RSOLV](../routing/resolver.md#lookup-order) specifies: presentations, rewrites, defaults and routes, then models and the revision history.
+The tabs a request passes through in turn MUST read as a sequence, distinct from the two it does not.
+Each tab MUST show how many records it holds.
 
-An activation MUST NOT wait on reconciling a client's settings, and a slow or failed reconciliation MUST be reported on the page without undoing or delaying the activation.
+> [!NOTE]
+> The policy is ordered rules across several tables, the way a router's or a firewall's is, and the tab strip is the one place the whole order can be read at a glance.
 
-The page MAY import a configuration file into the draft, behind a confirmation, as [RMIG](../routing/migration.md#importing-a-file-deliberately) specifies.
+The page MUST open on the first tab holding a record that cannot be served as written, and on the first tab otherwise.
+
+Each tab MUST show its records as a table, with the selected record's detail beneath it.
+A panel MUST be no taller than its content, except a list that scrolls, which takes the rows left over.
+
+Records MUST NOT be shown or edited as a serialised document.
+A matcher MUST be shown in its own notation, such as a prefix with the part it captures, rather than as the regular expression it compiles to, unless it is a regular expression.
+
+> [!NOTE]
+> The document is the store's representation of the policy, not the operator's.
+> A rule an operator has to read as JSON is a rule they will not check.
+
+### Reading a table
+
+Rewrites MUST be grouped by scope, in priority order, and each group MUST end with the default that catches what none of its rules did.
+A scope with no default MUST say that a request no rule catches is refused.
+
+A value every row of a group shares MUST be stated once for the group rather than repeated as a column.
+
+A rewrite MUST be shown by what it matches and the route it picks, and MUST NOT need a name of its own.
+
+Each rewrite and default MUST show its reach: what a request it catches gets now, being served by the route's first candidate, served by a later one that is billed, refused because every candidate is disabled or unconfigured, or refused for want of a route.
+Reach MUST be worked out from the same availability [preview](../routing/revisions.md#preview) uses.
+
+> [!NOTE]
+> Whether the first candidate is up is the wrong question: a rule whose first choice is off but whose fallback serves is spending money, not failing, and the operator needs to see which.
+
+Each rewrite and default MUST show how many requests it caught in the last 24 hours, counted from the provenance [RPROV](../routing/provenance.md) records.
+That count MUST read as a floor where some of the window predates the record, and as not recorded where none of it does.
+
+A rule's detail MUST show what it matches with a worked example, what it sends on, the route and its candidates, its reach with the reason for it, whether an earlier rule in its scope already catches what it matches, and its recent catches.
+
+### Routes
+
+The routes tab MUST show each route with the providers its candidates reach in order, what refers to it, the lanes it holds and its reach.
+
+Opening a route MUST show it whole, reading in the direction a request travels:
+
+- the candidates it is sent to, in order, with the failures and consents on each edge between them
+- the blocks that handle it, naming each one that is enabled with its setting, and naming the ones that are not
+- every rewrite, presentation and default that sends a request to it
+
+The route view MUST be able to step to the other routes without returning to the table.
+
+### Tracing a request
+
+Every routing tab MUST be able to trace a described request through the active revision, by the same [preview](../routing/revisions.md#preview) the editor uses.
+
+A trace MUST give its outcome first, being the binding and model that would serve and whether that is billed, then each stage of the lookup order and the route walk with its verdict and the reason for it.
+The table behind a trace MUST mark the row that caught the request and the rows it fell past.
+
+### Editing
+
+A record MUST be edited in place, in the table that shows it, as a form of fields.
+
+Each field MUST be checked as it changes, against the same compilation an activation runs.
+A field that is refused MUST say beside itself why, and how to make it acceptable.
+A field that is accepted MAY say beside itself what it does.
+
+A form holding a refused field MUST NOT be saveable, and its save control MUST name the field in the way.
+
+> [!NOTE]
+> There is no separate validation step for the operator to remember, because a form that would not compile cannot be saved in the first place.
+
+While a rewrite or default is being edited, the page MUST show how the scope's recent requests would route with the change, beside how they routed.
+
+Saving MUST [save](../routing/revisions.md#saving-an-edit) the form as one edit, activated for new and cold lanes.
+The page MUST NOT offer a separate control to validate or to activate.
+
+The page MUST always show which revision is live.
+After a save that left lanes on an earlier revision, it MUST say how many.
+Where a client's settings have not been reconciled with the live revision, it MUST say so, and MUST NOT wait for that reconciliation, as [RPUB](../routing/publication.md) requires.
+
+### History
+
+The history tab MUST list the revisions newest first, each with a summary of what it changed from its predecessor and the lanes pinned to it.
+
+A revision's detail MUST list each record it added, changed or removed, in words.
+
+The history tab MUST be able to:
+
+- [reactivate](../routing/revisions.md#history-and-reactivation) the selected revision
+- move running lanes onto the live revision, by [widening](../routing/revisions.md#widening-an-activation) its activation
+- trace a described request under the selected revision
+
+A move that would lose a warm cache MUST ask for a second confirmation, and the first MUST name the lanes whose cache it would lose.
+
+### Models
+
+The models tab MUST show the classifiers, the upgrade policies with the move each would make now, the compaction target, and the offers in each binding's catalogue.
+
+It MUST be able to [promote](../routing/models.md) a learned model.
 
 ## The configuration pages
 
@@ -165,7 +259,8 @@ Configuration is edited on two pages, providers and settings.
 
 Both MUST write through the control operations [DCTRL](../service/control.md#the-operations) specifies, and an edit MUST take effect without a restart.
 
-A refused value MUST be reported on the page, leaving the stored value as it was.
+A value MUST be edited in place, in the row that shows it, and checked as it changes.
+A refused value MUST be reported beside the field that holds it, and MUST leave the stored value as it was.
 
 Where the service is not answering, both pages MUST report that rather than offer values to edit.
 
@@ -175,6 +270,13 @@ Where the service is not answering, both pages MUST report that rather than offe
 ### Providers
 
 The providers page MUST show every provider Toker knows, enabled or not, with the endpoint it is reached at and which source supplies its credential.
+
+The page MUST open on a provider that is enabled but not configured, where there is one.
+
+The page MUST show what in routing depends on each provider, counting the rewrites, defaults and routes that reach it through any candidate, a fallback included.
+
+> [!NOTE]
+> Counting only the routes a provider comes first in understates what turning it off would change.
 
 The page MUST be able to enable and disable a provider, set its endpoint, choose where its credential comes from, and set the settings particular to that provider.
 
@@ -191,6 +293,10 @@ The page MUST be able to clear that mark, as [WSAFE](../wire/safeguards.md#a-rej
 ### Settings
 
 The settings page MUST show and edit the gate settings, the notice style of each frontend profile, the session and ping header names, whether the idle-sleep lock is held, and the extra transcript roots.
+
+A token count MUST be accepted in the same shorthand the dashboard displays it in.
+
+A setting left unset MUST say what it falls back to.
 
 The page MUST show where the store is and which port the listener answers on, and MUST NOT offer to edit either, those being settled before the store is opened as [DCONF](../service/config.md#before-the-store) specifies.
 

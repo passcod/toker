@@ -5,7 +5,7 @@ id: RREV
 # Revisions
 
 A policy document reaches live traffic as a numbered revision, drafted, validated and activated without restarting the service.
-This spec covers the draft, the operations on it, activation and its scopes, and the history behind it.
+This spec covers the draft, saving an edit straight to live traffic, the operations on both, activation and its scopes, and the history behind it.
 
 The document those operations carry is specified by [RDOC](document.md).
 
@@ -22,9 +22,33 @@ The whole result MUST be validated before it is stored.
 
 Renaming a record MUST be expressed as a removal and an addition.
 
+## Saving an edit
+
+A save applies an edit to the active revision's document and activates the result, as one operation.
+
+A save MUST carry the active revision it was made against, and MUST fail, changing nothing, where the active revision has moved.
+A save MUST apply its operations to the active revision's document, not to the draft.
+The result MUST be validated whole, and an error MUST refuse the save and change nothing.
+
+A save that compiles MUST be activated with the new and cold lanes scope, and MUST replace the draft with the activated document, as any activation does.
+
+> [!NOTE]
+> That scope moves only the lanes it can move without losing a warm cache, so a save needs no consent and disturbs nothing in flight.
+> Moving the rest is a separate, deliberate step, by [widening](#widening-an-activation).
+
+> [!NOTE]
+> An edit applied to the draft would carry anything else the draft held into live traffic with it.
+
 ## Preview
 
-Preview resolves an invented request against the draft using the same resolver inference uses, and returns the outcome and the trace.
+Preview resolves a described request using the same resolver inference uses, and returns the outcome and the trace.
+
+Preview MUST be able to resolve against the active revision, the draft, an edit not yet saved, or any revision kept in the history.
+
+A described request MAY be invented, or MAY be taken from the facts a ledger row recorded, which are content-free as [RPROV](provenance.md) requires.
+
+> [!NOTE]
+> Replaying recent requests shows what an edit would change for the traffic the operator actually has, which an invented request cannot.
 
 Preview MUST use the snapshot's availability without per-request credential evidence and without open circuits.
 
@@ -56,6 +80,15 @@ An immediate activation that would lose a warm cache MUST be refused while any l
 Without consent, a lane that became warm after the check MUST stay on its pinned revision.
 
 A revision a lane is pinned to MUST be kept and compiled on demand against current evidence.
+
+### Widening an activation
+
+The active revision's scope MAY be widened after it was activated, from new lanes to new and cold lanes, or from either to immediate, without creating a revision.
+Widening to immediate MUST follow the same consent rules as an immediate activation.
+A scope MUST NOT be narrowed.
+
+> [!NOTE]
+> Moving running lanes onto the live revision is a decision about lanes, not about the policy, so it leaves the history as it was.
 
 ## History and reactivation
 
