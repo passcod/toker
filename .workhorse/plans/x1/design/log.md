@@ -38,6 +38,9 @@ No browser rig: Toker is a terminal app. Captures come from running the real TUI
 | 6 | D is chosen, composed with E's route page as the detail level and C's chain as the trace | The fresh critique (`critique-round-1.md`): D is the operator's table, the only main frame passing the blur test, one grid held at three widths, the leanest colour inventory; its faults are polish and one missing frame. D and E are two levels of one design and C is a third | the five directions | the converged mockups | kept |
 | 7 | Panels are sized to their content and the ground below is left bare; short panels stack | The dashboard never draws a box taller than what is in it. D1 has 4 empty rows only because its content happens to be 36 rows long; A1, B1 and C1 have 20 to 26 | `compare/` A1, B1, C1, D4 | the converged mockups | kept |
 | 8 | No sentence on the page: no narration rows, no subtitles in title rules, no explanatory empty states | Every direction narrated, and the reference has not one such line; the lookup order is already the tab strip's arrows | every direction's table heads | the converged mockups | kept; what a newcomer needs goes in the `?` overlay |
+| 9 | A revision is one record's edit, and history reads as a list of single changes | Under call 4 every save is a revision, so a revision bundling three edits describes a workflow the design does not have | the first history frame, `add rewrite, add claude-sub fallback, drop a default` | `converged-04-history.html` | kept; rev 1, written by setup, is the one exception |
+| 10 | Reactivating a revision is `a make live`, not `r` | `r` refreshes on every page; overloading it on one tab would make the same key do two things | `[r] reactivate` | `converged-04-history.html` and the `?` overlay | kept |
+| 11 | Only the focused panel shows a selected row | Two reversed rows on one screen leave the operator not knowing where `e` goes | Models with both UPGRADES and OFFERS selected | `converged-03-tables.html` | kept |
 
 Observations held for the critique rather than settled here:
 
@@ -116,7 +119,7 @@ Round 1 found 2 criticals (D has no revision surface at all; panels are drawn to
 
 ## In flight
 
-- step 2.3: the converged mockups, from `brief-converged.md`, drawn by one agent
+- step 2.3: the converged mockups, from `brief-converged.md`, drawn by two agents in parallel (01-03 and 08; 04, 05 and 07); a consistency pass on both, then the narrow frames (06)
 
 ## Next
 
