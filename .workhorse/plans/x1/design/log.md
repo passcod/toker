@@ -33,6 +33,11 @@ No browser rig: Toker is a terminal app. Captures come from running the real TUI
 | 1 | `V` is deleted rather than improved, and its diagnostics attach to the records they concern | `RREV#draft` already validates the whole draft before storing it, so `V` adds nothing to validity; its only unique content is the advisory diagnostics | `current/routing-status-validated-100x24.png` | all five directions | kept: no spec change needed, and it removes a command and a popup |
 | 2 | The draft is stated as a count of changes, not as a generation number | `draft 2` tells the operator nothing they can act on; "3 changes not live" names the action | the live header `draft 2 · …` | A `draft ≠ rev 2 · +1 ~2 · a activate`, B `revision 2 live · no changes` | kept; B's wording reads better than A's |
 | 3 | Activation keeps its consent step for an immediate activation that would lose a warm cache, and loses it everywhere else | `RREV#activation` requires that consent, and the design language requires a destructive action to arm rather than fire; every other scope disturbs nothing in flight | the current activation modal | the live-apply note | kept |
+| 4 | Saving a valid form puts it live, for new lanes; there is no draft in the interface and no apply key | The operator: "the entire idea was to apply live, so you don't have a validate-and-then-apply step". A save is one deliberate act per record, not a keystroke, so a revision per save is acceptable. New lanes is the scope that disturbs nothing in flight, so it needs no consent | the critique's `rev 2 live · draft +1 ~2 · [a] apply` | the converged mockups | kept over the critique's suggestion, on the operator's words. Moving running lanes onto a revision is an explicit act from history, and arms when a warm cache would be lost (call 3) |
+| 5 | The design assumes the generated-only semantics are retired: no `legacy-` names, no "generated" property, records carry invented authored names | The operator: "every legacy behaviour should die". Designing a surface for a property that is to be deleted keeps it alive. The retirement itself is compiler work, recorded as needing a card | every direction keeps or dims `legacy-route-` | the converged mockups | kept |
+| 6 | D is chosen, composed with E's route page as the detail level and C's chain as the trace | The fresh critique (`critique-round-1.md`): D is the operator's table, the only main frame passing the blur test, one grid held at three widths, the leanest colour inventory; its faults are polish and one missing frame. D and E are two levels of one design and C is a third | the five directions | the converged mockups | kept |
+| 7 | Panels are sized to their content and the ground below is left bare; short panels stack | The dashboard never draws a box taller than what is in it. D1 has 4 empty rows only because its content happens to be 36 rows long; A1, B1 and C1 have 20 to 26 | `compare/` A1, B1, C1, D4 | the converged mockups | kept |
+| 8 | No sentence on the page: no narration rows, no subtitles in title rules, no explanatory empty states | Every direction narrated, and the reference has not one such line; the lookup order is already the tab strip's arrows | every direction's table heads | the converged mockups | kept; what a newcomer needs goes in the `?` overlay |
 
 Observations held for the critique rather than settled here:
 
@@ -87,10 +92,6 @@ Toker is public, so nothing from them goes into the repository without invented 
 
 All five are drawn: 76 frames in 19 files, screenshotted to PNG frame by frame with `split_shot.py` in the rig work directory, and 43 of them curated into `compare/` as a matched set of eight per direction plus the reference and the current design.
 
-## In flight
-
-- the fresh critique of all five (step 2.2)
-
 ## What I have seen myself, before the critique
 
 Not a verdict; the fresh critic has not reported yet.
@@ -105,7 +106,18 @@ Not a verdict; the fresh critic has not reported yet.
 - **A is the safest and the least ambitious**, and its presentations table is a complete fix for the fifteen identical rows.
 - **D and E may not be competitors.** D is the rule level and E the route level; D's `[enter] open the rule's route` and E's `2 rules` tab already point at each other, and E's overview is an index to D's tables rather than a copy of them.
 
+## Step 2.2 — the critique
+
+A fresh critic read the five directions against the reference and the operator's words, from screenshots only: `critique-round-1.md`.
+It chose D, and composed it with E and C (calls 6 to 8).
+Its findings that are defects in the current product were filed as issues; the ones about the mockups are the converged brief's to-do list.
+
+Round 1 found 2 criticals (D has no revision surface at all; panels are drawn to the frame), 9 suggestions and 3 nits.
+
+## In flight
+
+- step 2.3: the converged mockups, from `brief-converged.md`, drawn by one agent
+
 ## Next
 
-- critique the three side by side with a fresh critic, choose one, record why in the ledger
-- refine the chosen mockup through a few UI-loop iterations before anything is built
+- critique the converged set with a fresh critic, change one thing at a time, and repeat until two clean critiques in a row, the second by a critic who has not seen the earlier rounds
