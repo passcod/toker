@@ -138,7 +138,7 @@
 │<span class="b"> </span><span class="d b">│</span><span class="b"> </span><span class="d b"> 6</span><span class="b">  </span><span class="d b">prefix</span><span class="b"> </span><span class="d b">-</span><span class="b">                         → </span><span class="d b">-</span><span class="b">                                         -                               </span><span class="d b">-</span><span class="b"> </span>│
 │ <span class="d">│</span>     <span class="d">┌</span> <span class="d">match</span>   <span class="b">prefix</span>  ▏                                                                                            │
 │ <span class="d">│</span>     <span class="d">│</span> <span class="d">route</span>   <span class="d">-</span>                                                                                                    │
-│ <span class="d">│</span>     <span class="d">│</span> <span class="d">sends</span>   <span class="r">${model}                      </span>                                                                       │
+│ <span class="d">│</span>     <span class="d">│</span> <span class="d">sends</span>   <span class="r">${model}  ←/→                 </span>                                                                       │
 │ <span class="d">│</span>     <span class="d">└</span> [ctrl+s] <span class="d">fix 2 fields to save</span>   [esc] cancel                                                                 │
 │ <span class="d">└─</span> <span class="d">else</span>  default anthropic_messages    → claude-sub                                <span class="yellow">no cred</span>                        ≥3 │
 │ <span class="d">┌─ </span><span class="b">openai_chat</span>  5 rules · → ${model} <span class="d">───────────────────────────────────────────────────────────────────────────────</span> │
@@ -178,7 +178,7 @@
 │<span class="b"> </span><span class="d b">│</span><span class="b"> </span><span class="d b"> 6</span><span class="b">  </span><span class="d b">glob</span><span class="b">   claude-*                  → openrouter-messages                       ok                              </span><span class="d b">-</span><span class="b"> </span>│
 │ <span class="d">│</span>     <span class="d">┌</span> <span class="d">match</span>   <span class="b">glob</span>  claude-*▏                 catches claude-sonnet-5 and 2 more                                   │
 │ <span class="d">│</span>     <span class="d">│</span> <span class="d">route</span>   openrouter-messages             1 candidate · <span class="yellow">billed</span>                                                 │
-│ <span class="d">│</span>     <span class="d">│</span> <span class="d">sends</span>   <span class="r">${model}                      </span>  <span class="red">a glob captures nothing, so ${model} would be empty:</span>                 │
+│ <span class="d">│</span>     <span class="d">│</span> <span class="d">sends</span>   <span class="r">${model}  ←/→                 </span>  <span class="red">a glob captures nothing, so ${model} would be empty:</span>                 │
 │ <span class="d">│</span>     <span class="d">│</span>                                         <span class="red">use a prefix or a regex</span>                                              │
 │ <span class="d">│</span>     <span class="d">└</span> [ctrl+s] <span class="d">fix sends to save</span>   [esc] cancel                                                                    │
 │ <span class="d">└─</span> <span class="d">else</span>  default anthropic_messages    → claude-sub                                <span class="yellow">no cred</span>                        ≥3 │
@@ -218,7 +218,7 @@
 │<span class="b"> </span><span class="d b">│</span><span class="b"> </span><span class="d b"> 6</span><span class="b">  </span><span class="d b">glob</span><span class="b">   claude-*                  → openrouter-messages                       ok                              </span><span class="d b">-</span><span class="b"> </span>│
 │ <span class="d">│</span>     <span class="d">┌</span> <span class="d">match</span>   <span class="b">glob</span>  claude-*                  catches claude-sonnet-5 and 2 more                                   │
 │ <span class="d">│</span>     <span class="d">│</span> <span class="d">route</span>   openrouter-messages             1 candidate · <span class="yellow">billed</span>                                                 │
-│ <span class="d">│</span>     <span class="d">│</span> <span class="d">sends</span>   <span class="r">claude-sonnet-5▏              </span>  sent as claude-sonnet-5 whatever the name                            │
+│ <span class="d">│</span>     <span class="d">│</span> <span class="d">sends</span>   <span class="r">as asked  ←/→                 </span>  the name is sent unchanged                                           │
 │ <span class="d">│</span>     <span class="d">└</span> [ctrl+s] save   [esc] cancel                                                                                 │
 │ <span class="d">└─</span> <span class="d">else</span>  default anthropic_messages    → claude-sub                                <span class="yellow">no cred</span>                        ≥3 │
 │ <span class="d">┌─ </span><span class="b">openai_chat</span>  5 rules · → ${model} <span class="d">───────────────────────────────────────────────────────────────────────────────</span> │
@@ -255,7 +255,7 @@
 │ <span class="d">│</span> <span class="d"> 3</span>  <span class="d">prefix</span> anthropic_api/${model}    → claude-api              ${model}          <span class="d">off</span>                             <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 4</span>  <span class="d">prefix</span> openrouter/${model}       → openrouter-messages     ${model}          ok                             41 │
 │ <span class="d">│</span> <span class="d"> 5</span>  <span class="d">prefix</span> codex_sub/${model}        → codex                   ${model}          <span class="d">off</span>                             <span class="d">-</span> │
-│<span class="r"> │  6  glob   claude-*                  → openrouter-messages     claude-sonnet-5   ok                              - </span>│
+│<span class="r"> │  6  glob   claude-*                  → openrouter-messages     as asked          ok                              - </span>│
 │ <span class="d">└─</span> <span class="d">else</span>  default anthropic_messages    → claude-sub                                <span class="yellow">no cred</span>                        ≥3 │
 │ <span class="d">┌─ </span><span class="b">openai_chat</span>  5 rules <span class="d">────────────────────────────────────────────────────────────────────────────────────────────</span> │
 │ <span class="d">│</span> <span class="d"> 1</span>  <span class="d">prefix</span> openrouter/${model}       → openrouter-chat         ${model}          ok                              9 │
@@ -274,10 +274,10 @@
 ┌RULE──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">claude-* → openrouter-messages</span>                                                                                       │
 │ <span class="d">match</span>     glob  claude-*                                                                                             │
-│ <span class="d">example</span>   claude-haiku-4-5 → claude-sonnet-5                                                                         │
+│ <span class="d">example</span>   claude-haiku-4-5 → claude-haiku-4-5                                                                        │
 │ <span class="d">sends to</span>  openrouter-messages<span class="d">  1 candidate · openrouter · </span><span class="yellow">billed</span>                                                     │
 │ <span class="d">reach</span>     ok                                                                                                         │
-│ <span class="d">overlaps</span>  none: the prefixes differ                                                                                  │
+│ <span class="d">overlaps</span>  none: no rule above catches claude-*                                                                       │
 │ <span class="d">recent</span>    <span class="d">-</span>                                                                                                          │
 │ [e] edit   [n] new   [m] move   [space] turn off   [d] delete   [t] trace   [enter] open route                       │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -301,7 +301,7 @@
 │<span class="b"> </span><span class="d b">│</span><span class="b"> </span><span class="d b"> 6</span><span class="b">  </span><span class="d b">prefix</span><span class="b"> </span><span class="d b">-</span><span class="b">                         → </span><span class="d b">-</span><span class="b">                                         -                               </span><span class="d b">-</span><span class="b"> </span>│
 │ <span class="d">│</span>     <span class="d">┌</span> <span class="d">match</span>   <span class="b">prefix</span>  ▏                                                                                            │
 │ <span class="d">│</span>     <span class="d">│</span> <span class="d">route</span>   <span class="d">-</span>                                                                                                    │
-│ <span class="d">│</span>     <span class="d">│</span> <span class="d">sends</span>   <span class="r">${model}                      </span>                                                                       │
+│ <span class="d">│</span>     <span class="d">│</span> <span class="d">sends</span>   <span class="r">${model}  ←/→                 </span>                                                                       │
 │ <span class="d">│</span>     <span class="d">└</span> [ctrl+s] <span class="d">fix 2 fields to save</span>   [esc] cancel                                                                 │
 │ <span class="d">└─</span> <span class="d">else</span>  default anthropic_messages    → claude-sub                                <span class="yellow">no cred</span>                        ≥3 │
 │ <span class="d">┌─ </span><span class="b">openai_chat</span>  5 rules · → ${model} <span class="d">───────────────────────────────────────────────────────────────────────────────</span> │
@@ -342,7 +342,7 @@
 │<span class="b"> </span><span class="d b">│</span><span class="b"> </span><span class="d b"> 6</span><span class="b">  </span><span class="d b">glob</span><span class="b">   claude-*                  → openrouter-messages                       ok                              </span><span class="d b">-</span><span class="b"> </span>│
 │ <span class="d">│</span>     <span class="d">┌</span> <span class="d">match</span>   <span class="b">glob</span>  claude-*▏                 catches claude-sonnet-5 and 2 more                                   │
 │ <span class="d">│</span>     <span class="d">│</span> <span class="d">route</span>   openrouter-messages             1 candidate · <span class="yellow">billed</span>                                                 │
-│ <span class="d">│</span>     <span class="d">│</span> <span class="d">sends</span>   <span class="r">${model}                      </span>  <span class="red">a glob captures nothing, so ${model} would be empty:</span>                 │
+│ <span class="d">│</span>     <span class="d">│</span> <span class="d">sends</span>   <span class="r">${model}  ←/→                 </span>  <span class="red">a glob captures nothing, so ${model} would be empty:</span>                 │
 │ <span class="d">│</span>     <span class="d">│</span>                                         <span class="red">use a prefix or a regex</span>                                              │
 │ <span class="d">│</span>     <span class="d">└</span> [ctrl+s] <span class="d">fix sends to save</span>   [esc] cancel                                                                    │
 │ <span class="d">└─</span> <span class="d">else</span>  default anthropic_messages    → claude-sub                                <span class="yellow">no cred</span>                        ≥3 │
@@ -383,7 +383,7 @@
 │<span class="b"> </span><span class="d b">│</span><span class="b"> </span><span class="d b"> 6</span><span class="b">  </span><span class="d b">glob</span><span class="b">   claude-*                  → openrouter-messages                       ok                              </span><span class="d b">-</span><span class="b"> </span>│
 │ <span class="d">│</span>     <span class="d">┌</span> <span class="d">match</span>   <span class="b">glob</span>  claude-*                  catches claude-sonnet-5 and 2 more                                   │
 │ <span class="d">│</span>     <span class="d">│</span> <span class="d">route</span>   openrouter-messages             1 candidate · <span class="yellow">billed</span>                                                 │
-│ <span class="d">│</span>     <span class="d">│</span> <span class="d">sends</span>   <span class="r">claude-sonnet-5▏              </span>  sent as claude-sonnet-5 whatever the name                            │
+│ <span class="d">│</span>     <span class="d">│</span> <span class="d">sends</span>   <span class="r">as asked  ←/→                 </span>  the name is sent unchanged                                           │
 │ <span class="d">│</span>     <span class="d">└</span> [ctrl+s] save   [esc] cancel                                                                                 │
 │ <span class="d">└─</span> <span class="d">else</span>  default anthropic_messages    → claude-sub                                <span class="yellow">no cred</span>                        ≥3 │
 │ <span class="d">┌─ </span><span class="b">openai_chat</span>  5 rules · → ${model} <span class="d">───────────────────────────────────────────────────────────────────────────────</span> │
@@ -421,7 +421,7 @@
 │ <span class="d">│</span> <span class="d"> 3</span>  <span class="d">prefix</span> anthropic_api/${model}    → claude-api              ${model}          <span class="d">off</span>                             <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 4</span>  <span class="d">prefix</span> openrouter/${model}       → openrouter-messages     ${model}          ok                             41 │
 │ <span class="d">│</span> <span class="d"> 5</span>  <span class="d">prefix</span> codex_sub/${model}        → codex                   ${model}          <span class="d">off</span>                             <span class="d">-</span> │
-│<span class="r"> │  6  glob   claude-*                  → openrouter-messages     claude-sonnet-5   ok                              - </span>│
+│<span class="r"> │  6  glob   claude-*                  → openrouter-messages     as asked          ok                              - </span>│
 │ <span class="d">└─</span> <span class="d">else</span>  default anthropic_messages    → claude-sub                                <span class="yellow">no cred</span>                        ≥3 │
 │ <span class="d">┌─ </span><span class="b">openai_chat</span>  5 rules <span class="d">────────────────────────────────────────────────────────────────────────────────────────────</span> │
 │ <span class="d">│</span> <span class="d"> 1</span>  <span class="d">prefix</span> openrouter/${model}       → openrouter-chat         ${model}          ok                              9 │
@@ -440,10 +440,10 @@
 ┌RULE──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">claude-* → openrouter-messages</span>                                                                                       │
 │ <span class="d">match</span>     glob  claude-*                                                                                             │
-│ <span class="d">example</span>   claude-haiku-4-5 → claude-sonnet-5                                                                         │
+│ <span class="d">example</span>   claude-haiku-4-5 → claude-haiku-4-5                                                                        │
 │ <span class="d">sends to</span>  openrouter-messages<span class="d">  1 candidate · openrouter · </span><span class="yellow">billed</span>                                                     │
 │ <span class="d">reach</span>     ok                                                                                                         │
-│ <span class="d">overlaps</span>  none: the prefixes differ                                                                                  │
+│ <span class="d">overlaps</span>  none: no rule above catches claude-*                                                                       │
 │ <span class="d">recent</span>    <span class="d">-</span>                                                                                                          │
 │ [e] edit   [n] new   [m] move   [space] turn off   [d] delete   [t] trace   [enter] open route                       │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

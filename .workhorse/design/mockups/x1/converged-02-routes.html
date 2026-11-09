@@ -109,47 +109,47 @@
 </head>
 <body>
 <h1>Converged: routes</h1>
-<h2>Routes, with the selected route&rsquo;s candidates &mdash; 120&times;40</h2>
-<pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 presentations 15</span><span class="d"> → </span><span class="d">2 rewrites 14</span><span class="d"> → </span><span class="d">3 defaults 4</span><span class="d"> → </span><span class="b r">4 routes 7</span><span class="d"> · </span><span class="d">5 models 11</span><span class="d"> · </span><span class="d">6 history 9</span>             rev 9 live 
-┌ROUTES────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ <span class="d">route</span>                <span class="d">sent to</span>                    <span class="d">rules</span> <span class="d">defaults</span> <span class="d">lanes</span>           <span class="d">now</span>                                   │
-│<span class="r"> claude-sub           anthropic_sub → openrouter 4     2        2 warm · 5 cold no cred · falls to openrouter, billed </span>│
-│ claude-api           anthropic_api              3     <span class="d">0</span>        <span class="d">none</span>            <span class="d">off</span>                                   │
-│ openrouter-messages  openrouter                 1     <span class="d">0</span>        <span class="d">none</span>            ok                                    │
-│ openrouter-chat      openrouter                 1     2        3 cold          ok                                    │
-│ openrouter-responses openrouter                 1     <span class="d">0</span>        <span class="d">none</span>            ok                                    │
-│ openai-chat          openai_api                 1     <span class="d">0</span>        <span class="d">none</span>            <span class="d">off</span>                                   │
-│ codex                codex_sub → openrouter     3     <span class="d">0</span>        <span class="d">none</span>            <span class="d">off</span> · falls to openrouter, <span class="yellow">billed</span>     │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ROUTE─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ <span class="b">claude-sub</span>                                                                                                           │
-│ 1  anthropic_sub.anthropic_messages  subscription    as asked                                <span class="yellow">no cred</span>                 │
-│    ↓ when unavailable before send · overloaded · 5xx   <span class="d">billed:</span> <span class="yellow">allow</span>   <span class="d">ambiguous retry:</span> deny   <span class="d">cache:</span> preserve warm  │
-│ 2  openrouter.openrouter_messages    <span class="yellow">billed</span>          alias claude-* → anthropic/claude-*     ok                      │
-│ [enter] open route   [e] edit   [n] add fallback   [m] move   [t] trace                                              │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        </pre>
+<h2>Routes, with the selected route&rsquo;s candidates &mdash; 135&times;40</h2>
+<pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 presentations 15</span><span class="d"> → </span><span class="d">2 rewrites 14</span><span class="d"> → </span><span class="d">3 defaults 4</span><span class="d"> → </span><span class="b r">4 routes 7</span><span class="d"> · </span><span class="d">5 models 11</span><span class="d"> · </span><span class="d">6 history 9</span>                            rev 9 live 
+┌ROUTES───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ <span class="d">route</span>                 <span class="d">sent to</span>                      <span class="d">matched by</span>             <span class="d">lanes</span>             <span class="d">now</span>                                     │
+│<span class="r"> claude-sub            anthropic_sub → openrouter   4 rules · 2 defaults   2 warm · 5 cold   no cred · falls to openrouter, billed   </span>│
+│ claude-api            anthropic_api                3 rules                <span class="d">none</span>              <span class="d">off</span>                                     │
+│ openrouter-messages   openrouter                   1 rule                 <span class="d">none</span>              ok                                      │
+│ openrouter-chat       openrouter                   1 rule · 2 defaults    3 cold            ok                                      │
+│ openrouter-responses  openrouter                   1 rule                 <span class="d">none</span>              ok                                      │
+│ openai-chat           openai_api                   1 rule                 <span class="d">none</span>              <span class="d">off</span>                                     │
+│ codex                 codex_sub → openrouter       3 rules                <span class="d">none</span>              <span class="d">off</span> · falls to openrouter, <span class="yellow">billed</span>       │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ROUTE────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ <span class="b">claude-sub</span>                                                                                                                          │
+│ 1  anthropic_sub.anthropic_messages  subscription    as asked                                <span class="yellow">no cred</span>                                │
+│    ↓ when unavailable before send · overloaded · 5xx   <span class="d">billed:</span> <span class="yellow">allow</span>   <span class="d">ambiguous retry:</span> deny   <span class="d">cache:</span> preserve warm                 │
+│ 2  openrouter.openrouter_messages    <span class="yellow">billed</span>          alias claude-* → anthropic/claude-*     ok                                     │
+│ [enter] open route   [e] edit   [n] add fallback   [m] move   [t] trace                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                       
+                                                                                                                                       </pre>
 <h2>The route page, <code>enter</code> on claude-sub &mdash; 120&times;40</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 presentations 15</span><span class="d"> → </span><span class="d">2 rewrites 14</span><span class="d"> → </span><span class="d">3 defaults 4</span><span class="d"> → </span><span class="b r">4 routes 7</span><span class="d"> · </span><span class="d">5 models 11</span><span class="d"> · </span><span class="d">6 history 9</span>             rev 9 live 
 ┌ROUTE─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
