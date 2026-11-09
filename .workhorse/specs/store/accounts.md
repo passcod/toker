@@ -147,7 +147,13 @@ Such a row carries neither an account nor a digest.
 Every command other than setup, the service included, MUST refuse to run while the store holds such a row, and MUST say that setup attributes them.
 
 Setup MUST offer the accounts it can discover and MUST ask which of them the unattributed rows belong to.
+Where Toker knows no account at all, setup MUST ask the operator for the email address the rows were served on, and MUST open an account the operator named for it.
 Setup MUST write that account onto every unattributed row, in one transaction.
+
+> [!NOTE]
+> A history imported or copied from another machine reaches one that has never served the provider, so no login exists to learn an account from.
+> Refusing there would leave every other command refusing as well, with nothing the operator could do to lift it.
+> An address that a credential later resolves to joins the account opened here, as [Identity](#identity) requires.
 
 An interrupted move MUST be repaired by running setup again.
 
