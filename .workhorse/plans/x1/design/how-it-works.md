@@ -74,7 +74,9 @@ Its last line holds the controls for that rule.
 ### Presentations
 
 [Presentations](../../../design/mockups/x1/converged-03-tables.html#presentations) are the published models.
-Each row includes a pattern of provider models, excludes some, says which slot of the client's picker it fills (`opus`, `sonnet`, `haiku`), and shows how many models it lists and the newest of them.
+Each row includes a pattern of provider models, excludes some, says which tier of the client's picker it is listed under (`as`), and shows how many models it lists and the newest of them.
+The tiers are the client's own, so they come with the scope: Claude Code's are `opus`, `sonnet`, `haiku` and `fable`, and a codex scope would offer `luna`, `terra`, `sol` and `astra`.
+Any model can be listed under any tier, which is how `openai/gpt-*-sol` comes to sit in Claude Code's `opus` slot.
 The group's `else` row (`no slug equals it → rewrites`) is where the chain continues when a request names something that isn't published.
 The detail panel calls out overlaps with other rows, and whether the presentation has reached the client's settings yet.
 

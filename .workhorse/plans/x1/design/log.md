@@ -165,6 +165,7 @@ Skipped: nit 10, the shorter after-save header, because the full tab strip takes
 ## Where it stands
 
 - round 6 critic (Fable, fresh) running
+- the user flagged that the presentations `as` tiers were treated as Claude's; the guide now says tiers are the client's own, and the wider problem (Toker hardcodes tiers and families in code) is card Y1
 
 ## Next
 
