@@ -139,26 +139,26 @@
 <span class="b">REWRITES</span> <span class="d">──────────────────────────────────────────────────────────────────────</span> 
        <span class="d">match</span>                     <span class="d">route</span>                 <span class="d">reach</span>               <span class="d">hits</span> 
  <span class="d">┌─ </span><span class="b">anthropic_messages</span>  5 rules · prefix → ${model} <span class="d">───────────────────────────</span> 
- <span class="d">│</span> <span class="d"> 1</span>  anthropic/${model}      → claude-sub            <span class="yellow">no cred</span>                <span class="d">-</span> 
-<span class="r"> │  2  anthropic_sub/${model}  → claude-sub            no cred               ≥1 </span>
+ <span class="d">│</span> <span class="d"> 1</span>  anthropic/${model}      → claude-sub            <span class="yellow">no cred</span> · <span class="yellow">billed</span>       <span class="d">-</span> 
+<span class="r"> │  2  anthropic_sub/${model}  → claude-sub            no cred · billed      ≥1 </span>
  <span class="d">│</span> <span class="d"> 3</span>  anthropic_api/${model}  → claude-api            <span class="d">off</span>                    <span class="d">-</span> 
  <span class="d">│</span> <span class="d"> 4</span>  openrouter/${model}     → openrouter-messages   ok                    41 
- <span class="d">│</span> <span class="d"> 5</span>  codex_sub/${model}      → codex                 <span class="d">off</span>                    <span class="d">-</span> 
- <span class="d">└─</span> <span class="d">else</span>  default              → claude-sub            <span class="yellow">no cred</span>               ≥3 
+ <span class="d">│</span> <span class="d"> 5</span>  codex_sub/${model}      → codex                 <span class="d">off</span> · <span class="yellow">billed</span>           <span class="d">-</span> 
+ <span class="d">└─</span> <span class="d">else</span>  default              → claude-sub            <span class="yellow">no cred</span> · <span class="yellow">billed</span>      ≥3 
  <span class="d">┌─ </span><span class="b">openai_chat</span>  5 rules · prefix → ${model} <span class="d">──────────────────────────────────</span> 
  <span class="d">│</span> <span class="d"> 1</span>  openrouter/${model}     → openrouter-chat       ok                     9 
  <span class="d">│</span> <span class="d"> 2</span>  openai_api/${model}     → openai-chat           <span class="d">off</span>                    <span class="d">-</span> 
- <span class="d">│</span> <span class="d"> 3</span>  codex_sub/${model}      → codex                 <span class="d">off</span>                    <span class="d">-</span> 
+ <span class="d">│</span> <span class="d"> 3</span>  codex_sub/${model}      → codex                 <span class="d">off</span> · <span class="yellow">billed</span>           <span class="d">-</span> 
  <span class="d">│</span> <span class="d"> 4</span>  anthropic_api/${model}  → claude-api            <span class="d">off</span>                    <span class="d">-</span> 
- <span class="d">│</span> <span class="d"> 5</span>  anthropic_sub/${model}  → claude-sub            <span class="yellow">no cred</span>                <span class="d">-</span> 
+ <span class="d">│</span> <span class="d"> 5</span>  anthropic_sub/${model}  → claude-sub            <span class="yellow">no cred</span> · <span class="yellow">billed</span>       <span class="d">-</span> 
  <span class="d">└─</span> <span class="d">else</span>  default              → openrouter-chat       ok                     <span class="d">-</span> 
  <span class="d">┌─ </span><span class="b">openai_responses</span>  4 rules · prefix → ${model} <span class="d">─────────────────────────────</span> 
- <span class="d">│</span> <span class="d"> 1</span>  codex_sub/${model}      → codex                 <span class="d">off</span>                   ≥2 
+ <span class="d">│</span> <span class="d"> 1</span>  codex_sub/${model}      → codex                 <span class="d">off</span> · <span class="yellow">billed</span>          ≥2 
  <span class="d">│</span> <span class="d"> 2</span>  anthropic_api/${model}  → claude-api            <span class="d">off</span>                    <span class="d">-</span> 
- <span class="d">│</span> <span class="d"> 3</span>  anthropic_sub/${model}  → claude-sub            <span class="yellow">no cred</span>                <span class="d">-</span> 
+ <span class="d">│</span> <span class="d"> 3</span>  anthropic_sub/${model}  → claude-sub            <span class="yellow">no cred</span> · <span class="yellow">billed</span>       <span class="d">-</span> 
  <span class="d">│</span> <span class="d"> 4</span>  openrouter/${model}     → openrouter-responses  ok                     <span class="d">-</span> 
  <span class="d">└─</span> <span class="d">else</span>  no default           → <span class="yellow">refused · no route</span>                           <span class="d">-</span> 
- <span class="yellow">no cred</span>   [pgdn] more   [enter] open route                                     </pre>
+ <span class="yellow">no cred</span> · <span class="yellow">billed</span>   [pgdn] more   [enter] open route                            </pre>
 <h2 id="route-page-100x24">The claude-sub route page &mdash; 100&times;24</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1</span><span class="d"> → </span><span class="d">2</span><span class="d"> → </span><span class="d">3</span><span class="d"> → </span><span class="b r">4 routes 7</span><span class="d"> · </span><span class="d">5</span><span class="d"> · </span><span class="d">6</span>                                                     rev 9 live 
 <span class="b">ROUTE</span> <span class="d">─────────────────────────────────────────────────────────────────────────────────────────────</span> 
@@ -170,10 +170,11 @@
       <span class="d">billed:</span> <span class="yellow">allow</span>   <span class="d">ambiguous retry:</span> deny   <span class="d">cache:</span> preserve warm                                  
  2  openrouter.openrouter_messages    <span class="yellow">billed</span>       alias claude-* → anthropic/claude-*   ok         
                                                                                                     
- <span class="b">handled by</span>  3 on · 4 off                                                                           
-   upgrade          newest on claude-sub<span class="d"> · no newer model in sonnet</span>                                 
+ <span class="b">handled by</span>  4 on · 3 off<span class="d">: server safeguards · required capabilities · health circuits</span>              
+   upgrade          newest on claude-sub<span class="d"> · claude-opus-4-7 → claude-opus-5</span>                          
    lane transition  moves when cold<span class="d"> · 2 warm, 5 cold pinned</span>                                         
    compaction       cold compactions → sonnet<span class="d"> · cache allowed when cold</span>                             
+   alias            claude-* → anthropic/claude-*<span class="d"> · on openrouter</span>                                   
                                                                                                     
  <span class="b">matched by</span>  4 rules · 2 defaults                                                                   
    rewrite  anthropic_messages 1            anthropic/${model}                                      
@@ -182,8 +183,7 @@
    rewrite  openai_responses 3              anthropic_sub/${model}                                  
    default  anthropic_messages                                                                      
    default  unprefixed/anthropic_messages                                                           
- [e] edit   [n] add fallback   [m] move   [t] trace   [←/→] other routes   [esc] back               
-                                                                                                    </pre>
+ [e] edit   [n] add fallback   [m] move   [t] trace   [←/→] other routes   [esc] back               </pre>
 <h2 id="providers-80x24">Providers, opened on the problem &mdash; 80&times;24</h2>
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="b r">1 providers 5</span><span class="d"> · 2 settings</span>                                 2 providers on 
 <span class="b">PROVIDERS</span> <span class="d">─────────────────────────────────────────────────────────────────────</span> 

@@ -93,3 +93,16 @@ Applied from `critique-round-3.md` section 4. Width and font checks re-run on 01
 - **#15.** COMPACTION reads `cold compactions → sonnet   cache allowed when cold`.
 - **#17.** The `claude-*` RULE detail reads `match  glob  claude-* · sends as asked`.
 - **#18.** The new-row placeholder in save-flow state 1 leaves untyped cells blank: only `6` and `prefix` remain. The form beneath keeps its own `-` for the empty route field.
+
+## Round 4 fixes
+
+Regenerated from `/tmp/x1gen` (which already carries the `refused · no route` label). The frame captions now get their ids from the generator, and a regeneration before any change reproduced the existing HTML exactly, so the ids and the label are as they were. Width and font checks pass on 01, 02, 03, 06 and 08; every file was re-shot and the changed frames looked at.
+
+- **#1.** The refusal beside `sends` reads `a glob captures nothing, so ${model} would be empty:` and, wrapped, `send as asked, or match with a prefix or regex` (01-04 and the refused states of 08).
+- **#2.** The route page head reads `handled by  3 on · 4 off: server safeguards · required capabilities · health circuits · classifier`, with the names dim, in 02-02, 02-03 and 06-03. At 100 columns it fits exactly (98 of 98 cells), so no shortening was needed. E's route frames hold only seven blocks, so there is no fourth off block other than `alias rules` (excluded) and `compaction` (which this page lists as on). I used `classifier`, a field of E's upgrade block. It is the weakest of the options, because an upgrade needs a classifier, so replace the name if you prefer. The coherent alternative is to make `alias rules` on and read `4 on · 3 off`.
+- **#3.** The route page upgrade line reads `newest on claude-sub · claude-opus-4-7 → claude-opus-5`.
+- **#4.** Trace link 7 reads `no newer model in claude-sonnet`.
+- **#5.** At 80x24 the spend clause is kept as `no cred · billed` and `off · billed`, in the column and in the summary line. Nothing had to be shed: the longer text fits beside `hits` at 80.
+- **#6.** The presentations else row reads `→ rewrites`.
+- **#7.** In the edit states the head reads `5 rules · 1 new · sends ${model}` (01-04 and all four 08 states).
+- **#8.** In save-flow state 1 a dim `needed` sits beside the empty `match` and `route` fields.

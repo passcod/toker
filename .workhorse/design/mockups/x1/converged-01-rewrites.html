@@ -235,7 +235,7 @@
 │ 4 route          claude-sub                                                                                          │
 │ 5 candidate 1    ↓ fell past  anthropic_sub.anthropic_messages  <span class="yellow">no cred</span>                                              │
 │ 6 candidate 2    <span class="b">&gt; serves</span>     openrouter.openrouter_messages  <span class="yellow">billed</span>  <span class="d">alias claude-* → anthropic/claude-*</span>            │
-│ 7 upgrade        none         no newer model in sonnet                                                               │
+│ 7 upgrade        none         no newer model in claude-sonnet                                                        │
 │ 8 provider       on           openrouter · credential in keyring                                                     │
 │ 9 gate           passes       cold gate on · 6,883 tokens, under the floor                                           │
 │ [t] trace another   [enter] open link   [esc] close                                                                  │
@@ -246,7 +246,7 @@
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 presentations 15</span><span class="d"> → </span><span class="b r">2 rewrites 14</span><span class="d"> → </span><span class="d">3 defaults 4</span><span class="d"> → </span><span class="d">4 routes 7</span><span class="d"> · </span><span class="d">5 models 11</span><span class="d"> · </span><span class="d">6 history 9</span>   editing · rev 9 live 
 ┌REWRITES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │       <span class="d">kind</span>   <span class="d">match</span>                       <span class="d">route</span>                                     <span class="d">reach</span>                        <span class="d">hits</span> │
-│ <span class="d">┌─ </span><span class="b">anthropic_messages</span>  5 rules · sends ${model} <span class="d">────────────────────────────────────────────────────────────────────</span> │
+│ <span class="d">┌─ </span><span class="b">anthropic_messages</span>  5 rules · 1 new · sends ${model} <span class="d">────────────────────────────────────────────────────────────</span> │
 │ <span class="d">│</span> <span class="d"> 1</span>  <span class="d">prefix</span> anthropic/${model}        → claude-sub                                <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>       <span class="d">-</span> │
 │ <span class="d">│</span> <span class="d"> 2</span>  <span class="d">prefix</span> anthropic_sub/${model}    → claude-sub                                <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>      ≥1 │
 │ <span class="d">│</span> <span class="d"> 3</span>  <span class="d">prefix</span> anthropic_api/${model}    → claude-api                                <span class="d">off</span>                             <span class="d">-</span> │
@@ -256,7 +256,7 @@
 │ <span class="d">│</span>     <span class="d">┌</span> <span class="d">match</span>   glob  claude-*                  catches claude-sonnet-5 and 2 more                                   │
 │ <span class="d">│</span>     <span class="d">│</span> <span class="d">route</span>   openrouter-messages             1 candidate · <span class="yellow">billed</span>                                                 │
 │ <span class="d">│</span>     <span class="d">│</span> <span class="d">sends</span>   <span class="r">${model}                  ←/→ </span>  <span class="red">a glob captures nothing, so ${model} would be empty:</span>                 │
-│ <span class="d">│</span>     <span class="d">│</span>                                         <span class="red">use a prefix or a regex</span>                                              │
+│ <span class="d">│</span>     <span class="d">│</span>                                         <span class="red">send as asked, or match with a prefix or regex</span>                       │
 │ <span class="d">│</span>     <span class="d">└</span> [ctrl+s] <span class="d">fix sends to save</span>   [esc] cancel                                                                    │
 │ <span class="d">└─</span> <span class="d">else</span>  default                       → claude-sub                                <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>      ≥3 │
 │ <span class="d">┌─ </span><span class="b">openai_chat</span>  5 rules · sends ${model} <span class="d">───────────────────────────────────────────────────────────────────────────</span> │

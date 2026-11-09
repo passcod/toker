@@ -75,7 +75,7 @@ Its last line holds the controls for that rule.
 
 [Presentations](../../../design/mockups/x1/converged-03-tables.html#presentations) are the published models.
 Each row includes a pattern of provider models, excludes some, says which slot of the client's picker it fills (`opus`, `sonnet`, `haiku`), and shows how many models it lists and the newest of them.
-The group's `else` row (`no slug equals it → 2 rewrites`) is where the chain continues when a request names something that isn't published.
+The group's `else` row (`no slug equals it → rewrites`) is where the chain continues when a request names something that isn't published.
 The detail panel calls out overlaps with other rows, and whether the presentation has reached the client's settings yet.
 
 ### Defaults
@@ -92,7 +92,7 @@ The detail below is the candidate list, with the fallback conditions written on 
 It reads top to bottom as three questions:
 
 - **sent to**: the candidates, in order, with the edges between them.
-- **handled by**: which per-route behaviours are on (upgrade to newest, how lanes move to a new revision, where compactions go).
+- **handled by**: which per-route behaviours are on (upgrade to newest, how lanes move to a new revision, where compactions go, the alias a provider needs), with the ones that are off named dimly on the same line; `enter` there turns one on.
 - **matched by**: every rule and default that sends traffic here, so you can see a route's inbound side without hunting through the rewrites.
 
 `←/→` steps through the other routes (`1 of 7`), and `esc` returns to the table with the selection where you left it.
@@ -114,7 +114,7 @@ There's no separate validate step and no apply step: a form that would be invali
 [Editing a rule](../../../design/mockups/x1/converged-01-rewrites.html#editing) shows a new rule 6 being added to `anthropic_messages`.
 The form opens under the row with its three fields, `match`, `route` and `sends`, and each field has its reading beside it.
 A reading in plain text tells you what the value does (`catches claude-sonnet-5 and 2 more`).
-A reading in red is a refusal and says how to fix it: here, a glob captures nothing, so `${model}` would be empty.
+A reading in red is a refusal and says how to fix it: here, a glob captures nothing, so `${model}` would be empty, and the refusal offers the two ways out, sending the name as asked or matching with a prefix or regex.
 While anything is refused, the save control says what's in the way (`[ctrl+s] fix sends to save`) instead of `save`.
 
 Below the table, the **preview** replays recent requests against the edited rule (`3 of 5 recent requests would change route`), showing each one's route now and with the change, so you can see the effect before you commit to it.
