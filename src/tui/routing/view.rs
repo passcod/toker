@@ -183,7 +183,10 @@ const KEYS: [(&str, &str); 18] = [
     ("↑/↓ j/k", "select a record"),
     ("←/→ h/l 1–4", "switch view"),
     ("pgup/pgdn", "scroll the detail"),
-    ("n", "add a record, asking which kind where a view lists several"),
+    (
+        "n",
+        "add a record, asking which kind where a view lists several",
+    ),
     ("e", "edit the selected record in a form"),
     ("d", "remove the selected record"),
     ("v", "preview a request"),
@@ -191,7 +194,10 @@ const KEYS: [(&str, &str); 18] = [
     ("a", "activate the draft"),
     ("x", "reactivate the selected revision"),
     ("p", "promote"),
-    ("i", "import toker.toml's routing into the draft, from the status view"),
+    (
+        "i",
+        "import toker.toml's routing into the draft, from the status view",
+    ),
     ("r", "refresh"),
     ("click", "select a record, or focus a form field"),
     ("wheel", "scroll what is under the pointer"),
@@ -396,13 +402,23 @@ fn modal_lines(modal: &Modal) -> Vec<String> {
             short(value),
             confirm_hint(),
         ],
-        Modal::PreviewResult(result) => vec![
-            chrome::hints(&[("any key", "close")]),
-            pretty(result),
-        ],
-        Modal::Activate { scope, force_cache_transition } => activation_lines("Activate this draft?", *scope, *force_cache_transition),
-        Modal::Reactivate { revision_id, scope, force_cache_transition } => {
-            let mut lines = activation_lines(&format!("Create a forward revision from revision {revision_id}?"), *scope, *force_cache_transition);
+        Modal::PreviewResult(result) => {
+            vec![chrome::hints(&[("any key", "close")]), pretty(result)]
+        }
+        Modal::Activate {
+            scope,
+            force_cache_transition,
+        } => activation_lines("Activate this draft?", *scope, *force_cache_transition),
+        Modal::Reactivate {
+            revision_id,
+            scope,
+            force_cache_transition,
+        } => {
+            let mut lines = activation_lines(
+                &format!("Create a forward revision from revision {revision_id}?"),
+                *scope,
+                *force_cache_transition,
+            );
             lines.insert(1, "The active pointer never moves backwards.".to_owned());
             lines
         }
@@ -411,10 +427,20 @@ fn modal_lines(modal: &Modal) -> Vec<String> {
             "The active revision does not change until the draft is activated.".to_owned(),
             confirm_hint(),
         ],
-        Modal::Conflict { daemon_generation, daemon_draft } => vec![
+        Modal::Conflict {
+            daemon_generation,
+            daemon_draft,
+        } => vec![
             "The daemon draft changed while this terminal was editing.".to_owned(),
-            format!("daemon generation: {}", daemon_generation.map_or_else(|| "unknown".to_owned(), |value| value.to_string())),
-            chrome::hints(&[("r", "reload, discarding local typed edits"), ("a", "reapply them to this daemon copy"), ("esc", "close")]),
+            format!(
+                "daemon generation: {}",
+                daemon_generation.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+            ),
+            chrome::hints(&[
+                ("r", "reload, discarding local typed edits"),
+                ("a", "reapply them to this daemon copy"),
+                ("esc", "close"),
+            ]),
             pretty(daemon_draft),
         ],
     }
@@ -569,7 +595,9 @@ mod tests {
                 .iter()
                 .any(|(keys, _)| keys.split([' ', '/']).any(|token| token == key))
         };
-        for key in ['e', 'n', 'd', 'v', 'V', 'a', 'x', 'p', 'i', 'r', 'h', 'j', 'k', 'l'] {
+        for key in [
+            'e', 'n', 'd', 'v', 'V', 'a', 'x', 'p', 'i', 'r', 'h', 'j', 'k', 'l',
+        ] {
             assert!(
                 !super::super::owns_key(KeyCode::Char(key)) || named(&key.to_string()),
                 "{key} is taken but not named"
@@ -810,7 +838,10 @@ mod tests {
     fn a_short_page_goes_ruled() {
         let state = page_in(super::View::Routes);
         let (tall, _) = drawn_at(&state, 120, 40);
-        assert!(tall.contains("\u{250c}DETAIL"), "boxed while it fits:\n{tall}");
+        assert!(
+            tall.contains("\u{250c}DETAIL"),
+            "boxed while it fits:\n{tall}"
+        );
         let (short, _) = drawn_at(&state, 120, 12);
         assert!(short.contains("DETAIL \u{2500}"), "ruled:\n{short}");
         assert!(!short.contains('\u{250c}'), "{short}");

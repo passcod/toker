@@ -1,18 +1,17 @@
 ---
 source: src/tui/routing/view.rs
+assertion_line: 975
 expression: frame(&state)
 ---
- ?  ⇄
-1 PRE┌ROUTING PREVIEW─────────────────────────────────────────────────────────────────────────────────────────────┐ & AC
-     │> protocol: < anthropic_messages >                                                                          │
-┌PREV│  profile: (none)                                                                                           │────┐
-│3  {│  model: (none)                                                                                             │    │
-│draf│  lane key: (none)                                                                                          │    │
-│dyna│  prompt bound: 0                                                                                           │    │
-│code│  message count: (none)                                                                                     │    │
-│open│  tool count: 0                                                                                             │    │
-│lane│                                                                                                            │    │
-│diag│                                                                                                            │    │
+ ? ⇄ 1  2  3  4 preview, revisions & activation                                                                  draft 4
+┌PREV┌ROUTING PREVIEW─────────────────────────────────────────────────────────────────────────────────────────────┐────┐
+│3  {│> protocol: < anthropic_messages >                                                                          │    │
+│draf│  profile: (none)                                                                                           │    │
+│dyna│  model: (none)                                                                                             │    │
+│code│  lane key: (none)                                                                                          │    │
+│open│  prompt bound: 0                                                                                           │    │
+│lane│  message count: (none)                                                                                     │    │
+│diag│  tool count: 0                                                                                             │    │
 │    │                                                                                                            │    │
 │    │                                                                                                            │    │
 │    │                                                                                                            │    │
@@ -30,7 +29,9 @@ expression: frame(&state)
 │    │                                                                                                            │    │
 │    │                                                                                                            │    │
 │    │                                                                                                            │    │
-│    │Content-free request facts only · Enter previews · Esc cancels                                              │    │
 │    │                                                                                                            │    │
-└────└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘────┘
-draft 4 · ←/→ or 1–4 view · ↑/↓ select · n new · e edit · d remove · v preview · V validate · a activate · p promote · r
+│    │                                                                                                            │    │
+│    │content-free request facts only · enter preview · esc cancel                                                │    │
+│    │                                                                                                            │    │
+│    └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
+└────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘

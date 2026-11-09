@@ -209,14 +209,17 @@ impl Page {
             self.entries
                 .iter()
                 .enumerate()
-                .map(|(index, entry)| self.entry_lines(entry, index == self.selected, width, now_ms))
+                .map(|(index, entry)| {
+                    self.entry_lines(entry, index == self.selected, width, now_ms)
+                })
                 .collect()
         };
         let need = entries.iter().map(Vec::len).sum();
         let inner = chrome::panel(frame, body, "ACCOUNTS", Chrome::fitting(need, body.height));
         let selected = (!self.entries.is_empty()).then_some(self.selected);
         let rows = chrome::list(frame, inner, entries, selected, NOUN);
-        self.rows.replace(if selected.is_some() { rows } else { Vec::new() });
+        self.rows
+            .replace(if selected.is_some() { rows } else { Vec::new() });
         chrome::chips(frame, &header);
         if overlay {
             chrome::overlay(
@@ -444,7 +447,10 @@ mod tests {
         // assigned when an account becomes known.
         assert!(text.contains("not resolved"), "{text}");
         assert!(text.contains("?  "), "{text}");
-        assert!(!text.contains("n names"), "no page carries a footer: {text}");
+        assert!(
+            !text.contains("n names"),
+            "no page carries a footer: {text}"
+        );
     }
 
     /// The page's keys are in its overlay rather than a footer
@@ -499,7 +505,12 @@ mod tests {
 
         // The first row drawn is not the first entry once the list has
         // scrolled to the selection, so a click there names what it shows.
-        let first = page.rows.borrow().first().cloned().expect("a row was drawn");
+        let first = page
+            .rows
+            .borrow()
+            .first()
+            .cloned()
+            .expect("a row was drawn");
         assert!(first.entry > 0, "{:?}", page.rows.borrow());
         page.click(first.area.as_position());
         assert_eq!(page.selected, first.entry);

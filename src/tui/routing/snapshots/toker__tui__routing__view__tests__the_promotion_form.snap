@@ -1,14 +1,13 @@
 ---
 source: src/tui/routing/view.rs
+assertion_line: 972
 expression: frame(&state)
 ---
- ?  ⇄
-1 PRE┌PROMOTE LEARNED MODEL───────────────────────────────────────────────────────────────────────────────────────┐ & AC
-     │> binding: ▏                                                                                                │
-┌PREV│    Tab: anthropic_sub.anthropic_messages | anthropic_api.anthropic_messages | openai_api.openai_chat_comple│────┐
-│3  {│  model:                                                                                                    │    │
-│draf│                                                                                                            │    │
-│dyna│                                                                                                            │    │
+ ? ⇄ 1  2  3  4 preview, revisions & activation                                                                  draft 4
+┌PREV┌PROMOTE LEARNED MODEL───────────────────────────────────────────────────────────────────────────────────────┐────┐
+│3  {│> binding: ▏                                                                                                │    │
+│draf│    Tab: anthropic_sub.anthropic_messages | anthropic_api.anthropic_messages | openai_api.openai_chat_comple│    │
+│dyna│  model:                                                                                                    │    │
 │code│                                                                                                            │    │
 │open│                                                                                                            │    │
 │lane│                                                                                                            │    │
@@ -30,7 +29,9 @@ expression: frame(&state)
 │    │                                                                                                            │    │
 │    │                                                                                                            │    │
 │    │                                                                                                            │    │
-│    │Tab completes from a daemon offer · Enter records · Esc cancels                                             │    │
 │    │                                                                                                            │    │
-└────└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘────┘
-draft 4 · ←/→ or 1–4 view · ↑/↓ select · n new · e edit · d remove · v preview · V validate · a activate · p promote · r
+│    │                                                                                                            │    │
+│    │tab complete from a daemon offer · enter record · esc cancel                                                │    │
+│    │                                                                                                            │    │
+│    └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
+└────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘

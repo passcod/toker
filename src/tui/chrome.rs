@@ -500,7 +500,9 @@ pub(super) struct Section<'a> {
 }
 
 /// The `?` overlay: each page's own keys, and on the dashboard the marks
-/// it renders as well, centred over the frame and clipped to it.
+/// it renders as well, centred over the frame. How to close it rides in
+/// the bottom border, so it shows at any size the border does; rows that
+/// do not fit are counted rather than cut at the edge.
 pub(super) fn overlay(frame: &mut Frame, title: &str, sections: &[Section]) {
     let key_w = sections
         .iter()
@@ -511,9 +513,6 @@ pub(super) fn overlay(frame: &mut Frame, title: &str, sections: &[Section]) {
     let mut lines: Vec<Line> = Vec::new();
     for section in sections {
         if let Some(heading) = section.heading {
-            if !lines.is_empty() {
-                lines.push(Line::raw(""));
-            }
             lines.push(Line::styled(heading.to_owned(), Style::new().bold()));
         }
         lines.extend(section.rows.iter().map(|(key, meaning)| {
@@ -524,11 +523,22 @@ pub(super) fn overlay(frame: &mut Frame, title: &str, sections: &[Section]) {
             ])
         }));
     }
-    lines.push(Line::styled(hints(&[("? or esc", "close")]), Style::new().dim()));
-    let text_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let close = hints(&[("? or esc", "close")]);
+    let text_w = lines
+        .iter()
+        .map(Line::width)
+        .chain([close.width(), title.width()])
+        .max()
+        .unwrap_or(0) as u16;
     let area = frame.area();
     let width = text_w.saturating_add(4).min(area.width);
     let height = (lines.len() as u16).saturating_add(2).min(area.height);
+    let room = usize::from(height.saturating_sub(2));
+    if lines.len() > room && room > 0 {
+        let hidden = lines.len() - (room - 1);
+        lines.truncate(room - 1);
+        lines.push(Line::styled(format!("… {hidden} more"), Style::new().dim()));
+    }
     let popup = Rect {
         x: area.x + (area.width - width) / 2,
         y: area.y + (area.height - height) / 2,
@@ -538,6 +548,7 @@ pub(super) fn overlay(frame: &mut Frame, title: &str, sections: &[Section]) {
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
         .title_top(title.to_owned())
+        .title_bottom(Line::styled(close, Style::new().dim()))
         .padding(Padding::horizontal(1));
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
@@ -704,10 +715,7 @@ mod tests {
     fn a_message_wraps_rather_than_clipping() {
         let lines = message_lines(Some("the service refused the value it was sent"), 16);
         let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
-        assert_eq!(
-            text,
-            ["the service", "refused the", "value it was", "sent"]
-        );
+        assert_eq!(text, ["the service", "refused the", "value it was", "sent"]);
         assert!(message_lines(None, 16).is_empty());
     }
 }

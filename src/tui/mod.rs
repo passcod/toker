@@ -321,7 +321,14 @@ pub fn run(
                 continue;
             }
             if left && !modal && header.switch.contains(at) {
-                page = next_page(page, &mut ui, &mut routing, &mut config, &mut accounts, &store);
+                page = next_page(
+                    page,
+                    &mut ui,
+                    &mut routing,
+                    &mut config,
+                    &mut accounts,
+                    &store,
+                );
                 continue;
             }
             if page == Page::Accounts {
@@ -433,7 +440,14 @@ pub fn run(
             }
             match key.code {
                 crossterm::event::KeyCode::Tab => {
-                    page = next_page(page, &mut ui, &mut routing, &mut config, &mut accounts, &store);
+                    page = next_page(
+                        page,
+                        &mut ui,
+                        &mut routing,
+                        &mut config,
+                        &mut accounts,
+                        &store,
+                    );
                 }
                 crossterm::event::KeyCode::Char('?') => toggle_legend(&mut ui),
                 crossterm::event::KeyCode::Esc if ui.legend => ui.legend = false,

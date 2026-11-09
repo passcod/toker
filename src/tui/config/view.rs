@@ -81,8 +81,19 @@ pub(super) fn render(frame: &mut Frame, state: &State, overlay: bool) -> Drawn {
             })
             .collect();
         let need = entries.iter().map(Vec::len).sum();
-        let inner = chrome::panel(frame, body, title(state), Chrome::fitting(need, body.height));
-        chrome::list(frame, inner, entries, Some(state.selected()), NOUNS[current])
+        let inner = chrome::panel(
+            frame,
+            body,
+            title(state),
+            Chrome::fitting(need, body.height),
+        );
+        chrome::list(
+            frame,
+            inner,
+            entries,
+            Some(state.selected()),
+            NOUNS[current],
+        )
     } else {
         Vec::new()
     };
@@ -261,7 +272,6 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-
     /// The frame as the screen reads it, trailing blanks trimmed.
     fn frame(state: &State, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
@@ -314,11 +324,17 @@ mod tests {
         state.set_view(View::Settings);
         let rows = state.rows().len();
         let roomy = frame(&state, 100, rows as u16 + 3);
-        assert!(roomy.contains("\u{250c}SETTINGS"), "boxed while it fits:\n{roomy}");
+        assert!(
+            roomy.contains("\u{250c}SETTINGS"),
+            "boxed while it fits:\n{roomy}"
+        );
 
         let short = frame(&state, 100, 6);
         assert!(short.contains("SETTINGS \u{2500}"), "ruled:\n{short}");
-        assert!(short.contains("more settings"), "the cut is counted:\n{short}");
+        assert!(
+            short.contains("more settings"),
+            "the cut is counted:\n{short}"
+        );
     }
 
     /// A click names the row drawn where it lands, not one counted from
@@ -337,7 +353,10 @@ mod tests {
         let first = drawn.rows.first().cloned().expect("a row was drawn");
         assert!(first.entry > 0, "the list scrolled: {:?}", drawn.rows);
         let at = first.area.as_position();
-        assert_eq!(crate::tui::chrome::entry_at(&drawn.rows, at), Some(first.entry));
+        assert_eq!(
+            crate::tui::chrome::entry_at(&drawn.rows, at),
+            Some(first.entry)
+        );
     }
 
     /// The page's keys are in its overlay, every key it takes named there,
@@ -347,7 +366,11 @@ mod tests {
         use crossterm::event::KeyCode;
         for key in ['e', ' ', '1', '2', 'h', 'j', 'k', 'l'] {
             assert!(super::super::owns_key(KeyCode::Char(key)));
-            let token = if key == ' ' { "space".to_owned() } else { key.to_string() };
+            let token = if key == ' ' {
+                "space".to_owned()
+            } else {
+                key.to_string()
+            };
             assert!(
                 super::KEYS
                     .iter()
@@ -370,7 +393,10 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("KEYS") && text.contains("switch view"), "{text}");
+        assert!(
+            text.contains("KEYS") && text.contains("switch view"),
+            "{text}"
+        );
     }
 
     /// A refused value is said under the header, with the page still

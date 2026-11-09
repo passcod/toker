@@ -82,7 +82,11 @@ impl Page {
 
     /// Draw the page, with its key overlay over it when `overlay` is set,
     /// and return where the header's chips landed.
-    pub(super) fn render(&self, frame: &mut ratatui::Frame, overlay: bool) -> crate::tui::chrome::Header {
+    pub(super) fn render(
+        &self,
+        frame: &mut ratatui::Frame,
+        overlay: bool,
+    ) -> crate::tui::chrome::Header {
         let drawn = view::render(frame, &self.state, overlay);
         let header = drawn.header;
         self.drawn.replace(drawn);
