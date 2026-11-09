@@ -1,12 +1,11 @@
 ---
 source: src/tui/routing/view.rs
+assertion_line: 821
 expression: "frame(&page_in(super::View::Presentations))"
 ---
- ?  ⇄
-1 PRESENTATIONS  2 ROUTES, CANDIDATES & DEFAULTS  3 REWRITES, FAMILIES, UPGRADES & COMPACTION  4 PREVIEW, REVISIONS & AC
-
+ ? ⇄ 1 presentations  2  3  4                                                                                    draft 4
 ┌PRESENTATIONS───────────────────────────────────┐┌DETAIL──────────────────────────────────────────────────────────────┐
-│mixed  {"id":"p-mixed","slug":"mixed","label":"M││draft generation 4                                                  │
+│mixed  {"id":"p-mixed","slug":"mixed","label":"…││draft generation 4                                                  │
 │                                                ││mixed  Mixed                                                        │
 │                                                ││scope: openai_responses                                             │
 │                                                ││source: virtual, routes through mixed                               │
@@ -32,5 +31,7 @@ expression: "frame(&page_in(super::View::Presentations))"
 │                                                ││                                                                    │
 │                                                ││                                                                    │
 │                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
 └────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘
-draft 4 · ←/→ or 1–4 view · ↑/↓ select · n new · e edit · d remove · v preview · V validate · a activate · p promote · r

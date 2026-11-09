@@ -133,10 +133,17 @@ impl Page {
         }
     }
 
-    pub(super) fn render(&self, frame: &mut ratatui::Frame, legend: bool) -> view::Drawn {
-        let drawn = view::render(frame, &self.state, legend);
-        self.drawn.replace(drawn.clone());
-        drawn
+    /// Draw the page, with its key overlay over it when `overlay` is set,
+    /// and return where the header's chips landed.
+    pub(super) fn render(
+        &self,
+        frame: &mut ratatui::Frame,
+        overlay: bool,
+    ) -> crate::tui::chrome::Header {
+        let drawn = view::render(frame, &self.state, overlay);
+        let header = drawn.header;
+        self.drawn.replace(drawn);
+        header
     }
 
     /// A left click in the body: focus the form field under it, or select
@@ -154,10 +161,10 @@ impl Page {
         if self.state.modal().active() {
             return;
         }
-        // Inside the list's border: one row down from its top edge.
-        if drawn.entries.contains(at) && at.y > drawn.entries.y {
-            self.state
-                .select(drawn.entries_offset + usize::from(at.y - drawn.entries.y - 1));
+        if let Some(tab) = drawn.tabs.iter().position(|tab| tab.contains(at)) {
+            self.set_view(tab);
+        } else if let Some(entry) = crate::tui::chrome::entry_at(&drawn.rows, at) {
+            self.state.select(entry);
         }
     }
 

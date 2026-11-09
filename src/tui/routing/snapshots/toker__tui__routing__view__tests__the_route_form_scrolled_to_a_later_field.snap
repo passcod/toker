@@ -1,22 +1,23 @@
 ---
 source: src/tui/routing/view.rs
+assertion_line: 935
 expression: frame(&state)
 ---
- ?  ⇄
-1 PRE┌EDIT ROUTE──────────────────────────────────────────────────────────────────────────────────────────────────┐ & AC
-     │        [ ] images                                                                                          │
-┌ROUT│        [ ] tools                                                                                           │────┐
-│mixe│        [ ] tool choice none                                                                                │    │
-│defa│        [ ] tool choice named                                                                               │    │
+ ? ⇄ 1  2 routes, candidates & defaults  3  4                                                                    draft 4
+┌ROUT┌EDIT ROUTE──────────────────────────────────────────────────────────────────────────────────────────────────┐────┐
+│mixe│        [ ] images                                                                                          │    │
+│defa│        [ ] tools                                                                                           │    │
+│    │        [ ] tool choice none                                                                                │    │
+│    │        [ ] tool choice named                                                                               │    │
 │    │        [ ] tool choice unnamed                                                                             │    │
 │    │        [ ] tool choice other                                                                               │    │
 │    │      [x] enabled                                                                                           │    │
 │    │      HEALTH CIRCUITS                                                                                       │    │
 │    │        + add health circuit                                                                                │    │
 │    │    FALLBACK FROM CANDIDATE 1 TO 2                                                                          │    │
-│    │      fallback before send: < enabled >                                                                     │    │
+│    │      fallback before send: < enabled >                                                                     │s   │
 │    │      FALLBACK AFTER SEND ON                                                                                │    │
-│    │        [ ] authentication                                                                                  │s   │
+│    │        [ ] authentication                                                                                  │    │
 │    │>       [ ] model not found                                                                                 │    │
 │    │        [x] rate limit                                                                                      │    │
 │    │        [ ] provider quota                                                                                  │    │
@@ -30,7 +31,7 @@ expression: frame(&state)
 │    │    candidate 2 billed                                                                                      │    │
 │    │      id: billed                                                                                            │    │
 │    │      binding: openrouter.openrouter_responses                                                              │    │
-│    │Up/Down field · Left/Right change · Tab complete · Ctrl+S saves · Esc cancels                               │    │
+│    │↑/↓ field · ←/→ change · tab complete · ctrl+s save · esc cancel                                            │    │
 │    │                                                                                                            │    │
-└────└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘────┘
-draft 4 · ←/→ or 1–4 view · ↑/↓ select · n new · e edit · d remove · v preview · V validate · a activate · p promote · r
+│    └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
+└────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘

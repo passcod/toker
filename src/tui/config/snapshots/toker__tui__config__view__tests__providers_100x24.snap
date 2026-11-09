@@ -1,9 +1,9 @@
 ---
 source: src/tui/config/view.rs
-assertion_line: 258
+assertion_line: 288
 expression: "frame(&loaded(), 100, 24)"
 ---
- 1 providers   2 settings
+ ? ⇄ 1 providers  2 settings
 ┌PROVIDERS─────────────────────────────────────────────────────────────────────────────────────────┐
 │anthropic_sub    on                                                                               │
 │    endpoint           (the built-in one)                                                         │
@@ -24,5 +24,6 @@ expression: "frame(&loaded(), 100, 24)"
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
-  space toggles  e edits  1/2 switches  q quits

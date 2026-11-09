@@ -1,9 +1,9 @@
 ---
 source: src/tui/config/view.rs
-assertion_line: 265
+assertion_line: 295
 expression: "frame(&state, 100, 24)"
 ---
- 1 providers   2 settings
+ ? ⇄ 1 providers  2 settings
 ┌SETTINGS──────────────────────────────────────────────────────────────────────────────────────────┐
 │quota gate             on (default)                                                               │
 │cold gate              off                                                                        │
@@ -24,5 +24,6 @@ expression: "frame(&state, 100, 24)"
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
-  space toggles  e edits  1/2 switches  q quits

@@ -1,14 +1,15 @@
 ---
 source: src/tui/routing/view.rs
+assertion_line: 950
 expression: "frame(&adding(super::View::Rewrites, '1'))"
 ---
- ?  ⇄
-1 PRE┌ADD REWRITE─────────────────────────────────────────────────────────────────────────────────────────────────┐ & AC
-     │> id: new-rewrite▏                                                                                          │
-┌REWR│  SCOPE                                                                                                     │────┐
-│r-so│    kind: < protocol >                                                                                      │    │
-│gpt-│    protocol: < openai_chat >                                                                               │    │
-│newe│  priority: 0                                                                                               │    │
+ ? ⇄ 1  2  3 rewrites, families, upgrades & compaction  4                                                        draft 4
+┌REWR┌ADD REWRITE─────────────────────────────────────────────────────────────────────────────────────────────────┐────┐
+│r-so│> id: new-rewrite▏                                                                                          │    │
+│gpt-│  SCOPE                                                                                                     │    │
+│newe│    kind: < protocol >                                                                                      │    │
+│    │    protocol: < openai_chat >                                                                               │    │
+│    │  priority: 0                                                                                               │    │
 │    │  MATCHES                                                                                                   │    │
 │    │    kind: < exact >                                                                                         │    │
 │    │    value: model-name                                                                                       │    │
@@ -30,7 +31,7 @@ expression: "frame(&adding(super::View::Rewrites, '1'))"
 │    │                                                                                                            │    │
 │    │                                                                                                            │    │
 │    │                                                                                                            │    │
-│    │Up/Down field · Left/Right change · Tab complete · Ctrl+S saves · Esc cancels                               │    │
+│    │↑/↓ field · ←/→ change · tab complete · ctrl+s save · esc cancel                                            │    │
 │    │                                                                                                            │    │
-└────└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘────┘
-draft 4 · ←/→ or 1–4 view · ↑/↓ select · n new · e edit · d remove · v preview · V validate · a activate · p promote · r
+│    └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
+└────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘

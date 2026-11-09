@@ -1,18 +1,17 @@
 ---
 source: src/tui/routing/view.rs
+assertion_line: 848
 expression: frame(&state)
 ---
- ?  ⇄
-1 PRESENTATIONS  2 ROUTES, CANDIDATES & DEFAULTS  3 REWRITES, FAMILIES, UPGRADES & COMPACTION  4 PREVIEW, REVISIONS & AC
-
+ ? ⇄ 1  2  3  4 preview, revisions & activation                                                                  draft 4
 ┌PREVIEW, REVISIONS & ACTIVATION─────────────────┐┌DETAIL──────────────────────────────────────────────────────────────┐
 │3  {"revision_id":3,"policy":{}}                ││draft generation 4                                                  │
-│draft  {"policy":{"description":"example draft",││codex_sub.codex_responses  codex_sub                                │
-│dynamic_responses_models  {"adapter":"dynamic_re││cost class: subscription                                            │
-│codex_sub.codex_responses  {"binding_id":"codex_││configured: yes (configured)                                        │
-│openrouter.openrouter_responses  {"binding_id":"││enabled: yes (enabled)                                              │
-│lane_impacts  {"total":4,"unpinned":1,"warm":2,"││credential: unknown                                                 │
-│diagnostic  {"code":"virtual-presentation-unlist││catalogue: fresh                                                    │
+│draft  {"policy":{"description":"example draft"…││codex_sub.codex_responses  codex_sub                                │
+│dynamic_responses_models  {"adapter":"dynamic_r…││cost class: subscription                                            │
+│codex_sub.codex_responses  {"binding_id":"codex…││configured: yes (configured)                                        │
+│openrouter.openrouter_responses  {"binding_id":…││enabled: yes (enabled)                                              │
+│lane_impacts  {"total":4,"unpinned":1,"warm":2,…││credential: unknown                                                 │
+│diagnostic  {"code":"virtual-presentation-unlis…││catalogue: fresh                                                    │
 │                                                ││                                                                    │
 │                                                ││CAPABILITIES                                                        │
 │                                                ││  sampling: supported                                               │
@@ -32,5 +31,7 @@ expression: frame(&state)
 │                                                ││                                                                    │
 │                                                ││                                                                    │
 │                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
 └────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘
-draft 4 · ←/→ or 1–4 view · ↑/↓ select · n new · e edit · d remove · v preview · V validate · a activate · p promote · r

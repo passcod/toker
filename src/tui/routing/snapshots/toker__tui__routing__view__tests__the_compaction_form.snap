@@ -1,14 +1,15 @@
 ---
 source: src/tui/routing/view.rs
+assertion_line: 965
 expression: "frame(&adding(super::View::Rewrites, '4'))"
 ---
- ?  ⇄
-1 PRE┌ADD COMPACTION──────────────────────────────────────────────────────────────────────────────────────────────┐ & AC
-     │  ROUTE                                                                                                     │
-┌REWR│>   route: mixed▏                                                                                           │────┐
-│r-so│    Tab: mixed                                                                                              │    │
-│gpt-│    ARGUMENTS                                                                                               │    │
-│newe│      + add argument                                                                                        │    │
+ ? ⇄ 1  2  3 rewrites, families, upgrades & compaction  4                                                        draft 4
+┌REWR┌ADD COMPACTION──────────────────────────────────────────────────────────────────────────────────────────────┐────┐
+│r-so│  ROUTE                                                                                                     │    │
+│gpt-│>   route: mixed▏                                                                                           │    │
+│newe│    Tab: mixed                                                                                              │    │
+│    │    ARGUMENTS                                                                                               │    │
+│    │      + add argument                                                                                        │    │
 │    │  lane transition: < move_when_cold >                                                                       │    │
 │    │  cache transition: < allow_when_cold >                                                                     │    │
 │    │                                                                                                            │    │
@@ -30,7 +31,7 @@ expression: "frame(&adding(super::View::Rewrites, '4'))"
 │    │                                                                                                            │    │
 │    │                                                                                                            │    │
 │    │                                                                                                            │    │
-│    │Up/Down field · Left/Right change · Tab complete · Ctrl+S saves · Esc cancels                               │    │
+│    │↑/↓ field · ←/→ change · tab complete · ctrl+s save · esc cancel                                            │    │
 │    │                                                                                                            │    │
-└────└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘────┘
-draft 4 · ←/→ or 1–4 view · ↑/↓ select · n new · e edit · d remove · v preview · V validate · a activate · p promote · r
+│    └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
+└────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘

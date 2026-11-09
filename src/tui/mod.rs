@@ -42,6 +42,7 @@
 //! explicit "no … data" / `?` strings, never as zero.
 
 mod accounts;
+mod chrome;
 mod config;
 pub(crate) mod control;
 mod detail;
@@ -167,13 +168,16 @@ pub fn run(
     // grouped counts follow it; nothing model-visible does.
     let mut ui = view::Ui {
         fmt: locale::Fmt::from_env(),
-        no_color: view::no_color(std::env::var_os("NO_COLOR")),
         legend: false,
         scroll: view::Scroll::default(),
         gate_armed: gates.quota_enabled,
         detail: None,
     };
+    // `NO_COLOR`, read once and applied to whichever page draws.
+    let no_color = chrome::no_color(std::env::var_os("NO_COLOR"));
     let mut drawn = view::Drawn::default();
+    // The chips of the page last drawn, for the mouse.
+    let mut header = chrome::Header::default();
     let mut page = Page::Dashboard;
     let mut routing = routing::Page::new(port, settings);
     let mut config = config::Page::new(port);
@@ -260,17 +264,19 @@ pub fn run(
         }
         routing.poll();
         config.poll();
-        terminal.draw(|frame| match page {
-            Page::Dashboard => {
-                drawn = view::render(frame, &snapshot, &clock(&ui.fmt), &tz, &ui);
+        terminal.draw(|frame| {
+            header = match page {
+                Page::Dashboard => {
+                    drawn = view::render(frame, &snapshot, &clock(&ui.fmt), &tz, &ui);
+                    drawn.header
+                }
+                Page::Routing => routing.render(frame, ui.legend),
+                Page::Config => config.render(frame, ui.legend),
+                Page::Accounts => accounts.render(frame, snapshot.now_ms, ui.legend),
+            };
+            if no_color {
+                chrome::strip_colour(frame);
             }
-            Page::Routing => {
-                let routing_drawn = routing.render(frame, ui.legend);
-                drawn.legend_button = routing_drawn.legend_button;
-                drawn.routing_button = routing_drawn.routing_button;
-            }
-            Page::Config => config.render(frame),
-            Page::Accounts => accounts.render(frame, snapshot.now_ms),
         })?;
         // The list may have shrunk under its offset since the last
         // frame: hold the offset at what the frame could show.
@@ -299,6 +305,43 @@ pub fn run(
         // click opens a session's detail, or acts in the open one.
         if let crossterm::event::Event::Mouse(mouse) = event {
             let at = ratatui::layout::Position::new(mouse.column, mouse.row);
+            let left = mouse.kind
+                == crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left);
+            // The chips act on every page, but not under a modal or an
+            // entry, which takes every key and so every click on the
+            // page's own controls.
+            let modal = match page {
+                Page::Dashboard => false,
+                Page::Routing => routing.modal_active(),
+                Page::Config => config.editing(),
+                Page::Accounts => accounts.naming(),
+            };
+            if left && !modal && header.keys.contains(at) {
+                toggle_legend(&mut ui);
+                continue;
+            }
+            if left && !modal && header.switch.contains(at) {
+                page = next_page(
+                    page,
+                    &mut ui,
+                    &mut routing,
+                    &mut config,
+                    &mut accounts,
+                    &store,
+                );
+                continue;
+            }
+            if page == Page::Accounts {
+                match mouse.kind {
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                        accounts.click(at)
+                    }
+                    crossterm::event::MouseEventKind::ScrollDown => accounts.move_selection(1),
+                    crossterm::event::MouseEventKind::ScrollUp => accounts.move_selection(-1),
+                    _ => {}
+                }
+                continue;
+            }
             if page == Page::Config {
                 match mouse.kind {
                     crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
@@ -311,19 +354,11 @@ pub fn run(
                 continue;
             }
             if page == Page::Routing {
-                // Both header actions remain available on both pages; the
-                // body takes clicks and the wheel for the list, the detail
-                // pane and an open form.
+                // The body takes clicks and the wheel for the tabs, the
+                // list, the detail pane and an open form.
                 match mouse.kind {
                     crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                        if drawn.legend_button.contains(at) {
-                            toggle_legend(&mut ui);
-                        } else if drawn.routing_button.contains(at) {
-                            page = Page::Dashboard;
-                            ui.legend = false;
-                        } else {
-                            routing.click(at);
-                        }
+                        routing.click(at)
                     }
                     crossterm::event::MouseEventKind::ScrollDown => routing.wheel(at, 1),
                     crossterm::event::MouseEventKind::ScrollUp => routing.wheel(at, -1),
@@ -331,19 +366,7 @@ pub fn run(
                 }
                 continue;
             }
-            if mouse.kind
-                == crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
-            {
-                if drawn.legend_button.contains(at) {
-                    toggle_legend(&mut ui);
-                    continue;
-                }
-                if drawn.routing_button.contains(at) {
-                    page = Page::Routing;
-                    ui.legend = false;
-                    routing.refresh();
-                    continue;
-                }
+            if left {
                 match (&mut ui.detail, &drawn.popup) {
                     (Some(popup), Some(drawn_popup)) => match drawn_popup.control_at(at) {
                         Some(control) => {
@@ -417,28 +440,14 @@ pub fn run(
             }
             match key.code {
                 crossterm::event::KeyCode::Tab => {
-                    page = match page {
-                        Page::Dashboard => {
-                            ui.detail = None;
-                            ui.legend = false;
-                            routing.refresh();
-                            Page::Routing
-                        }
-                        Page::Routing => {
-                            ui.legend = false;
-                            config.refresh();
-                            Page::Config
-                        }
-                        Page::Config => {
-                            ui.legend = false;
-                            accounts.refresh(&store);
-                            Page::Accounts
-                        }
-                        Page::Accounts => {
-                            ui.legend = false;
-                            Page::Dashboard
-                        }
-                    };
+                    page = next_page(
+                        page,
+                        &mut ui,
+                        &mut routing,
+                        &mut config,
+                        &mut accounts,
+                        &store,
+                    );
                 }
                 crossterm::event::KeyCode::Char('?') => toggle_legend(&mut ui),
                 crossterm::event::KeyCode::Esc if ui.legend => ui.legend = false,
@@ -456,14 +465,16 @@ pub fn run(
                 crossterm::event::KeyCode::Char('r') if page == Page::Accounts => {
                     accounts.refresh(&store)
                 }
-                crossterm::event::KeyCode::Up if page == Page::Accounts => {
+                crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k')
+                    if page == Page::Accounts =>
+                {
                     accounts.move_selection(-1)
                 }
-                crossterm::event::KeyCode::Down if page == Page::Accounts => {
+                crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j')
+                    if page == Page::Accounts =>
+                {
                     accounts.move_selection(1)
                 }
-                crossterm::event::KeyCode::Up if page == Page::Config => config.move_selection(-1),
-                crossterm::event::KeyCode::Down if page == Page::Config => config.move_selection(1),
                 code if page == Page::Config && config::owns_key(code) => {
                     config.key(key);
                 }
@@ -570,6 +581,35 @@ pub fn run(
         )));
     }
     Ok(())
+}
+
+/// The page after `page`, the way `Tab` and the `⇄` chip both go: the
+/// overlay closes, and the page arrived at re-reads what it shows.
+fn next_page(
+    page: Page,
+    ui: &mut view::Ui,
+    routing: &mut routing::Page,
+    config: &mut config::Page,
+    accounts: &mut accounts::Page,
+    store: &Store,
+) -> Page {
+    ui.legend = false;
+    match page {
+        Page::Dashboard => {
+            ui.detail = None;
+            routing.refresh();
+            Page::Routing
+        }
+        Page::Routing => {
+            config.refresh();
+            Page::Config
+        }
+        Page::Config => {
+            accounts.refresh(store);
+            Page::Accounts
+        }
+        Page::Accounts => Page::Dashboard,
+    }
 }
 
 /// Open or close the legend, always dismissing the mutually exclusive

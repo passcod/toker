@@ -9,10 +9,10 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+
+use super::chrome::{self, Chrome, Noun, RowHit};
 
 use crate::store::{Account, AccountIdentity, AccountNameSource, CredentialAccount, Store};
 
@@ -53,6 +53,8 @@ pub(super) struct Page {
     naming: Option<String>,
     /// What went wrong with the last write, said rather than swallowed.
     error: Option<String>,
+    /// Where the last frame put each entry's rows, for the mouse.
+    rows: std::cell::RefCell<Vec<RowHit>>,
 }
 
 impl Page {
@@ -63,6 +65,7 @@ impl Page {
             attributed: std::collections::BTreeMap::new(),
             naming: None,
             error: None,
+            rows: Default::default(),
         };
         page.refresh(store);
         page
@@ -114,6 +117,11 @@ impl Page {
         }
         let last = self.entries.len() - 1;
         self.selected = self.selected.saturating_add_signed(delta).min(last);
+    }
+
+    /// Whether the naming entry is open, taking every key.
+    pub(super) fn naming(&self) -> bool {
+        self.naming.is_some()
     }
 
     /// Handle a key. Returns true while the naming entry has it, so the
@@ -185,43 +193,55 @@ impl Page {
         }
     }
 
-    pub(super) fn render(&self, frame: &mut Frame, now_ms: i64) {
-        let area = frame.area();
-        let [body, footer] =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
-        let block = Block::bordered().title_top("ACCOUNTS");
-        let inner = block.inner(body);
-        frame.render_widget(block, body);
-        frame.render_widget(Paragraph::new(self.lines(inner, now_ms)), inner);
-        frame.render_widget(Paragraph::new(self.footer()), footer);
+    /// Draw the page, with its key overlay over it when `overlay` is set,
+    /// and return where the header's chips landed.
+    pub(super) fn render(&self, frame: &mut Frame, now_ms: i64, overlay: bool) -> chrome::Header {
+        // A failed read or write says so over the last list read, which
+        // stays standing: an empty page would read as "no accounts".
+        let (header, body) = chrome::page(frame, self.error.as_deref());
+        let width = usize::from(body.width.saturating_sub(2));
+        let entries: Vec<Vec<Line<'static>>> = if self.entries.is_empty() {
+            vec![vec![Line::styled(
+                "no account has served yet",
+                Style::new().dim(),
+            )]]
+        } else {
+            self.entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    self.entry_lines(entry, index == self.selected, width, now_ms)
+                })
+                .collect()
+        };
+        let need = entries.iter().map(Vec::len).sum();
+        let inner = chrome::panel(frame, body, "ACCOUNTS", Chrome::fitting(need, body.height));
+        let selected = (!self.entries.is_empty()).then_some(self.selected);
+        let rows = chrome::list(frame, inner, entries, selected, NOUN);
+        self.rows
+            .replace(if selected.is_some() { rows } else { Vec::new() });
+        chrome::chips(frame, &header);
+        if overlay {
+            chrome::overlay(
+                frame,
+                "KEYS",
+                &[chrome::Section {
+                    heading: None,
+                    rows: &KEYS,
+                }],
+            );
+        }
+        header
     }
 
-    fn lines(&self, inner: Rect, now_ms: i64) -> Vec<Line<'static>> {
-        if let Some(error) = &self.error {
-            return vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!("  {error}"),
-                    Style::new().fg(Color::Red),
-                )),
-            ];
+    /// Select the entry whose row holds `at`, if any.
+    pub(super) fn click(&mut self, at: ratatui::layout::Position) {
+        if self.naming.is_some() {
+            return;
         }
-        if self.entries.is_empty() {
-            return vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  no account has served yet",
-                    Style::new().dim(),
-                )),
-            ];
+        if let Some(entry) = chrome::entry_at(&self.rows.borrow(), at) {
+            self.selected = entry;
         }
-        let width = inner.width as usize;
-        let mut lines = Vec::new();
-        for (index, entry) in self.entries.iter().enumerate() {
-            let selected = index == self.selected;
-            lines.extend(self.entry_lines(entry, selected, width, now_ms));
-        }
-        lines
     }
 
     fn entry_lines(
@@ -256,18 +276,13 @@ impl Page {
         };
         let seen = format!("last seen {}", ago(now_ms - entry.last_seen_ms()));
         let head_used = mark.width() + 2 + name.width() + seen.width();
-        let mut head = vec![
+        let head = vec![
             Span::styled(mark, mark_style),
             Span::raw("  "),
             Span::styled(name, name_style),
             Span::raw(" ".repeat(width.saturating_sub(head_used))),
             Span::styled(seen, Style::new().dim()),
         ];
-        if selected {
-            for span in &mut head {
-                span.style = span.style.add_modifier(Modifier::REVERSED);
-            }
-        }
 
         let field = |label: &str, value: Vec<Span<'static>>| -> Line<'static> {
             let mut spans = vec![Span::raw(format!("    {label:<19}"))];
@@ -315,6 +330,8 @@ impl Page {
                 ));
             }
         }
+        // The entry takes every key, `?` included, so it says them itself
+        // rather than leaving them to the overlay.
         if selected && let Some(typed) = &self.naming {
             lines.push(field(
                 "name it",
@@ -323,19 +340,33 @@ impl Page {
                     Span::styled("▏", Style::new().fg(Color::Cyan)),
                 ],
             ));
+            lines.push(field(
+                "",
+                vec![Span::styled(
+                    chrome::hints(&[("enter", "save"), ("esc", "cancel")]),
+                    Style::new().dim(),
+                )],
+            ));
         }
         lines
     }
-
-    fn footer(&self) -> Line<'static> {
-        let hint = if self.naming.is_some() {
-            "  enter saves   esc cancels"
-        } else {
-            "  n names an account   ↑/↓ selects   q quits"
-        };
-        Line::from(Span::styled(hint.to_owned(), Style::new().dim()))
-    }
 }
+
+/// What the counts call the entries they leave out.
+const NOUN: Noun = Noun {
+    one: "account",
+    many: "accounts",
+};
+
+/// The page's keys, in its `?` overlay.
+const KEYS: [(&str, &str); 6] = [
+    ("↑/↓ j/k", "select"),
+    ("n", "name the selected account"),
+    ("r", "refresh"),
+    ("esc", "back to the dashboard"),
+    ("tab or ⇄", "next page"),
+    ("q", "quit"),
+];
 
 /// A rough age, the way every other elapsed figure on the dashboard
 /// reads: the largest unit that still carries a whole number.
@@ -377,7 +408,9 @@ mod tests {
     fn rendered(page: &Page, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
         terminal
-            .draw(|frame| page.render(frame, NOW))
+            .draw(|frame| {
+                page.render(frame, NOW, false);
+            })
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let mut text = String::new();
@@ -414,7 +447,73 @@ mod tests {
         // assigned when an account becomes known.
         assert!(text.contains("not resolved"), "{text}");
         assert!(text.contains("?  "), "{text}");
-        assert!(text.contains("n names an account"), "{text}");
+        assert!(
+            !text.contains("n names"),
+            "no page carries a footer: {text}"
+        );
+    }
+
+    /// The page's keys are in its overlay rather than a footer
+    /// (spec: UTUI#finding-the-keys).
+    #[test]
+    fn the_overlay_names_the_page_keys() {
+        let store = store();
+        observe(&store, "ana-token", Some("ana@example.net"), NOW - 120_000);
+        let page = Page::new(&store);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                page.render(frame, NOW, true);
+            })
+            .expect("draw");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("KEYS"), "{text}");
+        assert!(text.contains("name the selected account"), "{text}");
+        assert!(text.contains("? or esc close"), "{text}");
+    }
+
+    /// Too short for every entry in full, the others shed to their head
+    /// line while the selected one keeps its fields, and a click lands on
+    /// the entry drawn where it falls (spec: UTUI#what-is-shed-first).
+    #[test]
+    fn a_short_page_sheds_the_other_entries_to_their_head_line() {
+        let store = store();
+        for (index, email) in ["ana", "ben", "cal", "dee", "eve"].iter().enumerate() {
+            observe(
+                &store,
+                &format!("{email}-token"),
+                Some(&format!("{email}@example.net")),
+                NOW - (index as i64 + 1) * 60_000,
+            );
+        }
+        let mut page = Page::new(&store);
+        page.move_selection(4);
+        let text = rendered(&page, 80, 7);
+        assert!(text.contains("ACCOUNTS ─"), "ruled, not boxed: {text}");
+        assert_eq!(
+            text.matches("provider").count(),
+            1,
+            "only the selected entry keeps its fields: {text}"
+        );
+        assert!(text.contains("above"), "the cut is counted: {text}");
+
+        // The first row drawn is not the first entry once the list has
+        // scrolled to the selection, so a click there names what it shows.
+        let first = page
+            .rows
+            .borrow()
+            .first()
+            .cloned()
+            .expect("a row was drawn");
+        assert!(first.entry > 0, "{:?}", page.rows.borrow());
+        page.click(first.area.as_position());
+        assert_eq!(page.selected, first.entry);
     }
 
     #[test]

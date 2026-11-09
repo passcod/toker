@@ -4,25 +4,25 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    text::Line,
+    widgets::{Block, Clear, Paragraph, Wrap},
 };
 use serde_json::Value;
 
 use super::form::Form;
 use super::model::{Entry, Modal, State, View};
 use super::template::singular;
+use crate::tui::chrome::{self, Chrome, Noun, RowHit};
 
 /// The page areas that the loop needs for click handling.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Drawn {
-    pub(crate) legend_button: Rect,
-    pub(crate) routing_button: Rect,
-    pub(super) tabs: Rect,
+    pub(crate) header: chrome::Header,
+    pub(super) tabs: Vec<Rect>,
+    /// Where each entry's row landed.
+    pub(super) rows: Vec<RowHit>,
     pub(super) entries: Rect,
     pub(super) detail: Rect,
-    /// How many entries are scrolled off the top of the list.
-    pub(super) entries_offset: usize,
     /// Where an open form's fields are, for clicks.
     pub(super) form: Option<FormHit>,
 }
@@ -34,69 +34,103 @@ pub(super) struct FormHit {
     pub(super) rows: Vec<Option<usize>>,
 }
 
-pub(super) fn render(frame: &mut Frame, state: &State, legend: bool) -> Drawn {
-    let area = frame.area();
-    let (legend_button, routing_button, content) = header_actions(area);
-    let [tabs, body, footer] = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .areas(content);
-    render_header_actions(frame, legend_button, routing_button);
-    frame.render_widget(Paragraph::new(StateTabs::line(state)), tabs);
+/// Below this width the list and the detail pane stack rather than sit
+/// side by side, where each would be too narrow to read.
+const SIDE_BY_SIDE_MIN_WIDTH: u16 = 100;
 
-    let [master, detail] =
-        Layout::horizontal([Constraint::Percentage(42), Constraint::Fill(1)]).areas(body);
+/// What the list's counts call the entries they leave out.
+const NOUN: Noun = Noun {
+    one: "record",
+    many: "records",
+};
+
+pub(super) fn render(frame: &mut Frame, state: &State, overlay: bool) -> Drawn {
+    // A refusal or a failed read is said over the page, which stays
+    // usable read-only on the snapshot it last loaded.
+    let (header, body) = chrome::page(frame, state.error());
+    let labels = View::ALL.map(View::tab);
+    let current = View::ALL
+        .iter()
+        .position(|view| *view == state.view())
+        .unwrap_or(0);
+    let tabs_min = chrome::tabs_min_width(&labels, current);
+    let tabs_area = chrome::status(frame, header.rest, tabs_min, &status_text(state));
+    let tabs = chrome::tabs(frame, tabs_area, &labels, current);
+
     let entries = state.entries();
-    let rows: Vec<ListItem> = if entries.is_empty() {
-        vec![ListItem::new("no routing data yet")]
+    let list: Vec<Vec<Line<'static>>> = if entries.is_empty() {
+        vec![vec![Line::raw("no routing data yet")]]
     } else {
         entries
             .iter()
-            .enumerate()
-            .map(|(index, entry)| ListItem::new(entry_summary(entry)).style(selected(index, state)))
+            .map(|entry| vec![Line::raw(entry_summary(entry))])
             .collect()
     };
-    // The list scrolls to keep the selection in sight; the offset is kept
-    // so a click can name the entry it lands on.
-    let mut list_state = ListState::default().with_selected(Some(state.selected()));
-    frame.render_stateful_widget(
-        List::new(rows).block(Block::bordered().title(state.view().title())),
-        master,
-        &mut list_state,
-    );
-
     let lines = detail_lines(state, entries.get(state.selected()));
-    // `Paragraph` does not report its wrapped height, so estimate it: a line
-    // wider than the pane takes its ceiling in rows, plus one for the word
-    // wrap that can push a word onto the next row. Over-counting only lets
-    // the pane scroll a row past the end.
-    let width = usize::from(detail.width.saturating_sub(2).max(1));
-    let wrapped: usize = lines
-        .iter()
-        .map(|line| match line.width() {
-            columns if columns <= width => 1,
-            columns => columns.div_ceil(width) + 1,
-        })
-        .sum();
+
+    let stacked = body.width < SIDE_BY_SIDE_MIN_WIDTH;
+    let (master, detail) = if stacked {
+        // The list takes what it needs, up to a third of the body; the
+        // detail pane the rest.
+        let list_rows = (list.len() as u16 + Chrome::Boxed.cost())
+            .min(body.height / 3)
+            .max(Chrome::Boxed.cost() + 1)
+            .min(body.height);
+        let [master, detail] =
+            Layout::vertical([Constraint::Length(list_rows), Constraint::Fill(1)]).areas(body);
+        (master, detail)
+    } else {
+        let [master, detail] =
+            Layout::horizontal([Constraint::Percentage(42), Constraint::Fill(1)]).areas(body);
+        (master, detail)
+    };
+    // One framing for both panes, boxed only while neither loses content
+    // to its border (spec: UTUI#what-is-shed-first).
+    let detail_need = wrapped_rows(&lines, detail.width.saturating_sub(2));
+    let chrome = if Chrome::fitting(list.len(), master.height) == Chrome::Boxed
+        && Chrome::fitting(detail_need, detail.height) == Chrome::Boxed
+    {
+        Chrome::Boxed
+    } else {
+        Chrome::Ruled
+    };
+
+    let inner = chrome::panel(frame, master, state.view().title(), chrome);
+    let selected = (!entries.is_empty()).then_some(state.selected());
+    let rows = chrome::list(frame, inner, list, selected, NOUN);
+    let rows = if selected.is_some() { rows } else { Vec::new() };
+
+    let inner = chrome::panel(frame, detail, "DETAIL", chrome);
+    // Re-measured at the width the pane really has, which the ruled form
+    // shares with the boxed one.
+    let wrapped = wrapped_rows(&lines, inner.width);
     let furthest = u16::try_from(wrapped)
         .unwrap_or(u16::MAX)
-        .saturating_sub(detail.height.saturating_sub(2));
+        .saturating_sub(inner.height);
     state.set_detail_furthest(furthest);
-    let pane = Paragraph::new(lines)
-        .block(Block::bordered().title("DETAIL"))
-        .wrap(Wrap { trim: false });
     frame.render_widget(
-        pane.scroll((state.detail_scroll().min(furthest), 0)),
-        detail,
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((state.detail_scroll().min(furthest), 0)),
+        inner,
     );
-    frame.render_widget(
-        Paragraph::new(footer_text(state)).style(Style::new().dim()),
-        footer,
-    );
-    if legend {
-        render_legend(frame);
+
+    chrome::chips(frame, &header);
+    if overlay {
+        chrome::overlay(
+            frame,
+            "KEYS",
+            &[
+                chrome::Section {
+                    heading: None,
+                    rows: &KEYS,
+                },
+                chrome::Section {
+                    heading: Some("IN A FORM"),
+                    rows: &FORM_KEYS,
+                },
+            ],
+        );
     }
     let form = if state.modal().active() {
         render_modal(frame, state)
@@ -104,80 +138,86 @@ pub(super) fn render(frame: &mut Frame, state: &State, legend: bool) -> Drawn {
         None
     };
     Drawn {
-        legend_button,
-        routing_button,
+        header,
         tabs,
+        rows,
         entries: master,
         detail,
-        entries_offset: list_state.offset(),
         form,
     }
 }
 
-fn header_actions(area: Rect) -> (Rect, Rect, Rect) {
-    let height = area.height.min(1);
-    let legend_width = area.width.min(3);
-    let routing_width = area.width.saturating_sub(legend_width).min(3);
-    let legend = Rect::new(area.x, area.y, legend_width, height);
-    let routing = Rect::new(area.x + legend_width, area.y, routing_width, height);
-    let content = Rect::new(
-        area.x,
-        area.y + height,
-        area.width,
-        area.height.saturating_sub(height),
-    );
-    (legend, routing, content)
+/// How many rows `lines` take wrapped to `width`. `Paragraph` does not
+/// report its wrapped height, so this estimates it: a line wider than the
+/// pane takes its ceiling in rows, plus one for the word wrap that can
+/// push a word onto the next row. Over-counting only lets the pane scroll
+/// a row past the end.
+fn wrapped_rows(lines: &[Line], width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    lines
+        .iter()
+        .map(|line| match line.width() {
+            columns if columns <= width => 1,
+            columns => columns.div_ceil(width) + 1,
+        })
+        .sum()
 }
 
-fn render_header_actions(frame: &mut Frame, legend: Rect, routing: Rect) {
-    frame.render_widget(
-        Paragraph::new(if legend.width >= 3 { " ? " } else { "?" })
-            .style(Style::new().add_modifier(Modifier::REVERSED)),
-        legend,
-    );
-    frame.render_widget(
-        Paragraph::new(if routing.width >= 3 { " ⇄ " } else { "⇄" })
-            .style(Style::new().add_modifier(Modifier::REVERSED)),
-        routing,
-    );
-}
-
-struct StateTabs;
-
-impl StateTabs {
-    fn line(state: &State) -> Line<'static> {
-        let mut spans = Vec::new();
-        for (index, view) in [
-            View::Presentations,
-            View::Routes,
-            View::Rewrites,
-            View::Status,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            if index > 0 {
-                spans.push(Span::raw("  "));
-            }
-            let label = format!("{} {}", index + 1, view.title());
-            let style = if view == state.view() {
-                Style::new().bold().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::new().dim()
-            };
-            spans.push(Span::styled(label, style));
-        }
-        Line::from(spans)
+/// What the page is in the middle of, at the right of its header.
+fn status_text(state: &State) -> String {
+    let mut parts = Vec::new();
+    if let Some(generation) = state.generation() {
+        parts.push(format!("draft {generation}"));
     }
+    if state.in_flight() {
+        parts.push("working".to_owned());
+    }
+    if let Some(note) = state.settings_note() {
+        parts.push(note.to_owned());
+    }
+    parts.join(" · ")
 }
 
-fn selected(index: usize, state: &State) -> Style {
-    if index == state.selected() {
-        Style::new().add_modifier(Modifier::REVERSED)
-    } else {
-        Style::new()
-    }
-}
+/// The page's keys, in its `?` overlay.
+const KEYS: [(&str, &str); 18] = [
+    ("↑/↓ j/k", "select a record"),
+    ("←/→ h/l 1–4", "switch view"),
+    ("pgup/pgdn", "scroll the detail"),
+    (
+        "n",
+        "add a record, asking which kind where a view lists several",
+    ),
+    ("e", "edit the selected record in a form"),
+    ("d", "remove the selected record"),
+    ("v", "preview a request"),
+    ("V", "validate the draft"),
+    ("a", "activate the draft"),
+    ("x", "reactivate the selected revision"),
+    ("p", "promote"),
+    (
+        "i",
+        "import toker.toml's routing into the draft, from the status view",
+    ),
+    ("r", "refresh"),
+    ("click", "select a record, or focus a form field"),
+    ("wheel", "scroll what is under the pointer"),
+    ("esc", "back to the dashboard"),
+    ("tab or ⇄", "next page"),
+    ("q", "quit"),
+];
+
+/// A form's keys. A form takes every key, `?` included, so it also says
+/// the common ones on its own last line.
+const FORM_KEYS: [(&str, &str); 8] = [
+    ("↑/↓", "move between fields"),
+    ("←/→", "change the value"),
+    ("tab", "complete"),
+    ("space", "toggle"),
+    ("alt+↑/↓", "move a list item or candidate"),
+    ("ctrl+d", "remove a list item"),
+    ("ctrl+s", "save"),
+    ("esc", "cancel"),
+];
 
 fn entry_summary(entry: &Entry<'_>) -> String {
     let value = entry.value;
@@ -214,12 +254,6 @@ fn entry_summary(entry: &Entry<'_>) -> String {
 }
 
 fn detail_lines(state: &State, selected: Option<&Entry<'_>>) -> Vec<Line<'static>> {
-    if let Some(error) = state.error() {
-        return vec![Line::styled(
-            format!("unavailable: {error}"),
-            Style::new().bold(),
-        )];
-    }
     let mut lines = match selected {
         Some(entry) => match state.snapshot() {
             Some(snapshot) => super::detail::lines(snapshot, entry),
@@ -241,21 +275,6 @@ fn detail_lines(state: &State, selected: Option<&Entry<'_>>) -> Vec<Line<'static
         );
     }
     lines
-}
-
-fn footer_text(state: &State) -> String {
-    let generation = state
-        .generation()
-        .map(|generation| format!("draft {generation} · "))
-        .unwrap_or_default();
-    let busy = if state.in_flight() { "working · " } else { "" };
-    let settings = state
-        .settings_note()
-        .map(|note| format!("{note} · "))
-        .unwrap_or_default();
-    format!(
-        "{generation}{busy}{settings}←/→ or 1–4 view · ↑/↓ select · n new · e edit · d remove · v preview · V validate · a activate · p promote · r refresh · Tab dashboard · ? help"
-    )
 }
 
 fn short(value: &Value) -> String {
@@ -369,87 +388,81 @@ fn modal_lines(modal: &Modal) -> Vec<String> {
         // A form draws itself.
         Modal::Form(_) => Vec::new(),
         Modal::NewKind { kinds, preselected } => {
-            let mut lines = vec!["Add which kind of record? The number or Enter picks it.".to_owned()];
+            let mut lines = vec!["Add which kind of record?".to_owned()];
             lines.extend(kinds.iter().enumerate().map(|(index, kind)| {
                 let mark = if index == *preselected { ">" } else { " " };
                 format!("{mark} {} {}", index + 1, singular(kind))
             }));
-            lines.push("Esc cancels".to_owned());
+            let pick = format!("1–{} or enter", kinds.len());
+            lines.push(chrome::hints(&[(&pick, "pick"), ("esc", "cancel")]));
             lines
         }
         Modal::Remove { key, value } => vec![
             format!("Remove this {key} record? This changes only the draft."),
             short(value),
-            "y/Enter confirms · n/Esc cancels".to_owned(),
+            confirm_hint(),
         ],
-        Modal::PreviewResult(result) => vec![
-            "Press any key to close.".to_owned(),
-            pretty(result),
-        ],
-        Modal::Activate { scope, force_cache_transition } => activation_lines("Activate this draft?", *scope, *force_cache_transition),
-        Modal::Reactivate { revision_id, scope, force_cache_transition } => {
-            let mut lines = activation_lines(&format!("Create a forward revision from revision {revision_id}?"), *scope, *force_cache_transition);
+        Modal::PreviewResult(result) => {
+            vec![chrome::hints(&[("any key", "close")]), pretty(result)]
+        }
+        Modal::Activate {
+            scope,
+            force_cache_transition,
+        } => activation_lines("Activate this draft?", *scope, *force_cache_transition),
+        Modal::Reactivate {
+            revision_id,
+            scope,
+            force_cache_transition,
+        } => {
+            let mut lines = activation_lines(
+                &format!("Create a forward revision from revision {revision_id}?"),
+                *scope,
+                *force_cache_transition,
+            );
             lines.insert(1, "The active pointer never moves backwards.".to_owned());
             lines
         }
         Modal::Import => vec![
             "Replace the current draft with the routing in toker.toml?".to_owned(),
             "The active revision does not change until the draft is activated.".to_owned(),
-            "y/Enter confirms · n/Esc cancels".to_owned(),
+            confirm_hint(),
         ],
-        Modal::Conflict { daemon_generation, daemon_draft } => vec![
+        Modal::Conflict {
+            daemon_generation,
+            daemon_draft,
+        } => vec![
             "The daemon draft changed while this terminal was editing.".to_owned(),
-            format!("daemon generation: {}", daemon_generation.map_or_else(|| "unknown".to_owned(), |value| value.to_string())),
-            "r reloads and discards local typed edits · a reapplies them to this daemon copy · Esc closes".to_owned(),
+            format!(
+                "daemon generation: {}",
+                daemon_generation.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+            ),
+            chrome::hints(&[
+                ("r", "reload, discarding local typed edits"),
+                ("a", "reapply them to this daemon copy"),
+                ("esc", "close"),
+            ]),
             pretty(daemon_draft),
         ],
     }
+}
+
+/// The prompt every confirmation closes on.
+fn confirm_hint() -> String {
+    chrome::hints(&[("y/enter", "confirm"), ("n/esc", "cancel")])
 }
 
 fn activation_lines(prompt: &str, scope: usize, force_cache_transition: bool) -> Vec<String> {
     let scope = ["new lanes", "new and cold lanes", "immediate"][scope.min(2)];
     vec![
         prompt.to_owned(),
-        format!("scope: {scope} (h/l changes)"),
+        format!("scope: {scope} · {}", chrome::hints(&[("h/l", "change")])),
         format!(
-            "forced warm-cache transition: {} (f toggles)",
-            if force_cache_transition { "YES" } else { "no" }
+            "forced warm-cache transition: {} · {}",
+            if force_cache_transition { "YES" } else { "no" },
+            chrome::hints(&[("f", "toggle")])
         ),
-        "y/Enter confirms · n/Esc cancels".to_owned(),
+        confirm_hint(),
     ]
-}
-
-fn render_legend(frame: &mut Frame) {
-    let lines = [
-        "ROUTING HELP",
-        "Tab  return to dashboard",
-        "1–4, ←/→  change routing view",
-        "↑/↓, j/k  select an item; PgUp/PgDn scroll the detail",
-        "n  add a record from a template (asks which kind where a view has several)",
-        "e  edit typed record in a form; Ctrl+S saves, Esc cancels",
-        "   in a form: ↑/↓ field · ←/→ change · Tab complete · Ctrl+D remove item",
-        "   Alt+↑/↓ moves a list item or candidate · Space toggles",
-        "d  confirm removal",
-        "defaults (routes view) and compaction (rewrites view) take n, e and d",
-        "v preview; V validate; a activate; x reactivate; p promote",
-        "i  import legacy toker.toml routing into the draft (status view)",
-        "mouse: click selects an item or focuses a form field; the wheel scrolls",
-        "A missing daemon endpoint leaves the loaded read-only view usable",
-        "? or Esc closes",
-    ];
-    let width = lines.iter().map(|line| line.len()).max().unwrap_or(0) as u16 + 4;
-    let area = frame.area();
-    let popup = Rect::new(
-        area.x + area.width.saturating_sub(width.min(area.width)) / 2,
-        area.y + area.height.saturating_sub((lines.len() + 2) as u16) / 2,
-        width.min(area.width),
-        (lines.len() as u16 + 2).min(area.height),
-    );
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(lines.join("\n")).block(Block::bordered()),
-        popup,
-    );
 }
 
 #[cfg(test)]
@@ -487,8 +500,22 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(text.contains("e edit"));
-        assert!(text.contains("a activate"));
+        assert!(!text.contains("n new"), "no page carries a footer: {text}");
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &state, true);
+            })
+            .expect("draw");
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("edit the selected record"), "{text}");
+        assert!(text.contains("activate the draft"), "{text}");
     }
 
     #[test]
@@ -553,17 +580,40 @@ mod tests {
             text.lines()
                 .rev()
                 .nth(1)
-                .is_some_and(|line| line.contains("confirms")),
+                .is_some_and(|line| line.contains("y/enter confirm · n/esc cancel")),
             "the confirmation prompt stays above the refusal: {text}"
         );
     }
 
-    /// Every key the page acts on is named in the legend, so a key that was
-    /// added cannot stay undocumented.
+    /// Every key the page acts on is named in its overlay, so a key that
+    /// was added cannot stay undocumented (spec: UTUI#finding-the-keys).
     #[test]
-    fn the_legend_names_every_record_key() {
-        let backend = TestBackend::new(140, 30);
-        let mut terminal = Terminal::new(backend).expect("terminal");
+    fn the_overlay_names_every_key_the_page_takes() {
+        use crossterm::event::KeyCode;
+        let named = |key: &str| {
+            super::KEYS
+                .iter()
+                .any(|(keys, _)| keys.split([' ', '/']).any(|token| token == key))
+        };
+        for key in [
+            'e', 'n', 'd', 'v', 'V', 'a', 'x', 'p', 'i', 'r', 'h', 'j', 'k', 'l',
+        ] {
+            assert!(
+                !super::super::owns_key(KeyCode::Char(key)) || named(&key.to_string()),
+                "{key} is taken but not named"
+            );
+        }
+        assert!(named("pgup") && named("pgdn"));
+        for key in ["tab", "alt+↑", "ctrl+d", "ctrl+s", "space"] {
+            assert!(
+                super::FORM_KEYS
+                    .iter()
+                    .any(|(keys, _)| keys.split([' ', '/']).any(|token| token == key)),
+                "{key} in a form"
+            );
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("terminal");
         terminal
             .draw(|frame| {
                 render(frame, &State::default(), true);
@@ -576,19 +626,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        for key_help in [
-            "n  add a record",
-            "e  edit typed record",
-            "d  confirm removal",
-            "defaults (routes view)",
-            "i  import",
-            "PgUp/PgDn scroll the detail",
-            "Ctrl+S saves",
-            "Tab complete",
-            "Alt+↑/↓ moves",
-            "the wheel scrolls",
-        ] {
-            assert!(text.contains(key_help), "{key_help}: {text}");
+        for heading in ["KEYS", "IN A FORM", "? or esc close"] {
+            assert!(text.contains(heading), "{heading}: {text}");
         }
     }
 
@@ -742,6 +781,70 @@ mod tests {
         ));
         state.set_view(view);
         state
+    }
+
+    /// The page at `width`×`height`, and where it put things.
+    fn drawn_at(state: &State, width: u16, height: u16) -> (String, super::Drawn) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        let mut drawn = super::Drawn::default();
+        terminal
+            .draw(|frame| drawn = render(frame, state, false))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let text = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (text, drawn)
+    }
+
+    /// Below 100 columns the list sits over the detail pane rather than
+    /// beside it, where both would be too narrow to read.
+    #[test]
+    fn a_narrow_page_stacks_the_list_over_the_detail() {
+        let state = page_in(super::View::Routes);
+        let (_, wide) = drawn_at(&state, 100, 32);
+        assert_eq!(wide.entries.y, wide.detail.y, "side by side from 100");
+        assert!(wide.entries.right() <= wide.detail.x);
+        let (text, narrow) = drawn_at(&state, 99, 32);
+        assert_eq!(narrow.entries.x, narrow.detail.x, "stacked below:\n{text}");
+        assert!(narrow.entries.bottom() <= narrow.detail.y, "{text}");
+        assert!(narrow.entries.height <= 32 / 3, "{text}");
+    }
+
+    /// The other tabs collapse to their number before the current label
+    /// clips, and every tab stays clickable.
+    #[test]
+    fn a_narrow_header_collapses_the_other_tabs() {
+        let state = page_in(super::View::Routes);
+        let (text, drawn) = drawn_at(&state, 90, 32);
+        let header = text.lines().next().unwrap_or_default();
+        assert!(
+            header.contains("1  2 routes, candidates & defaults  3  4"),
+            "{header}"
+        );
+        assert_eq!(drawn.tabs.len(), 4);
+    }
+
+    /// Too short for the detail boxed, both panes give up their borders
+    /// before any line of content (spec: UTUI#what-is-shed-first).
+    #[test]
+    fn a_short_page_goes_ruled() {
+        let state = page_in(super::View::Routes);
+        let (tall, _) = drawn_at(&state, 120, 40);
+        assert!(
+            tall.contains("\u{250c}DETAIL"),
+            "boxed while it fits:\n{tall}"
+        );
+        let (short, _) = drawn_at(&state, 120, 12);
+        assert!(short.contains("DETAIL \u{2500}"), "ruled:\n{short}");
+        assert!(!short.contains('\u{250c}'), "{short}");
     }
 
     #[test]
@@ -970,16 +1073,28 @@ mod tests {
         // Out of range is ignored rather than clamped to a different entry.
         state.select(99);
         assert_eq!(state.selected(), 2);
-        // A short list keeps the selection in view through an offset.
+        // A short list keeps the selection in view, and a click on a row
+        // names the entry drawn there rather than one counted from the top.
         let mut terminal = Terminal::new(TestBackend::new(120, 8)).expect("terminal");
-        let mut offset = 0;
+        let mut drawn = super::Drawn::default();
         state.select(5);
         terminal
-            .draw(|frame| offset = render(frame, &state, false).entries_offset)
+            .draw(|frame| drawn = render(frame, &state, false))
             .expect("draw");
+        let selected = drawn
+            .rows
+            .iter()
+            .find(|hit| hit.entry == 5)
+            .expect("row 5 is drawn in an 8-line terminal");
         assert!(
-            offset > 0,
-            "row 5 does not fit in a 8-line terminal: {offset}"
+            drawn.rows[0].entry > 0,
+            "the list scrolled to reach row 5: {:?}",
+            drawn.rows
+        );
+        state.select(0);
+        assert_eq!(
+            crate::tui::chrome::entry_at(&drawn.rows, selected.area.as_position()),
+            Some(5)
         );
     }
 }

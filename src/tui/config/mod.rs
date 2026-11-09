@@ -18,7 +18,13 @@ use model::State;
 pub(super) fn owns_key(code: KeyCode) -> bool {
     matches!(
         code,
-        KeyCode::Char('e' | ' ' | '1' | '2') | KeyCode::Enter | KeyCode::Backspace | KeyCode::Esc
+        KeyCode::Char('e' | ' ' | '1' | '2' | 'h' | 'j' | 'k' | 'l')
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Enter
+            | KeyCode::Backspace
     )
 }
 
@@ -53,10 +59,6 @@ impl Page {
         }
     }
 
-    pub(super) fn move_selection(&mut self, delta: isize) {
-        self.state.move_selection(delta);
-    }
-
     /// Handle a key owned by this page. Returns whether a text entry was
     /// open, so the loop knows the key was swallowed by it.
     pub(super) fn key(&mut self, key: KeyEvent) -> bool {
@@ -78,15 +80,29 @@ impl Page {
         }
     }
 
-    pub(super) fn render(&self, frame: &mut ratatui::Frame) {
-        let drawn = view::render(frame, &self.state);
+    /// Draw the page, with its key overlay over it when `overlay` is set,
+    /// and return where the header's chips landed.
+    pub(super) fn render(
+        &self,
+        frame: &mut ratatui::Frame,
+        overlay: bool,
+    ) -> crate::tui::chrome::Header {
+        let drawn = view::render(frame, &self.state, overlay);
+        let header = drawn.header;
         self.drawn.replace(drawn);
+        header
     }
 
     pub(super) fn click(&mut self, at: ratatui::layout::Position) {
         let drawn = self.drawn.borrow().clone();
-        if drawn.entries.contains(at) && at.y > drawn.entries.y {
-            self.state.select(usize::from(at.y - drawn.entries.y - 1));
+        if let Some(tab) = drawn.tabs.iter().position(|tab| tab.contains(at)) {
+            self.state.set_view(if tab == 0 {
+                model::View::Providers
+            } else {
+                model::View::Settings
+            });
+        } else if let Some(entry) = crate::tui::chrome::entry_at(&drawn.rows, at) {
+            self.state.select(entry);
         }
     }
 

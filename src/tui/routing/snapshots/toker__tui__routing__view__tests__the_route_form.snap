@@ -1,22 +1,23 @@
 ---
 source: src/tui/routing/view.rs
+assertion_line: 925
 expression: frame(&state)
 ---
- ?  ⇄
-1 PRE┌EDIT ROUTE──────────────────────────────────────────────────────────────────────────────────────────────────┐ & AC
-     │> id: mixed▏  (fixed)                                                                                       │
-┌ROUT│  name: Subscription then billed                                                                            │────┐
-│mixe│  description: (none)                                                                                       │    │
-│defa│  PARAMETERS                                                                                                │    │
+ ? ⇄ 1  2 routes, candidates & defaults  3  4                                                                    draft 4
+┌ROUT┌EDIT ROUTE──────────────────────────────────────────────────────────────────────────────────────────────────┐────┐
+│mixe│> id: mixed▏  (fixed)                                                                                       │    │
+│defa│  name: Subscription then billed                                                                            │    │
+│    │  description: (none)                                                                                       │    │
+│    │  PARAMETERS                                                                                                │    │
 │    │    + add parameter                                                                                         │    │
 │    │  CANDIDATES                                                                                                │    │
 │    │    candidate 1 sub                                                                                         │    │
 │    │      id: sub                                                                                               │    │
 │    │      binding: codex_sub.codex_responses                                                                    │    │
 │    │      MODEL                                                                                                 │    │
-│    │        kind: < exact >                                                                                     │    │
+│    │        kind: < exact >                                                                                     │s   │
 │    │        model: gpt-example                                                                                  │    │
-│    │      upgrade policy: (none)                                                                                │s   │
+│    │      upgrade policy: (none)                                                                                │    │
 │    │      [ ] alias rules                                                                                       │    │
 │    │      REQUIRED CAPABILITIES                                                                                 │    │
 │    │        [ ] sampling                                                                                        │    │
@@ -30,7 +31,7 @@ expression: frame(&state)
 │    │        [ ] tool choice other                                                                               │    │
 │    │      [x] enabled                                                                                           │    │
 │    │      HEALTH CIRCUITS                                                                                       │    │
-│    │Up/Down field · Left/Right change · Tab complete · Ctrl+S saves · Esc cancels                               │    │
+│    │↑/↓ field · ←/→ change · tab complete · ctrl+s save · esc cancel                                            │    │
 │    │                                                                                                            │    │
-└────└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘────┘
-draft 4 · ←/→ or 1–4 view · ↑/↓ select · n new · e edit · d remove · v preview · V validate · a activate · p promote · r
+│    └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
+└────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘
