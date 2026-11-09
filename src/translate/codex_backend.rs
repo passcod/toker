@@ -447,6 +447,9 @@ fn input_of(
                         // reasoning is opaque; see the module docs).
                         // The drop does not split the message's parts.
                         CanonBlock::Thinking { .. } | CanonBlock::RedactedThinking { .. } => {}
+                        CanonBlock::Opaque(extension) => {
+                            report_incompatible(extension, report);
+                        }
                         CanonBlock::Annotated { .. } => {
                             unreachable!("semantic() removes annotations")
                         }

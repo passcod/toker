@@ -19,7 +19,7 @@ use crate::ir::canonical::{
 };
 use crate::observe::sse::SseEvent;
 use crate::routing::DialectId;
-use crate::translate::TranslateError;
+use crate::translate::{TranslateError, TranslationReport};
 
 const DIALECT: DialectId = DialectId::CodexResponses;
 
@@ -502,6 +502,8 @@ pub struct OpenAiResponsesRenderer {
     reasoning: Option<ReasoningItem>,
     started: bool,
     ended: bool,
+    /// What this rendering omitted from a foreign dialect, content-free.
+    report: TranslationReport,
 }
 
 #[derive(Debug, Clone)]
@@ -535,7 +537,13 @@ impl OpenAiResponsesRenderer {
             reasoning: None,
             started: false,
             ended: false,
+            report: TranslationReport::default(),
         }
+    }
+
+    /// The content-free losses so far, drained.
+    pub fn take_report(&mut self) -> TranslationReport {
+        std::mem::take(&mut self.report)
     }
 
     pub fn feed(&mut self, event: &CanonEvent) -> Vec<SseEvent> {
@@ -683,7 +691,12 @@ impl OpenAiResponsesRenderer {
                 }
                 out.push(self.sse(kind, extension.value().clone()));
             }
-            CanonEvent::ProviderEvent(_) => {}
+            CanonEvent::ProviderEvent(extension)
+            | CanonEvent::ProviderFields { extension, .. }
+            | CanonEvent::ProviderBlockEvent { extension, .. } => {
+                self.report
+                    .push_omitted_extension(extension, DialectId::CodexResponses);
+            }
         }
         out
     }
@@ -936,9 +949,10 @@ fn output_of_block(block: &CanonBlock, index: usize) -> Option<Value> {
             "name": name, "arguments": serde_json::to_string(input)
                 .expect("tool input serialises"), "status": "completed",
         })),
-        CanonBlock::Image { .. } | CanonBlock::ToolResult { .. } | CanonBlock::Annotated { .. } => {
-            None
-        }
+        CanonBlock::Image { .. }
+        | CanonBlock::ToolResult { .. }
+        | CanonBlock::Annotated { .. }
+        | CanonBlock::Opaque(_) => None,
     }
 }
 

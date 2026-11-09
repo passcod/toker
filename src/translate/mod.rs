@@ -258,7 +258,8 @@ pub mod to_anthropic;
 pub mod to_codex;
 
 pub use anthropic_backend::{
-    AnthropicResponseStream, canonical_turn_from_anthropic, render_anthropic,
+    AnthropicResponseStream, canonical_turn_from_anthropic, canonical_turn_from_messages,
+    render_anthropic,
 };
 pub use anthropic_frontend::from_anthropic;
 pub use codex_backend::{codex_from_canonical, render_codex};
@@ -351,6 +352,45 @@ impl TranslationReport {
 
     pub fn is_empty(&self) -> bool {
         self.losses.is_empty()
+    }
+
+    pub fn extend(&mut self, other: TranslationReport) {
+        self.losses.extend(other.losses);
+    }
+
+    /// Record one opaque extension a frontend of dialect `frontend` cannot
+    /// replay. Only the wire path is kept, never the value.
+    pub fn push_omitted_extension(
+        &mut self,
+        extension: &crate::ir::canonical::CanonicalExtension,
+        frontend: crate::routing::DialectId,
+    ) {
+        if !extension.source().shares_replay_domain(frontend) {
+            self.push(TranslationLoss::new(
+                extension.wire_path(),
+                TranslationLossReason::IncompatibleExtensionDialect,
+                1,
+            ));
+        }
+    }
+
+    /// The losses a complete response suffers on a frontend of dialect
+    /// `frontend`: every provider extension from another replay domain.
+    pub fn for_response_extensions(
+        turn: &crate::ir::canonical::CanonTurn,
+        frontend: crate::routing::DialectId,
+    ) -> TranslationReport {
+        use crate::ir::canonical::CanonBlock;
+        let mut report = TranslationReport::default();
+        for extension in &turn.output_extensions {
+            report.push_omitted_extension(extension, frontend);
+        }
+        for block in turn.blocks.iter().flatten() {
+            if let CanonBlock::Opaque(extension) = block {
+                report.push_omitted_extension(extension, frontend);
+            }
+        }
+        report
     }
 }
 

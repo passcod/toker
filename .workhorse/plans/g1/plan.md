@@ -32,13 +32,13 @@ Check that `/status` in Claude Code reads the auto mode server as enabled throug
 
 ### Response extensions (WCANON)
 
-- [ ] Add an opaque block variant for responses in `src/ir/canonical.rs`, and a way for known `CanonEvent`s to carry field extensions; keep the `Debug` impl content-free
-- [ ] `canonical_turn_from_anthropic`: retain unmodelled top-level fields, unmodelled block fields and unknown block kinds, tagged `anthropic_messages` with their wire position
-- [ ] `AnthropicResponseStream`: retain unmodelled fields on known events, replace `IncomingBlock::Unknown` dropping with opaque events per start/delta/stop, and emit unknown event kinds as `ProviderEvent`
-- [ ] Tag OpenRouter Messages responses `openrouter_messages` where the interpreter is shared, and share the replay domain check with the request side's `can_replay`
-- [ ] `anthropic_from_canonical` and `AnthropicRenderer`: replay same-domain extensions in position, with block indices from the renderer's own counter; never let an extension overwrite a modelled key
-- [ ] Chat and Responses frontends: omit Messages-domain extensions and report content-free losses (the Responses frontend already drops foreign `ProviderEvent`s; check it reports them)
-- [ ] `ResponseProjection`: confirm `is_reasoning_wire` leaves non-reasoning Messages extensions alone, with a test that `thinking: disabled` keeps a `safeguard_results` extension
+- [x] Add an opaque block variant for responses in `src/ir/canonical.rs`, and a way for known `CanonEvent`s to carry field extensions; keep the `Debug` impl content-free
+- [x] `canonical_turn_from_anthropic`: retain unmodelled top-level fields, unmodelled block fields and unknown block kinds, tagged `anthropic_messages` with their wire position
+- [x] `AnthropicResponseStream`: retain unmodelled fields on known events, replace `IncomingBlock::Unknown` dropping with opaque events per start/delta/stop, and emit unknown event kinds as `ProviderEvent`
+- [x] Tag OpenRouter Messages responses `openrouter_messages` where the interpreter is shared, and share the replay domain check with the request side's `can_replay`
+- [x] `anthropic_from_canonical` and `AnthropicRenderer`: replay same-domain extensions in position, with block indices from the renderer's own counter; never let an extension overwrite a modelled key
+- [x] Chat and Responses frontends: omit Messages-domain extensions and report content-free losses (the Responses frontend already drops foreign `ProviderEvent`s; check it reports them)
+- [x] `ResponseProjection`: confirm `is_reasoning_wire` leaves non-reasoning Messages extensions alone, with a test that `thinking: disabled` keeps a `safeguard_results` extension
 - [ ] Insta snapshots for a complete and a streamed response carrying an unknown top-level field, an unknown field on `message_delta`, an unknown block kind and an unknown event kind, each byte-identical through a Messages to Messages route
 
 ### The pair and the binding capability (WSAFE, ROUTE)

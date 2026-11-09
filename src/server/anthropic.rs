@@ -76,7 +76,7 @@ use crate::middleware::quota::{Blocking, Meters, Rendering, grant_for};
 use crate::observe::{AnthropicObserver, SseSplitter};
 use crate::policy::force_newest;
 use crate::providers::{Provider, parse_rate_limits};
-use crate::routing::{BackendAdapterId, ModelTarget, ProtocolId};
+use crate::routing::{BackendAdapterId, DialectId, ModelTarget, ProtocolId};
 use crate::store::MetersSnapshot;
 use crate::translate;
 
@@ -1418,7 +1418,8 @@ pub(crate) fn required_capabilities(request: &CanonicalRequest) -> crate::policy
             CanonBlock::Annotated { .. } => unreachable!("semantic removes annotations"),
             CanonBlock::Text(_)
             | CanonBlock::Thinking { .. }
-            | CanonBlock::RedactedThinking { .. } => (false, false),
+            | CanonBlock::RedactedThinking { .. }
+            | CanonBlock::Opaque(_) => (false, false),
         }
     }
     let (has_images, has_tool_history) = request
@@ -1948,6 +1949,19 @@ pub(crate) async fn forward_canonical_messages(
         );
     }
 
+    // The dialect tags what the canonical form retains but does not model.
+    let dialect = record
+        .as_ref()
+        .and_then(|ctx| ctx.server.registry.binding(&ctx.binding_id))
+        .map(|binding| binding.dialect())
+        .filter(|dialect| {
+            matches!(
+                dialect,
+                DialectId::AnthropicMessages | DialectId::OpenRouterMessages
+            )
+        })
+        .unwrap_or(DialectId::AnthropicMessages);
+
     if expected_stream {
         let stream = CanonicalMessagesStream::new(
             upstream,
@@ -1957,6 +1971,7 @@ pub(crate) async fn forward_canonical_messages(
             in_flight,
             model,
             response_projection,
+            dialect,
         );
         let mut headers = response_headers(&upstream_headers, false);
         headers.insert(
@@ -1998,7 +2013,8 @@ pub(crate) async fn forward_canonical_messages(
     let mut turn = match serde_json::from_slice::<serde_json::Value>(&buffered.bytes)
         .map_err(|error| error.to_string())
         .and_then(|body| {
-            translate::canonical_turn_from_anthropic(&body).map_err(|error| error.to_string())
+            translate::canonical_turn_from_messages(&body, dialect)
+                .map_err(|error| error.to_string())
         }) {
         Ok(turn) => turn,
         Err(error) => {
@@ -2079,6 +2095,7 @@ impl CanonicalMessagesStream {
         in_flight: Option<InFlightGuard>,
         model: &str,
         response_projection: ResponseProjection,
+        dialect: DialectId,
     ) -> CanonicalMessagesStream {
         let (abort, registration) = AbortHandle::new_pair();
         let stream: UpstreamBody = Box::pin(response.bytes_stream());
@@ -2086,7 +2103,7 @@ impl CanonicalMessagesStream {
             inner: Box::pin(Abortable::new(stream, registration)),
             abort,
             splitter: SseSplitter::new(),
-            backend: translate::AnthropicResponseStream::new(),
+            backend: translate::AnthropicResponseStream::for_dialect(dialect),
             frontend: translate::anthropic_frontend::AnthropicRenderer::new(model),
             observer: AnthropicObserver::new(),
             pending: VecDeque::new(),

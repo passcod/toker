@@ -13,7 +13,7 @@ use serde_json::{Map, Number, Value, json};
 use crate::ir::canonical::{
     CanonBlock, CanonError, CanonErrorKind, CanonEvent, CanonMessage, CanonRole, CanonStopReason,
     CanonSystemPart, CanonTool, CanonToolCall, CanonToolChoice, CanonTurn, CanonicalExtension,
-    CanonicalRequest, CanonicalUsage, ThinkingSpec, ToolResultContent,
+    CanonicalRequest, CanonicalUsage, ProviderBlockPhase, ThinkingSpec, ToolResultContent,
 };
 use crate::observe::sse::SseEvent;
 use crate::routing::DialectId;
@@ -231,6 +231,13 @@ fn block_value(
     }
 
     Some(match block {
+        CanonBlock::Opaque(extension) if can_replay(extension.source(), dialect) => {
+            extension.value().clone()
+        }
+        CanonBlock::Opaque(extension) => {
+            report_incompatible(extension, report);
+            return None;
+        }
         CanonBlock::Text(text) => json!({"type": "text", "text": text}),
         CanonBlock::Image { url } => {
             json!({"type": "image", "source": {"type": "url", "url": url}})
@@ -352,14 +359,8 @@ fn replay_extensions(
     }
 }
 
-fn can_replay(source: DialectId, target: DialectId) -> bool {
-    matches!(
-        (source, target),
-        (
-            DialectId::AnthropicMessages | DialectId::OpenRouterMessages,
-            DialectId::AnthropicMessages | DialectId::OpenRouterMessages,
-        )
-    )
+pub(crate) fn can_replay(source: DialectId, target: DialectId) -> bool {
+    source.shares_replay_domain(target)
 }
 
 fn report_incompatible(extension: &CanonicalExtension, report: &mut TranslationReport) {
@@ -372,12 +373,62 @@ fn report_incompatible(extension: &CanonicalExtension, report: &mut TranslationR
 
 // ── response interpretation ─────────────────────────────────────────
 
+/// What the interpreter hands the canonical form as MODELLED, per wire
+/// object. Anything else on those objects is a provider extension and crosses
+/// the boundary opaquely ([`CanonEvent::ProviderFields`],
+/// [`CanonTurn::output_extensions`]). Usage is modelled whole.
+mod modelled {
+    pub const MESSAGE_START: &[&str] = &["type", "message"];
+    pub const MESSAGE: &[&str] = &[
+        "id",
+        "type",
+        "role",
+        "model",
+        "content",
+        "usage",
+        "provider",
+        "stop_reason",
+        "stop_sequence",
+    ];
+    pub const BLOCK_START: &[&str] = &["type", "index", "content_block"];
+    pub const BLOCK_DELTA: &[&str] = &["type", "index", "delta"];
+    pub const BLOCK_STOP: &[&str] = &["type", "index"];
+    pub const MESSAGE_DELTA: &[&str] = &["type", "delta", "usage", "provider"];
+    pub const MESSAGE_DELTA_DELTA: &[&str] = &["stop_reason", "stop_sequence"];
+}
+
+/// The members of `object` outside `modelled`, as an object, when there are
+/// any.
+fn residue(object: &Value, modelled: &[&str]) -> Option<Value> {
+    let fields: Map<String, Value> = object
+        .as_object()?
+        .iter()
+        .filter(|(field, _)| !modelled.contains(&field.as_str()))
+        .map(|(field, value)| (field.clone(), value.clone()))
+        .collect();
+    (!fields.is_empty()).then_some(Value::Object(fields))
+}
+
 /// Stateful interpretation of one Anthropic Messages SSE turn.
-#[derive(Debug, Clone, Default)]
+///
+/// Everything the canonical does not model is retained, in arrival order, for
+/// a frontend of the same replay domain: unmodelled fields ahead of the event
+/// they sit on, unknown content blocks and unknown deltas as whole events at
+/// their provider index, unknown event kinds as they arrive. A wire event
+/// between `message_delta` and `message_stop` follows the turn's end, which a
+/// renderer has already closed, so only the fields modelled there survive.
+#[derive(Debug, Clone)]
 pub struct AnthropicResponseStream {
+    dialect: DialectId,
     blocks: BTreeMap<u64, IncomingBlock>,
     start_usage: Option<Map<String, Value>>,
     serving_provider: Option<String>,
+}
+
+impl Default for AnthropicResponseStream {
+    fn default() -> Self {
+        AnthropicResponseStream::new()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -391,12 +442,31 @@ enum IncomingBlock {
         initial_input: Value,
         arguments: String,
     },
-    Unknown,
+    /// A block of a kind the canonical does not model: every event of it
+    /// replays whole.
+    Opaque,
+}
+
+impl IncomingBlock {
+    fn is_reasoning(&self) -> bool {
+        matches!(self, IncomingBlock::Thinking | IncomingBlock::Redacted)
+    }
 }
 
 impl AnthropicResponseStream {
     pub fn new() -> AnthropicResponseStream {
-        AnthropicResponseStream::default()
+        AnthropicResponseStream::for_dialect(DialectId::AnthropicMessages)
+    }
+
+    /// An interpreter tagging what it retains with `dialect`, one of the
+    /// Messages dialects.
+    pub fn for_dialect(dialect: DialectId) -> AnthropicResponseStream {
+        AnthropicResponseStream {
+            dialect,
+            blocks: BTreeMap::new(),
+            start_usage: None,
+            serving_provider: None,
+        }
     }
 
     /// Interpret one already-split SSE event. Invalid JSON and unknown event
@@ -419,8 +489,48 @@ impl AnthropicResponseStream {
             Some("error") => vec![CanonEvent::TurnFailed {
                 error: canonical_error(event.get("error").unwrap_or(event)),
             }],
-            Some("message_stop") | Some("ping") | None | Some(_) => Vec::new(),
+            Some("message_stop") | Some("ping") | None => Vec::new(),
+            Some(kind) => vec![CanonEvent::ProviderEvent(CanonicalExtension::new(
+                self.dialect,
+                format!("$.events.{kind}"),
+                event.clone(),
+            ))],
         }
+    }
+
+    /// The unmodelled fields of one object of `event`, ahead of the events
+    /// it produces. `within` names the object by its key, or is empty for the
+    /// event itself.
+    fn fields(
+        &self,
+        out: &mut Vec<CanonEvent>,
+        event_kind: &str,
+        within: &str,
+        object: Option<&Value>,
+        modelled: &[&str],
+        reasoning: bool,
+    ) {
+        let Some(value) = object.and_then(|object| residue(object, modelled)) else {
+            return;
+        };
+        let path = if within.is_empty() {
+            format!("$.{event_kind}")
+        } else {
+            format!("$.{event_kind}.{within}")
+        };
+        out.push(CanonEvent::ProviderFields {
+            extension: CanonicalExtension::new(self.dialect, path, value),
+            reasoning,
+        });
+    }
+
+    fn block_event(&self, index: u64, phase: ProviderBlockPhase, event: &Value) -> Vec<CanonEvent> {
+        let kind = event.get("type").and_then(Value::as_str).unwrap_or("event");
+        vec![CanonEvent::ProviderBlockEvent {
+            index,
+            phase,
+            extension: CanonicalExtension::new(self.dialect, format!("$.{kind}"), event.clone()),
+        }]
     }
 
     fn message_start(&mut self, event: &Value) -> Vec<CanonEvent> {
@@ -432,9 +542,27 @@ impl AnthropicResponseStream {
             .get("provider")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        vec![CanonEvent::TurnStarted {
+        let mut out = Vec::new();
+        self.fields(
+            &mut out,
+            "message_start",
+            "",
+            Some(event),
+            modelled::MESSAGE_START,
+            false,
+        );
+        self.fields(
+            &mut out,
+            "message_start",
+            "message",
+            Some(message),
+            modelled::MESSAGE,
+            false,
+        );
+        out.push(CanonEvent::TurnStarted {
             turn_id: message.get("id").and_then(Value::as_str).map(str::to_owned),
-        }]
+        });
+        out
     }
 
     fn block_start(&mut self, event: &Value) -> Vec<CanonEvent> {
@@ -445,8 +573,54 @@ impl AnthropicResponseStream {
             return Vec::new();
         };
         let mut out = Vec::new();
-        let incoming = match block.get("type").and_then(Value::as_str) {
-            Some("text") => {
+        let (incoming, block_fields): (IncomingBlock, Option<&[&str]>) =
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => (IncomingBlock::Text, Some(&["type", "text"])),
+                Some("thinking") => (
+                    IncomingBlock::Thinking,
+                    Some(&["type", "thinking", "signature"]),
+                ),
+                Some("redacted_thinking") => (IncomingBlock::Redacted, Some(&["type", "data"])),
+                Some("tool_use") => match (
+                    block.get("id").and_then(Value::as_str),
+                    block.get("name").and_then(Value::as_str),
+                ) {
+                    (Some(id), Some(name)) => (
+                        IncomingBlock::ToolUse {
+                            id: id.to_owned(),
+                            name: name.to_owned(),
+                            initial_input: block.get("input").cloned().unwrap_or_else(|| json!({})),
+                            arguments: String::new(),
+                        },
+                        Some(&["type", "id", "name", "input"]),
+                    ),
+                    _ => (IncomingBlock::Opaque, None),
+                },
+                _ => (IncomingBlock::Opaque, None),
+            };
+        let Some(block_fields) = block_fields else {
+            self.blocks.insert(index, IncomingBlock::Opaque);
+            return self.block_event(index, ProviderBlockPhase::Start, event);
+        };
+        let reasoning = incoming.is_reasoning();
+        self.fields(
+            &mut out,
+            "content_block_start",
+            "",
+            Some(event),
+            modelled::BLOCK_START,
+            reasoning,
+        );
+        self.fields(
+            &mut out,
+            "content_block_start",
+            "content_block",
+            Some(block),
+            block_fields,
+            reasoning,
+        );
+        match &incoming {
+            IncomingBlock::Text => {
                 if let Some(text) = block.get("text").and_then(Value::as_str)
                     && !text.is_empty()
                 {
@@ -454,9 +628,8 @@ impl AnthropicResponseStream {
                         delta: text.to_owned(),
                     });
                 }
-                IncomingBlock::Text
             }
-            Some("thinking") => {
+            IncomingBlock::Thinking => {
                 if let Some(thinking) = block.get("thinking").and_then(Value::as_str)
                     && !thinking.is_empty()
                 {
@@ -465,31 +638,17 @@ impl AnthropicResponseStream {
                         delta: thinking.to_owned(),
                     });
                 }
-                IncomingBlock::Thinking
             }
-            Some("redacted_thinking") => {
+            IncomingBlock::Redacted => {
                 if let Some(data) = block.get("data").and_then(Value::as_str) {
                     out.push(CanonEvent::RedactedThinking {
                         data: data.to_owned(),
                         provider_id: None,
                     });
                 }
-                IncomingBlock::Redacted
             }
-            Some("tool_use") => match (
-                block.get("id").and_then(Value::as_str),
-                block.get("name").and_then(Value::as_str),
-            ) {
-                (Some(id), Some(name)) => IncomingBlock::ToolUse {
-                    id: id.to_owned(),
-                    name: name.to_owned(),
-                    initial_input: block.get("input").cloned().unwrap_or_else(|| json!({})),
-                    arguments: String::new(),
-                },
-                _ => IncomingBlock::Unknown,
-            },
-            _ => IncomingBlock::Unknown,
-        };
+            IncomingBlock::ToolUse { .. } | IncomingBlock::Opaque => {}
+        }
         self.blocks.insert(index, incoming);
         out
     }
@@ -501,61 +660,105 @@ impl AnthropicResponseStream {
         let Some(delta) = event.get("delta") else {
             return Vec::new();
         };
+        let Some(block) = self.blocks.get_mut(&index) else {
+            // A delta for a block that never started has nothing to attach to.
+            return Vec::new();
+        };
+        if matches!(block, IncomingBlock::Opaque) {
+            return self.block_event(index, ProviderBlockPhase::Delta, event);
+        }
+        let reasoning = block.is_reasoning();
+        let delta_fields: &[&str] = match delta.get("type").and_then(Value::as_str) {
+            Some("text_delta") => &["type", "text"],
+            Some("thinking_delta") => &["type", "thinking"],
+            Some("signature_delta") => &["type", "signature"],
+            Some("input_json_delta") => &["type", "partial_json"],
+            _ => return self.block_event(index, ProviderBlockPhase::Delta, event),
+        };
+        let mut out = Vec::new();
+        self.fields(
+            &mut out,
+            "content_block_delta",
+            "",
+            Some(event),
+            modelled::BLOCK_DELTA,
+            reasoning,
+        );
+        self.fields(
+            &mut out,
+            "content_block_delta",
+            "delta",
+            Some(delta),
+            delta_fields,
+            reasoning,
+        );
         match delta.get("type").and_then(Value::as_str) {
-            Some("text_delta") => delta
-                .get("text")
-                .and_then(Value::as_str)
-                .map(|text| {
-                    vec![CanonEvent::TextDelta {
+            Some("text_delta") => {
+                if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                    out.push(CanonEvent::TextDelta {
                         delta: text.to_owned(),
-                    }]
-                })
-                .unwrap_or_default(),
-            Some("thinking_delta") => delta
-                .get("thinking")
-                .and_then(Value::as_str)
-                .map(|thinking| {
-                    vec![CanonEvent::ThinkingDelta {
+                    });
+                }
+            }
+            Some("thinking_delta") => {
+                if let Some(thinking) = delta.get("thinking").and_then(Value::as_str) {
+                    out.push(CanonEvent::ThinkingDelta {
                         part: index,
                         delta: thinking.to_owned(),
-                    }]
-                })
-                .unwrap_or_default(),
-            Some("signature_delta") => delta
-                .get("signature")
-                .and_then(Value::as_str)
-                .map(|signature| {
-                    vec![CanonEvent::ThinkingSignature {
+                    });
+                }
+            }
+            Some("signature_delta") => {
+                if let Some(signature) = delta.get("signature").and_then(Value::as_str) {
+                    out.push(CanonEvent::ThinkingSignature {
                         part: index,
                         signature: signature.to_owned(),
-                    }]
-                })
-                .unwrap_or_default(),
-            Some("input_json_delta") => {
+                    });
+                }
+            }
+            _ => {
                 if let Some(IncomingBlock::ToolUse { arguments, .. }) = self.blocks.get_mut(&index)
                     && let Some(fragment) = delta.get("partial_json").and_then(Value::as_str)
                 {
                     arguments.push_str(fragment);
                 }
-                Vec::new()
             }
-            _ => Vec::new(),
         }
+        out
     }
 
     fn block_stop(&mut self, event: &Value) -> Vec<CanonEvent> {
         let Some(index) = event.get("index").and_then(Value::as_u64) else {
             return Vec::new();
         };
-        match self.blocks.remove(&index) {
-            Some(IncomingBlock::Text) => vec![CanonEvent::TextEnded],
-            Some(IncomingBlock::Thinking) => vec![CanonEvent::ThinkingEnded],
-            Some(IncomingBlock::ToolUse {
+        let Some(block) = self.blocks.remove(&index) else {
+            return Vec::new();
+        };
+        if matches!(block, IncomingBlock::Opaque) {
+            return self.block_event(index, ProviderBlockPhase::Stop, event);
+        }
+        let mut out = Vec::new();
+        // A redacted block renders whole at its start, leaving no stop for
+        // these fields to ride.
+        if !matches!(block, IncomingBlock::Redacted) {
+            self.fields(
+                &mut out,
+                "content_block_stop",
+                "",
+                Some(event),
+                modelled::BLOCK_STOP,
+                block.is_reasoning(),
+            );
+        }
+        match block {
+            IncomingBlock::Text => out.push(CanonEvent::TextEnded),
+            IncomingBlock::Thinking => out.push(CanonEvent::ThinkingEnded),
+            IncomingBlock::ToolUse {
                 id,
                 name,
                 initial_input,
                 arguments,
-            }) => vec![CanonEvent::ToolCall(CanonToolCall {
+            } => out.push(CanonEvent::ToolCall(CanonToolCall {
                 id,
                 name,
                 arguments: if arguments.is_empty() {
@@ -564,9 +767,10 @@ impl AnthropicResponseStream {
                 } else {
                     arguments
                 },
-            })],
-            Some(IncomingBlock::Redacted | IncomingBlock::Unknown) | None => Vec::new(),
+            })),
+            IncomingBlock::Redacted | IncomingBlock::Opaque => {}
         }
+        out
     }
 
     fn message_delta(&mut self, event: &Value) -> Vec<CanonEvent> {
@@ -580,10 +784,28 @@ impl AnthropicResponseStream {
             event.get("usage"),
             self.serving_provider.as_deref(),
         );
-        vec![CanonEvent::TurnEnded {
+        let mut out = Vec::new();
+        self.fields(
+            &mut out,
+            "message_delta",
+            "",
+            Some(event),
+            modelled::MESSAGE_DELTA,
+            false,
+        );
+        self.fields(
+            &mut out,
+            "message_delta",
+            "delta",
+            event.get("delta"),
+            modelled::MESSAGE_DELTA_DELTA,
+            false,
+        );
+        out.push(CanonEvent::TurnEnded {
             stop_reason: stop_reason(reason),
             usage,
-        }]
+        });
+        out
     }
 }
 
@@ -658,8 +880,34 @@ fn canonical_error(error: &Value) -> CanonError {
     }
 }
 
+/// The response content block kinds the canonical models; any other kind is
+/// carried whole as [`CanonBlock::Opaque`].
+const MODELLED_RESPONSE_BLOCKS: &[&str] = &["text", "thinking", "redacted_thinking", "tool_use"];
+
+/// The top-level members of a complete response the canonical models.
+const MODELLED_RESPONSE_FIELDS: &[&str] = &[
+    "id",
+    "type",
+    "role",
+    "model",
+    "content",
+    "stop_reason",
+    "stop_sequence",
+    "usage",
+    "provider",
+];
+
 /// Interpret one complete non-streaming Anthropic Messages response.
 pub fn canonical_turn_from_anthropic(body: &Value) -> Result<CanonTurn, TranslateError> {
+    canonical_turn_from_messages(body, DialectId::AnthropicMessages)
+}
+
+/// Interpret one complete non-streaming Messages response of `dialect`,
+/// tagging what the canonical does not model with it.
+pub fn canonical_turn_from_messages(
+    body: &Value,
+    dialect: DialectId,
+) -> Result<CanonTurn, TranslateError> {
     if body.get("type").and_then(Value::as_str) == Some("error") {
         let error = body
             .get("error")
@@ -691,7 +939,30 @@ pub fn canonical_turn_from_anthropic(body: &Value) -> Result<CanonTurn, Translat
         .ok_or_else(|| TranslateError::Malformed {
             reason: "anthropic response content is missing or not an array".to_owned(),
         })?;
-    let blocks = content_blocks_of(CanonRole::Assistant, content, 0)?;
+    let mut blocks = Vec::with_capacity(content.len());
+    for block in content {
+        let modelled = block
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| MODELLED_RESPONSE_BLOCKS.contains(&kind));
+        if modelled {
+            blocks.extend(content_blocks_of(
+                CanonRole::Assistant,
+                std::slice::from_ref(block),
+                0,
+            )?);
+        } else if block.is_object() {
+            blocks.push(CanonBlock::Opaque(CanonicalExtension::new(
+                dialect,
+                "$.content[]",
+                block.clone(),
+            )));
+        } else {
+            return Err(TranslateError::Malformed {
+                reason: "anthropic response content block is not an object".to_owned(),
+            });
+        }
+    }
     let mut text = String::new();
     let mut thinking = BTreeMap::new();
     let mut tool_calls = Vec::new();
@@ -709,10 +980,21 @@ pub fn canonical_turn_from_anthropic(body: &Value) -> Result<CanonTurn, Translat
             }),
             CanonBlock::Image { .. }
             | CanonBlock::ToolResult { .. }
-            | CanonBlock::RedactedThinking { .. } => {}
+            | CanonBlock::RedactedThinking { .. }
+            | CanonBlock::Opaque(_) => {}
             CanonBlock::Annotated { .. } => unreachable!("semantic() removes annotations"),
         }
     }
+
+    let output_extensions = body
+        .as_object()
+        .into_iter()
+        .flat_map(|object| object.iter())
+        .filter(|(field, _)| !MODELLED_RESPONSE_FIELDS.contains(&field.as_str()))
+        .map(|(field, value)| {
+            CanonicalExtension::node_field(dialect, format!("$.{field}"), field, value.clone())
+        })
+        .collect();
 
     Ok(CanonTurn {
         turn_id: body.get("id").and_then(Value::as_str).map(str::to_owned),
@@ -728,7 +1010,7 @@ pub fn canonical_turn_from_anthropic(body: &Value) -> Result<CanonTurn, Translat
         ),
         error: None,
         tool_calls,
-        output_extensions: Vec::new(),
+        output_extensions,
         blocks: Some(blocks),
         text,
         thinking,
@@ -1138,5 +1420,258 @@ data: {"type":"message_stop"}
             render_anthropic(&canonical, DialectId::AnthropicMessages),
             Err(TranslateError::Malformed { .. })
         ));
+    }
+
+    /// Run wire events through the interpreter and the Messages renderer, as
+    /// a Messages to Messages route does, returning what the client would see.
+    fn relay(events: &[serde_json::Value]) -> Vec<(String, serde_json::Value)> {
+        let mut stream = AnthropicResponseStream::new();
+        let mut renderer = crate::translate::anthropic_frontend::AnthropicRenderer::new("m");
+        events
+            .iter()
+            .flat_map(|event| stream.feed(event))
+            .flat_map(|event| renderer.feed(&event))
+            .map(|event| {
+                (
+                    event.event.clone().expect("named event"),
+                    serde_json::from_str(&event.data()).expect("json data"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn provider_extensions_cross_a_messages_route_in_position() {
+        let wire = [
+            json!({"type": "message_start", "message": {
+                "id": "msg_1", "type": "message", "role": "assistant", "model": "up",
+                "content": [], "usage": {"input_tokens": 3}, "container": {"id": "c1"}}}),
+            json!({"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "text", "text": "", "citations": null}}),
+            json!({"type": "content_block_delta", "index": 0, "extra": 1,
+                   "delta": {"type": "text_delta", "text": "hi"}}),
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "future_delta", "payload": [1]}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1,
+                   "content_block": {"type": "future_block", "results": [{"id": "toolu_1"}]}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "content_block_start", "index": 2,
+                   "content_block": {"type": "tool_use", "id": "toolu_1", "name": "run", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 2,
+                   "delta": {"type": "input_json_delta", "partial_json": "{}"}}),
+            json!({"type": "content_block_stop", "index": 2}),
+            json!({"type": "future_event", "payload": {"a": 1}}),
+            json!({"type": "message_delta", "future_top": [{"id": "toolu_1"}],
+                   "delta": {"stop_reason": "tool_use", "stop_sequence": null, "future_delta": 2},
+                   "usage": {"output_tokens": 5}}),
+            json!({"type": "message_stop"}),
+        ];
+        let seen = relay(&wire);
+        let names: Vec<&str> = seen.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "future_event",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_eq!(seen[0].1["message"]["container"], json!({"id": "c1"}));
+        assert_eq!(seen[1].1["content_block"]["citations"], json!(null));
+        assert_eq!(seen[2].1["extra"], json!(1));
+        assert_eq!(
+            seen[3].1,
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "future_delta", "payload": [1]}})
+        );
+        assert_eq!(
+            seen[5].1,
+            json!({"type": "content_block_start", "index": 1,
+                   "content_block": {"type": "future_block", "results": [{"id": "toolu_1"}]}})
+        );
+        assert_eq!(seen[6].1, json!({"type": "content_block_stop", "index": 1}));
+        assert_eq!(
+            seen[7].1["index"],
+            json!(2),
+            "later blocks follow the provider block"
+        );
+        assert_eq!(seen[7].1["content_block"]["id"], json!("toolu_1"));
+        assert_eq!(
+            seen[10].1,
+            json!({"type": "future_event", "payload": {"a": 1}})
+        );
+        assert_eq!(seen[11].1["future_top"], json!([{"id": "toolu_1"}]));
+        assert_eq!(seen[11].1["delta"]["future_delta"], json!(2));
+        assert_eq!(seen[11].1["delta"]["stop_reason"], json!("tool_use"));
+    }
+
+    #[test]
+    fn a_provider_block_takes_its_index_from_the_renderers_counter() {
+        // The provider numbers its opaque block 5; the client sees the next
+        // index of the renderer's own count, and its stop agrees.
+        let seen = relay(&[
+            json!({"type": "message_start", "message": {"id": "m", "usage": {}}}),
+            json!({"type": "content_block_start", "index": 5,
+                   "content_block": {"type": "future_block"}}),
+            json!({"type": "content_block_stop", "index": 5}),
+            json!({"type": "content_block_start", "index": 6,
+                   "content_block": {"type": "text", "text": "t"}}),
+            json!({"type": "content_block_stop", "index": 6}),
+        ]);
+        let indexes: Vec<_> = seen
+            .iter()
+            .skip(1)
+            .map(|(_, data)| data["index"].clone())
+            .collect();
+        assert_eq!(indexes, [json!(0), json!(0), json!(1), json!(1), json!(1)]);
+    }
+
+    #[test]
+    fn a_modelled_field_is_never_overwritten_by_an_extension() {
+        let mut turn = canonical_turn_from_anthropic(&json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "up",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn", "stop_sequence": null,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "safeguard_like": {"id": "toolu_1"}
+        }))
+        .expect("interprets");
+        turn.output_extensions.push(CanonicalExtension::node_field(
+            DialectId::AnthropicMessages,
+            "$.stop_reason",
+            "stop_reason",
+            json!("tampered"),
+        ));
+        let rendered = anthropic_from_canonical("m", &turn);
+        assert_eq!(rendered["stop_reason"], json!("end_turn"));
+        assert_eq!(rendered["safeguard_like"], json!({"id": "toolu_1"}));
+    }
+
+    #[test]
+    fn a_complete_response_keeps_unknown_fields_and_blocks_in_position() {
+        let body = json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "up",
+            "content": [
+                {"type": "text", "text": "a", "citations": null},
+                {"type": "future_block", "results": [{"id": "toolu_1"}]},
+                {"type": "tool_use", "id": "toolu_1", "name": "run", "input": {}}
+            ],
+            "stop_reason": "tool_use", "stop_sequence": null,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "future_top": {"results": [{"id": "toolu_1"}]}
+        });
+        let turn = canonical_turn_from_anthropic(&body).expect("interprets");
+        assert_eq!(turn.tool_calls.len(), 1);
+        let rendered = anthropic_from_canonical("up", &turn);
+        assert_eq!(rendered["content"], body["content"]);
+        assert_eq!(rendered["future_top"], body["future_top"]);
+        assert_eq!(rendered["stop_reason"], json!("tool_use"));
+    }
+
+    #[test]
+    fn disabled_thinking_leaves_provider_extensions_alone() {
+        use crate::ir::canonical::{CanonicalRequest, ResponseProjection, ThinkingSpec};
+        let projection = ResponseProjection::for_request(&CanonicalRequest {
+            thinking: Some(ThinkingSpec::Disabled),
+            ..CanonicalRequest::default()
+        });
+        let mut stream = AnthropicResponseStream::new();
+        let events: Vec<_> = [
+            json!({"type": "content_block_start", "index": 0, "x": 1,
+                   "content_block": {"type": "thinking", "thinking": "", "extra": 2}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "future_event"}),
+            json!({"type": "message_delta", "future_top": 1,
+                   "delta": {"stop_reason": "end_turn"}}),
+        ]
+        .iter()
+        .flat_map(|event| stream.feed(event))
+        .filter(|event| projection.allows(event))
+        .collect();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                CanonEvent::ProviderFields { extension, .. }
+                    if extension.value().get("x").is_some()
+                        || extension.value().get("extra").is_some()
+            )),
+            "fields of a reasoning block go with the reasoning"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, CanonEvent::ProviderEvent(_)))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            CanonEvent::ProviderFields { extension, .. } if extension.value().get("future_top").is_some()
+        )));
+
+        let mut turn = canonical_turn_from_anthropic(&json!({
+            "id": "m", "type": "message", "role": "assistant", "model": "up",
+            "content": [{"type": "thinking", "thinking": "t", "signature": "s"},
+                        {"type": "future_block", "results": []},
+                        {"type": "text", "text": "a"}],
+            "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1},
+            "future_top": true
+        }))
+        .expect("interprets");
+        projection.apply(&mut turn);
+        let rendered = anthropic_from_canonical("m", &turn);
+        assert_eq!(rendered["future_top"], json!(true));
+        assert_eq!(
+            rendered["content"],
+            json!([{"type": "future_block", "results": []}, {"type": "text", "text": "a"}])
+        );
+    }
+
+    #[test]
+    fn foreign_frontends_report_each_omitted_extension_without_its_value() {
+        use crate::translate::{OpenAiChatRenderer, OpenAiResponsesRenderer, TranslationReport};
+        let mut stream = AnthropicResponseStream::new();
+        let mut chat = OpenAiChatRenderer::new("m");
+        let mut responses = OpenAiResponsesRenderer::new("m");
+        for event in [
+            json!({"type": "future_event", "secret": "do-not-leak"}),
+            json!({"type": "message_delta", "future_top": "do-not-leak",
+                   "delta": {"stop_reason": "end_turn"}}),
+        ]
+        .iter()
+        .flat_map(|event| stream.feed(event))
+        {
+            chat.feed(&event);
+            responses.feed(&event);
+        }
+        for report in [chat.take_report(), responses.take_report()] {
+            assert_eq!(report.losses().len(), 2);
+            assert!(report.losses().iter().all(|loss| {
+                loss.reason() == TranslationLossReason::IncompatibleExtensionDialect
+                    && !loss.path().contains("do-not-leak")
+            }));
+        }
+        let turn = canonical_turn_from_anthropic(&json!({
+            "id": "m", "type": "message", "role": "assistant", "model": "up",
+            "content": [{"type": "future_block"}], "stop_reason": "end_turn",
+            "usage": {}, "future_top": 1
+        }))
+        .expect("interprets");
+        let report =
+            TranslationReport::for_response_extensions(&turn, DialectId::OpenAiChatCompletions);
+        assert_eq!(report.losses().len(), 2);
+        assert!(
+            TranslationReport::for_response_extensions(&turn, DialectId::OpenRouterMessages)
+                .is_empty()
+        );
     }
 }

@@ -7,6 +7,7 @@
 use axum::http::StatusCode;
 use serde_json::Value;
 
+use crate::ir::canonical::CanonEvent;
 use crate::observe::{SseEvent, SseSplitter};
 use crate::policy::FailureClass;
 use crate::providers::codex::{ResponseError, ResponseEvent, ResponsesSse};
@@ -469,9 +470,19 @@ pub(crate) async fn precommit_anthropic(
             .and_then(classify_anthropic_event);
         let canonical = failure.is_none()
             && event.as_ref().is_some_and(|event| {
-                !crate::translate::AnthropicResponseStream::new()
+                // Only an event the canonical models counts as the stream
+                // committing; an unknown event kind is carried, not read.
+                crate::translate::AnthropicResponseStream::new()
                     .feed_sse(event)
-                    .is_empty()
+                    .iter()
+                    .any(|event| {
+                        !matches!(
+                            event,
+                            CanonEvent::ProviderEvent(_)
+                                | CanonEvent::ProviderFields { .. }
+                                | CanonEvent::ProviderBlockEvent { .. }
+                        )
+                    })
             });
         if failure.is_none()
             && evidence != CommitEvidence::ByteCapReached

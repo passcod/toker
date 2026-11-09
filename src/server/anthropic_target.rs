@@ -20,7 +20,7 @@ use crate::ir::canonical::CanonEvent;
 use crate::observe::{AnthropicObserver, SseEvent, SseSplitter};
 use crate::policy::BindingId;
 use crate::providers::Provider;
-use crate::routing::ProtocolId;
+use crate::routing::{DialectId, ProtocolId};
 use crate::translate::{
     self, AnthropicResponseStream, OpenAiChatRenderer, OpenAiResponsesRenderer,
 };
@@ -43,6 +43,13 @@ pub(crate) enum FrontendWire {
 }
 
 impl FrontendWire {
+    fn dialect(self) -> DialectId {
+        match self {
+            FrontendWire::Chat => DialectId::OpenAiChatCompletions,
+            FrontendWire::Responses => DialectId::CodexResponses,
+        }
+    }
+
     fn protocol(self) -> ProtocolId {
         match self {
             Self::Chat => ProtocolId::OpenAiChat,
@@ -524,6 +531,16 @@ async fn forward(
             return upstream_failure(ErrorWire::Openai, "invalid upstream response");
         }
     };
+    let mut record = record;
+    if let Some(ctx) = record.as_mut() {
+        let losses =
+            translate::TranslationReport::for_response_extensions(&turn, frontend.dialect());
+        if !losses.is_empty() {
+            ctx.translation_report
+                .get_or_insert_with(Default::default)
+                .extend(losses);
+        }
+    }
     if let Some(ctx) = record.as_ref() {
         let mut observer = AnthropicObserver::new();
         observer.observe_json(&buffered.bytes);
@@ -621,6 +638,13 @@ impl FrontendRenderer {
             Self::Responses(renderer) => renderer.turn_ended(),
         }
     }
+
+    fn take_report(&mut self) -> translate::TranslationReport {
+        match self {
+            Self::Chat(renderer) => renderer.take_report(),
+            Self::Responses(renderer) => renderer.take_report(),
+        }
+    }
 }
 
 fn stream_events(
@@ -648,7 +672,13 @@ fn stream_events(
                 return Some((Ok(bytes), state));
             }
             if state.ended {
-                if let Some(ctx) = state.record.take().filter(|_| state.succeeded) {
+                let report = state.frontend.take_report();
+                if let Some(mut ctx) = state.record.take().filter(|_| state.succeeded) {
+                    if !report.is_empty() {
+                        ctx.translation_report
+                            .get_or_insert_with(Default::default)
+                            .extend(report);
+                    }
                     let (reported_model, capture) =
                         std::mem::take(&mut state.observer).finish_parts();
                     record_anthropic_measurement(

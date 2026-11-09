@@ -465,6 +465,7 @@ fn unsupported(block: &CanonBlock) -> TranslateError {
         CanonBlock::ToolResult { .. } => "tool_result",
         CanonBlock::Thinking { .. } => "thinking",
         CanonBlock::RedactedThinking { .. } => "redacted_thinking",
+        CanonBlock::Opaque(_) => "provider_block",
         CanonBlock::Annotated { block, .. } => return unsupported(block),
     };
     TranslateError::UnsupportedBlock {

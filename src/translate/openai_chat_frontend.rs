@@ -14,7 +14,7 @@ use crate::ir::canonical::{
 };
 use crate::observe::sse::SseEvent;
 use crate::routing::DialectId;
-use crate::translate::TranslateError;
+use crate::translate::{TranslateError, TranslationReport};
 
 const DIALECT: DialectId = DialectId::OpenAiChatCompletions;
 
@@ -462,11 +462,18 @@ pub struct OpenAiChatRenderer {
     started: bool,
     tool_index: u64,
     ended: bool,
+    /// What this rendering omitted from a foreign dialect, content-free.
+    report: TranslationReport,
 }
 
 impl OpenAiChatRenderer {
     pub fn turn_ended(&self) -> bool {
         self.ended
+    }
+
+    /// The content-free losses so far, drained.
+    pub fn take_report(&mut self) -> TranslationReport {
+        std::mem::take(&mut self.report)
     }
 
     pub fn new(model: &str) -> OpenAiChatRenderer {
@@ -476,6 +483,7 @@ impl OpenAiChatRenderer {
             started: false,
             tool_index: 0,
             ended: false,
+            report: TranslationReport::default(),
         }
     }
 
@@ -550,7 +558,13 @@ impl OpenAiChatRenderer {
                     event: None,
                 }]
             }
-            CanonEvent::ProviderEvent(_) => Vec::new(),
+            CanonEvent::ProviderEvent(extension)
+            | CanonEvent::ProviderFields { extension, .. }
+            | CanonEvent::ProviderBlockEvent { extension, .. } => {
+                self.report
+                    .push_omitted_extension(extension, DialectId::OpenAiChatCompletions);
+                Vec::new()
+            }
         }
     }
 

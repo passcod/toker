@@ -75,6 +75,19 @@ impl DialectId {
             DialectId::CodexResponses => "codex_responses",
         }
     }
+
+    /// Whether an opaque value tagged with `self` replays on a wire speaking
+    /// `target`. The two Messages dialects share one replay domain; every
+    /// other dialect is a domain of its own.
+    pub const fn shares_replay_domain(self, target: DialectId) -> bool {
+        matches!(
+            (self, target),
+            (
+                DialectId::AnthropicMessages | DialectId::OpenRouterMessages,
+                DialectId::AnthropicMessages | DialectId::OpenRouterMessages,
+            )
+        ) || self as u8 == target as u8
+    }
 }
 
 impl fmt::Display for DialectId {
