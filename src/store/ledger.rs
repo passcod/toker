@@ -901,7 +901,10 @@ impl PolicyRouteProvenance {
 /// so they are queryable; payloads whose shape is meter-source-dependent
 /// go in the JSON `extra` column instead — e.g. a `blocked` row's meter
 /// snapshot and context tokens, which mirror whatever source fed the gate.
-#[derive(Debug, Clone, PartialEq)]
+/// `Default` is every field absent, which is what a row carrying no
+/// observation is — including `ts_ms`, which defaults to the epoch and
+/// so is one a caller always sets.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RequestRow {
     /// Row id, assigned by SQLite on insert; `None` while inserting.
     pub id: Option<i64>,

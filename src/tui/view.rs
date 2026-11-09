@@ -3916,6 +3916,58 @@ mod tests {
     }
 
     #[test]
+    fn the_account_strip_scrolls_sideways_on_whole_accounts() {
+        let snap = multi_account_quota_snapshot();
+        let at = |offset: usize, width: u16| -> String {
+            let mut ui = plain();
+            ui.scroll.accounts = offset;
+            let mut terminal = Terminal::new(TestBackend::new(width, 30)).expect("terminal");
+            let tz = utc();
+            let drawn = std::cell::Cell::new(0);
+            terminal
+                .draw(|frame| {
+                    drawn
+                        .set(super::render(frame, &snap, "12:34:56", &tz, &ui).accounts_max_offset);
+                })
+                .expect("draw");
+            let buffer = terminal.backend().buffer();
+            let mut text = String::new();
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    text.push_str(buffer[(x, y)].symbol());
+                }
+                text.push('\n');
+            }
+            format!("{}\nmax_offset={}", text, drawn.get())
+        };
+
+        // Only one account fits at this width, so each step moves the
+        // strip by a whole one and counts what it left behind.
+        let first = at(0, 80);
+        assert!(first.contains("ana@example.net"), "{first}");
+        assert!(first.contains("… 2 more"), "{first}");
+        assert!(!first.contains("‹"), "nothing is hidden to the left yet");
+        assert!(first.contains("max_offset=2"), "{first}");
+
+        let second = at(1, 80);
+        assert!(second.contains("ben@example.net"), "{second}");
+        assert!(second.contains("‹1"), "{second}");
+        assert!(second.contains("… 1 more"), "{second}");
+
+        let last = at(2, 80);
+        assert!(last.contains("acct 3"), "{last}");
+        assert!(last.contains("‹2"), "{last}");
+        assert!(
+            !last.contains("more"),
+            "scrolling stops once the last account is in view: {last}"
+        );
+
+        // Every account fits, so there is nowhere to scroll to.
+        let wide = at(0, 200);
+        assert!(wide.contains("max_offset=0"), "{wide}");
+    }
+
+    #[test]
     fn quota_panel_renders_meters_spent_and_binding() {
         let snap = quota_snapshot();
         // 200 columns: the rate panel (alone: the fixture is unbilled)

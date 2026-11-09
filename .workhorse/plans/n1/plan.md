@@ -21,4 +21,4 @@ Implement the account model described by ACCT and thread it through credential r
 - [x] Migrate historical unattributed rows through setup and refuse other commands until setup completes.
 - [x] Render the account-aware dashboard and the accounts page.
   The dashboard and the accounts page read the store directly, the way the dashboard already read it, so no service snapshot or control endpoint was needed. Naming an account writes through the store like the TUI's existing grant and revoke.
-- [ ] Add focused tests for migration, attribution, account isolation and account-aware rendering.
+- [x] Add focused tests for migration, attribution, account isolation and account-aware rendering.

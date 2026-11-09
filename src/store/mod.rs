@@ -1791,6 +1791,45 @@ mod tests {
     const HOUR_MS: i64 = 60 * 60 * 1000;
 
     #[test]
+    fn two_accounts_sharing_a_reset_hold_their_allowances_apart() {
+        let store = mem_store();
+        let one = crate::test_support::account(&store, "anthropic_sub", "one@example.test");
+        let two = crate::test_support::account(&store, "anthropic_sub", "two@example.test");
+        assert_ne!(one, two);
+        // A reset is a time, and nothing stops two accounts' windows
+        // landing on the same one. Keyed by the reset alone, a release
+        // granted on the spent account would carry a session on the
+        // account that was never stopped.
+        let allowance = |account, release| Allowance {
+            session_id: "ses-shared".to_owned(),
+            account_number: account,
+            meter: "5h".to_owned(),
+            reset_value: 1_700_000_000,
+            release,
+        };
+        store
+            .record_allowance(&allowance(one, Release::Plan))
+            .expect("record");
+        store
+            .record_allowance(&allowance(two, Release::Overage))
+            .expect("record");
+        let held = store.load_allowances().expect("allowances");
+        assert_eq!(held.len(), 2, "one row each, not one overwriting the other");
+        assert_eq!(
+            held.iter()
+                .find(|row| row.account_number == one)
+                .map(|row| row.release),
+            Some(Release::Plan)
+        );
+        assert_eq!(
+            held.iter()
+                .find(|row| row.account_number == two)
+                .map(|row| row.release),
+            Some(Release::Overage)
+        );
+    }
+
+    #[test]
     fn rows_predating_accounts_are_counted_apart_from_rows_awaiting_resolution() {
         let store = mem_store();
         store

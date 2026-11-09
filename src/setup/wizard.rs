@@ -539,8 +539,10 @@ ExecStart="{exe}" serve
 {store_env}Restart=always
 # A refusal over a configuration file still being here cannot resolve
 # itself: only `toker setup` moves the machine off it, so retrying
-# only fills the journal (spec: DLIFE#starting).
-RestartPreventExitStatus={refusal}
+# only fills the journal (spec: DLIFE#starting). The same holds for
+# rows served before toker recorded which account they were on: only
+# setup attributes them (spec: ACCT#moving-a-machine-onto-accounts).
+RestartPreventExitStatus={refusal} {unattributed}
 RestartSec=1
 SyslogIdentifier=toker
 
@@ -567,6 +569,7 @@ MemoryDenyWriteExecute=true
         exe = exe.display(),
         state_dir = state_dir.display(),
         refusal = crate::config::EXIT_CONFIG_FILE_PRESENT,
+        unattributed = crate::accounts::EXIT_ROWS_UNATTRIBUTED,
     )
 }
 
@@ -4221,8 +4224,9 @@ default_backend_anthropic = "codex_sub"
             "Type=exec",
             "Restart=always",
             &format!(
-                "RestartPreventExitStatus={}",
-                crate::config::EXIT_CONFIG_FILE_PRESENT
+                "RestartPreventExitStatus={} {}",
+                crate::config::EXIT_CONFIG_FILE_PRESENT,
+                crate::accounts::EXIT_ROWS_UNATTRIBUTED
             ),
             "RestartSec=1",
             "SyslogIdentifier=toker",
