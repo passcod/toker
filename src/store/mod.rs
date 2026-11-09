@@ -5688,7 +5688,7 @@ mod tests {
     }
 
     #[test]
-    fn retirement_refuses_while_a_lane_is_pinned_and_changes_nothing() {
+    fn retirement_clears_every_pin_to_a_generated_revision() {
         let store = mem_store();
         let RevisionOneActivation::Activated { revision: old, .. } = store
             .activate_revision_one(&policy("generated"), 100, 4, &[])
@@ -5699,23 +5699,24 @@ mod tests {
         mark_generated(&store, old.revision_id);
         pin_lane(&store, "a", old.revision_id);
         pin_lane(&store, "b", old.revision_id);
-        let before = store.load_routing_policy_state().unwrap();
 
-        let refused = store.activate_revision_one(&policy("fresh"), 200, 5, &[]);
-        let Err(Error::InvalidRoutingState(message)) = refused else {
-            panic!("a pinned lane refuses retirement: {refused:?}")
+        let RevisionOneActivation::Activated { revision, .. } = store
+            .activate_revision_one(&policy("fresh"), 200, 5, &[])
+            .unwrap()
+        else {
+            panic!("the first revision is established afresh")
         };
-        assert!(message.contains("2 lanes"), "{message}");
-        assert!(
-            message.contains(&format!("revision {} (2)", old.revision_id)),
-            "{message}"
-        );
-        assert_eq!(store.load_routing_policy_state().unwrap(), before);
+        assert_ne!(revision.revision_id, old.revision_id);
+        for key in ["a", "b"] {
+            let lane = store.load_lane(key).unwrap().expect("the lane is kept");
+            assert_eq!(lane.pin, None, "{key}");
+            assert_eq!(lane.pin_generation, 1, "{key}: a stale pin swap must fail");
+        }
         assert!(
             store
                 .load_policy_revision(old.revision_id)
                 .unwrap()
-                .is_some()
+                .is_none()
         );
     }
 

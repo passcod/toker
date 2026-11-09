@@ -975,9 +975,8 @@ pub(super) fn activate_revision_one(
 /// semantics, which no longer decode, and return their ids.
 ///
 /// Runs inside the first-revision transaction, before anything reads the
-/// pointer or the draft. A lane pinned to one refuses the whole transaction,
-/// since its cache was built under that revision. Where the pointer named
-/// one, the pointer, draft and import marker are cleared so the caller
+/// pointer or the draft. Lanes pinned to one lose their pin. Where the
+/// pointer named one, the pointer, draft and import marker are cleared so the caller
 /// establishes the first revision afresh; where only the draft was based on
 /// one, the draft restarts from the active revision.
 // spec: RMIG#retiring-generated-revisions
@@ -992,26 +991,18 @@ fn retire_generated_revisions(conn: &Connection, now_ms: i64) -> Result<Vec<i64>
     if retired.is_empty() {
         return Ok(retired);
     }
-    let pinned: Vec<(i64, i64)> = conn
-        .prepare(
-            "SELECT policy_revision_id, COUNT(*) FROM lanes
-             WHERE policy_revision_id IN (SELECT value FROM json_each(?1))
-             GROUP BY policy_revision_id ORDER BY policy_revision_id",
-        )?
-        .query_map([id_list(&retired)], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    if !pinned.is_empty() {
-        let lanes: i64 = pinned.iter().map(|(_, count)| count).sum();
-        let revisions = pinned
-            .iter()
-            .map(|(revision, count)| format!("revision {revision} ({count})"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(Error::InvalidRoutingState(format!(
-            "{lanes} lanes are pinned to generated policy revisions that can no \
-             longer be compiled: {revisions}"
-        )));
-    }
+    // A lane pinned to a retired revision is unpinned whatever its
+    // temperature: one cache rebuild on a lane that happened to be warm
+    // costs less than holding the service down until the prune drops it.
+    // The generation moves so a compare-and-swap built on the old pin fails.
+    conn.execute(
+        "UPDATE lanes SET pin_generation = pin_generation + 1,
+             policy_revision_id = NULL, policy_route_id = NULL,
+             route_fingerprint = NULL, candidate_id = NULL, binding_id = NULL,
+             baseline_model = NULL, effective_model = NULL
+         WHERE policy_revision_id IN (SELECT value FROM json_each(?1))",
+        [id_list(&retired)],
+    )?;
 
     // The rows still referring to the retired revisions are repointed or
     // cleared below and by the caller, all before this transaction commits.

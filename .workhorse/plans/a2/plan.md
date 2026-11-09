@@ -24,7 +24,7 @@ The live store held two generated revisions with identical documents, eight lane
 - [x] Compiler: drop `PolicyOrigin` and every guard; compile the substitution; derive Chat/Responses listings for every revision with the route check, replacing `add_generated_publication`
 - [x] Resolver: family substitution through the reached candidate's upgrade policy classifier and bar; rename the legacy compaction facts
 - [x] Generator: emit authored vocabulary (Anthropic-only regex classifiers, scaled bar, exact/regex alias rules, substitution); `compile_document` and `compile_stored_revision` become the ordinary compile
-- [x] Store: drop `PolicyCompilerOrigin` (column stays, defaulting to authored); retire generated revisions inside the first-revision transaction (refuse on pins, delete, reset pointer/draft/marker or rebase the draft, repair publications)
+- [x] Store: drop `PolicyCompilerOrigin` (column stays, defaulting to authored); retire generated revisions inside the first-revision transaction (clear every pin to them, delete, reset pointer/draft/marker or rebase the draft, repair publications)
 - [x] Tests updated for the new vocabulary, retirement and derived listings; test-cases file (new and rewritten tests run by name, the full suite left to CI)
 - [x] `cargo check --all-targets`, `cargo clippy --all-targets`, `cargo fmt`
 

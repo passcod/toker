@@ -29,6 +29,6 @@
 
 - [x] A generated active revision is deleted and the first revision is established afresh, with publications repointed to it (verifies spec: RMIG)
 - [x] Generated history under an authored active revision is deleted, its draft rebased onto the active revision, and a lineage pointer to it cleared (verifies spec: RMIG)
-- [x] A lane pinned to a generated revision refuses the transaction, naming the lanes and revisions, and changes nothing (verifies spec: RMIG)
+- [x] Every lane pinned to a generated revision loses its pin, with its pin generation moved, and the lane itself is kept (verifies spec: RMIG)
 - [x] A machine whose config cannot build a first revision keeps its generated revisions when retirement would leave it with nothing (verifies spec: RMIG)
-- [ ] The service starts on a copy of a real store holding generated revisions, once no lane is pinned to them, and routes as before
+- [ ] The service starts on a copy of a real store holding generated revisions and pinned lanes, and routes as before

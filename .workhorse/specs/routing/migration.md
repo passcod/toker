@@ -169,14 +169,12 @@ An earlier version stored revisions whose documents carried semantics only its g
 Such a revision no longer decodes, and MUST be retired in the transaction that [creates the first revision](#creating-it), before it reads the pointer.
 The service MUST reach that transaction on every start, whether or not a revision is active, and setup reaches it as before.
 
-A lane pinned to a generated revision whose [cache temperature](../store/lanes.md#cache-temperature) is cold by its own record, its recorded lifetime having run out, MUST have its pin cleared in the same transaction.
-Where any other lane is pinned to a generated revision, the service MUST refuse to start, naming how many lanes are pinned and to which revisions, and MUST change nothing.
+That transaction MUST clear the pin of every lane pinned to a generated revision, and MUST delete every generated revision.
 
 > [!NOTE]
-> A pinned lane's cache was built under that revision, and resolving it under another one could lose that cache without the consent [RPIN](pins.md#one-decision-for-every-move) requires for a move.
-> A cold lane has no cache left to lose, and an idle lane keeps its pin until the lane table prunes it, which would otherwise hold the service down for as long as the prune takes.
+> A lane warm at that moment loses its cache once, as an activation forced past warm lanes would.
+> Refusing instead would hold the service down until every such lane went idle and was pruned, and on the machines that exist those lanes were long cold anyway.
 
-Otherwise, that transaction MUST delete every generated revision.
 Where the active pointer named one, the same transaction MUST clear the pointer, the draft and the import marker, and MUST then establish the first revision as a machine with no file to read does, as [creating it](#creating-it) specifies.
 Where the draft was based on a generated revision, or no longer decodes, the same transaction MUST replace the draft with the active revision's document at the next generation.
 
