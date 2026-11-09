@@ -36,7 +36,7 @@ Most of what is worth checking is therefore a pair: the figure an account should
 - [ ] Interrupting setup part-way through the move leaves the store readable, and running setup again completes it
 - [x] A window re-anchored forward while open, and a reading whose window had already ended, are not read as a second account
 - [x] The real store on this machine reads as one account's history: 96,013 measurements, 95,981 naming a live window, no conflicts (checked against a copy)
-- [ ] `toker setup` attributes the real store's ~96,900 pre-account rows, run against a copy first
+- [ ] `toker setup` attributes the real store's 96,991 pre-account rows, run against a copy first
 
 ## The dashboard
 

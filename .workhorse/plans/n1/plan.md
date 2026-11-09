@@ -29,6 +29,6 @@ Implement the account model described by ACCT and thread it through credential r
 
 ## Verifying on this machine
 
-The store here holds roughly 96,700 rows served before accounts were recorded, all on one account.
+The store here holds 96,991 `anthropic_sub` rows served before accounts were recorded, all on one account: 96,013 of them carry a five-hour reading, and the single-account check finds no conflict among them.
 Run `toker setup` against a **copy** first and check it attributes them without refusing, then against the real store.
 Every other command, the service included, refuses until that has happened.
