@@ -5,7 +5,7 @@ id: RMIG
 # Migrating routing into the store
 
 Routing was once configuration interpreted per request, and is now a series of revisions in the store.
-This spec covers the seam between the two: how a machine whose routing was in its file gets a revision, what survives an interrupted migration, and how a file may be read deliberately afterwards.
+This spec covers the seam between the two: how a machine whose routing was in its file gets a revision, what survives an interrupted migration, how a file may be read deliberately afterwards, and how revisions an earlier version generated are retired.
 
 ## The routing fields
 
@@ -41,6 +41,7 @@ A pointer to a revision that is missing, or that no longer compiles, MUST be a s
 > Falling back to the file would route a machine by rules the operator had since replaced, and would do so silently.
 
 The migration that creates the policy tables MUST NOT touch the pointer.
+The pointer MUST be cleared only by [retiring a generated revision](#retiring-generated-revisions).
 
 ## The first revision
 
@@ -54,8 +55,8 @@ It MUST generate each of these.
 | a default per protocol, and one for the unprefixed profile | the configured default for that protocol |
 | a rewrite per provider prefix | the known providers |
 | presentation selectors | the configured picker rules |
-| a classifier and an upgrade policy per binding | enabled only where the equivalent toggle was |
-| a compaction target | the configured compaction model |
+| a classifier and an upgrade policy per binding serving Anthropic's model identities | enabled only where the equivalent toggle was |
+| a compaction model substitution over the Anthropic Messages bindings other than OpenRouter | the configured compaction model |
 
 Every known provider MUST own its prefix even while disabled.
 
@@ -67,18 +68,31 @@ Where no default exists for the Messages protocol but a configured binding has a
 > [!NOTE]
 > Those calls name the client's own bare model identifiers whatever the operator picked, and policy never recognises them by their prompt.
 
-### Generated semantics
+### In authored vocabulary
 
-The first revision needs matchers, classifiers and bars that authored policy cannot express.
-
-Each MUST be marked as generated at compile time, and the compiler MUST refuse every one of them from an authored document.
-
-A revision MUST record its compiler origin, and an edit or a reactivation of a generated revision MUST inherit it, as [RREV](revisions.md#history-and-reactivation) requires.
-
-A field no longer written MUST be kept in the document type.
+The first revision MUST be written in the vocabulary of an authored document, and MUST be compiled by the same compiler as any other revision.
 
 > [!NOTE]
-> A stored revision carrying it must still decode and keep its fingerprint.
+> Toker has one user on a couple of machines, and a parallel set of matchers, parsers, bars and targets kept only to reproduce one generated file's quirks cost more than the quirks were worth.
+
+A model map's entry naming a model MUST become an alias rule with an exact matcher on that identity.
+A model map's entry naming a family MUST become an alias rule matching the identities the generated classifier places in that family.
+
+The generated classifier MUST match an identity of the form `claude-`, a family name, then a trailing run of numeric version segments, and MUST read that run as a numeric tuple of any length.
+It MUST give no family to an identity carrying a date the catalogue does not know.
+
+> [!NOTE]
+> Its observed days and prompt sizes would otherwise authorise routing traffic to a different identity.
+
+An identity whose version segments precede its family name has no family under the generated classifier.
+
+> [!NOTE]
+> Only Anthropic's earlier naming took that shape, so a request naming one of those models keeps it rather than being upgraded.
+> Reading those identities needs a classifier that pulls digits out of the middle of a name, which is what misread every other provider's identities.
+
+The generated upgrade policies MUST use the scaled evidence bar, and MUST let a promotion stand in for evidence, as [RMODEL](models.md#electing-a-familys-target) specifies.
+
+The generated compaction substitution MUST name the configured compaction model, or the Sonnet family where none is configured, as [RCOMP](compaction.md#choosing-the-target) specifies.
 
 ### Creating it
 
@@ -148,6 +162,25 @@ The result MUST be an ordinary draft, validated, previewed, edited and activated
 > [!NOTE]
 > Import is for a file that carries routing.
 > One that carries none yields a document built from the enabled providers alone, which is the first revision for a fresh machine rather than the operator's edited policy.
+
+## Retiring generated revisions
+
+An earlier version stored revisions whose documents carried semantics only its generated first revision could use, and recorded them with a generated compiler origin.
+Such a revision no longer decodes, and MUST be retired by the service at startup, before it establishes or loads the active revision.
+
+Where any lane is pinned to a generated revision, the service MUST refuse to start, naming how many lanes are pinned and to which revisions, and MUST change nothing.
+
+> [!NOTE]
+> A pinned lane's cache was built under that revision, and resolving it under another one could lose that cache without the consent [RPIN](pins.md#one-decision-for-every-move) requires for a move.
+
+Otherwise, in one immediate transaction, the service MUST delete every generated revision.
+Where the active pointer named one, the same transaction MUST clear the pointer, the draft and the import marker, and MUST then establish the first revision as a machine with no file to read does, as [creating it](#creating-it) specifies.
+Where the draft was based on a generated revision, the same transaction MUST replace the draft with the active revision's document at the next generation.
+
+> [!NOTE]
+> Deleting these rows is the one exception to keeping the store's history, because a revision that cannot be decoded keeps nothing a reader could use.
+
+A ledger row naming a retired revision MUST keep that revision's number, and the number MUST NOT be reused.
 
 ## Adopting rows written before ownership was recorded
 

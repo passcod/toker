@@ -54,16 +54,19 @@ Toker MUST NOT answer with a partial list.
 
 Such a presentation MUST still compile, because a catalogue can legitimately lag a policy.
 
-### Generated listings
+### Derived listings
 
-A revision generated from an earlier configuration MUST continue to list the slugs clients had already learned.
+A Chat or Responses listing MUST also carry slugs derived from the inventory, for every revision.
+For each offer a configured provider holds for that protocol, the derived slugs are the offer's identity prefixed with its provider's name, and the bare identity where the revision's default for that protocol reaches that provider.
 
-Those slugs MUST be computed when the revision is compiled, from the stored document's own defaults and the current inventory.
+A derived slug MUST be listed only where the revision's rewrites and defaults route it to the binding holding the offer.
 
 > [!NOTE]
-> A stored revision then lists what it routes, rather than what a configuration file says today.
+> A revision then lists what it routes, so an authored revision without a provider's prefix rewrite does not advertise slugs that would fall through to its default.
 
-A generated slug is publication only.
+Derived slugs MUST be computed when the revision is compiled, from the stored document and the current inventory.
+
+A derived slug is publication only.
 A request naming one MUST be routed through the revision's rewrites and defaults, which keep the alias and upgrade policy of the route they reach.
 
 A slug a presentation also publishes MUST belong to the presentation.

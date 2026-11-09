@@ -57,13 +57,22 @@ Toker MUST NOT rebuild learning from history.
 
 ## Electing a family's target
 
-An upgrade policy names a classifier, the sources its candidates are drawn from, how much evidence a model needs, and whether a manual promotion stands in for that evidence.
+An upgrade policy names a classifier, the sources its candidates are drawn from, the evidence bar a model must clear, and whether a manual promotion stands in for that evidence.
 
-A model MUST become its family's target once it has been served on more distinct local days than the requirement, which MUST be half the days the binding has any evidence for, capped at a small maximum.
+The evidence bar MUST be one of these.
+
+| bar | a model clears it once |
+| --- | --- |
+| none | always |
+| distinct days | it has been served on at least the declared number of distinct local days |
+| promotion | it has been explicitly promoted |
+| scaled | it has been served on more distinct local days than half the days the binding has any evidence for, capped at a small maximum |
 
 > [!NOTE]
 > An absolute bar asks a young ledger for evidence it cannot contain, leaving a fresh install dormant for a week.
 > A scaled bar accepts what is present on day one and tightens as history arrives.
+
+A family's target MUST be the newest candidate that clears its policy's bar and fits the prompt.
 
 A candidate MUST belong to the same family as the requested model and MUST carry a strictly greater version.
 
@@ -84,14 +93,10 @@ Whether to move a request to it MUST be decided separately, by the cache rules b
 
 ### Classifying an identity
 
-A family split MUST fold a published dated snapshot to its undated form before comparing.
+An identity MUST be classified by its canonical identity, so that a published dated snapshot belongs to the family and version of its undated form.
+What a classifier declares is specified by [RDOC](document.md#classifiers).
 
-An identity carrying a date the catalogue does not know MUST have no family at all.
-
-> [!NOTE]
-> Its observed days and prompt sizes would otherwise authorise routing traffic to a different identity.
-
-An identity with no version MUST be excluded from the election, both as a target and as a baseline.
+An identity with no family or no version MUST be excluded from the election, both as a target and as a baseline.
 
 ### Promotion
 
@@ -194,7 +199,7 @@ A declared ceiling MUST NOT be treated as evidence that a route has served a pro
 
 ## Identities are exact
 
-A published dated snapshot MUST fold to its catalogue key.
+A model's canonical identity is its identifier with letter case folded and any bracketed suffix removed, and a published dated snapshot MUST fold to its catalogue key.
 
 Family resemblance MUST NOT assign a limit to a model, and a shared name prefix MUST NOT be read as evidence of capability.
 
