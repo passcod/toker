@@ -123,6 +123,9 @@ pub(super) struct State {
     loading: bool,
     in_flight: bool,
     modal: Modal,
+    /// Whether the preview shown asked for server safeguards. The result of
+    /// a route with no candidate left does not say, so the page remembers.
+    preview_asked: bool,
     /// How far the detail pane is scrolled, and how far it can be; the view
     /// owns the second because only it knows the pane's height and wrapping.
     detail_scroll: u16,
@@ -148,6 +151,7 @@ impl Default for State {
             loading: false,
             in_flight: false,
             modal: Modal::None,
+            preview_asked: false,
             detail_scroll: 0,
             detail_furthest: std::cell::Cell::new(0),
             conflicted_edits: Vec::new(),
@@ -255,6 +259,10 @@ impl State {
 
     pub(super) fn in_flight(&self) -> bool {
         self.in_flight
+    }
+
+    pub(super) fn preview_asked(&self) -> bool {
+        self.preview_asked
     }
 
     pub(super) fn move_view(&mut self, delta: isize) {
@@ -498,7 +506,12 @@ impl State {
                     self.modal = Modal::None;
                 }
             }
-            "preview" => self.modal = Modal::PreviewResult(response.body),
+            "preview" => {
+                self.preview_asked = command.body.as_ref().is_some_and(|body| {
+                    body.get("asks_server_safeguards") == Some(&Value::Bool(true))
+                });
+                self.modal = Modal::PreviewResult(response.body);
+            }
             "activate" | "reactivate" => {
                 self.merge_activation(response.body);
                 self.conflicted_edits.clear();
@@ -1065,6 +1078,9 @@ impl State {
                 body[key] = Value::from(number);
             }
         }
+        if facts.get("asks_server_safeguards") == Some(&Value::Bool(true)) {
+            body["asks_server_safeguards"] = Value::Bool(true);
+        }
         Some(command(
             "preview",
             Method::POST,
@@ -1422,11 +1438,32 @@ fn changed_records(snapshot: &Value) -> Vec<String> {
 fn form_action(form: &Form) -> ModalAction {
     let value = form.value();
     match form.purpose() {
-        Purpose::Record { kind, adding } => ModalAction::Edit(vec![if adding {
-            add_edit(kind, value.clone())
-        } else {
-            replace_edit(kind, value.clone())
-        }]),
+        Purpose::Record { kind, adding } => {
+            let mut record = value.clone();
+            // The flag is the one route field with its own operation, which
+            // is what raises the document to the format that carries it, so
+            // the record travels without it and the operation follows.
+            let honours = (kind == "routes")
+                .then(|| {
+                    record
+                        .as_object_mut()
+                        .and_then(|route| route.remove("honours_server_safeguards"))
+                })
+                .flatten();
+            let mut edits = vec![if adding {
+                add_edit(kind, record)
+            } else {
+                replace_edit(kind, record)
+            }];
+            if kind == "routes" {
+                edits.push(json!({
+                    "kind": "set_route_server_safeguards",
+                    "route_id": value.get("id").cloned().unwrap_or(Value::Null),
+                    "honours": honours == Some(Value::Bool(true)),
+                }));
+            }
+            ModalAction::Edit(edits)
+        }
         Purpose::Description => ModalAction::Edit(vec![json!({
             "kind": "set_description",
             "description": value.get("description").cloned().unwrap_or(Value::Null),

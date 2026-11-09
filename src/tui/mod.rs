@@ -475,7 +475,14 @@ pub fn run(
                 {
                     accounts.move_selection(1)
                 }
-                code if page == Page::Config && config::owns_key(code) => {
+                // Not with Ctrl held: Ctrl+C is the quit below, and the page's
+                // `c` is a plain key.
+                code if page == Page::Config
+                    && config::owns_key(code)
+                    && !key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
                     config.key(key);
                 }
                 code if page == Page::Routing && routing::owns_key(code) => {

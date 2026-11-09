@@ -18,18 +18,18 @@
 - [x] A supported binding receives the field and the beta together, with the client's other betas intact (verifies spec: WSAFE)
 - [x] An unknown binding receives the field and the beta together (verifies spec: WSAFE)
 - [x] A binding whose effective support is unsupported receives neither, and keeps the client's other betas (verifies spec: WSAFE)
-- [ ] A Codex route reports the ask as an incompatible-dialect loss and sends no beta (verifies spec: WSAFE)
+- [x] A Codex route reports the ask as an incompatible-dialect loss and sends no beta (verifies spec: WSAFE)
 - [x] No verdict is synthesised for a response that carries none (verifies spec: WSAFE)
 
 ## Rejection and the mark
 
 - [x] An unknown binding that refuses the ask is sent the request once more without the pair, writing two rows in one attempt group (verifies spec: WSAFE)
 - [x] A binding declaring support that refuses the ask is forwarded the refusal, not retried and not marked (verifies spec: WSAFE)
-- [ ] A refusal that names the announcing beta rather than the field is retried the same way (verifies spec: WSAFE)
+- [x] A refusal that names the announcing beta rather than the field is retried the same way (verifies spec: WSAFE)
 - [x] A mark withholds the pair from later requests (verifies spec: WSAFE)
-- [ ] A mark survives a restart (verifies spec: WSAFE)
-- [ ] A catalogue refresh, a credential change and the control operation each clear a mark (verifies spec: WSAFE)
-- [ ] A refusal and a thinking rewrite named by the same response are applied in one extra send (verifies spec: WSAFE)
+- [x] A mark survives a restart (verifies spec: WSAFE)
+- [x] A catalogue refresh, a credential change and the control operation each clear a mark (verifies spec: WSAFE)
+- [x] A refusal and a thinking rewrite named by the same response are applied in one extra send (verifies spec: WSAFE)
 
 ## Routing
 

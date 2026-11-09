@@ -4668,6 +4668,41 @@ api_key = "sk-proj-test"
         );
     }
 
+    #[test]
+    fn a_catalogue_refresh_and_a_credential_change_each_clear_a_safeguards_mark() {
+        let dir = crate::setup::test_dir("safeguards-mark-clears");
+        let server = server(&dir);
+        let binding = crate::policy::BindingId::new("openrouter.openrouter_messages").unwrap();
+        let listing = |fetched_at_ms| crate::catalog::FetchedCatalog {
+            fetched_at_ms,
+            models: vec![crate::catalog::FetchedModel {
+                id: "some-model".to_owned(),
+                context_window: None,
+                chronology: None,
+                raw: serde_json::Value::Null,
+            }],
+        };
+        server.install_catalog("openrouter", listing(1));
+
+        server.mark_safeguards_rejected(&binding);
+        assert!(server.safeguards_marks().contains(&binding));
+        assert_eq!(server.store.load_safeguards_marks().unwrap().len(), 1);
+
+        // The same listing fetched again still clears it.
+        server.install_catalog("openrouter", listing(2));
+        assert!(server.safeguards_marks().is_empty());
+        assert!(server.store.load_safeguards_marks().unwrap().is_empty());
+
+        server.mark_safeguards_rejected(&binding);
+        assert_eq!(
+            server.clear_safeguards_marks_for_provider("anthropic_sub"),
+            0
+        );
+        assert!(server.safeguards_marks().contains(&binding));
+        assert_eq!(server.clear_safeguards_marks_for_provider("openrouter"), 1);
+        assert!(server.safeguards_marks().is_empty());
+    }
+
     #[tokio::test]
     async fn active_chat_policy_selects_target_and_records_provenance() {
         let (server, seen) = policy_chat_server().await;

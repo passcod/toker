@@ -4,7 +4,8 @@
 //! queue, so an unavailable or restarting daemon cannot stall redraws.
 //!
 //! One worker serves one namespace (`routing`, `config`), named when the
-//! client is built, so a page's commands can only reach its own endpoints.
+//! client is built, so a page's commands reach its own endpoints, plus any
+//! operation it names by an absolute path under `/_toker`.
 
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread;
@@ -120,6 +121,19 @@ fn base_endpoint(port: u16, namespace: &str) -> String {
     format!("http://127.0.0.1:{port}/_toker/{namespace}")
 }
 
+/// Where a command goes: under the worker's namespace, or where an absolute
+/// path (`/safeguards/mark/clear`) names an operation outside it, which the
+/// pages use for an operation that belongs to no one namespace.
+fn endpoint(base: &str, path: &str) -> String {
+    match path.strip_prefix('/') {
+        Some(absolute) => {
+            let root = base.rsplit_once('/').map_or(base, |(root, _)| root);
+            format!("{root}/{absolute}")
+        }
+        None => format!("{base}/{path}"),
+    }
+}
+
 fn worker(
     base: String,
     snapshot: &'static str,
@@ -161,7 +175,7 @@ async fn request(
     command: &Command,
 ) -> Result<Response, String> {
     let mut request = client
-        .request(command.method.clone(), format!("{base}/{}", command.path))
+        .request(command.method.clone(), endpoint(base, command.path))
         .header("x-toker-control", command.control)
         .timeout(if command.method == Method::GET {
             REQUEST_TIMEOUT
@@ -187,7 +201,7 @@ async fn request(
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, base_endpoint};
+    use super::{Command, base_endpoint, endpoint};
 
     #[test]
     fn control_requests_are_pinned_to_loopback_and_their_namespace() {
@@ -202,6 +216,19 @@ mod tests {
         assert_eq!(
             Command::snapshot("config-snapshot").control,
             "config-snapshot"
+        );
+    }
+
+    #[test]
+    fn an_absolute_path_leaves_the_namespace_but_not_the_control_root() {
+        let base = base_endpoint(18123, "config");
+        assert_eq!(
+            endpoint(&base, "snapshot"),
+            "http://127.0.0.1:18123/_toker/config/snapshot"
+        );
+        assert_eq!(
+            endpoint(&base, "/safeguards/mark/clear"),
+            "http://127.0.0.1:18123/_toker/safeguards/mark/clear"
         );
     }
 }

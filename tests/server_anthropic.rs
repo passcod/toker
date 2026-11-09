@@ -4593,7 +4593,10 @@ async fn a_refusal_naming_the_beta_is_retried_like_one_naming_the_field() {
     assert_eq!(response.status(), StatusCode::OK);
     let captured = openrouter.captured();
     assert_eq!(captured.len(), 2);
-    assert!(upstream_betas(&captured[1]).is_empty(), "no beta header is left to send");
+    assert!(
+        upstream_betas(&captured[1]).is_empty(),
+        "no beta header is left to send"
+    );
     let second: Value = serde_json::from_slice(&captured[1].body).expect("retry JSON");
     assert!(second.get("safeguards").is_none());
     assert_eq!(store.load_safeguards_marks().expect("marks").len(), 1);
@@ -4623,7 +4626,10 @@ async fn one_refusal_naming_thinking_and_safeguards_earns_one_extra_send_with_bo
     let captured = openrouter.captured();
     assert_eq!(captured.len(), 2, "one refusal, one retry");
     let retry: Value = serde_json::from_slice(&captured[1].body).expect("retry JSON");
-    assert_eq!(retry.pointer("/thinking/type"), Some(&json!("between_tools")));
+    assert_eq!(
+        retry.pointer("/thinking/type"),
+        Some(&json!("between_tools"))
+    );
     assert!(retry.get("safeguards").is_none());
     let rows = wait_for_rows(&store, 2).await;
     assert_eq!(
@@ -4641,7 +4647,9 @@ async fn the_mark_is_shown_in_the_config_snapshot_and_cleared_by_the_control_ope
     let betas = [("anthropic-beta", SAFEGUARDS_BETA)];
     let body = safeguards_request_body("openrouter/sg-refuse", false);
     assert_eq!(
-        post_messages(addr, "/v1/messages", &betas, &body).await.status(),
+        post_messages(addr, "/v1/messages", &betas, &body)
+            .await
+            .status(),
         StatusCode::OK
     );
 
@@ -4661,9 +4669,15 @@ async fn the_mark_is_shown_in_the_config_snapshot_and_cleared_by_the_control_ope
             .cloned()
             .unwrap_or_else(|| panic!("{binding} is listed: {snapshot}"))
     };
-    assert_eq!(entry("openrouter.openrouter_messages")["declared"], json!("unknown"));
+    assert_eq!(
+        entry("openrouter.openrouter_messages")["declared"],
+        json!("unknown")
+    );
     assert!(entry("openrouter.openrouter_messages")["marked_ms"].is_number());
-    assert_eq!(entry("anthropic_sub.anthropic_messages")["declared"], json!("supported"));
+    assert_eq!(
+        entry("anthropic_sub.anthropic_messages")["declared"],
+        json!("supported")
+    );
     assert!(entry("anthropic_sub.anthropic_messages")["marked_ms"].is_null());
 
     let clear = |binding: &str| {
@@ -4681,7 +4695,11 @@ async fn the_mark_is_shown_in_the_config_snapshot_and_cleared_by_the_control_ope
         .send()
         .await
         .expect("ungated clear");
-    assert_eq!(refused.status(), StatusCode::FORBIDDEN, "the usual gate applies");
+    assert_eq!(
+        refused.status(),
+        StatusCode::FORBIDDEN,
+        "the usual gate applies"
+    );
     let cleared: Value = clear("openrouter.openrouter_messages")
         .await
         .expect("clear")

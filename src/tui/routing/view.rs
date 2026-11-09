@@ -370,6 +370,13 @@ fn render_form(frame: &mut Frame, state: &State, form: &Form) -> FormHit {
 fn modal_text(state: &State) -> Vec<String> {
     let modal = state.modal();
     let mut lines = modal_lines(modal);
+    if let Modal::PreviewResult(result) = modal
+        && state.preview_asked()
+    {
+        // Under the close hint, over the raw result it summarises.
+        let summary = super::detail::preview_safeguards(result);
+        lines.splice(1..1, summary);
+    }
     if matches!(modal, Modal::Activate { .. } | Modal::Reactivate { .. }) {
         // Before the closing "confirms" line, so the prompt stays last.
         let confirm = lines.pop();

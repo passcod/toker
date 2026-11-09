@@ -1386,7 +1386,9 @@ mod tests {
         let other = crate::policy::BindingId::new("anthropic_sub.anthropic_messages").unwrap();
         let store = Store::open(&db).expect("open");
         store.set_safeguards_mark(&binding, 100).expect("mark");
-        store.set_safeguards_mark(&binding, 200).expect("marking again");
+        store
+            .set_safeguards_mark(&binding, 200)
+            .expect("marking again");
         drop(store);
 
         let store = Store::open(&db).expect("reopen");

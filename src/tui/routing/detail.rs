@@ -43,6 +43,61 @@ pub(super) fn lines(snapshot: &Value, entry: &Entry<'_>) -> Vec<String> {
     lines
 }
 
+/// What a preview that asked for server safeguards says about them: each
+/// candidate the walk looked at with its binding's effective support, the
+/// ones skipped for lacking it, and whether the route was walked again
+/// without the requirement. Only the three support words and ids are shown,
+/// never anything the request carried.
+///
+/// Empty where the body is not a preview result with a walk in it.
+pub(super) fn preview_safeguards(body: &Value) -> Vec<String> {
+    let result = body.get("result").unwrap_or(body);
+    let trace = array(result, "trace");
+    let mut lines = Vec::new();
+    for event in trace {
+        match text(event, "kind") {
+            "candidate" => {
+                let support = event
+                    .get("server_safeguards")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unreported");
+                let skipped = match event.pointer("/result/Err").and_then(Value::as_str) {
+                    Some("LacksServerSafeguards") => {
+                        "  skipped: lacks server safeguards".to_owned()
+                    }
+                    Some(other) => format!("  skipped: {other}"),
+                    None => String::new(),
+                };
+                lines.push(format!(
+                    "  {}  {}  {support}{skipped}",
+                    text(event, "candidate_id"),
+                    text(event, "binding_id"),
+                ));
+            }
+            "safeguards_walked_again" => {
+                lines.push("  walked again without the requirement".to_owned());
+            }
+            _ => {}
+        }
+    }
+    if lines.is_empty() {
+        return lines;
+    }
+    lines.insert(0, "SERVER SAFEGUARDS asked for".to_owned());
+    if let Some(serving) = result.get("server_safeguards")
+        && let Some(effective) = serving.get("effective").and_then(Value::as_str)
+    {
+        let marked = if serving.get("marked") == Some(&Value::Bool(true)) {
+            ", rejection mark held"
+        } else {
+            ""
+        };
+        lines.push(format!("  serving binding: {effective}{marked}"));
+    }
+    lines.push(String::new());
+    lines
+}
+
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or("-")
 }
@@ -204,6 +259,9 @@ fn route(snapshot: &Value, record: &Value) -> Vec<String> {
         format!("{}  {}", text(record, "id"), text(record, "display_name")),
         format!("lane transition: {}", text(record, "lane_transition")),
     ];
+    if record.get("honours_server_safeguards") == Some(&Value::Bool(true)) {
+        lines.push("honours server safeguards: a request that asks needs them".to_owned());
+    }
     let derived = derived(snapshot);
     let facts = derived
         .ok()
