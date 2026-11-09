@@ -1139,6 +1139,9 @@ pub(crate) fn upstream_request_headers(
 /// body), minus `content-encoding` — unless `keep_content_encoding`, for
 /// the untouched compressed-passthrough branch, where the bytes are
 /// verbatim and the encoding must stay.
+///
+/// Where the upstream sent the overage utilisation and no monthly overage
+/// period utilisation, the latter is added with the former's value.
 pub(crate) fn response_headers(upstream: &HeaderMap, keep_content_encoding: bool) -> HeaderMap {
     let mut outgoing = HeaderMap::with_capacity(upstream.len());
     for (name, value) in upstream {
@@ -1150,8 +1153,23 @@ pub(crate) fn response_headers(upstream: &HeaderMap, keep_content_encoding: bool
         }
         outgoing.append(name, value.clone());
     }
+    // spec: WCANON#response-headers
+    // Claude Code drops the overage utilisation from its rate limit event
+    // exactly while overage is drawn (the exhausted plan window is the
+    // representative claim then), but passes the monthly overage period
+    // utilisation through in every state. The API has not been seen
+    // sending the monthly one, so a host reads the figure from there.
+    if !outgoing.contains_key(OVERAGE_PERIOD_MONTHLY_UTILIZATION)
+        && let Some(value) = upstream.get(OVERAGE_UTILIZATION)
+    {
+        outgoing.insert(OVERAGE_PERIOD_MONTHLY_UTILIZATION, value.clone());
+    }
     outgoing
 }
+
+const OVERAGE_UTILIZATION: &str = "anthropic-ratelimit-unified-overage-utilization";
+const OVERAGE_PERIOD_MONTHLY_UTILIZATION: &str =
+    "anthropic-ratelimit-unified-overage-period-monthly-utilization";
 
 pub(crate) fn is_compressed(headers: &HeaderMap) -> bool {
     match headers
@@ -1370,8 +1388,77 @@ pub(crate) fn plain_status(status: StatusCode, message: &'static str) -> Respons
 
 #[cfg(test)]
 mod tests {
-    use super::{ErrorWire, buffer_up_to, buffered_body, transport_failure};
-    use axum::http::{StatusCode, header};
+    use super::{
+        ErrorWire, OVERAGE_PERIOD_MONTHLY_UTILIZATION, OVERAGE_UTILIZATION, buffer_up_to,
+        buffered_body, response_headers, transport_failure,
+    };
+    use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        pairs
+            .iter()
+            .map(|(name, value)| {
+                (
+                    header::HeaderName::from_static(name),
+                    HeaderValue::from_static(value),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn overage_utilisation_is_copied_into_the_monthly_header() {
+        let upstream = headers(&[(OVERAGE_UTILIZATION, "0.4127")]);
+        let outgoing = response_headers(&upstream, false);
+        assert_eq!(outgoing.get(OVERAGE_UTILIZATION).unwrap(), "0.4127");
+        assert_eq!(
+            outgoing.get(OVERAGE_PERIOD_MONTHLY_UTILIZATION).unwrap(),
+            "0.4127"
+        );
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_number_is_copied_as_sent() {
+        let upstream = headers(&[(OVERAGE_UTILIZATION, "about half")]);
+        let outgoing = response_headers(&upstream, false);
+        assert_eq!(
+            outgoing.get(OVERAGE_PERIOD_MONTHLY_UTILIZATION).unwrap(),
+            "about half"
+        );
+    }
+
+    #[test]
+    fn a_monthly_header_the_provider_sent_is_kept() {
+        let upstream = headers(&[
+            (OVERAGE_UTILIZATION, "0.4127"),
+            (OVERAGE_PERIOD_MONTHLY_UTILIZATION, "0.9"),
+        ]);
+        let outgoing = response_headers(&upstream, false);
+        let monthly: Vec<_> = outgoing
+            .get_all(OVERAGE_PERIOD_MONTHLY_UTILIZATION)
+            .iter()
+            .collect();
+        assert_eq!(monthly, ["0.9"]);
+    }
+
+    #[test]
+    fn neither_header_is_added_when_the_provider_sent_no_overage_utilisation() {
+        let upstream = headers(&[("anthropic-ratelimit-unified-5h-utilization", "0.2")]);
+        let outgoing = response_headers(&upstream, false);
+        assert!(!outgoing.contains_key(OVERAGE_UTILIZATION));
+        assert!(!outgoing.contains_key(OVERAGE_PERIOD_MONTHLY_UTILIZATION));
+    }
+
+    #[test]
+    fn a_monthly_header_alone_is_not_touched() {
+        let upstream = headers(&[(OVERAGE_PERIOD_MONTHLY_UTILIZATION, "0.9")]);
+        let outgoing = response_headers(&upstream, false);
+        assert_eq!(
+            outgoing.get(OVERAGE_PERIOD_MONTHLY_UTILIZATION).unwrap(),
+            "0.9"
+        );
+        assert!(!outgoing.contains_key(OVERAGE_UTILIZATION));
+    }
 
     async fn error_of(response: axum::response::Response) -> serde_json::Value {
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
