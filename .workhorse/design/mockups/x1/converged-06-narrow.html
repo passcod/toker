@@ -113,21 +113,21 @@
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1</span><span class="d"> → </span><span class="b r">2 rewrites 14</span><span class="d"> → </span><span class="d">3</span><span class="d"> → </span><span class="d">4</span><span class="d"> · </span><span class="d">5</span><span class="d"> · </span><span class="d">6</span>                                                  rev 9 live 
 <span class="b">REWRITES</span> <span class="d">──────────────────────────────────────────────────────────────────────────────────────────</span> 
        <span class="d">match</span>                              <span class="d">route</span>                   <span class="d">reach</span>                        <span class="d">hits</span> 
- <span class="d">┌─ </span><span class="b">anthropic_messages</span>  5 rules · prefix → ${model} <span class="d">───────────────────────────────────────────────</span> 
+ <span class="d">┌─ </span><span class="b">anthropic_messages</span>  5 rules · prefix · sends ${model} <span class="d">─────────────────────────────────────────</span> 
  <span class="d">│</span> <span class="d"> 1</span>  anthropic/${model}               → claude-sub              <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>       <span class="d">-</span> 
 <span class="r"> │  2  anthropic_sub/${model}           → claude-sub              no cred · billed fallback      ≥1 </span>
  <span class="d">│</span> <span class="d"> 3</span>  anthropic_api/${model}           → claude-api              <span class="d">off</span>                             <span class="d">-</span> 
  <span class="d">│</span> <span class="d"> 4</span>  openrouter/${model}              → openrouter-messages     ok                             41 
  <span class="d">│</span> <span class="d"> 5</span>  codex_sub/${model}               → codex                   <span class="d">off</span> · <span class="yellow">billed fallback</span>           <span class="d">-</span> 
  <span class="d">└─</span> <span class="d">else</span>  default                       → claude-sub              <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>      ≥3 
- <span class="d">┌─ </span><span class="b">openai_chat</span>  5 rules · prefix → ${model} <span class="d">──────────────────────────────────────────────────────</span> 
+ <span class="d">┌─ </span><span class="b">openai_chat</span>  5 rules · prefix · sends ${model} <span class="d">────────────────────────────────────────────────</span> 
  <span class="d">│</span> <span class="d"> 1</span>  openrouter/${model}              → openrouter-chat         ok                              9 
  <span class="d">│</span> <span class="d"> 2</span>  openai_api/${model}              → openai-chat             <span class="d">off</span>                             <span class="d">-</span> 
  <span class="d">│</span> <span class="d"> 3</span>  codex_sub/${model}               → codex                   <span class="d">off</span> · <span class="yellow">billed fallback</span>           <span class="d">-</span> 
  <span class="d">│</span> <span class="d"> 4</span>  anthropic_api/${model}           → claude-api              <span class="d">off</span>                             <span class="d">-</span> 
  <span class="d">│</span> <span class="d"> 5</span>  anthropic_sub/${model}           → claude-sub              <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>       <span class="d">-</span> 
  <span class="d">└─</span> <span class="d">else</span>  default                       → openrouter-chat         ok                              <span class="d">-</span> 
- <span class="d">┌─ </span><span class="b">openai_responses</span>  4 rules · prefix → ${model} <span class="d">─────────────────────────────────────────────────</span> 
+ <span class="d">┌─ </span><span class="b">openai_responses</span>  4 rules · prefix · sends ${model} <span class="d">───────────────────────────────────────────</span> 
  <span class="d">│</span> <span class="d"> 1</span>  codex_sub/${model}               → codex                   <span class="d">off</span> · <span class="yellow">billed fallback</span>          ≥2 
  <span class="d">│</span> <span class="d"> 2</span>  anthropic_api/${model}           → claude-api              <span class="d">off</span>                             <span class="d">-</span> 
  <span class="d">│</span> <span class="d"> 3</span>  anthropic_sub/${model}           → claude-sub              <span class="yellow">no cred</span> · <span class="yellow">billed fallback</span>       <span class="d">-</span> 
@@ -138,21 +138,21 @@
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1</span><span class="d"> → </span><span class="b r">2 rewrites 14</span><span class="d"> → </span><span class="d">3</span><span class="d"> → </span><span class="d">4</span><span class="d"> · </span><span class="d">5</span><span class="d"> · </span><span class="d">6</span>                              rev 9 live 
 <span class="b">REWRITES</span> <span class="d">──────────────────────────────────────────────────────────────────────</span> 
        <span class="d">match</span>                     <span class="d">route</span>                 <span class="d">reach</span>               <span class="d">hits</span> 
- <span class="d">┌─ </span><span class="b">anthropic_messages</span>  5 rules · prefix → ${model} <span class="d">───────────────────────────</span> 
+ <span class="d">┌─ </span><span class="b">anthropic_messages</span>  5 rules · prefix · sends ${model} <span class="d">─────────────────────</span> 
  <span class="d">│</span> <span class="d"> 1</span>  anthropic/${model}      → claude-sub            <span class="yellow">no cred</span> · <span class="yellow">billed</span>       <span class="d">-</span> 
 <span class="r"> │  2  anthropic_sub/${model}  → claude-sub            no cred · billed      ≥1 </span>
  <span class="d">│</span> <span class="d"> 3</span>  anthropic_api/${model}  → claude-api            <span class="d">off</span>                    <span class="d">-</span> 
  <span class="d">│</span> <span class="d"> 4</span>  openrouter/${model}     → openrouter-messages   ok                    41 
  <span class="d">│</span> <span class="d"> 5</span>  codex_sub/${model}      → codex                 <span class="d">off</span> · <span class="yellow">billed</span>           <span class="d">-</span> 
  <span class="d">└─</span> <span class="d">else</span>  default              → claude-sub            <span class="yellow">no cred</span> · <span class="yellow">billed</span>      ≥3 
- <span class="d">┌─ </span><span class="b">openai_chat</span>  5 rules · prefix → ${model} <span class="d">──────────────────────────────────</span> 
+ <span class="d">┌─ </span><span class="b">openai_chat</span>  5 rules · prefix · sends ${model} <span class="d">────────────────────────────</span> 
  <span class="d">│</span> <span class="d"> 1</span>  openrouter/${model}     → openrouter-chat       ok                     9 
  <span class="d">│</span> <span class="d"> 2</span>  openai_api/${model}     → openai-chat           <span class="d">off</span>                    <span class="d">-</span> 
  <span class="d">│</span> <span class="d"> 3</span>  codex_sub/${model}      → codex                 <span class="d">off</span> · <span class="yellow">billed</span>           <span class="d">-</span> 
  <span class="d">│</span> <span class="d"> 4</span>  anthropic_api/${model}  → claude-api            <span class="d">off</span>                    <span class="d">-</span> 
  <span class="d">│</span> <span class="d"> 5</span>  anthropic_sub/${model}  → claude-sub            <span class="yellow">no cred</span> · <span class="yellow">billed</span>       <span class="d">-</span> 
  <span class="d">└─</span> <span class="d">else</span>  default              → openrouter-chat       ok                     <span class="d">-</span> 
- <span class="d">┌─ </span><span class="b">openai_responses</span>  4 rules · prefix → ${model} <span class="d">─────────────────────────────</span> 
+ <span class="d">┌─ </span><span class="b">openai_responses</span>  4 rules · prefix · sends ${model} <span class="d">───────────────────────</span> 
  <span class="d">│</span> <span class="d"> 1</span>  codex_sub/${model}      → codex                 <span class="d">off</span> · <span class="yellow">billed</span>          ≥2 
  <span class="d">│</span> <span class="d"> 2</span>  anthropic_api/${model}  → claude-api            <span class="d">off</span>                    <span class="d">-</span> 
  <span class="d">│</span> <span class="d"> 3</span>  anthropic_sub/${model}  → claude-sub            <span class="yellow">no cred</span> · <span class="yellow">billed</span>       <span class="d">-</span> 
@@ -165,14 +165,14 @@
  <span class="b">claude-sub</span>                                                                                  <span class="d">1 of 7</span> 
                                                                                                     
  <span class="b">sent to</span>  2 candidates                                                                              
-<span class="r"> 1  anthropic_sub.anthropic_messages  subscription as asked                              no cred    </span>
+<span class="r"> 1  anthropic_sub.anthropic_messages  subscription  as asked                              no cred   </span>
     ↓ when unavailable before send · overloaded · 5xx                                               
       <span class="d">billed:</span> <span class="yellow">allow</span>   <span class="d">ambiguous retry:</span> deny   <span class="d">cache:</span> preserve warm                                  
- 2  openrouter.openrouter_messages    <span class="yellow">billed</span>       alias claude-* → anthropic/claude-*   ok         
+ 2  openrouter.openrouter_messages    <span class="yellow">billed</span>        alias claude-* → anthropic/claude-*   ok        
                                                                                                     
  <span class="b">handled by</span>  4 on · 3 off<span class="d">: server safeguards · required capabilities · health circuits</span>              
    upgrade          newest on claude-sub<span class="d"> · claude-opus-4-7 → claude-opus-5</span>                          
-   lane transition  moves when cold<span class="d"> · 2 warm, 5 cold pinned</span>                                         
+   lane transition  moves when cold<span class="d"> · 2 warm · 5 cold</span>                                               
    compaction       cold compactions → sonnet<span class="d"> · cache allowed when cold</span>                             
    alias            claude-* → anthropic/claude-*<span class="d"> · on openrouter</span>                                   
                                                                                                     

@@ -107,3 +107,14 @@ Regenerated from `/tmp/x1gen` (which already carries the `refused · no route` l
 - **#7.** In the edit states the head reads `5 rules · 1 new · sends ${model}` (01-04 and all four 08 states).
 - **#8.** In save-flow state 1 a dim `needed` sits beside the empty `match` and `route` fields.
 - **#2, revised: alias rules are on.** The route page head reads `handled by  4 on · 3 off: server safeguards · required capabilities · health circuits` (off names dim), replacing the `classifier` choice above. A fourth on line follows the other three: `alias  claude-* → anthropic/claude-* · on openrouter`. Applied in 02-02, 02-03 and 06-03. The 100x24 route page still fits, now using exactly 24 of 24 rows with nothing shed.
+
+## Round 5 fixes
+
+Caption ids kept; widths and fonts re-checked on 01, 02, 03, 06 and 08; files re-shot and the changed frames looked at. Nit 10 skipped as instructed.
+
+- **S2.** The route page lane line reads `moves when cold · 2 warm · 5 cold` in 02-02, 02-03 and 06-03.
+- **Nit 2.** The at-rest scope heads read `5 rules · prefix · sends ${model}` (01, 06). The presentations head keeps `→ openrouter-messages`, which points at a route.
+- **Nit 5.** The add-fallback form's outgoing-name field is labelled `sends`, focused and reversed with the typed fixed model `claude-sonnet-5`, a caret, and `←/→` showing it cycles. The control line reads `fix sends to save`, and the refusal stays.
+- **Nit 8.** At 100x24 there are two spaces between `subscription` and `as asked` (the model and reach columns moved one cell right).
+- **Nit 9.** The routes tab's ROUTE detail line gains `[m] move`: `[e] edit   [n] add fallback   [m] move   [t] trace   [enter] open route`.
+- **Nit 11.** Every refusal is bold and red: the sends refusal (01-04, 08 refused states) and the model refusal in 02-03.
