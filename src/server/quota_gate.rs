@@ -4,6 +4,7 @@
 //! ends the request and never becomes candidate-unavailability or fallback
 //! evidence; later physical attempts do not evaluate the gate again.
 
+use axum::http::HeaderMap;
 use serde_json::Value;
 
 use crate::ir::Release;
@@ -12,6 +13,11 @@ use crate::middleware::quota::{
     Blocking, GateDecision, Grant, Meter, Meters, decide, grant_for, plan_room,
 };
 
+use crate::providers::Provider;
+use crate::routing::ProtocolId;
+use crate::store::CredentialDigest;
+
+use super::proxy::{outgoing_credential_digest, outgoing_headers};
 use super::{Server, record::now_ms};
 
 pub(crate) struct QuotaBlock {
@@ -26,27 +32,45 @@ pub(crate) fn armed(server: &Server, backend_id: &str) -> bool {
     server.config().gates.quota_enabled && backend_id == crate::release::GATED_BACKEND
 }
 
-/// The account a gate decision is about. The gate runs before the request
-/// is sent, so it cannot read the account off a response: it takes the one
-/// the session is already being served on, and for a session with no row
-/// yet the one this provider served last.
+/// The credential a request will be served with, and the account it names.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RequestCredential {
+    pub(crate) digest: Option<CredentialDigest>,
+    pub(crate) account_number: Option<i64>,
+}
+
+/// The account a gate decision is about: the one named by the credential
+/// the request is about to be sent with (spec: ACCT#routing-does-not-select-an-account).
 ///
-/// A machine with one account answers both the same way. A machine with
-/// several can gate a session's very first request against the wrong
-/// account's windows; that request then writes the row that settles it, so
-/// the window of error is one request and it does not recur.
-pub(crate) fn gate_account(
+/// The gate runs before the request is sent, but the credential it will carry
+/// is already decided, so the account is read off that. Reading it off the
+/// session's last row instead, or the provider's, followed a login switched
+/// mid-session onto the old account's windows. Because a blocked request
+/// sends nothing and writes no served row, that guess then repeated for every
+/// request after it.
+///
+/// A credential that resolves to no account answers `None`, and the gate then
+/// has no reading to stop the request on.
+pub(crate) fn request_credential(
     server: &Server,
-    backend_id: &str,
-    session_id: Option<&str>,
-) -> Option<i64> {
-    server
-        .store
-        .account_for(backend_id, session_id)
-        .unwrap_or_else(|error| {
-            tracing::error!(%error, "account lookup failed");
-            None
-        })
+    provider: &dyn Provider,
+    incoming: &HeaderMap,
+    frontend: ProtocolId,
+) -> RequestCredential {
+    let headers = outgoing_headers(
+        provider,
+        incoming,
+        &server.config().session_header_names,
+        frontend,
+    );
+    let digest = outgoing_credential_digest(&headers);
+    let account_number = digest
+        .as_ref()
+        .and_then(|digest| server.observe_credential(provider.id(), digest));
+    RequestCredential {
+        digest,
+        account_number,
+    }
 }
 
 /// One account's meters for the gate. With no account known there is no
@@ -82,6 +106,7 @@ pub(crate) fn grant_release(
     server: &Server,
     session_id: Option<&str>,
     backend_id: &str,
+    account_number: Option<i64>,
     release: Option<Release>,
     stale_meters: Option<&Value>,
 ) -> Option<(Release, Grant)> {
@@ -90,7 +115,7 @@ pub(crate) fn grant_release(
     }
     let (session, release) = session_id.zip(release)?;
     // No account, no window to release against, so nothing is recorded.
-    let account_number = gate_account(server, backend_id, Some(session))?;
+    let account_number = account_number?;
     let now = now_ms();
     let fresh = grant_for(stale_meters.map(Meters::over), now);
     if let Err(error) =
@@ -108,17 +133,14 @@ pub(crate) fn decide_block(
     server: &Server,
     backend_id: &str,
     session_id: Option<&str>,
+    account_number: Option<i64>,
     frontend: Option<&str>,
     stale_meters: Option<Value>,
 ) -> Option<QuotaBlock> {
     if !armed(server, backend_id) {
         return None;
     }
-    let allowances = allowances_for_session(
-        server,
-        session_id,
-        gate_account(server, backend_id, session_id),
-    );
+    let allowances = allowances_for_session(server, session_id, account_number);
     let GateDecision::Block { meter, resets_at } = decide(
         stale_meters.as_ref().map(Meters::over),
         &allowances,

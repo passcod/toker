@@ -60,6 +60,10 @@ pub struct RequestFacts {
     /// Exact revision-one compaction evidence, separate from generic cache
     /// temperature so it cannot authorize unrelated transitions.
     pub legacy_compaction: Option<LegacyCompactionFacts>,
+    /// The account each provider's credential names for this request, by
+    /// provider id. A provider with no entry is one whose accounts Toker
+    /// cannot tell apart, or whose credential no source has named yet.
+    pub accounts: BTreeMap<String, i64>,
     /// The caller owns the clock. The resolver never reads one.
     pub now_ms: i64,
 }
@@ -2191,6 +2195,7 @@ mod tests {
             binding_affinity: None,
             class: RequestClass::Inference,
             legacy_compaction: None,
+            accounts: BTreeMap::new(),
             now_ms: 100,
         }
     }

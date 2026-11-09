@@ -884,46 +884,6 @@ impl Store {
         state::load_meters_by_account(&*self.conn()?, provider_id)
     }
 
-    /// The account a request on this provider is about: the one the
-    /// session is already being served on, and for a session with no row
-    /// yet the one the provider served last.
-    ///
-    /// Every quota read takes its account from here, so the gate, a
-    /// release and a revoke all agree about whose window is in question.
-    /// `None` is the answer when nothing has been served yet or no source
-    /// has named the credential — an absence each caller handles, rather
-    /// than a zero it could spend against (spec: ACCT#an-account-not-yet-known).
-    ///
-    /// A machine with one account answers both ways the same. A machine
-    /// with several can answer a session's very first request with the
-    /// wrong one; that request writes the row that settles it, so the
-    /// window of error is one request and it does not recur.
-    pub fn account_for(&self, provider_id: &str, session_id: Option<&str>) -> Result<Option<i64>> {
-        if let Some(session_id) = session_id
-            && let Some(account) = self.session_account(provider_id, session_id)?
-        {
-            return Ok(Some(account));
-        }
-        if let Some(account) = self.provider_account(provider_id)? {
-            return Ok(Some(account));
-        }
-        // Nothing served yet. One account known is not a guess, so take it;
-        // several, and which one a request is on is exactly what nothing
-        // has said yet, so answer none rather than pick the nearest.
-        self.sole_account(provider_id)
-    }
-
-    /// The provider's only known account, or `None` where it holds none or
-    /// holds more than one.
-    pub fn sole_account(&self, provider_id: &str) -> Result<Option<i64>> {
-        let mut numbers = self.account_numbers(provider_id)?;
-        Ok(if numbers.len() == 1 {
-            numbers.pop()
-        } else {
-            None
-        })
-    }
-
     /// Every account known on a provider, in discovery order. Callers that
     /// need to tell "none" from "more than one" apart read this; the table
     /// holds one row per login, so reading it whole costs nothing.
@@ -936,20 +896,17 @@ impl Store {
         )
     }
 
-    /// The account a provider most recently served, whatever the session.
-    pub fn provider_account(&self, provider_id: &str) -> Result<Option<i64>> {
-        row_of(
-            &*self.conn()?,
-            "SELECT account_number FROM requests
-             WHERE provider = ?1 AND account_number IS NOT NULL
-             ORDER BY ts_ms DESC, id DESC LIMIT 1",
-            [provider_id],
-            |row| Ok(row.get("account_number")?),
-        )
-    }
-
-    /// The account a session is being served on: the newest row of that
+    /// The account a session was last served on: the newest row of that
     /// session that names one.
+    ///
+    /// This is what the ledger recorded, for readers with no request in hand,
+    /// such as the TUI showing a session or granting it a release. A request
+    /// being served names its account by its credential instead, because
+    /// after a login switch the newest row is on the account just left, and
+    /// a blocked request writes no served row to correct it
+    /// (spec: ACCT#routing-does-not-select-an-account). A session with no
+    /// served row has no account here, and no other session's is borrowed
+    /// for it.
     pub fn session_account(&self, provider_id: &str, session_id: &str) -> Result<Option<i64>> {
         row_of(
             &*self.conn()?,
@@ -1949,6 +1906,13 @@ mod tests {
         pending.credential_digest =
             Some(CredentialDigest::new("ab".repeat(32)).expect("a well-formed digest"));
         store.record_request(&pending).expect("record");
+
+        // A block the gate wrote after accounts began names neither, since
+        // it sent nothing upstream. It is not history from before accounts,
+        // and counting it would stop every command from running.
+        let mut blocked = window_row(4_000, "anthropic_sub", 500);
+        blocked.kind = Some(RowKind::Blocked);
+        store.record_request(&blocked).expect("record");
 
         assert_eq!(
             store

@@ -1534,14 +1534,16 @@ mod tests {
         use crate::store::MetersSnapshot;
         let store = Store::open(":memory:").expect("store");
         let now = jiff::Timestamp::now();
+        let account = crate::test_support::account(&store, "anthropic_sub", "one@example.test");
         let mut row = testrows::bare(now.as_millisecond() - 60_000);
         row.session_id = Some("ses-act".to_owned());
         row.provider = Some("anthropic_sub".to_owned());
+        row.account_number = Some(account);
         store.record_request(&row).expect("record");
         store
             .save_account_meters(
                 "anthropic_sub",
-                crate::test_support::account(&store, "anthropic_sub", "one@example.test"),
+                account,
                 &MetersSnapshot {
                     updated_ms: now.as_millisecond(),
                     snapshot: serde_json::json!({

@@ -2667,9 +2667,10 @@ fn poison_meters(store: &Store, util5h: f64, offset_secs: i64) -> (i64, Value) {
 }
 
 /// The one account these tests are served on, learned the way the proxy
-/// learns one: a credential digest named by a local identity.
+/// learns one: a credential digest named by a local identity. It is the
+/// credential the test server signs with when a request brings none.
 fn fixture_account(store: &Store) -> i64 {
-    let digest = toker::providers::credential_digest("fixture-credential");
+    let digest = toker::providers::credential_digest(HELD_OAUTH_TOKEN);
     store
         .observe_credential(
             "anthropic_sub",
@@ -2803,6 +2804,97 @@ async fn a_spent_meter_blocks_with_a_synthetic_200_and_never_reaches_upstream() 
         rows.iter().all(|row| row.kind == Some(RowKind::Blocked)),
         "both blocked rows recorded"
     );
+}
+
+#[tokio::test]
+async fn the_gate_follows_the_credential_sent_not_the_session_s_last_account() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+    // The held token's account is spent. Another login, on the same
+    // machine and the same session, is not.
+    poison_meters(&store, 1.0, 3600);
+    let spent = fixture_account(&store);
+    let now_ms = jiff::Timestamp::now().as_millisecond();
+    let other_digest = toker::providers::credential_digest("switched-token");
+    let other = store
+        .observe_credential(
+            "anthropic_sub",
+            &other_digest,
+            now_ms,
+            Some(&toker::store::AccountIdentity {
+                upstream_id: None,
+                email: Some("other@example.test".to_owned()),
+                named_by: toker::store::AccountNameSource::Local,
+            }),
+        )
+        .expect("observe the other credential")
+        .expect("the identity names an account");
+    assert_ne!(other, spent);
+    let healthy = json!({
+        "util5h": 0.01, "reset5h": now_ms / 1000 + 3600,
+        "util7d": 0.2, "reset7d": now_ms / 1000 + 5 * 86400,
+    });
+    store
+        .save_account_meters(
+            "anthropic_sub",
+            other,
+            &MetersSnapshot {
+                updated_ms: now_ms,
+                snapshot: healthy,
+            },
+        )
+        .expect("other meters");
+
+    // The spent account's own credential is stopped, and the row says whose
+    // window stopped it.
+    let body = messages_body_no_stream("claude-opus-5");
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    response.bytes().await.expect("blocked bytes");
+    assert!(mock.captured().is_empty(), "the spent account is blocked");
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::Blocked));
+    assert_eq!(rows[0].account_number, Some(spent));
+    assert_eq!(
+        rows[0].credential_digest,
+        Some(toker::providers::credential_digest(HELD_OAUTH_TOKEN))
+    );
+    assert_eq!(
+        store
+            .unattributed_row_count("anthropic_sub")
+            .expect("count"),
+        0,
+        "a block is not history from before accounts"
+    );
+
+    // The same session, after the login is switched, is not gated on the
+    // account it left, however recently that one served it.
+    let headers = [("authorization", "Bearer switched-token")];
+    let response = post_messages(addr, "/v1/messages", &headers, &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("forwarded bytes");
+    assert_eq!(mock.captured().len(), 1, "the other account is not spent");
+
+    // And switching back is stopped again: the gate is about the
+    // credential in hand each time.
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    response.bytes().await.expect("blocked bytes");
+    assert_eq!(mock.captured().len(), 1, "blocked again");
+}
+
+#[tokio::test]
+async fn a_credential_no_source_has_named_is_not_gated_on_another_account() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+    poison_meters(&store, 1.0, 3600);
+
+    // A login nothing has named yet. Its request is served, and the spent
+    // account's reading is no evidence about it.
+    let body = messages_body_no_stream("claude-opus-5");
+    let headers = [("authorization", "Bearer unnamed-token")];
+    let response = post_messages(addr, "/v1/messages", &headers, &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("forwarded bytes");
+    assert_eq!(mock.captured().len(), 1, "served, not gated");
 }
 
 #[tokio::test]

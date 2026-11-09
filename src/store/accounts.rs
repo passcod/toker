@@ -321,10 +321,17 @@ pub(super) fn load_credentials(conn: &Connection) -> Result<Vec<CredentialAccoun
 ///
 /// A row carrying a digest but no account is not one of these. Its account is
 /// simply not resolved yet, and resolving the digest backfills it.
+///
+/// Neither is a row the proxy wrote about a request it never sent: a block,
+/// a release, a cold notice and the like carry no credential by nature, so
+/// counting them made every gate event written after accounts began read as
+/// history from before, and every command refused to run over it. Only a
+/// real API measurement (`kind IS NULL`) was ever served on an account.
 pub(super) fn unattributed_row_count(conn: &Connection, provider: &str) -> Result<i64> {
     Ok(conn.query_row(
         "SELECT COUNT(*) FROM requests
-         WHERE provider = ?1 AND account_number IS NULL AND credential_digest IS NULL",
+         WHERE provider = ?1 AND account_number IS NULL AND credential_digest IS NULL
+           AND kind IS NULL",
         [provider],
         |row| row.get(0),
     )?)
@@ -409,7 +416,8 @@ pub(super) fn attribute_unattributed_rows(
     let tx = conn.transaction()?;
     let moved = tx.execute(
         "UPDATE requests SET account_number = ?2
-         WHERE provider = ?1 AND account_number IS NULL AND credential_digest IS NULL",
+         WHERE provider = ?1 AND account_number IS NULL AND credential_digest IS NULL
+           AND kind IS NULL",
         rusqlite::params![provider, account],
     )?;
     tx.commit()?;

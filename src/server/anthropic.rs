@@ -321,6 +321,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // when the gate is armed (every other backend must be a no-op without
     // even reading meters).
     let mut meters_snapshot: Option<serde_json::Value> = None;
+    // The credential the gate reads, resolved once per request.
+    let mut request_credential: Option<super::quota_gate::RequestCredential> = None;
     if let Ok(mut ir) = parsed {
         let mut ingress_canonical = (path == "/v1/messages")
             .then(|| translate::from_anthropic(ir.value()).ok())
@@ -581,6 +583,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 class,
             );
             facts.asks_server_safeguards = translate::asks_server_safeguards(request);
+            facts.accounts = server.request_accounts(&parts.headers, ProtocolId::AnthropicMessages);
             if class == crate::policy::RequestClass::Compaction {
                 facts.legacy_compaction = Some(legacy_compaction_facts(
                     &server,
@@ -603,6 +606,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 pinned_binding
                     .as_ref()
                     .and_then(|binding| server.registry.binding(binding)),
+                &facts.accounts,
                 facts.now_ms,
                 class == crate::policy::RequestClass::Compaction,
             );
@@ -722,10 +726,18 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         // release is made of.
         let gate_armed = path == "/v1/messages" && super::quota_gate::armed(&server, backend.id());
         if gate_armed {
+            let credential = request_credential.get_or_insert_with(|| {
+                super::quota_gate::request_credential(
+                    &server,
+                    backend.as_ref(),
+                    &parts.headers,
+                    ProtocolId::AnthropicMessages,
+                )
+            });
             meters_snapshot = super::quota_gate::load_meters_for(
                 &server,
                 backend.id(),
-                super::quota_gate::gate_account(&server, backend.id(), session_id.as_deref()),
+                credential.account_number,
             );
         }
         if path == "/v1/messages" {
@@ -749,8 +761,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 let fresh = grant_for(meters, now);
                 // A release spends one account's window, so a marker on a
                 // session Toker cannot place yet records nothing.
-                let account_number =
-                    super::quota_gate::gate_account(&server, backend.id(), Some(session));
+                let account_number = request_credential
+                    .as_ref()
+                    .and_then(|credential| credential.account_number);
                 if let Some(account_number) = account_number
                     && let Err(error) = crate::release::record_grant(
                         &server.store,
@@ -871,19 +884,28 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // gets the SSE turn, since `streamFalse` could not be read.
     let gate_armed = path == "/v1/messages" && super::quota_gate::armed(&server, backend.id());
     if gate_armed {
+        let credential = request_credential.get_or_insert_with(|| {
+            super::quota_gate::request_credential(
+                &server,
+                backend.as_ref(),
+                &parts.headers,
+                ProtocolId::AnthropicMessages,
+            )
+        });
         if meters_snapshot.is_none() {
             // The unparseable-body case: the release/strip section above
             // never ran, so the snapshot was never loaded.
             meters_snapshot = super::quota_gate::load_meters_for(
                 &server,
                 backend.id(),
-                super::quota_gate::gate_account(&server, backend.id(), session_id.as_deref()),
+                credential.account_number,
             );
         }
         if let Some(block) = super::quota_gate::decide_block(
             &server,
             backend.id(),
             session_id.as_deref(),
+            credential.account_number,
             frontend.as_deref(),
             meters_snapshot,
         ) {
@@ -910,6 +932,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 path,
                 session_id: session_id.as_deref(),
                 backend_id: backend.id(),
+                credential,
                 frontend_protocol: "anthropic",
                 meter: block.meter,
                 resets_at: block.resets_at,
@@ -1805,7 +1828,7 @@ fn cold_compaction_target(
     let pinned = lane
         .and_then(|lane| lane.pin.as_ref())
         .and_then(|pin| server.registry.binding(&pin.binding_id));
-    let lane_facts = server.lane_facts(lane, pinned, facts.now_ms, true);
+    let lane_facts = server.lane_facts(lane, pinned, &facts.accounts, facts.now_ms, true);
     server
         .resolve_policy_attempt(&facts, credentials, lane, lane_facts.as_ref())
         .ok()?

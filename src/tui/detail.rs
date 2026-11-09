@@ -73,7 +73,7 @@ impl Detail {
         // release never shows as this session's (spec:
         // ACCT#what-is-attributed-to-an-account).
         let account = store
-            .account_for(GATED_BACKEND, Some(session))
+            .session_account(GATED_BACKEND, session)
             .map_err(|error| keep("account", error))
             .ok()
             .flatten();
@@ -617,9 +617,11 @@ mod tests {
     /// read from it the way the loop reads it.
     fn fixture(meters: Option<serde_json::Value>) -> (Store, Detail) {
         let store = Store::open(":memory:").expect("store");
+        let account = crate::test_support::account(&store, "anthropic_sub", "one@example.test");
         let mut rows = Vec::new();
         for (at, prompt) in [(NOW - 120_000, 40_000), (NOW - 60_000, 52_000)] {
             let mut row = bare(at);
+            row.account_number = Some(account);
             row.session_id = Some("ses-detail-0001".to_owned());
             row.provider = Some("anthropic_sub".to_owned());
             row.requested_model = Some("claude-opus-5".to_owned());
@@ -643,7 +645,7 @@ mod tests {
             store
                 .save_account_meters(
                     "anthropic_sub",
-                    crate::test_support::account(&store, "anthropic_sub", "one@example.test"),
+                    account,
                     &MetersSnapshot {
                         updated_ms: NOW,
                         snapshot: meters,
