@@ -55,7 +55,7 @@ A response that carries no results MUST reach the client without any.
 
 ## A rejection
 
-Where a binding whose declared support is unknown refuses a request with a 400 whose error names the `safeguards` field, Toker MUST send the request once more without the field and without the beta announcing it.
+Where a binding whose declared support is unknown refuses a request with a 400 whose error names the `safeguards` field or the `anthropic-beta` value announcing it, Toker MUST send the request once more without the field and without the beta announcing it.
 Toker MUST forward whatever the second send returns.
 
 Both sends MUST be recorded as separate ledger rows within one attempt group, and the refusal's meters MUST feed the quota gate.

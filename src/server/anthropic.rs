@@ -1533,23 +1533,29 @@ pub(crate) fn note_meters(
     }
 }
 
-/// Send the request once more with `thinking: disabled` rewritten to
-/// `between_tools`, when the upstream refused the first with a 400 that
-/// names that form. Any other response comes back as it arrived.
+/// Send the request once more, rewritten, when the upstream refused the first
+/// with a 400 that names a rewrite Toker can make. Any other response comes
+/// back as it arrived. Two refusals earn a rewrite:
 ///
-/// Claude Code turns thinking off on its side calls (the auto-mode
-/// classifier among them) and decides per model whether `disabled` is
-/// allowed from a list built into the client. From 2026-10-08 Anthropic
-/// started refusing it on `claude-sonnet-5` in bursts, with "To turn
-/// thinking off on this model, send `between_tools`", while the same call
-/// succeeded between bursts; a client built before that keeps sending
-/// `disabled`, and every Bash permission check in auto mode fails. The
-/// rewrite waits for the refusal rather than running up front, because
-/// whether `between_tools` is accepted where `disabled` still is was never
-/// observed, and the refusal is the only evidence a model wants it.
+/// - **`thinking: disabled`**, which becomes `between_tools`. Claude Code
+///   turns thinking off on its side calls (the auto-mode classifier among
+///   them) and decides per model whether `disabled` is allowed from a list
+///   built into the client. From 2026-10-08 Anthropic started refusing it on
+///   `claude-sonnet-5` in bursts, with "To turn thinking off on this model,
+///   send `between_tools`", while the same call succeeded between bursts; a
+///   client built before that keeps sending `disabled`, and every Bash
+///   permission check in auto mode fails. The rewrite waits for the refusal
+///   rather than running up front, because whether `between_tools` is
+///   accepted where `disabled` still is was never observed, and the refusal
+///   is the only evidence a model wants it.
+/// - **server safeguards** (spec: WSAFE#a-rejection), where the binding's
+///   support is only unknown: the ask and the beta announcing it are
+///   withheld, and the binding is marked so later requests do not repeat the
+///   refused send.
 ///
-/// Once only: a second refusal is forwarded and recorded like any error.
-/// The refused response's meters still feed the gate.
+/// A refusal is inspected once and the rewrites it names applied together,
+/// in one extra send. A second refusal is forwarded and recorded like any
+/// error. The refused response's meters still feed the gate.
 pub(crate) enum ThinkingRetry {
     Original(reqwest::Response),
     Retried(reqwest::Response),
@@ -1574,9 +1580,11 @@ pub(crate) async fn retry_thinking_off(
     if upstream.status() != StatusCode::BAD_REQUEST {
         return Ok(ThinkingRetry::Original(upstream));
     }
-    let Some(retry) = between_tools_body(&sent) else {
+    let thinking_possible = body_disables_thinking(&sent);
+    let safeguards_possible = safeguards_retry_possible(server, record.as_ref(), &sent);
+    if !thinking_possible && !safeguards_possible {
         return Ok(ThinkingRetry::Original(upstream));
-    };
+    }
     let status = upstream.status();
     let headers = upstream.headers().clone();
     let Ok(buffered) = buffer_up_to(upstream, super::proxy::PRECOMMIT_BODY_CAP).await else {
@@ -1590,11 +1598,21 @@ pub(crate) async fn retry_thinking_off(
             rate_limits: parse_rate_limits(&headers),
         }));
     };
-    let wants_between_tools = buffered.rest.is_none()
-        && error_pair(&buffered.bytes)
-            .1
+    let message = (buffered.rest.is_none())
+        .then(|| error_pair(&buffered.bytes).1)
+        .flatten();
+    let wants_thinking = thinking_possible
+        && message
+            .as_deref()
             .is_some_and(|message| message.contains("between_tools"));
-    if !wants_between_tools {
+    let wants_safeguards = safeguards_possible
+        && message
+            .as_deref()
+            .is_some_and(translate::is_safeguards_refusal);
+    let retry = (wants_thinking || wants_safeguards)
+        .then(|| retry_body(&sent, wants_thinking, wants_safeguards))
+        .flatten();
+    let Some(retry) = retry else {
         let complete = buffered.rest.is_none();
         let failure = complete.then(|| {
             let body = serde_json::from_slice(&buffered.bytes).unwrap_or(serde_json::Value::Null);
@@ -1611,8 +1629,12 @@ pub(crate) async fn retry_thinking_off(
                 evidence: super::attempt::CommitEvidence::ByteCapReached,
             },
         }));
+    };
+    if wants_safeguards {
+        tracing::info!("upstream refused server safeguards; sending again without them");
+    } else {
+        tracing::info!("upstream refused thinking: disabled; sending again as between_tools");
     }
-    tracing::info!("upstream refused thinking: disabled; sending again as between_tools");
     if let Some(ctx) = record {
         let (error_type, _) = error_pair(&buffered.bytes);
         let rate_limits = parse_rate_limits(&headers);
@@ -1624,13 +1646,28 @@ pub(crate) async fn retry_thinking_off(
             retry_after_ms(&headers),
             rate_limits.as_ref(),
         );
-        ctx.attempt = ctx
-            .attempt
-            .as_ref()
-            .and_then(super::attempt::thinking_provenance);
+        ctx.attempt = ctx.attempt.as_ref().and_then(|attempt| {
+            if wants_safeguards {
+                super::attempt::safeguards_provenance(attempt)
+            } else {
+                super::attempt::thinking_provenance(attempt)
+            }
+        });
+        if wants_safeguards {
+            server.mark_safeguards_rejected(&ctx.binding_id);
+            ctx.safeguards.marked = Some(true);
+            ctx.safeguards.support = Some(crate::routing::CapabilityEvidence::Unsupported);
+        }
         cancellation.update_anthropic(Some(ctx));
         server.note_binding_sent(&ctx.binding_id, ctx.effective_model.as_deref());
     }
+    let retry_parts;
+    let parts = if wants_safeguards {
+        retry_parts = parts_without_safeguards_beta(parts);
+        &retry_parts
+    } else {
+        parts
+    };
     send_upstream(server, backend, parts, retry, &[])
         .await
         .map(|upstream| ThinkingRetry::Retried(upstream.response))
@@ -1657,19 +1694,71 @@ pub(crate) async fn retry_thinking_off(
         })
 }
 
-/// The sent canonical body with `thinking: disabled` made `between_tools`,
-/// or `None` when no such retry is possible.
-fn between_tools_body(sent: &Bytes) -> Option<Bytes> {
+/// Whether the sent body asks for `thinking: disabled`.
+fn body_disables_thinking(sent: &Bytes) -> bool {
+    serde_json::from_slice::<serde_json::Value>(sent)
+        .ok()
+        .and_then(|value| translate::from_anthropic(&value).ok())
+        .is_some_and(|canonical| {
+            canonical.thinking == Some(crate::ir::canonical::ThinkingSpec::Disabled)
+        })
+}
+
+/// Whether a refusal of the ask can earn a retry: the sent body carries it,
+/// and the binding's support is declared unknown and unmarked. A binding that
+/// declares support is forwarded whatever it says, and a marked one was sent no
+/// ask to refuse.
+fn safeguards_retry_possible(
+    server: &Server,
+    record: Option<&AnthropicRecordCtx>,
+    sent: &Bytes,
+) -> bool {
+    let Some(ctx) = record else {
+        return false;
+    };
+    let declared = server
+        .registry
+        .binding(&ctx.binding_id)
+        .and_then(|binding| binding.canonical_backend())
+        .map(|backend| backend.capabilities().server_safeguards);
+    declared == Some(crate::routing::CapabilityEvidence::Unknown)
+        && !server.safeguards_marks().contains(&ctx.binding_id)
+        && serde_json::from_slice::<serde_json::Value>(sent)
+            .ok()
+            .and_then(|value| translate::from_anthropic(&value).ok())
+            .is_some_and(|canonical| translate::asks_server_safeguards(&canonical))
+}
+
+/// The sent canonical body with the rewrites a refusal named applied, or
+/// `None` when no such retry is possible: `thinking: disabled` made
+/// `between_tools`, and the server safeguards ask removed.
+fn retry_body(sent: &Bytes, thinking: bool, safeguards: bool) -> Option<Bytes> {
     let value = serde_json::from_slice::<serde_json::Value>(sent).ok()?;
     let mut canonical = translate::from_anthropic(&value).ok()?;
-    if canonical.thinking != Some(crate::ir::canonical::ThinkingSpec::Disabled) {
+    if thinking {
+        if canonical.thinking != Some(crate::ir::canonical::ThinkingSpec::Disabled) {
+            return None;
+        }
+        canonical.thinking = Some(crate::ir::canonical::ThinkingSpec::BetweenTools);
+    }
+    if safeguards && !translate::withhold_server_safeguards(&mut canonical) {
         return None;
     }
-    canonical.thinking = Some(crate::ir::canonical::ThinkingSpec::BetweenTools);
     let rendered =
         translate::render_anthropic(&canonical, crate::routing::DialectId::AnthropicMessages)
             .ok()?;
     serde_json::to_vec(&rendered.value).ok().map(Bytes::from)
+}
+
+/// The request parts with the beta announcing server safeguards removed.
+fn parts_without_safeguards_beta(parts: &axum::http::request::Parts) -> axum::http::request::Parts {
+    let (mut copy, ()) = axum::http::Request::new(()).into_parts();
+    copy.method = parts.method.clone();
+    copy.uri = parts.uri.clone();
+    copy.version = parts.version;
+    copy.headers = parts.headers.clone();
+    strip_safeguards_beta(&mut copy.headers);
+    copy
 }
 
 /// The evidence the resolver's compaction rules read from a lane: whether

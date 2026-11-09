@@ -71,10 +71,21 @@ pub(crate) fn initial_provenance() -> AttemptProvenance {
 }
 
 pub(crate) fn thinking_provenance(current: &AttemptProvenance) -> Option<AttemptProvenance> {
+    negotiation_provenance(current, AttemptReason::ThinkingNegotiation)
+}
+
+pub(crate) fn safeguards_provenance(current: &AttemptProvenance) -> Option<AttemptProvenance> {
+    negotiation_provenance(current, AttemptReason::SafeguardsNegotiation)
+}
+
+fn negotiation_provenance(
+    current: &AttemptProvenance,
+    reason: AttemptReason,
+) -> Option<AttemptProvenance> {
     Some(AttemptProvenance {
         attempt_group_id: current.attempt_group_id.clone(),
         attempt_index: current.attempt_index.next()?,
-        reason: AttemptReason::ThinkingNegotiation,
+        reason,
     })
 }
 

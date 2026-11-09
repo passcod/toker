@@ -1993,6 +1993,10 @@ impl Server {
                 "/_toker/config/credential",
                 any(control::config::credential),
             )
+            .route(
+                "/_toker/safeguards/mark/clear",
+                any(control::config::clear_safeguards_mark),
+            )
             .route("/_toker/routing/snapshot", any(control::routing::snapshot))
             .route("/_toker/routing/draft", any(control::routing::draft))
             .route(
