@@ -644,7 +644,7 @@ fn publication(record: &Value) -> Vec<String> {
 mod tests {
     use serde_json::json;
 
-    use super::{Entry, lines};
+    use super::{Entry, lines, preview_safeguards};
 
     fn snapshot() -> serde_json::Value {
         json!({
@@ -736,6 +736,58 @@ mod tests {
         assert!(
             text.contains("info binding-unconfigured at /routes/0"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn a_route_says_it_honours_server_safeguards_only_when_it_does() {
+        let snapshot = snapshot();
+        let mut record = route();
+        let text = |record: &serde_json::Value| {
+            lines(
+                &snapshot,
+                &Entry {
+                    key: "routes",
+                    value: record,
+                },
+            )
+            .join("\n")
+        };
+        assert!(!text(&record).contains("server safeguards"));
+        record["honours_server_safeguards"] = json!(true);
+        assert!(text(&record).contains("honours server safeguards"));
+    }
+
+    fn walked_preview() -> serde_json::Value {
+        json!({"toker": "routing-preview", "ok": true, "result": {
+            "outcome": "selected",
+            "server_safeguards": {"asked": true, "effective": "unknown", "marked": false,
+                                  "skipped_candidate": true, "walked_again": true},
+            "trace": [
+                {"kind": "lookup", "provenance": "ProtocolDefault"},
+                {"kind": "candidate", "candidate_id": "sub", "binding_id": "codex_sub.codex_responses",
+                 "server_safeguards": "unsupported", "result": {"Err": "LacksServerSafeguards"}},
+                {"kind": "candidate", "candidate_id": "billed", "binding_id": "openrouter.anthropic_messages",
+                 "server_safeguards": "unknown", "result": {"Err": "HealthCircuitOpen"}},
+                {"kind": "safeguards_walked_again"},
+                {"kind": "candidate", "candidate_id": "sub", "binding_id": "codex_sub.codex_responses",
+                 "server_safeguards": "unsupported", "result": {"Ok": null}},
+            ],
+        }})
+    }
+
+    #[test]
+    fn a_preview_lists_each_candidate_s_support_and_the_second_walk() {
+        let text = preview_safeguards(&walked_preview()).join("\n");
+        insta::assert_snapshot!("preview_safeguards_walked_again", text);
+    }
+
+    #[test]
+    fn a_preview_with_no_walk_in_it_has_no_safeguards_section() {
+        assert!(preview_safeguards(&json!({"kind": "validation", "valid": true})).is_empty());
+        assert!(
+            preview_safeguards(&json!({"result": {"outcome": "unresolved", "code": "no_route"}}))
+                .is_empty()
         );
     }
 

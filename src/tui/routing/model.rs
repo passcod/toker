@@ -2017,6 +2017,97 @@ mod tests {
     }
 
     #[test]
+    fn the_preview_form_can_ask_for_server_safeguards() {
+        let mut state = loaded(full_snapshot());
+        press(&mut state, KeyCode::Char('v'));
+        // Down to the last field: protocol, profile, model, lane key,
+        // prompt bound, message count, tool count, then the switch.
+        for _ in 0..7 {
+            press(&mut state, KeyCode::Down);
+        }
+        press(&mut state, KeyCode::Char(' '));
+        assert_eq!(form_value(&state)["asks_server_safeguards"], true);
+        let command = state.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let body = command.expect("preview").body.expect("body");
+        assert_eq!(body["asks_server_safeguards"], true);
+        assert!(
+            !state.preview_asked(),
+            "only a reply settles what was shown"
+        );
+
+        // The page remembers the ask, since a result with no candidate
+        // left does not say whether it was made.
+        let mut ask = Command::snapshot("routing-snapshot");
+        ask.name = "preview";
+        ask.body = Some(body);
+        state.receive(Reply::Command(
+            ask,
+            Ok(Response {
+                status: 200,
+                body: serde_json::json!({"result": {"outcome": "unavailable"}}),
+            }),
+        ));
+        assert!(state.preview_asked());
+    }
+
+    #[test]
+    fn a_preview_that_does_not_ask_sends_no_such_fact() {
+        let mut state = loaded(full_snapshot());
+        press(&mut state, KeyCode::Char('v'));
+        let body = press(&mut state, KeyCode::Enter)
+            .expect("preview")
+            .body
+            .expect("body");
+        assert!(body.get("asks_server_safeguards").is_none());
+    }
+
+    #[test]
+    fn a_route_save_sets_or_clears_its_honour_flag_by_its_own_operation() {
+        let mut state = loaded(full_snapshot());
+        state.set_view(View::Routes);
+        press(&mut state, KeyCode::Char('e'));
+        // Down to the last field and switch it on.
+        for _ in 0..40 {
+            press(&mut state, KeyCode::Down);
+        }
+        press(&mut state, KeyCode::Char(' '));
+        assert_eq!(form_value(&state)["honours_server_safeguards"], true);
+        let command = state.key(CTRL_ENTER).expect("edit command");
+        let operations = command.body.expect("body")["edit"]["operations"].clone();
+        assert_eq!(operations[0]["kind"], "replace_route");
+        // The flag does not travel inside the route: its own operation
+        // carries it, and raises the document's format with it.
+        assert!(
+            operations[0]["route"]
+                .get("honours_server_safeguards")
+                .is_none()
+        );
+        assert_eq!(operations[1]["kind"], "set_route_server_safeguards");
+        assert_eq!(operations[1]["route_id"], "changed");
+        assert_eq!(operations[1]["honours"], true);
+        state.receive(reply(
+            "draft-edit",
+            200,
+            serde_json::json!({"generation": 4}),
+        ));
+
+        // Left off, the same save clears it.
+        press(&mut state, KeyCode::Char('e'));
+        let command = state.key(CTRL_ENTER).expect("edit command");
+        let operations = command.body.expect("body")["edit"]["operations"].clone();
+        assert_eq!(operations[1]["honours"], false);
+    }
+
+    #[test]
+    fn only_a_route_save_carries_the_honour_flag_operation() {
+        let mut state = loaded(full_snapshot());
+        press(&mut state, KeyCode::Char('e'));
+        let command = state.key(CTRL_ENTER).expect("edit command");
+        let operations = command.body.expect("body")["edit"]["operations"].clone();
+        assert_eq!(operations.as_array().expect("operations").len(), 1);
+    }
+
+    #[test]
     fn a_conflict_can_reload_and_discards_the_local_batch() {
         let mut state = loaded(full_snapshot());
         state.conflicted_edits =

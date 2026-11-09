@@ -1003,6 +1003,43 @@ mod tests {
         insta::assert_snapshot!(frame(&adding(super::View::Rewrites, '4')));
     }
 
+    /// A preview that asked for server safeguards puts each candidate's
+    /// support above the raw result; one that did not leaves it as it was.
+    #[test]
+    fn a_preview_that_asked_summarises_server_safeguards() {
+        let body = serde_json::json!({"toker": "routing-preview", "ok": true, "result": {
+            "outcome": "selected",
+            "route_id": "mixed",
+            "server_safeguards": {"asked": true, "effective": "supported", "marked": true,
+                                  "skipped_candidate": true, "walked_again": false},
+            "trace": [
+                {"kind": "candidate", "candidate_id": "sub", "binding_id": "codex_sub.codex_responses",
+                 "server_safeguards": "unsupported", "result": {"Err": "LacksServerSafeguards"}},
+                {"kind": "candidate", "candidate_id": "api", "binding_id": "anthropic_api.anthropic_messages",
+                 "server_safeguards": "supported", "result": {"Ok": null}},
+            ],
+        }});
+        let mut asked = page_in(super::View::Status);
+        let mut command = Command::snapshot("routing-snapshot");
+        command.name = "preview";
+        command.body = Some(serde_json::json!({"asks_server_safeguards": true}));
+        asked.receive(Reply::Command(
+            command,
+            Ok(Response {
+                status: 200,
+                body: body.clone(),
+            }),
+        ));
+        insta::assert_snapshot!("a_preview_that_asked", frame(&asked));
+
+        let mut plain = page_in(super::View::Status);
+        let mut command = Command::snapshot("routing-snapshot");
+        command.name = "preview";
+        command.body = Some(serde_json::json!({}));
+        plain.receive(Reply::Command(command, Ok(Response { status: 200, body })));
+        assert!(!frame(&plain).contains("SERVER SAFEGUARDS"));
+    }
+
     #[test]
     fn the_promotion_and_preview_forms() {
         let mut state = page_in(super::View::Status);
