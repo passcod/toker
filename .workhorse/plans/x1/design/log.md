@@ -49,11 +49,37 @@ Three directions briefed separately from `brief.md`, which carries the common co
 | A | faithful to the reference | keep the pages, views and master/detail; make every part as good as the dashboard |
 | B | the most minimal | delete the two pages and six tabs for one configuration tree |
 | C | fastest at the main task | lead with the resolution chain that answers "where does this go, and why"; records are reached through it |
+| D | the operator's first idea | ordered rule tables, read as firewall, forwarding and mangle tables |
+| E | the operator's second idea | one page per route, read downward from what it matches to where it goes |
+
+The operator's steer arrived after A, B and C were briefed, and is appended to `brief.md` as an addendum.
+It added two directions and three constraints that bind all five.
+
+### The steer
+
+- **There is no precedent**, so network routing is the near neighbour: AWS route tables, MikroTik firewall, forwarding and mangle tables. What to take is an ordered set of rules mapping one thing to another, possibly transforming on the way, in several tables for several stages. Toker's resolution order already is this and the current design hides it.
+- **No JSON**, to edit or to read.
+- **Live validation, and no validate-then-apply step.** A field says what is wrong beside itself and an invalid form cannot be saved. `V` is to be designed away, not improved. The draft and revision machinery stays internally, because lanes pin to revisions; what goes is the operator's experience of the ritual.
+- **Core first, then drill down.**
+
+A, B and C were sent the addendum mid-flight. B was additionally told to be honest about the mismatch between a tree, which expresses containment, and a rule table, which expresses ordered evaluation; C was told to show the rules a request fell past as well as the one that caught it, and to add a frame reading its chain from the route's side.
+
+## Rigs and disk
+
+| round | free on /home | notes |
+| --- | --- | --- |
+| 0 | 360G | google-chrome-stable present for screenshotting mockups; tmux present for capture |
+
+No browser rig is leased: Toker is a terminal app, so the capture rig is tmux plus an ANSI-to-HTML converter, and the mockups are HTML grids.
+Captures live in the card's rig work directory, in `live/` (the operator's instance, 135x50), `current/` (a sandbox on a copy of the real store, at 100x24, 120x40 and 80x24) and `empty/` (a fresh store).
+The scripts are in `scripts/` there: `matrix.py`, `empty.py`, `ansi2html.py`, `shot.py`.
+
+**The captures carry real account email addresses**, because they come from a copy of the real store.
+Toker is public, so nothing from them goes into the repository without invented names in place of the real ones.
 
 ## In flight
 
-- capture rig: ANSI to HTML to PNG, plus form and empty-state captures from a sandbox
-- directions A, B and C
+- directions A, B, C, D and E
 
 ## Next
 

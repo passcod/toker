@@ -86,3 +86,57 @@ Write it as the last section of your own report file, named in your prompt. It m
 - any internal change that would make configuring materially easier, as a note.
 
 Do not read the other directions' files, and do not look in `.workhorse/design/mockups/x1/` for anything but your own output.
+
+## Addendum: the operator's own steer
+
+Added after the directions were first briefed, from the person this is for.
+It overrides anything above that disagrees with it.
+
+### There is no precedent for this, but network routing is the near neighbour
+
+No product configures LLM routing well, so there is nothing to copy wholesale.
+The closest thing that works is a **network routing or firewall table**: AWS route tables, and MikroTik's firewall, forwarding and mangle tables.
+
+> Even a basic network routing table still requires you to have a lot of the state in your head, but it's quite a bit easier to reason about.
+> You can think of it as mapping things from a destination in a table: you're creating a set of rules that apply in order and map from one destination to another.
+> With firewall tables you map from one destination to another, possibly with a mangle or a transformation, a port forward, that kind of thing.
+
+The properties worth taking:
+
+- a rule maps one thing to another, and may transform on the way;
+- the rules are **ordered**, and the order is visible and is the semantics;
+- there are **several tables**, each applying to a different stage;
+- knowing what you are doing is still required, and that is accepted.
+
+Toker's resolution order already is this: a presentation matched by exact slug, else a rewrite by ascending priority, else the scope's default, and then the route's candidates walked in order.
+The current design hides it.
+
+### No JSON, in either direction
+
+> Editing things in JSON isn't my idea of fun. Reviewing JSON as the output is also not my idea of fun.
+
+No surface may show a record as JSON, and none may ask the operator to type JSON.
+A structured language is acceptable only where there is genuinely no equivalent, and that case has to be argued.
+
+### Live validation, and no validate-then-apply step
+
+> There shouldn't really be a need to review anything. The entire idea was to apply live, so you don't have a validate-and-then-apply step.
+> Think of a web interface: validation happens live on the interface all the time, and then you can't click OK to submit if there is a validation error.
+
+So:
+
+- a field is validated as it is edited, and says what is wrong beside itself;
+- a form that is invalid cannot be saved, and the reason is visible before the operator tries;
+- there is no separate validate command whose result is a report to read;
+- `V` as it stands is the thing to design away, not to improve.
+
+The draft and revision machinery is internal and stays, because lanes pin to revisions.
+What goes is the operator's experience of a validate-then-review-then-activate ritual.
+If your direction needs an internal change to deliver this, propose it in your report.
+
+### Core first, then drill down
+
+> It's really about rendering it in a way that someone can understand, not necessarily providing all of the information upfront, but having the core information available and then being able to drill down, and have some representation at the top.
+
+A surface leads with the few facts that matter, and the rest is reachable rather than present.
+A screen that shows everything it knows has failed this.
