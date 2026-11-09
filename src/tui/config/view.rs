@@ -9,7 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 
-use super::model::{Provider, Row, Settings, Snapshot, State, View};
+use super::model::{Provider, Row, Safeguards, Settings, Snapshot, State, View};
 use crate::tui::chrome::{self, Chrome, Noun, RowHit};
 
 /// Where the last frame put things, for the mouse.
@@ -24,11 +24,12 @@ pub(super) struct Drawn {
 const TABS: [&str; 2] = ["providers", "settings"];
 
 /// The page's keys, in its `?` overlay.
-const KEYS: [(&str, &str); 8] = [
+const KEYS: [(&str, &str); 9] = [
     ("↑/↓ j/k", "select"),
     ("←/→ h/l 1 2", "switch view"),
     ("space", "toggle"),
     ("e", "edit"),
+    ("c", "clear a provider's server safeguards rejection marks"),
     ("r", "refresh"),
     ("esc", "back to the dashboard"),
     ("tab or ⇄", "next page"),
@@ -181,6 +182,10 @@ fn line_for(row: Row, snapshot: &Snapshot) -> Line<'static> {
             Some(provider) => field("    credential", credential_line(provider)),
             None => Line::from(""),
         },
+        Row::Safeguards(index) => match snapshot.safeguards.get(index) {
+            Some(binding) => field("    server safeguards", safeguards_line(binding)),
+            None => Line::from(""),
+        },
         Row::Quota => field("quota gate", on_off(snapshot.settings.quota_enabled, true)),
         Row::Cold => field("cold gate", on_off(snapshot.settings.cold_enabled, true)),
         Row::ColdOutlook => field("cold outlook", on_off(snapshot.settings.cold_outlook, true)),
@@ -216,6 +221,18 @@ fn provider_line(provider: &Provider) -> String {
         "on"
     };
     format!("{:<16} {state}", provider.name)
+}
+
+/// A binding's declared support, and that a refusal has marked it, which
+/// reads as unsupported to the router until the mark is cleared
+/// (spec: WSAFE#a-rejection-mark).
+fn safeguards_line(binding: &Safeguards) -> String {
+    let marked = if binding.marked_ms.is_some() {
+        ", marked unsupported"
+    } else {
+        ""
+    };
+    format!("{}  {}{marked}", binding.binding_id, binding.declared)
 }
 
 fn credential_line(provider: &Provider) -> String {
@@ -364,7 +381,7 @@ mod tests {
     #[test]
     fn the_overlay_names_every_key_the_page_takes() {
         use crossterm::event::KeyCode;
-        for key in ['e', ' ', '1', '2', 'h', 'j', 'k', 'l'] {
+        for key in ['e', 'c', ' ', '1', '2', 'h', 'j', 'k', 'l'] {
             assert!(super::super::owns_key(KeyCode::Char(key)));
             let token = if key == ' ' {
                 "space".to_owned()

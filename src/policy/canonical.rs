@@ -19,10 +19,14 @@ use super::document::{
 const POLICY_FINGERPRINT_DOMAIN_V1: &[u8] = b"toker.policy.document.v1\0";
 const POLICY_FINGERPRINT_DOMAIN_V2: &[u8] = b"toker.policy.document.v2\0";
 const POLICY_FINGERPRINT_DOMAIN_V3: &[u8] = b"toker.policy.document.v3\0";
+const POLICY_FINGERPRINT_DOMAIN_V4: &[u8] = b"toker.policy.document.v4\0";
 // Route semantics evolve independently from the document format. Change this
 // domain whenever the closed projection below changes meaning or shape.
 const ROUTE_FINGERPRINT_DOMAIN_V1: &[u8] = b"toker.policy.route-semantics.v1\0";
 const ROUTE_FINGERPRINT_DOMAIN_V2: &[u8] = b"toker.policy.route-semantics.v2\0";
+// A route that honours server safeguards has semantics v2 cannot express, so it
+// takes this domain; every other route keeps v2 whatever its document version.
+const ROUTE_FINGERPRINT_DOMAIN_V3: &[u8] = b"toker.policy.route-semantics.v3\0";
 
 /// Limits applied before a document enters the runtime compiler.
 ///
@@ -236,6 +240,7 @@ pub fn policy_fingerprint(
         1 => POLICY_FINGERPRINT_DOMAIN_V1,
         2 => POLICY_FINGERPRINT_DOMAIN_V2,
         3 => POLICY_FINGERPRINT_DOMAIN_V3,
+        4 => POLICY_FINGERPRINT_DOMAIN_V4,
         version => return Err(CanonicalError::UnsupportedFormat(version)),
     };
     Ok(PolicyFingerprint(hash(domain, &policy_bytes(document)?)))
@@ -326,6 +331,8 @@ struct SemanticRoute {
     first: SemanticCandidate,
     steps: Vec<SemanticStep>,
     lane_transition: LaneTransitionPolicy,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    honours_server_safeguards: bool,
 }
 
 impl From<&Route> for SemanticRoute {
@@ -338,6 +345,7 @@ impl From<&Route> for SemanticRoute {
             first: SemanticCandidate::from(&route.chain.first),
             steps: route.chain.steps.iter().map(SemanticStep::from).collect(),
             lane_transition: route.lane_transition,
+            honours_server_safeguards: route.honours_server_safeguards,
         }
     }
 }
@@ -439,14 +447,18 @@ impl From<&UpgradePolicy> for SemanticUpgrade {
 }
 
 pub fn route_fingerprint(semantics: &RouteSemantics) -> Result<RouteFingerprint, CanonicalError> {
-    let domain = route_domain(semantics.format_version)?;
+    let domain = if semantics.route.honours_server_safeguards {
+        ROUTE_FINGERPRINT_DOMAIN_V3
+    } else {
+        route_domain(semantics.format_version)?
+    };
     Ok(RouteFingerprint(hash(domain, &canonical_bytes(semantics)?)))
 }
 
 fn route_domain(format_version: u32) -> Result<&'static [u8], CanonicalError> {
     match format_version {
         1 => Ok(ROUTE_FINGERPRINT_DOMAIN_V1),
-        2 | 3 => Ok(ROUTE_FINGERPRINT_DOMAIN_V2),
+        2..=4 => Ok(ROUTE_FINGERPRINT_DOMAIN_V2),
         version => Err(CanonicalError::UnsupportedFormat(version)),
     }
 }
@@ -1064,6 +1076,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn honouring_server_safeguards_is_route_semantics_and_a_quiet_route_keeps_its_fingerprint() {
+        let quiet = |version: u32| {
+            let mut document = full_document(route("Route", None));
+            document.format_version = version;
+            digest(document)
+        };
+        assert_eq!(
+            quiet(3),
+            quiet(4),
+            "a route that never opts in keeps its fingerprint across versions"
+        );
+        let mut honouring = route("Route", None);
+        honouring.honours_server_safeguards = true;
+        assert_ne!(quiet(4), digest(full_document(honouring)));
+    }
+
     fn route(display_name: &str, description: Option<&str>) -> Route {
         let mut first = candidate("candidate");
         first.upgrade_policy_id = Some(UpgradePolicyId::new("upgrade").unwrap());
@@ -1075,6 +1104,7 @@ mod tests {
             }],
         });
         Route {
+            honours_server_safeguards: false,
             id: RouteId::new("route").unwrap(),
             display_name: display_name.to_owned(),
             description: description.map(str::to_owned),

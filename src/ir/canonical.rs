@@ -306,6 +306,10 @@ pub enum CanonBlock {
         is_error: Option<bool>,
         extensions: Vec<CanonicalExtension>,
     },
+    /// A whole response content block of a kind the canonical does not model.
+    /// It keeps its place in the ordered block sequence; only a renderer of
+    /// the same replay domain can emit it.
+    Opaque(CanonicalExtension),
 }
 
 impl CanonBlock {
@@ -387,6 +391,7 @@ impl CanonBlock {
                 }
                 value
             }
+            CanonBlock::Opaque(extension) => extension.value().clone(),
         }
     }
 }
@@ -705,6 +710,33 @@ pub enum CanonEvent {
     /// A provider-owned stream event that has no portable semantic shape.
     /// Only a frontend of the same dialect may replay its opaque payload.
     ProviderEvent(CanonicalExtension),
+    /// Unmodelled fields of one object within a stream event the canonical
+    /// does model. It arrives immediately BEFORE the events the wire event
+    /// produced, and a compatible renderer merges it into the next event of
+    /// the kind the extension's wire path names. `reasoning` marks fields of a
+    /// reasoning block's events, which a response projection removes with the
+    /// reasoning itself.
+    ProviderFields {
+        extension: CanonicalExtension,
+        reasoning: bool,
+    },
+    /// One whole wire event of a content block whose kind, or whose delta
+    /// kind, the canonical does not model. `index` is the provider's own block
+    /// index: a renderer numbers blocks itself and rewrites it.
+    ProviderBlockEvent {
+        index: u64,
+        phase: ProviderBlockPhase,
+        extension: CanonicalExtension,
+    },
+}
+
+/// Which event of a content block's life a [`CanonEvent::ProviderBlockEvent`]
+/// replays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderBlockPhase {
+    Start,
+    Delta,
+    Stop,
 }
 
 /// One canonical turn, complete — the non-streaming path's unit: a
@@ -782,6 +814,13 @@ impl ResponseProjection {
                     | CanonEvent::RedactedThinking { .. }
                     | CanonEvent::ThinkingEnded
             ) && !matches!(event, CanonEvent::ProviderEvent(extension) if extension.is_reasoning_wire())
+                && !matches!(
+                    event,
+                    CanonEvent::ProviderFields {
+                        reasoning: true,
+                        ..
+                    }
+                )
     }
 
     /// Remove every reasoning representation from a complete canonical turn.
@@ -970,6 +1009,10 @@ mod tests {
             caps.images.is_supported(),
             "the backend takes input_image parts"
         );
+        assert!(
+            caps.server_safeguards.is_unsupported(),
+            "the Responses wire has no field for the ask"
+        );
     }
 
     #[test]
@@ -979,6 +1022,16 @@ mod tests {
         assert!(caps.system_in_messages.is_supported());
         assert!(caps.thinking_replay.is_supported());
         assert!(caps.images.is_supported());
+        assert_eq!(
+            caps.server_safeguards,
+            crate::routing::CapabilityEvidence::Unknown,
+            "a Messages binding is unverified until it is observed"
+        );
+        assert!(
+            Capabilities::ANTHROPIC_MESSAGES
+                .server_safeguards
+                .is_supported()
+        );
     }
 
     #[test]
@@ -988,6 +1041,7 @@ mod tests {
         assert!(caps.system_in_messages.is_supported());
         assert!(caps.thinking_replay.is_unsupported());
         assert!(caps.images.is_supported());
+        assert!(caps.server_safeguards.is_unsupported());
     }
 
     /// The wire values are the parse's inverse: the exact shapes the

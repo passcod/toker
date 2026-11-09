@@ -219,6 +219,7 @@ fn gate_row(
     now_ms: i64,
 ) -> RequestRow {
     RequestRow {
+        safeguards: Default::default(),
         id: None,
         ts_ms: now_ms,
         duration_ms: None,

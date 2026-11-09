@@ -30,6 +30,9 @@ An export MUST carry nothing that is not a ledger column, as [UREAD](cli/readers
 
 Policy data and diagnostics MUST carry no prompt, completion or provider error body, as [DCTRL](service/control.md#the-operations) specifies.
 
+A provider extension's contents MUST NOT reach a log, the ledger or a translation-loss report, as [WCANON](wire/canonical.md#provider-extensions) specifies.
+A server safeguards request or result, and the action it concerns, MUST be recorded only as presence and outcome, as [WSAFE](wire/safeguards.md#what-is-recorded) specifies.
+
 ## A credential is never logged or displayed
 
 Toker MUST NOT write a credential's value to a log or to any output.

@@ -75,6 +75,19 @@ impl DialectId {
             DialectId::CodexResponses => "codex_responses",
         }
     }
+
+    /// Whether an opaque value tagged with `self` replays on a wire speaking
+    /// `target`. The two Messages dialects share one replay domain; every
+    /// other dialect is a domain of its own.
+    pub const fn shares_replay_domain(self, target: DialectId) -> bool {
+        matches!(
+            (self, target),
+            (
+                DialectId::AnthropicMessages | DialectId::OpenRouterMessages,
+                DialectId::AnthropicMessages | DialectId::OpenRouterMessages,
+            )
+        ) || self as u8 == target as u8
+    }
 }
 
 impl fmt::Display for DialectId {
@@ -97,6 +110,23 @@ impl CapabilityEvidence {
 
     pub const fn is_supported(self) -> bool {
         matches!(self, Self::Supported)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::Unsupported => "unsupported",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "supported" => Self::Supported,
+            "unsupported" => Self::Unsupported,
+            "unknown" => Self::Unknown,
+            _ => return None,
+        })
     }
 }
 
@@ -121,6 +151,11 @@ pub struct Capabilities {
     pub tool_choice_unnamed: CapabilityEvidence,
     /// A frontend tool-choice kind outside the canonical known set.
     pub tool_choice_other: CapabilityEvidence,
+    /// Provider-side review of the actions a turn proposes, asked for by the
+    /// `safeguards` request field and answered inside the same response.
+    /// Declared only from verified upstream behaviour; a provider's error never
+    /// rewrites it.
+    pub server_safeguards: CapabilityEvidence,
 }
 
 impl Capabilities {
@@ -134,6 +169,7 @@ impl Capabilities {
         tool_choice_named: CapabilityEvidence::Supported,
         tool_choice_unnamed: CapabilityEvidence::Unsupported,
         tool_choice_other: CapabilityEvidence::Unknown,
+        server_safeguards: CapabilityEvidence::Unsupported,
     };
 
     pub const UNKNOWN: Capabilities = Capabilities {
@@ -146,6 +182,7 @@ impl Capabilities {
         tool_choice_named: CapabilityEvidence::Unknown,
         tool_choice_unnamed: CapabilityEvidence::Unknown,
         tool_choice_other: CapabilityEvidence::Unknown,
+        server_safeguards: CapabilityEvidence::Unknown,
     };
 
     /// The Messages features verified on Anthropic and OpenRouter's Messages
@@ -161,6 +198,16 @@ impl Capabilities {
         tool_choice_named: CapabilityEvidence::Supported,
         tool_choice_unnamed: CapabilityEvidence::Supported,
         tool_choice_other: CapabilityEvidence::Unknown,
+        server_safeguards: CapabilityEvidence::Unknown,
+    };
+
+    /// The Messages features of the Anthropic bindings, which also declare
+    /// server safeguards supported. Another Messages binding stays on
+    /// [`Capabilities::MESSAGES`] until its request and response shapes are
+    /// verified independently.
+    pub const ANTHROPIC_MESSAGES: Capabilities = Capabilities {
+        server_safeguards: CapabilityEvidence::Supported,
+        ..Capabilities::MESSAGES
     };
 
     /// OpenRouter's live Chat Completions binding. The request and response
@@ -176,6 +223,7 @@ impl Capabilities {
         tool_choice_named: CapabilityEvidence::Supported,
         tool_choice_unnamed: CapabilityEvidence::Unsupported,
         tool_choice_other: CapabilityEvidence::Unknown,
+        server_safeguards: CapabilityEvidence::Unsupported,
     };
 
     /// The Codex subscription Responses binding's live-verified capabilities.
@@ -189,6 +237,7 @@ impl Capabilities {
         tool_choice_named: CapabilityEvidence::Unsupported,
         tool_choice_unnamed: CapabilityEvidence::Unsupported,
         tool_choice_other: CapabilityEvidence::Unsupported,
+        server_safeguards: CapabilityEvidence::Unsupported,
     };
 
     /// The streamed Responses subset verified against OpenRouter. The adapter
@@ -204,6 +253,7 @@ impl Capabilities {
         tool_choice_named: CapabilityEvidence::Unsupported,
         tool_choice_unnamed: CapabilityEvidence::Unsupported,
         tool_choice_other: CapabilityEvidence::Unsupported,
+        server_safeguards: CapabilityEvidence::Unsupported,
     };
 }
 
@@ -432,7 +482,7 @@ pub const ANTHROPIC_SUB_MESSAGES: BackendBinding = BackendBinding::canonical(
     CostClass::Subscription,
     None,
     BackendAdapterId::AnthropicMessages,
-    Capabilities::MESSAGES,
+    Capabilities::ANTHROPIC_MESSAGES,
     AdministrativeCapabilities::MESSAGES,
 );
 
@@ -444,7 +494,7 @@ pub const ANTHROPIC_API_MESSAGES: BackendBinding = BackendBinding::canonical(
     CostClass::Billed,
     None,
     BackendAdapterId::AnthropicMessages,
-    Capabilities::MESSAGES,
+    Capabilities::ANTHROPIC_MESSAGES,
     AdministrativeCapabilities::MESSAGES,
 );
 
@@ -1032,7 +1082,7 @@ mod tests {
                 ProtocolId::AnthropicMessages,
                 DialectId::AnthropicMessages,
                 BackendAdapterId::AnthropicMessages,
-                Capabilities::MESSAGES,
+                Capabilities::ANTHROPIC_MESSAGES,
                 None,
             ),
             (
@@ -1041,7 +1091,7 @@ mod tests {
                 ProtocolId::AnthropicMessages,
                 DialectId::AnthropicMessages,
                 BackendAdapterId::AnthropicMessages,
-                Capabilities::MESSAGES,
+                Capabilities::ANTHROPIC_MESSAGES,
                 None,
             ),
             (

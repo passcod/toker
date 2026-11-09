@@ -62,9 +62,23 @@ pub(super) struct Settings {
     pub(super) notice_default: Option<String>,
 }
 
+/// One Messages binding's standing with server safeguards: what it declares
+/// and whether a refusal has marked it. Support words only, never anything a
+/// request carried (spec: WSAFE#what-is-recorded).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct Safeguards {
+    pub(super) binding_id: String,
+    pub(super) provider: String,
+    /// `supported`, `unsupported` or `unknown`, as the service says it.
+    pub(super) declared: String,
+    /// When a rejection mark was set against the binding, if one is held.
+    pub(super) marked_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct Snapshot {
     pub(super) providers: Vec<Provider>,
+    pub(super) safeguards: Vec<Safeguards>,
     pub(super) settings: Settings,
     pub(super) db_path: String,
     pub(super) port: u64,
@@ -77,6 +91,9 @@ pub(super) enum Row {
     Provider(usize),
     Upstream(usize),
     Credential(usize),
+    /// One Messages binding's server safeguards support, by its place in the
+    /// snapshot's list. Shown, never edited; the mark is cleared with a key.
+    Safeguards(usize),
     Quota,
     Cold,
     ColdOutlook,
@@ -102,7 +119,7 @@ impl Row {
 
     /// Whether the row can be changed at all.
     pub(super) fn is_editable(self) -> bool {
-        !matches!(self, Row::Port | Row::Store)
+        !matches!(self, Row::Port | Row::Store | Row::Safeguards(_))
     }
 }
 
@@ -126,6 +143,10 @@ pub(super) struct State {
     /// rather than offer values to edit (spec: UTUI#the-configuration-pages).
     unreachable: bool,
     editing: Option<Editing>,
+    /// Bindings whose marks are still to be cleared after the one in flight.
+    /// A provider can hold several Messages bindings and the operation takes
+    /// one, so the replies chain them.
+    pending_clears: Vec<String>,
 }
 
 impl State {
@@ -170,10 +191,19 @@ impl State {
         match self.view {
             View::Providers => (0..snapshot.providers.len())
                 .flat_map(|index| {
+                    let provider = &snapshot.providers[index];
                     let mut rows = vec![Row::Provider(index), Row::Upstream(index)];
-                    if snapshot.providers[index].holds_a_credential() {
+                    if provider.holds_a_credential() {
                         rows.push(Row::Credential(index));
                     }
+                    rows.extend(
+                        snapshot
+                            .safeguards
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, binding)| binding.provider == provider.name)
+                            .map(|(at, _)| Row::Safeguards(at)),
+                    );
                     rows
                 })
                 .collect(),
@@ -217,6 +247,7 @@ impl State {
         match reply {
             Reply::Command(_, Err(error)) => {
                 self.unreachable = true;
+                self.pending_clears.clear();
                 self.error = Some(error);
                 None
             }
@@ -227,8 +258,14 @@ impl State {
                 }
                 if response.status / 100 == 2 {
                     self.error = None;
+                    if command.name == "safeguards-clear"
+                        && let Some(next) = self.pending_clears.pop()
+                    {
+                        return Some(self.clear_command(next));
+                    }
                     return Some(Command::snapshot("config-snapshot"));
                 }
+                self.pending_clears.clear();
                 self.error = Some(refusal(&response));
                 None
             }
@@ -256,6 +293,7 @@ impl State {
 
     pub(super) fn command_refused(&mut self, name: &'static str) {
         self.in_flight = false;
+        self.pending_clears.clear();
         self.unreachable = true;
         self.error = Some(format!("{name}: the service is not answering"));
     }
@@ -295,7 +333,63 @@ impl State {
                 self.begin_edit();
                 None
             }
+            KeyCode::Char('c') => self.clear_marks(),
             _ => None,
+        }
+    }
+
+    /// The provider the selected row belongs to, in the providers view.
+    fn focused_provider(&self) -> Option<&str> {
+        if self.view != View::Providers {
+            return None;
+        }
+        let snapshot = self.snapshot.as_ref()?;
+        let provider = |index: usize| snapshot.providers.get(index).map(|p| p.name.as_str());
+        match *self.rows().get(self.selected)? {
+            Row::Provider(index) | Row::Upstream(index) | Row::Credential(index) => provider(index),
+            Row::Safeguards(at) => snapshot.safeguards.get(at).map(|b| b.provider.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Clear the rejection marks held against the focused provider's
+    /// bindings, one request each. Holding none is said rather than sent,
+    /// since the service would answer that nothing was cleared.
+    fn clear_marks(&mut self) -> Option<Command> {
+        if !self.reachable() {
+            return None;
+        }
+        let provider = self.focused_provider()?.to_owned();
+        let mut marked: Vec<String> = self
+            .snapshot
+            .as_ref()?
+            .safeguards
+            .iter()
+            .filter(|binding| binding.provider == provider && binding.marked_ms.is_some())
+            .map(|binding| binding.binding_id.clone())
+            .collect();
+        if marked.is_empty() {
+            self.error = Some(format!("{provider}: no rejection mark is held"));
+            return None;
+        }
+        self.error = None;
+        // Popped from the end, so reversed to go in snapshot order.
+        marked.reverse();
+        let first = marked.pop()?;
+        self.pending_clears = marked;
+        Some(self.clear_command(first))
+    }
+
+    /// The request that forgets one binding's rejection mark. It lives under
+    /// `/_toker/safeguards`, beside the config namespace and not in it.
+    fn clear_command(&mut self, binding_id: String) -> Command {
+        self.in_flight = true;
+        Command {
+            name: "safeguards-clear",
+            method: Method::POST,
+            path: "/safeguards/mark/clear",
+            control: "safeguards-mark-clear",
+            body: Some(json!({ "binding_id": binding_id })),
         }
     }
 
@@ -497,6 +591,11 @@ fn parse_snapshot(body: &Value) -> Snapshot {
     let settings = body.get("settings").cloned().unwrap_or(Value::Null);
     let flag = |name: &str| settings.get(name).and_then(Value::as_bool);
     Snapshot {
+        safeguards: body
+            .get("safeguards")
+            .and_then(Value::as_array)
+            .map(|rows| rows.iter().map(parse_safeguards).collect())
+            .unwrap_or_default(),
         providers: body
             .get("providers")
             .and_then(Value::as_array)
@@ -552,6 +651,25 @@ fn parse_provider(row: &Value) -> Provider {
     }
 }
 
+fn parse_safeguards(row: &Value) -> Safeguards {
+    let word = |name: &str| {
+        row.get(name)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    Safeguards {
+        binding_id: word("binding_id"),
+        provider: word("provider"),
+        // An absent word reads as unknown, which is what an earlier service
+        // that did not report it would have been declaring.
+        declared: Some(word("declared"))
+            .filter(|declared| !declared.is_empty())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        marked_ms: row.get("marked_ms").and_then(Value::as_u64),
+    }
+}
+
 fn text(value: &Value, name: &str) -> Option<String> {
     value
         .get(name)
@@ -566,7 +684,7 @@ fn text(value: &Value, name: &str) -> Option<String> {
 pub(super) mod testing {
     use super::*;
 
-    fn snapshot_body() -> Value {
+    pub(super) fn snapshot_body() -> Value {
         json!({
             "providers": [
                 {
@@ -586,7 +704,20 @@ pub(super) mod testing {
                     "upstream": "http://gateway.invalid",
                     "credential": {"env": null, "env_set": false, "keyring": false,
                                    "literal_set": false}
+                },
+                {
+                    "provider": "openrouter",
+                    "enabled": true,
+                    "upstream": null,
+                    "credential": {"env": null, "env_set": false, "keyring": true,
+                                   "literal_set": false}
                 }
+            ],
+            "safeguards": [
+                {"binding_id": "anthropic_sub.anthropic_messages",
+                 "provider": "anthropic_sub", "declared": "supported", "marked_ms": null},
+                {"binding_id": "openrouter.anthropic_messages",
+                 "provider": "openrouter", "declared": "unknown", "marked_ms": 1700000000000u64}
             ],
             "settings": {
                 "quota_enabled": null,
@@ -644,8 +775,13 @@ mod tests {
                 Row::Provider(0),
                 Row::Upstream(0),
                 Row::Credential(0),
+                Row::Safeguards(0),
                 Row::Provider(1),
                 Row::Upstream(1),
+                Row::Provider(2),
+                Row::Upstream(2),
+                Row::Credential(2),
+                Row::Safeguards(1),
             ]
         );
     }
@@ -825,6 +961,150 @@ mod tests {
         // toggling it must turn it off, not set it to what it already is.
         let command = state.key(key(KeyCode::Char(' '))).expect("a request");
         assert_eq!(command.body.expect("a body")["quota_enabled"], json!(false));
+    }
+
+    fn clear_reply(status: u16) -> Reply {
+        Reply::Command(
+            Command {
+                name: "safeguards-clear",
+                method: Method::POST,
+                path: "/safeguards/mark/clear",
+                control: "safeguards-mark-clear",
+                body: None,
+            },
+            Ok(Response {
+                status,
+                body: json!({"toker": "safeguards-mark-clear", "ok": true, "cleared": true}),
+            }),
+        )
+    }
+
+    #[test]
+    fn the_snapshot_says_each_messages_binding_s_support_and_mark() {
+        let state = loaded();
+        let safeguards = &state.snapshot().expect("loaded").safeguards;
+        assert_eq!(safeguards.len(), 2);
+        assert_eq!(safeguards[0].declared, "supported");
+        assert_eq!(safeguards[0].marked_ms, None);
+        assert_eq!(safeguards[1].declared, "unknown");
+        assert!(safeguards[1].marked_ms.is_some());
+        // The rows are shown and never offered for editing.
+        assert!(!Row::Safeguards(0).is_editable());
+    }
+
+    #[test]
+    fn a_service_that_reports_no_safeguards_leaves_the_rows_out() {
+        let mut state = State::default();
+        let mut body = testing::snapshot_body();
+        body.as_object_mut().expect("object").remove("safeguards");
+        state.receive(Reply::Command(
+            Command::snapshot("config-snapshot"),
+            Ok(Response { status: 200, body }),
+        ));
+        assert!(state.snapshot().expect("loaded").safeguards.is_empty());
+        assert!(!state.rows().iter().any(|r| matches!(r, Row::Safeguards(_))));
+    }
+
+    #[test]
+    fn c_clears_the_marks_of_the_focused_providers_bindings() {
+        let mut state = loaded();
+        // openrouter's name line.
+        state.select(6);
+        let command = state.key(key(KeyCode::Char('c'))).expect("a request");
+        assert_eq!(command.name, "safeguards-clear");
+        assert_eq!(command.method, Method::POST);
+        assert_eq!(command.path, "/safeguards/mark/clear");
+        assert_eq!(command.control, "safeguards-mark-clear");
+        assert_eq!(
+            command.body.expect("a body"),
+            json!({"binding_id": "openrouter.anthropic_messages"})
+        );
+        // Nothing is applied locally: the mark shows until the service says.
+        assert!(
+            state.snapshot().expect("loaded").safeguards[1]
+                .marked_ms
+                .is_some()
+        );
+        let next = state.receive(clear_reply(200)).expect("a refresh follows");
+        assert_eq!(next.name, "snapshot");
+    }
+
+    #[test]
+    fn c_on_a_binding_row_clears_its_provider() {
+        let mut state = loaded();
+        state.select(9);
+        assert_eq!(state.rows()[9], Row::Safeguards(1));
+        let command = state.key(key(KeyCode::Char('c'))).expect("a request");
+        assert_eq!(
+            command.body.expect("a body")["binding_id"],
+            json!("openrouter.anthropic_messages")
+        );
+    }
+
+    #[test]
+    fn c_on_a_provider_with_no_mark_says_so_and_sends_nothing() {
+        let mut state = loaded();
+        assert!(state.key(key(KeyCode::Char('c'))).is_none());
+        assert_eq!(
+            state.error(),
+            Some("anthropic_sub: no rejection mark is held")
+        );
+        // Neither does a provider with no Messages binding at all.
+        state.select(4);
+        assert!(state.key(key(KeyCode::Char('c'))).is_none());
+        assert_eq!(state.error(), Some("codex_sub: no rejection mark is held"));
+    }
+
+    #[test]
+    fn marks_on_several_bindings_clear_one_request_after_another() {
+        let mut state = State::default();
+        let mut body = testing::snapshot_body();
+        body["safeguards"] = json!([
+            {"binding_id": "openrouter.a", "provider": "openrouter",
+             "declared": "unknown", "marked_ms": 1},
+            {"binding_id": "openrouter.b", "provider": "openrouter",
+             "declared": "unknown", "marked_ms": 2},
+        ]);
+        state.receive(Reply::Command(
+            Command::snapshot("config-snapshot"),
+            Ok(Response { status: 200, body }),
+        ));
+        state.select(
+            state
+                .rows()
+                .iter()
+                .position(|r| *r == Row::Provider(2))
+                .unwrap(),
+        );
+        let first = state.key(key(KeyCode::Char('c'))).expect("a request");
+        assert_eq!(
+            first.body.expect("a body")["binding_id"],
+            json!("openrouter.a")
+        );
+        let second = state.receive(clear_reply(200)).expect("the next one");
+        assert_eq!(second.name, "safeguards-clear");
+        assert_eq!(
+            second.body.expect("a body")["binding_id"],
+            json!("openrouter.b")
+        );
+        let refresh = state.receive(clear_reply(200)).expect("then the read");
+        assert_eq!(refresh.name, "snapshot");
+    }
+
+    #[test]
+    fn a_refused_clear_stops_the_chain_and_is_reported() {
+        let mut state = loaded();
+        state.select(6);
+        state.key(key(KeyCode::Char('c')));
+        let mut reply = clear_reply(400);
+        if let Reply::Command(_, Ok(response)) = &mut reply {
+            response.body = json!({"setting": "safeguards", "error": "the request does not parse"});
+        }
+        assert!(state.receive(reply).is_none());
+        assert_eq!(
+            state.error(),
+            Some("safeguards: the request does not parse")
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@
 use axum::http::StatusCode;
 use serde_json::Value;
 
+use crate::ir::canonical::CanonEvent;
 use crate::observe::{SseEvent, SseSplitter};
 use crate::policy::FailureClass;
 use crate::providers::codex::{ResponseError, ResponseEvent, ResponsesSse};
@@ -70,10 +71,21 @@ pub(crate) fn initial_provenance() -> AttemptProvenance {
 }
 
 pub(crate) fn thinking_provenance(current: &AttemptProvenance) -> Option<AttemptProvenance> {
+    negotiation_provenance(current, AttemptReason::ThinkingNegotiation)
+}
+
+pub(crate) fn safeguards_provenance(current: &AttemptProvenance) -> Option<AttemptProvenance> {
+    negotiation_provenance(current, AttemptReason::SafeguardsNegotiation)
+}
+
+fn negotiation_provenance(
+    current: &AttemptProvenance,
+    reason: AttemptReason,
+) -> Option<AttemptProvenance> {
     Some(AttemptProvenance {
         attempt_group_id: current.attempt_group_id.clone(),
         attempt_index: current.attempt_index.next()?,
-        reason: AttemptReason::ThinkingNegotiation,
+        reason,
     })
 }
 
@@ -469,9 +481,19 @@ pub(crate) async fn precommit_anthropic(
             .and_then(classify_anthropic_event);
         let canonical = failure.is_none()
             && event.as_ref().is_some_and(|event| {
-                !crate::translate::AnthropicResponseStream::new()
+                // Only an event the canonical models counts as the stream
+                // committing; an unknown event kind is carried, not read.
+                crate::translate::AnthropicResponseStream::new()
                     .feed_sse(event)
-                    .is_empty()
+                    .iter()
+                    .any(|event| {
+                        !matches!(
+                            event,
+                            CanonEvent::ProviderEvent(_)
+                                | CanonEvent::ProviderFields { .. }
+                                | CanonEvent::ProviderBlockEvent { .. }
+                        )
+                    })
             });
         if failure.is_none()
             && evidence != CommitEvidence::ByteCapReached

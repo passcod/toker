@@ -1,0 +1,10 @@
+---
+source: src/tui/routing/detail.rs
+expression: text
+---
+SERVER SAFEGUARDS asked for
+  sub  codex_sub.codex_responses  unsupported  skipped: lacks server safeguards
+  billed  openrouter.anthropic_messages  unknown  skipped: HealthCircuitOpen
+  walked again without the requirement
+  sub  codex_sub.codex_responses  unsupported
+  serving binding: unknown

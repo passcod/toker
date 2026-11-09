@@ -388,6 +388,7 @@ fn with_model(body: &[u8], from: &str, to: &str) -> Vec<u8> {
 
 fn bare_row(ts_ms: i64) -> RequestRow {
     RequestRow {
+        safeguards: Default::default(),
         id: None,
         ts_ms,
         duration_ms: None,

@@ -258,6 +258,7 @@ impl<'a> LegacyBuilder<'a> {
                 .then(|| upgrade_id(binding))
                 .transpose()?;
             self.policy.routes.push(Route {
+                honours_server_safeguards: false,
                 id: route_id,
                 display_name: format!("Legacy {} route", binding.provider()),
                 description: None,

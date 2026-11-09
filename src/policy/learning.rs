@@ -444,6 +444,7 @@ mod tests {
 
     fn row(model: &str, at: i64) -> RequestRow {
         RequestRow {
+            safeguards: Default::default(),
             id: None,
             ts_ms: at,
             duration_ms: None,

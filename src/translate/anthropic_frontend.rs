@@ -76,11 +76,13 @@ use serde_json::{Map, Value, json};
 use crate::ir::canonical::{
     CanonBlock, CanonError, CanonErrorKind, CanonEvent, CanonMessage, CanonRole, CanonStopReason,
     CanonSystemPart, CanonTool, CanonToolChoice, CanonTurn, CanonicalExtension, CanonicalRequest,
-    CanonicalUsage, SamplingSpec, ThinkingSpec, ToolResultContent,
+    CanonicalUsage, ProviderBlockPhase, SamplingSpec, ThinkingSpec, ToolResultContent,
 };
 use crate::observe::sse::SseEvent;
 use crate::routing::DialectId;
-use crate::translate::TranslateError;
+use crate::translate::anthropic_backend::mentions_safeguard_results;
+use crate::translate::{TranslateError, TranslationLoss, TranslationLossReason, TranslationReport};
+use std::collections::BTreeMap;
 
 /// Parse one Anthropic Messages request body into the canonical IR.
 ///
@@ -889,6 +891,23 @@ pub struct AnthropicRenderer {
     open: Option<OpenBlock>,
     /// Whether the turn's final-state event passed through.
     ended: bool,
+    /// Provider fields waiting for the next event of the kind they sit on.
+    pending_fields: Vec<PendingFields>,
+    /// The index this renderer gave each provider block still open, by the
+    /// provider's own index.
+    opaque_blocks: BTreeMap<u64, usize>,
+    /// What this rendering omitted, content-free.
+    report: TranslationReport,
+    /// Whether an emitted event carried server safeguards results.
+    results_replayed: bool,
+}
+
+/// Unmodelled fields of one object of a wire event not yet emitted.
+#[derive(Debug, Clone)]
+struct PendingFields {
+    event: String,
+    within: String,
+    fields: Map<String, Value>,
 }
 
 /// The content block under assembly: its kind (which stream feeds it)
@@ -936,7 +955,44 @@ impl AnthropicRenderer {
             next_index: 0,
             open: None,
             ended: false,
+            pending_fields: Vec::new(),
+            opaque_blocks: BTreeMap::new(),
+            report: TranslationReport::default(),
+            results_replayed: false,
         }
+    }
+
+    /// Whether an event emitted so far carried server safeguards results.
+    pub fn results_replayed(&self) -> bool {
+        self.results_replayed
+    }
+
+    /// The content-free losses so far, drained.
+    pub fn take_report(&mut self) -> TranslationReport {
+        std::mem::take(&mut self.report)
+    }
+
+    /// Build one SSE event, merging in any provider fields waiting for an
+    /// event of this name. A modelled member is never overwritten.
+    fn sse(&mut self, name: &str, mut data: Value) -> SseEvent {
+        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_fields)
+            .into_iter()
+            .partition(|pending| pending.event == name);
+        self.pending_fields = waiting;
+        for pending in ready {
+            let target = if pending.within.is_empty() {
+                Some(&mut data)
+            } else {
+                data.get_mut(&pending.within)
+            };
+            if let Some(object) = target.and_then(Value::as_object_mut) {
+                for (field, value) in pending.fields {
+                    object.entry(field).or_insert(value);
+                }
+            }
+        }
+        self.results_replayed |= mentions_safeguard_results(&data);
+        sse_event(name, data)
     }
 
     /// Feed one canonical turn event; every Anthropic SSE event it
@@ -954,7 +1010,7 @@ impl AnthropicRenderer {
                     if self.message_id.is_none() {
                         self.message_id.clone_from(turn_id);
                     }
-                    out.push(sse_event(
+                    out.push(self.sse(
                         "message_start",
                         json!({
                             "type": "message_start",
@@ -977,7 +1033,7 @@ impl AnthropicRenderer {
             }
             CanonEvent::TextDelta { delta } => {
                 let index = self.ensure_open(BlockKind::Text, &mut out);
-                out.push(sse_event(
+                out.push(self.sse(
                     "content_block_delta",
                     json!({
                         "type": "content_block_delta",
@@ -989,7 +1045,7 @@ impl AnthropicRenderer {
             CanonEvent::ThinkingDelta { part, delta } => {
                 let block = BlockKind::Thinking { part: *part };
                 let index = self.ensure_open(block, &mut out);
-                out.push(sse_event(
+                out.push(self.sse(
                     "content_block_delta",
                     json!({
                         "type": "content_block_delta",
@@ -1001,7 +1057,7 @@ impl AnthropicRenderer {
             CanonEvent::ThinkingSignature { part, signature } => {
                 let block = BlockKind::Thinking { part: *part };
                 let index = self.ensure_open(block, &mut out);
-                out.push(sse_event(
+                out.push(self.sse(
                     "content_block_delta",
                     json!({
                         "type": "content_block_delta",
@@ -1015,7 +1071,7 @@ impl AnthropicRenderer {
                 self.close_open(&mut out);
                 let index = self.next_index;
                 self.next_index += 1;
-                out.push(sse_event(
+                out.push(self.sse(
                     "content_block_start",
                     json!({
                         "type": "content_block_start",
@@ -1023,7 +1079,7 @@ impl AnthropicRenderer {
                         "content_block": {"type": "redacted_thinking", "data": data},
                     }),
                 ));
-                out.push(sse_event(
+                out.push(self.sse(
                     "content_block_stop",
                     json!({"type": "content_block_stop", "index": index}),
                 ));
@@ -1035,7 +1091,7 @@ impl AnthropicRenderer {
                 self.close_open(&mut out);
                 let index = self.next_index;
                 self.next_index += 1;
-                out.push(sse_event(
+                out.push(self.sse(
                     "content_block_start",
                     json!({
                         "type": "content_block_start",
@@ -1048,7 +1104,7 @@ impl AnthropicRenderer {
                         },
                     }),
                 ));
-                out.push(sse_event(
+                out.push(self.sse(
                     "content_block_delta",
                     json!({
                         "type": "content_block_delta",
@@ -1059,7 +1115,7 @@ impl AnthropicRenderer {
                         },
                     }),
                 ));
-                out.push(sse_event(
+                out.push(self.sse(
                     "content_block_stop",
                     json!({"type": "content_block_stop", "index": index}),
                 ));
@@ -1090,8 +1146,8 @@ impl AnthropicRenderer {
                         data.insert("provider".to_owned(), Value::String(provider.clone()));
                     }
                 }
-                out.push(sse_event("message_delta", Value::Object(data)));
-                out.push(sse_event("message_stop", json!({"type": "message_stop"})));
+                out.push(self.sse("message_delta", Value::Object(data)));
+                out.push(self.sse("message_stop", json!({"type": "message_stop"})));
                 self.ended = true;
             }
             CanonEvent::TurnFailed { error } => {
@@ -1099,14 +1155,110 @@ impl AnthropicRenderer {
                 // streams end at the error, mid-block if one was
                 // open (toker's own captured fixture 06 is the
                 // shape).
-                out.push(sse_event("error", anthropic_error_event_data(error)));
+                out.push(self.sse("error", anthropic_error_event_data(error)));
                 self.ended = true;
             }
             CanonEvent::Error { error } => {
-                out.push(sse_event("error", anthropic_error_event_data(error)));
+                out.push(self.sse("error", anthropic_error_event_data(error)));
             }
-            CanonEvent::ProviderEvent(_) => {}
+            CanonEvent::ProviderEvent(extension) => {
+                let kind = extension.value().get("type").and_then(Value::as_str);
+                match kind {
+                    Some(kind)
+                        if extension
+                            .source()
+                            .shares_replay_domain(DialectId::AnthropicMessages) =>
+                    {
+                        let kind = kind.to_owned();
+                        out.push(self.sse(&kind, extension.value().clone()));
+                    }
+                    _ => self
+                        .report
+                        .push_omitted_extension(extension, DialectId::AnthropicMessages),
+                }
+            }
+            CanonEvent::ProviderFields { extension, .. } => {
+                let fields = extension.value().as_object().filter(|_| {
+                    extension
+                        .source()
+                        .shares_replay_domain(DialectId::AnthropicMessages)
+                });
+                let path = extension.wire_path().strip_prefix("$.");
+                match (fields, path) {
+                    (Some(fields), Some(path)) => {
+                        let (event, within) = path.split_once('.').unwrap_or((path, ""));
+                        self.pending_fields.push(PendingFields {
+                            event: event.to_owned(),
+                            within: within.to_owned(),
+                            fields: fields.clone(),
+                        });
+                    }
+                    _ => self
+                        .report
+                        .push_omitted_extension(extension, DialectId::AnthropicMessages),
+                }
+            }
+            CanonEvent::ProviderBlockEvent {
+                index,
+                phase,
+                extension,
+            } => {
+                out.extend(self.replay_block_event(*index, *phase, extension));
+            }
         }
+        out
+    }
+
+    /// Replay one wire event of a provider content block under this
+    /// renderer's own numbering. A delta with no block of its own belongs to
+    /// the block open now.
+    fn replay_block_event(
+        &mut self,
+        upstream: u64,
+        phase: ProviderBlockPhase,
+        extension: &CanonicalExtension,
+    ) -> Vec<SseEvent> {
+        let mut out = Vec::new();
+        let kind = extension.value().get("type").and_then(Value::as_str);
+        let (true, Some(kind)) = (
+            extension
+                .source()
+                .shares_replay_domain(DialectId::AnthropicMessages),
+            kind,
+        ) else {
+            self.report
+                .push_omitted_extension(extension, DialectId::AnthropicMessages);
+            return out;
+        };
+        let kind = kind.to_owned();
+        let index = match phase {
+            ProviderBlockPhase::Start => {
+                self.close_open(&mut out);
+                let index = self.next_index;
+                self.next_index += 1;
+                self.opaque_blocks.insert(upstream, index);
+                Some(index)
+            }
+            ProviderBlockPhase::Delta => self
+                .opaque_blocks
+                .get(&upstream)
+                .copied()
+                .or_else(|| self.open.map(|open| open.index())),
+            ProviderBlockPhase::Stop => self.opaque_blocks.remove(&upstream),
+        };
+        let Some(index) = index else {
+            self.report.push(TranslationLoss::new(
+                extension.wire_path(),
+                TranslationLossReason::NotRepresentable,
+                1,
+            ));
+            return out;
+        };
+        let mut data = extension.value().clone();
+        if let Some(object) = data.as_object_mut() {
+            object.insert("index".to_owned(), json!(index));
+        }
+        out.push(self.sse(&kind, data));
         out
     }
 
@@ -1141,7 +1293,7 @@ impl AnthropicRenderer {
             BlockKind::Thinking { .. } => json!({"type": "thinking", "thinking": ""}),
             BlockKind::Text => json!({"type": "text", "text": ""}),
         };
-        sse_event(
+        self.sse(
             "content_block_start",
             json!({
                 "type": "content_block_start",
@@ -1154,7 +1306,7 @@ impl AnthropicRenderer {
     /// Close the open content block, if any (emits its stop).
     fn close_open(&mut self, out: &mut Vec<SseEvent>) {
         if let Some(block) = self.open.take() {
-            out.push(sse_event(
+            out.push(self.sse(
                 "content_block_stop",
                 json!({"type": "content_block_stop", "index": block.index()}),
             ));
@@ -1221,6 +1373,17 @@ pub fn anthropic_from_canonical(model: &str, turn: &CanonTurn) -> Value {
         message.insert("usage".to_owned(), usage_json(usage));
         if let Some(provider) = &usage.serving_provider {
             message.insert("provider".to_owned(), Value::String(provider.clone()));
+        }
+    }
+    for extension in &turn.output_extensions {
+        if extension
+            .source()
+            .shares_replay_domain(DialectId::AnthropicMessages)
+            && let Some(name) = extension.wire_name()
+        {
+            message
+                .entry(name.to_owned())
+                .or_insert_with(|| extension.value().clone());
         }
     }
     Value::Object(message)

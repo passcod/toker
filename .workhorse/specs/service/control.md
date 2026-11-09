@@ -56,6 +56,7 @@ A control path added later MUST require a JSON body where it mutates.
 | config snapshot | everything the configuration pages show, carrying no credential value |
 | config edit | apply a typed edit to a configuration row |
 | config credential | choose where a provider's credential comes from, and set the literal where that is the source |
+| safeguards mark clear | clear a binding's server safeguards rejection mark |
 
 The meaning of each routing operation is specified by [RREV](../routing/revisions.md), and the publication handoff by [RPUB](../routing/publication.md#publication-state).
 

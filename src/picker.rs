@@ -571,6 +571,7 @@ mod tests {
 
         let requested_model = crate::policy::StableId::new("requested_model").unwrap();
         let route = Route {
+            honours_server_safeguards: false,
             id: RouteId::new("route").unwrap(),
             display_name: "Route".to_owned(),
             description: None,

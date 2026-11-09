@@ -352,6 +352,13 @@ const ROUTE: &[Field] = &[
     field("parameters", "parameters", Node::List(&Node::Text)),
     field("chain", "candidates", Node::Chain),
     field("lane_transition", "lane transition", LANE_TRANSITION),
+    // Saved through its own edit operation rather than inside the route, so
+    // setting it can raise the document's format with it.
+    field(
+        "honours_server_safeguards",
+        "honours server safeguards",
+        Node::Bool(false),
+    ),
 ];
 
 const DEFAULT: &[Field] = &[
@@ -464,6 +471,11 @@ const PREVIEW: &[Field] = &[
     field("prompt_bound", "prompt bound", Node::Int),
     field("message_count", "message count", Node::OptInt),
     field("tool_count", "tool count", Node::Int),
+    field(
+        "asks_server_safeguards",
+        "asks for server safeguards",
+        Node::Bool(false),
+    ),
 ];
 
 /// What a form is for, which decides its schema and what saving it does.
@@ -533,7 +545,9 @@ impl Purpose {
             }
             Purpose::Description => "enter save · esc cancel",
             Purpose::Promote => "tab complete from a daemon offer · enter record · esc cancel",
-            Purpose::Preview => "content-free request facts only · enter preview · esc cancel",
+            Purpose::Preview => {
+                "content-free request facts only · space toggle · enter preview · esc cancel"
+            }
         }
     }
 }
@@ -2068,6 +2082,17 @@ mod tests {
         assert_eq!(form.value()["lane_transition"], "preserve_pinned");
         press(&mut form, KeyCode::Left);
         assert_eq!(form.value()["lane_transition"], "allow_immediate");
+    }
+
+    #[test]
+    fn a_route_can_be_set_to_honour_server_safeguards_and_back() {
+        let mut form = record("routes");
+        focus_label(&mut form, "honours server safeguards");
+        assert!(form.value().get("honours_server_safeguards").is_none());
+        press(&mut form, KeyCode::Char(' '));
+        assert_eq!(form.value()["honours_server_safeguards"], true);
+        press(&mut form, KeyCode::Char(' '));
+        assert_eq!(form.value()["honours_server_safeguards"], false);
     }
 
     /// Switching a union's kind rebuilds its fields and keeps the ones the

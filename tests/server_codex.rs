@@ -781,6 +781,7 @@ fn messages_codex_fallback_policy_with_model(
         }],
         presentations: vec![],
         routes: vec![Route {
+            honours_server_safeguards: false,
             id: route_id,
             display_name: "Messages Codex fallback".to_owned(),
             description: None,
@@ -857,6 +858,7 @@ fn responses_fallback_chain(
         }],
         presentations: vec![],
         routes: vec![Route {
+            honours_server_safeguards: false,
             id: route_id,
             display_name: "Responses fallback".to_owned(),
             description: None,

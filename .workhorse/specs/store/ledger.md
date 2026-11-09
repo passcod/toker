@@ -84,6 +84,18 @@ A meter snapshot MUST be kept as the provider reported it, and a header Toker do
 
 A row MUST carry the reset times of the windows its meters named, so that any window can be reconstructed afterwards.
 
+A row MUST record whether its request asked for server safeguards.
+A row for a request that asked MUST record:
+
+- the effective support of the binding that served it, as supported, unsupported or unknown, and whether a rejection mark was held
+- whether the response carried results, and whether they reached the client
+- whether honouring the ask skipped a candidate, and whether the route was walked again without it, as [RSOLV](../routing/resolver.md#honouring-server-safeguards) specifies
+
+These MUST NOT carry the contents of the ask or of its results, as [WSAFE](../wire/safeguards.md#what-is-recorded) requires.
+
+> [!NOTE]
+> A row from before these fields existed is silent on all of them, and is not a request that did not ask.
+
 A row reaching a provider MUST carry the account it was served on, as [ACCT](accounts.md#what-is-attributed-to-an-account) requires.
 
 A row whose account is not known MUST carry none, and MUST NOT carry one inferred from the rows around it.

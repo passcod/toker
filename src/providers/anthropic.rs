@@ -407,7 +407,7 @@ mod tests {
                 .canonical_backend()
                 .expect("Messages adapter is complete");
             assert_eq!(canonical.adapter(), BackendAdapterId::AnthropicMessages);
-            assert_eq!(canonical.capabilities(), Capabilities::MESSAGES);
+            assert_eq!(canonical.capabilities(), Capabilities::ANTHROPIC_MESSAGES);
         }
     }
 

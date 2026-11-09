@@ -76,7 +76,7 @@ use crate::middleware::quota::{Blocking, Meters, Rendering, grant_for};
 use crate::observe::{AnthropicObserver, SseSplitter};
 use crate::policy::force_newest;
 use crate::providers::{Provider, parse_rate_limits};
-use crate::routing::{BackendAdapterId, ModelTarget, ProtocolId};
+use crate::routing::{BackendAdapterId, DialectId, ModelTarget, ProtocolId};
 use crate::store::MetersSnapshot;
 use crate::translate;
 
@@ -587,6 +587,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 binding_affinity,
                 class,
             );
+            facts.asks_server_safeguards = translate::asks_server_safeguards(request);
             if class == crate::policy::RequestClass::Compaction {
                 facts.legacy_compaction = Some(legacy_compaction_facts(
                     &server,
@@ -861,6 +862,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 .map(|(_, to)| to),
             model_mappings: batch_model_mappings.take(),
             translation_report: None,
+            safeguards: Default::default(),
             policy_attempt: policy_attempt.clone().map(Arc::new),
         });
         gate_shape = shape;
@@ -1401,6 +1403,40 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     .await
 }
 
+/// Remove the `anthropic-beta` values announcing server safeguards, leaving
+/// every other value where it was. The header goes only if nothing else is
+/// left in it.
+pub(crate) fn strip_safeguards_beta(headers: &mut HeaderMap) {
+    let announces = |value: &HeaderValue| {
+        value
+            .to_str()
+            .is_ok_and(|value| value.split(',').any(translate::is_safeguards_beta))
+    };
+    if !headers.get_all("anthropic-beta").iter().any(announces) {
+        return;
+    }
+    let kept: Vec<HeaderValue> = headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|value| {
+            let Ok(text) = value.to_str() else {
+                return Some(value.clone());
+            };
+            let remaining: Vec<&str> = text
+                .split(',')
+                .filter(|flag| !translate::is_safeguards_beta(flag))
+                .collect();
+            (!remaining.is_empty())
+                .then(|| HeaderValue::from_str(&remaining.join(",")).ok())
+                .flatten()
+        })
+        .collect();
+    headers.remove("anthropic-beta");
+    for value in kept {
+        headers.append("anthropic-beta", value);
+    }
+}
+
 pub(crate) fn required_capabilities(request: &CanonicalRequest) -> crate::policy::CapabilityFlags {
     fn block_requirements(block: &CanonBlock) -> (bool, bool) {
         match block.semantic() {
@@ -1418,7 +1454,8 @@ pub(crate) fn required_capabilities(request: &CanonicalRequest) -> crate::policy
             CanonBlock::Annotated { .. } => unreachable!("semantic removes annotations"),
             CanonBlock::Text(_)
             | CanonBlock::Thinking { .. }
-            | CanonBlock::RedactedThinking { .. } => (false, false),
+            | CanonBlock::RedactedThinking { .. }
+            | CanonBlock::Opaque(_) => (false, false),
         }
     }
     let (has_images, has_tool_history) = request
@@ -1496,23 +1533,29 @@ pub(crate) fn note_meters(
     }
 }
 
-/// Send the request once more with `thinking: disabled` rewritten to
-/// `between_tools`, when the upstream refused the first with a 400 that
-/// names that form. Any other response comes back as it arrived.
+/// Send the request once more, rewritten, when the upstream refused the first
+/// with a 400 that names a rewrite Toker can make. Any other response comes
+/// back as it arrived. Two refusals earn a rewrite:
 ///
-/// Claude Code turns thinking off on its side calls (the auto-mode
-/// classifier among them) and decides per model whether `disabled` is
-/// allowed from a list built into the client. From 2026-10-08 Anthropic
-/// started refusing it on `claude-sonnet-5` in bursts, with "To turn
-/// thinking off on this model, send `between_tools`", while the same call
-/// succeeded between bursts; a client built before that keeps sending
-/// `disabled`, and every Bash permission check in auto mode fails. The
-/// rewrite waits for the refusal rather than running up front, because
-/// whether `between_tools` is accepted where `disabled` still is was never
-/// observed, and the refusal is the only evidence a model wants it.
+/// - **`thinking: disabled`**, which becomes `between_tools`. Claude Code
+///   turns thinking off on its side calls (the auto-mode classifier among
+///   them) and decides per model whether `disabled` is allowed from a list
+///   built into the client. From 2026-10-08 Anthropic started refusing it on
+///   `claude-sonnet-5` in bursts, with "To turn thinking off on this model,
+///   send `between_tools`", while the same call succeeded between bursts; a
+///   client built before that keeps sending `disabled`, and every Bash
+///   permission check in auto mode fails. The rewrite waits for the refusal
+///   rather than running up front, because whether `between_tools` is
+///   accepted where `disabled` still is was never observed, and the refusal
+///   is the only evidence a model wants it.
+/// - **server safeguards** (spec: WSAFE#a-rejection), where the binding's
+///   support is only unknown: the ask and the beta announcing it are
+///   withheld, and the binding is marked so later requests do not repeat the
+///   refused send.
 ///
-/// Once only: a second refusal is forwarded and recorded like any error.
-/// The refused response's meters still feed the gate.
+/// A refusal is inspected once and the rewrites it names applied together,
+/// in one extra send. A second refusal is forwarded and recorded like any
+/// error. The refused response's meters still feed the gate.
 pub(crate) enum ThinkingRetry {
     Original(reqwest::Response),
     Retried(reqwest::Response),
@@ -1537,9 +1580,11 @@ pub(crate) async fn retry_thinking_off(
     if upstream.status() != StatusCode::BAD_REQUEST {
         return Ok(ThinkingRetry::Original(upstream));
     }
-    let Some(retry) = between_tools_body(&sent) else {
+    let thinking_possible = body_disables_thinking(&sent);
+    let safeguards_possible = safeguards_retry_possible(server, record.as_ref(), &sent);
+    if !thinking_possible && !safeguards_possible {
         return Ok(ThinkingRetry::Original(upstream));
-    };
+    }
     let status = upstream.status();
     let headers = upstream.headers().clone();
     let Ok(buffered) = buffer_up_to(upstream, super::proxy::PRECOMMIT_BODY_CAP).await else {
@@ -1553,11 +1598,21 @@ pub(crate) async fn retry_thinking_off(
             rate_limits: parse_rate_limits(&headers),
         }));
     };
-    let wants_between_tools = buffered.rest.is_none()
-        && error_pair(&buffered.bytes)
-            .1
+    let message = (buffered.rest.is_none())
+        .then(|| error_pair(&buffered.bytes).1)
+        .flatten();
+    let wants_thinking = thinking_possible
+        && message
+            .as_deref()
             .is_some_and(|message| message.contains("between_tools"));
-    if !wants_between_tools {
+    let wants_safeguards = safeguards_possible
+        && message
+            .as_deref()
+            .is_some_and(translate::is_safeguards_refusal);
+    let retry = (wants_thinking || wants_safeguards)
+        .then(|| retry_body(&sent, wants_thinking, wants_safeguards))
+        .flatten();
+    let Some(retry) = retry else {
         let complete = buffered.rest.is_none();
         let failure = complete.then(|| {
             let body = serde_json::from_slice(&buffered.bytes).unwrap_or(serde_json::Value::Null);
@@ -1574,8 +1629,12 @@ pub(crate) async fn retry_thinking_off(
                 evidence: super::attempt::CommitEvidence::ByteCapReached,
             },
         }));
+    };
+    if wants_safeguards {
+        tracing::info!("upstream refused server safeguards; sending again without them");
+    } else {
+        tracing::info!("upstream refused thinking: disabled; sending again as between_tools");
     }
-    tracing::info!("upstream refused thinking: disabled; sending again as between_tools");
     if let Some(ctx) = record {
         let (error_type, _) = error_pair(&buffered.bytes);
         let rate_limits = parse_rate_limits(&headers);
@@ -1587,13 +1646,28 @@ pub(crate) async fn retry_thinking_off(
             retry_after_ms(&headers),
             rate_limits.as_ref(),
         );
-        ctx.attempt = ctx
-            .attempt
-            .as_ref()
-            .and_then(super::attempt::thinking_provenance);
+        ctx.attempt = ctx.attempt.as_ref().and_then(|attempt| {
+            if wants_safeguards {
+                super::attempt::safeguards_provenance(attempt)
+            } else {
+                super::attempt::thinking_provenance(attempt)
+            }
+        });
+        if wants_safeguards {
+            server.mark_safeguards_rejected(&ctx.binding_id);
+            ctx.safeguards.marked = Some(true);
+            ctx.safeguards.support = Some(crate::routing::CapabilityEvidence::Unsupported);
+        }
         cancellation.update_anthropic(Some(ctx));
         server.note_binding_sent(&ctx.binding_id, ctx.effective_model.as_deref());
     }
+    let retry_parts;
+    let parts = if wants_safeguards {
+        retry_parts = parts_without_safeguards_beta(parts);
+        &retry_parts
+    } else {
+        parts
+    };
     send_upstream(server, backend, parts, retry, &[])
         .await
         .map(|upstream| ThinkingRetry::Retried(upstream.response))
@@ -1620,19 +1694,71 @@ pub(crate) async fn retry_thinking_off(
         })
 }
 
-/// The sent canonical body with `thinking: disabled` made `between_tools`,
-/// or `None` when no such retry is possible.
-fn between_tools_body(sent: &Bytes) -> Option<Bytes> {
+/// Whether the sent body asks for `thinking: disabled`.
+fn body_disables_thinking(sent: &Bytes) -> bool {
+    serde_json::from_slice::<serde_json::Value>(sent)
+        .ok()
+        .and_then(|value| translate::from_anthropic(&value).ok())
+        .is_some_and(|canonical| {
+            canonical.thinking == Some(crate::ir::canonical::ThinkingSpec::Disabled)
+        })
+}
+
+/// Whether a refusal of the ask can earn a retry: the sent body carries it,
+/// and the binding's support is declared unknown and unmarked. A binding that
+/// declares support is forwarded whatever it says, and a marked one was sent no
+/// ask to refuse.
+fn safeguards_retry_possible(
+    server: &Server,
+    record: Option<&AnthropicRecordCtx>,
+    sent: &Bytes,
+) -> bool {
+    let Some(ctx) = record else {
+        return false;
+    };
+    let declared = server
+        .registry
+        .binding(&ctx.binding_id)
+        .and_then(|binding| binding.canonical_backend())
+        .map(|backend| backend.capabilities().server_safeguards);
+    declared == Some(crate::routing::CapabilityEvidence::Unknown)
+        && !server.safeguards_marks().contains(&ctx.binding_id)
+        && serde_json::from_slice::<serde_json::Value>(sent)
+            .ok()
+            .and_then(|value| translate::from_anthropic(&value).ok())
+            .is_some_and(|canonical| translate::asks_server_safeguards(&canonical))
+}
+
+/// The sent canonical body with the rewrites a refusal named applied, or
+/// `None` when no such retry is possible: `thinking: disabled` made
+/// `between_tools`, and the server safeguards ask removed.
+fn retry_body(sent: &Bytes, thinking: bool, safeguards: bool) -> Option<Bytes> {
     let value = serde_json::from_slice::<serde_json::Value>(sent).ok()?;
     let mut canonical = translate::from_anthropic(&value).ok()?;
-    if canonical.thinking != Some(crate::ir::canonical::ThinkingSpec::Disabled) {
+    if thinking {
+        if canonical.thinking != Some(crate::ir::canonical::ThinkingSpec::Disabled) {
+            return None;
+        }
+        canonical.thinking = Some(crate::ir::canonical::ThinkingSpec::BetweenTools);
+    }
+    if safeguards && !translate::withhold_server_safeguards(&mut canonical) {
         return None;
     }
-    canonical.thinking = Some(crate::ir::canonical::ThinkingSpec::BetweenTools);
     let rendered =
         translate::render_anthropic(&canonical, crate::routing::DialectId::AnthropicMessages)
             .ok()?;
     serde_json::to_vec(&rendered.value).ok().map(Bytes::from)
+}
+
+/// The request parts with the beta announcing server safeguards removed.
+fn parts_without_safeguards_beta(parts: &axum::http::request::Parts) -> axum::http::request::Parts {
+    let (mut copy, ()) = axum::http::Request::new(()).into_parts();
+    copy.method = parts.method.clone();
+    copy.uri = parts.uri.clone();
+    copy.version = parts.version;
+    copy.headers = parts.headers.clone();
+    strip_safeguards_beta(&mut copy.headers);
+    copy
 }
 
 /// The evidence the resolver's compaction rules read from a lane: whether
@@ -1948,6 +2074,19 @@ pub(crate) async fn forward_canonical_messages(
         );
     }
 
+    // The dialect tags what the canonical form retains but does not model.
+    let dialect = record
+        .as_ref()
+        .and_then(|ctx| ctx.server.registry.binding(&ctx.binding_id))
+        .map(|binding| binding.dialect())
+        .filter(|dialect| {
+            matches!(
+                dialect,
+                DialectId::AnthropicMessages | DialectId::OpenRouterMessages
+            )
+        })
+        .unwrap_or(DialectId::AnthropicMessages);
+
     if expected_stream {
         let stream = CanonicalMessagesStream::new(
             upstream,
@@ -1957,6 +2096,7 @@ pub(crate) async fn forward_canonical_messages(
             in_flight,
             model,
             response_projection,
+            dialect,
         );
         let mut headers = response_headers(&upstream_headers, false);
         headers.insert(
@@ -1998,7 +2138,8 @@ pub(crate) async fn forward_canonical_messages(
     let mut turn = match serde_json::from_slice::<serde_json::Value>(&buffered.bytes)
         .map_err(|error| error.to_string())
         .and_then(|body| {
-            translate::canonical_turn_from_anthropic(&body).map_err(|error| error.to_string())
+            translate::canonical_turn_from_messages(&body, dialect)
+                .map_err(|error| error.to_string())
         }) {
         Ok(turn) => turn,
         Err(error) => {
@@ -2019,7 +2160,13 @@ pub(crate) async fn forward_canonical_messages(
             );
         }
     };
-    if let Some(ctx) = record.as_ref() {
+    let results_seen = serde_json::from_slice::<serde_json::Value>(&buffered.bytes)
+        .is_ok_and(|body| translate::mentions_safeguard_results(&body));
+    response_projection.apply(&mut turn);
+    let body = translate::anthropic_frontend::anthropic_from_canonical(model, &turn);
+    let mut record = record;
+    if let Some(ctx) = record.as_mut() {
+        ctx.note_safeguards_results(results_seen, translate::mentions_safeguard_results(&body));
         let mut observer = AnthropicObserver::new();
         observer.observe_json(&buffered.bytes);
         let (reported_model, capture) = observer.finish_parts();
@@ -2031,8 +2178,6 @@ pub(crate) async fn forward_canonical_messages(
             status.as_u16(),
         );
     }
-    response_projection.apply(&mut turn);
-    let body = translate::anthropic_frontend::anthropic_from_canonical(model, &turn);
     anthropic_json_response(status, &upstream_headers, &body)
 }
 
@@ -2071,6 +2216,7 @@ struct CanonicalMessagesStream {
 }
 
 impl CanonicalMessagesStream {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         response: reqwest::Response,
         status: u16,
@@ -2079,6 +2225,7 @@ impl CanonicalMessagesStream {
         in_flight: Option<InFlightGuard>,
         model: &str,
         response_projection: ResponseProjection,
+        dialect: DialectId,
     ) -> CanonicalMessagesStream {
         let (abort, registration) = AbortHandle::new_pair();
         let stream: UpstreamBody = Box::pin(response.bytes_stream());
@@ -2086,7 +2233,7 @@ impl CanonicalMessagesStream {
             inner: Box::pin(Abortable::new(stream, registration)),
             abort,
             splitter: SseSplitter::new(),
-            backend: translate::AnthropicResponseStream::new(),
+            backend: translate::AnthropicResponseStream::for_dialect(dialect),
             frontend: translate::anthropic_frontend::AnthropicRenderer::new(model),
             observer: AnthropicObserver::new(),
             pending: VecDeque::new(),
@@ -2142,7 +2289,11 @@ impl CanonicalMessagesStream {
     }
 
     fn finish_recording(&mut self) {
-        if let Some(ctx) = self.ctx.take() {
+        if let Some(mut ctx) = self.ctx.take() {
+            ctx.note_safeguards_results(
+                self.backend.results_seen(),
+                self.frontend.results_replayed(),
+            );
             let (reported_model, capture) = std::mem::take(&mut self.observer).finish_parts();
             record_anthropic_measurement(
                 &ctx,

@@ -18,7 +18,7 @@ use model::State;
 pub(super) fn owns_key(code: KeyCode) -> bool {
     matches!(
         code,
-        KeyCode::Char('e' | ' ' | '1' | '2' | 'h' | 'j' | 'k' | 'l')
+        KeyCode::Char('e' | 'c' | ' ' | '1' | '2' | 'h' | 'j' | 'k' | 'l')
             | KeyCode::Up
             | KeyCode::Down
             | KeyCode::Left

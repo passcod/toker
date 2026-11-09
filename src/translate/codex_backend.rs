@@ -447,6 +447,9 @@ fn input_of(
                         // reasoning is opaque; see the module docs).
                         // The drop does not split the message's parts.
                         CanonBlock::Thinking { .. } | CanonBlock::RedactedThinking { .. } => {}
+                        CanonBlock::Opaque(extension) => {
+                            report_incompatible(extension, report);
+                        }
                         CanonBlock::Annotated { .. } => {
                             unreachable!("semantic() removes annotations")
                         }
@@ -1201,6 +1204,29 @@ mod tests {
         );
         let report = format!("{:?}", rendered.report);
         assert!(!report.contains("secret-user"));
+    }
+
+    #[test]
+    fn a_server_safeguards_ask_is_a_content_free_loss_on_the_responses_wire() {
+        let canonical = crate::translate::from_anthropic(&json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "safeguards": {"invented": "secret-ask"},
+        }))
+        .expect("parses");
+        assert!(crate::translate::asks_server_safeguards(&canonical));
+        let rendered = render_codex(&canonical, KEY).expect("renders with report");
+        assert_eq!(
+            rendered.report.losses(),
+            &[TranslationLoss::new(
+                "$.safeguards",
+                TranslationLossReason::IncompatibleExtensionDialect,
+                1,
+            )]
+        );
+        let wire = serde_json::to_string(&rendered.value).expect("serialises");
+        assert!(!wire.contains("safeguards") && !wire.contains("secret-ask"));
+        assert!(!format!("{:?}", rendered.report).contains("secret-ask"));
     }
 
     #[test]

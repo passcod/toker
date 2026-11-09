@@ -19,6 +19,7 @@ use serde_json::json;
 
 use super::{MAX_CONTROL_BODY, control_token_ok, forbidden, json_content_type, store_error};
 use crate::config::{Config, is_frontend_name};
+use crate::routing::{CapabilityEvidence, DialectId};
 use crate::server::Server;
 use crate::store::{Configuration, ProviderConfigRow, SettingsConfigRow};
 
@@ -67,6 +68,37 @@ pub(crate) async fn snapshot(State(server): State<Server>, request: Request) -> 
         Err(error) => return store_error(error),
     };
     let config = server.config();
+    let marks = match server.store.load_safeguards_marks() {
+        Ok(marks) => marks,
+        Err(error) => return store_error(error),
+    };
+    // Each Messages binding's declared support for server safeguards and the
+    // mark held against it: capability and temporary evidence, kept apart.
+    let safeguards: Vec<_> = server
+        .registry
+        .bindings()
+        .filter(|binding| {
+            binding
+                .dialect()
+                .shares_replay_domain(DialectId::AnthropicMessages)
+        })
+        .map(|binding| {
+            json!({
+                "binding_id": binding.id(),
+                "provider": binding.provider(),
+                "declared": binding
+                    .canonical_backend()
+                    .map_or(CapabilityEvidence::Unknown, |backend| {
+                        backend.capabilities().server_safeguards
+                    })
+                    .as_str(),
+                "marked_ms": marks
+                    .iter()
+                    .find(|mark| &mark.binding_id == binding.id())
+                    .map(|mark| mark.marked_ms),
+            })
+        })
+        .collect();
 
     let providers: Vec<_> = KNOWN_PROVIDERS
         .iter()
@@ -96,6 +128,7 @@ pub(crate) async fn snapshot(State(server): State<Server>, request: Request) -> 
             "toker": "config-snapshot",
             "ok": true,
             "providers": providers,
+            "safeguards": safeguards,
             "settings": settings_body(&stored.settings),
             "notices": stored.notices,
             // Shown but not editable: settled before the store is opened
@@ -308,6 +341,43 @@ pub(crate) async fn provider(State(server): State<Server>, request: Request) -> 
     )
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SafeguardsMarkClear {
+    binding_id: crate::policy::BindingId,
+}
+
+/// `POST /_toker/safeguards/mark/clear` — forget that a binding refused the
+/// server safeguards ask, so the next ask probes it again.
+pub(crate) async fn clear_safeguards_mark(
+    State(server): State<Server>,
+    request: Request,
+) -> Response {
+    if !control_token_ok(request.headers(), "safeguards-mark-clear")
+        || request.method() != Method::POST
+    {
+        return forbidden();
+    }
+    let body = match read_body(request).await {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
+    let clear: SafeguardsMarkClear = match serde_json::from_slice(&body) {
+        Ok(clear) => clear,
+        Err(_) => return refused("safeguards", "the request does not parse"),
+    };
+    let cleared = server.clear_safeguards_marks([&clear.binding_id]);
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "toker": "safeguards-mark-clear",
+            "ok": true,
+            "cleared": cleared > 0,
+        })),
+    )
+        .into_response()
+}
+
 /// `PUT /_toker/config/settings` — the settings row.
 pub(crate) async fn settings(State(server): State<Server>, request: Request) -> Response {
     if !control_token_ok(request.headers(), "config-edit") || request.method() != Method::PUT {
@@ -411,7 +481,7 @@ pub(crate) async fn credential(State(server): State<Server>, request: Request) -
         Err(_) => return refused("credential", "the credential request does not parse"),
     };
 
-    commit(
+    let response = commit(
         &server,
         |candidate| {
             if !KNOWN_PROVIDERS.contains(&edit.provider.as_str()) {
@@ -448,5 +518,11 @@ pub(crate) async fn credential(State(server): State<Server>, request: Request) -
             Ok(row)
         },
         |row| server.store.put_config_provider(row),
-    )
+    );
+    // A new credential may be enrolled where the old one was not, so the
+    // provider's refused asks are worth trying again (spec: WSAFE#a-rejection-mark).
+    if response.status() == StatusCode::OK {
+        server.clear_safeguards_marks_for_provider(&edit.provider);
+    }
+    response
 }

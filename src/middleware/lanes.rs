@@ -560,6 +560,7 @@ mod tests {
     /// shape, local copy for brevity).
     fn bare_row() -> RequestRow {
         RequestRow {
+            safeguards: Default::default(),
             id: None,
             ts_ms: 0,
             duration_ms: None,

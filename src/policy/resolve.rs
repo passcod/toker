@@ -52,6 +52,9 @@ pub struct RequestFacts {
     pub message_count: Option<u64>,
     pub tool_count: u64,
     pub required_capabilities: CapabilityFlags,
+    /// Whether the request asks for server safeguards. It binds a route only
+    /// where the route honours them.
+    pub asks_server_safeguards: bool,
     pub binding_affinity: Option<BindingId>,
     pub class: RequestClass,
     /// Exact revision-one compaction evidence, separate from generic cache
@@ -100,7 +103,12 @@ pub struct BindingAvailability {
     pub enabled: Evidence<&'static str>,
     pub credential: Evidence<&'static str>,
     pub catalogue: CatalogueAvailability,
+    /// Declared capabilities, with server safeguards narrowed to
+    /// unsupported where a rejection mark is held.
     pub capabilities: Capabilities,
+    /// Whether a rejection mark is held against the binding's server
+    /// safeguards.
+    pub safeguards_marked: bool,
     pub cost_class: CostClass,
 }
 
@@ -137,6 +145,19 @@ impl AvailabilitySnapshot {
         for (binding, credential) in credentials {
             if let Some(availability) = snapshot.bindings.get_mut(binding) {
                 availability.credential = *credential;
+            }
+        }
+        snapshot
+    }
+
+    /// Narrow server safeguards to unsupported on every marked binding.
+    pub fn with_safeguards_marks(&self, marked: &BTreeSet<BindingId>) -> Self {
+        let mut snapshot = self.clone();
+        for binding in marked {
+            if let Some(availability) = snapshot.bindings.get_mut(binding) {
+                availability.safeguards_marked = true;
+                availability.capabilities.server_safeguards =
+                    crate::routing::CapabilityEvidence::Unsupported;
             }
         }
         snapshot
@@ -210,6 +231,9 @@ pub enum SkipReason {
     BindingDisabled,
     CredentialUnavailable,
     MissingRequiredCapability,
+    /// The route honours server safeguards, the request asks for them, and the
+    /// binding's effective support is unsupported.
+    LacksServerSafeguards,
     BindingAffinity,
     ModelMissingFromFreshCatalogue,
     ModelUnknown,
@@ -234,8 +258,17 @@ pub struct CandidateEvidence {
 pub enum TraceEvent {
     Lookup(RouteProvenance),
     Candidate(CandidateEvidence),
-    Upgrade { from: String, to: String },
-    Alias { from: String, to: String },
+    Upgrade {
+        from: String,
+        to: String,
+    },
+    Alias {
+        from: String,
+        to: String,
+    },
+    /// A route honouring server safeguards ended without a candidate and was
+    /// walked again without the requirement.
+    SafeguardsWalkedAgain,
 }
 
 /// The complete, content-free result of pure preflight resolution.
@@ -273,7 +306,25 @@ pub struct AttemptPlan {
     pub cache_transition: Option<CacheTransitionPolicy>,
     pub fallback_cache_transition: Option<CacheTransitionPolicy>,
     pub trace: Vec<TraceEvent>,
+    /// What server safeguards meant for this attempt, content-free.
+    pub safeguards: SafeguardsPlan,
     continuation: Option<PostSendContinuation>,
+}
+
+/// What a request's ask for server safeguards came to for one attempt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SafeguardsPlan {
+    /// The request asked.
+    pub asked: bool,
+    /// The serving binding's effective support, when it is known to the
+    /// resolver's snapshot.
+    pub effective: Option<crate::routing::CapabilityEvidence>,
+    /// A rejection mark was held against the serving binding.
+    pub marked: bool,
+    /// Honouring the ask skipped at least one candidate.
+    pub skipped_candidate: bool,
+    /// The route was walked again without the requirement.
+    pub walked_again: bool,
 }
 
 impl AttemptPlan {
@@ -582,6 +633,9 @@ fn resolve_with_options<L: LearningView>(
     )
 }
 
+/// Walk the selected route, then, where honouring server safeguards left no
+/// candidate, walk it again without them. The plan records what the ask came
+/// to.
 #[allow(clippy::too_many_arguments)]
 fn resolve_selected<L: LearningView>(
     policy: &CompiledPolicy,
@@ -594,11 +648,76 @@ fn resolve_selected<L: LearningView>(
     selected: SelectedRoute<'_>,
     options: ResolveOptions,
 ) -> Result<AttemptPlan, ResolveFailure> {
+    let honour = facts.asks_server_safeguards
+        && selected
+            .route
+            .is_some_and(CompiledRoute::honours_server_safeguards);
+    let walk = |honour: bool, trace: Option<Vec<TraceEvent>>| {
+        walk_selected(
+            policy,
+            inventory,
+            learning,
+            lane,
+            availability,
+            circuits,
+            facts,
+            &selected,
+            options.clone(),
+            honour,
+            trace,
+        )
+    };
+    let mut walked_again = false;
+    let result = match walk(honour, None) {
+        Err(ResolveFailure::RouteUnavailable { mut trace, .. }) if honour => {
+            walked_again = true;
+            trace.push(TraceEvent::SafeguardsWalkedAgain);
+            walk(false, Some(trace))
+        }
+        other => other,
+    };
+    result.map(|mut plan| {
+        let live = availability.get(&plan.binding_id);
+        plan.safeguards = SafeguardsPlan {
+            asked: facts.asks_server_safeguards,
+            effective: live.map(|live| live.capabilities.server_safeguards),
+            marked: live.is_some_and(|live| live.safeguards_marked),
+            skipped_candidate: plan.trace.iter().any(|event| {
+                matches!(
+                    event,
+                    TraceEvent::Candidate(CandidateEvidence {
+                        result: Err(SkipReason::LacksServerSafeguards),
+                        ..
+                    })
+                )
+            }),
+            walked_again,
+        };
+        plan
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_selected<L: LearningView>(
+    policy: &CompiledPolicy,
+    inventory: &OfferInventory,
+    learning: &L,
+    lane: Option<&LaneFacts>,
+    availability: &AvailabilitySnapshot,
+    circuits: &CircuitSnapshot,
+    facts: &RequestFacts,
+    selected: &SelectedRoute<'_>,
+    options: ResolveOptions,
+    honour_server_safeguards: bool,
+    initial_trace: Option<Vec<TraceEvent>>,
+) -> Result<AttemptPlan, ResolveFailure> {
     let activation_allows_cache_loss = options.activation_allows_cache_loss;
-    let mut trace = options.post_send.as_ref().map_or_else(
-        || vec![TraceEvent::Lookup(selected.provenance.clone())],
-        |next| next.trace.clone(),
-    );
+    let mut trace = initial_trace.unwrap_or_else(|| {
+        options.post_send.as_ref().map_or_else(
+            || vec![TraceEvent::Lookup(selected.provenance.clone())],
+            |next| next.trace.clone(),
+        )
+    });
     if let Some((binding_id, model, route_id, fingerprint, candidate_id)) = selected.exact {
         if options.post_send.is_some() {
             return Err(ResolveFailure::MissingRoute);
@@ -640,6 +759,7 @@ fn resolve_selected<L: LearningView>(
             cache_transition: selected.cache_transition,
             fallback_cache_transition: None,
             trace,
+            safeguards: SafeguardsPlan::default(),
             continuation: None,
         });
     }
@@ -710,8 +830,14 @@ fn resolve_selected<L: LearningView>(
         let baseline = materialize_candidate(candidate, &selected.parameters, inventory, policy)?;
         let live = availability.get(candidate.binding_id());
         prior_live = live;
-        let mut evidence =
-            candidate_evidence(candidate, baseline.as_deref(), live, inventory, facts);
+        let mut evidence = candidate_evidence(
+            candidate,
+            baseline.as_deref(),
+            live,
+            inventory,
+            facts,
+            honour_server_safeguards,
+        );
         if index > route_start {
             evidence.crossed_from = Some(route.candidates()[index - 1].id().clone());
         }
@@ -855,6 +981,7 @@ fn resolve_selected<L: LearningView>(
                         stricter_cache_transition(policy, edge.cache_transition)
                     })
             }),
+            safeguards: SafeguardsPlan::default(),
             continuation: Some(PostSendContinuation {
                 policy_fingerprint: policy.fingerprint().clone(),
                 policy_revision: None,
@@ -1145,6 +1272,7 @@ fn candidate_evidence(
     live: Option<&BindingAvailability>,
     inventory: &OfferInventory,
     facts: &RequestFacts,
+    honour_server_safeguards: bool,
 ) -> CandidateEvidence {
     let reason = if !candidate.enabled() {
         Some(SkipReason::Disabled)
@@ -1162,6 +1290,10 @@ fn candidate_evidence(
                 facts.required_capabilities,
             ),
         )
+        .or_else(|| {
+            (honour_server_safeguards && live.capabilities.server_safeguards.is_unsupported())
+                .then_some(SkipReason::LacksServerSafeguards)
+        })
         .or_else(|| match candidate.model() {
             // A fresh listing can disprove a policy-owned exact offer. Models
             // supplied by a compatibility default or template remain
@@ -1860,6 +1992,7 @@ mod tests {
 
     fn route(first: Candidate, steps: Vec<RouteStep>) -> Route {
         Route {
+            honours_server_safeguards: false,
             id: id("route"),
             display_name: "route".to_owned(),
             description: None,
@@ -1981,7 +2114,8 @@ mod tests {
                     } else {
                         CatalogueAvailability::Absent
                     },
-                    capabilities: Capabilities::MESSAGES,
+                    capabilities: Capabilities::ANTHROPIC_MESSAGES,
+                    safeguards_marked: false,
                     cost_class: CostClass::Subscription,
                 },
             ),
@@ -1993,7 +2127,8 @@ mod tests {
                     enabled: Evidence::Positive("enabled"),
                     credential: Evidence::Unknown,
                     catalogue: CatalogueAvailability::Absent,
-                    capabilities: Capabilities::MESSAGES,
+                    capabilities: Capabilities::ANTHROPIC_MESSAGES,
+                    safeguards_marked: false,
                     cost_class: CostClass::Billed,
                 },
             ),
@@ -2052,6 +2187,7 @@ mod tests {
             message_count: Some(1),
             tool_count: 0,
             required_capabilities: Default::default(),
+            asks_server_safeguards: false,
             binding_affinity: None,
             class: RequestClass::Inference,
             legacy_compaction: None,
@@ -3607,6 +3743,172 @@ mod tests {
         ));
     }
 
+    /// Two Anthropic candidates, the first on the subscription binding, joined
+    /// by an edge that permits preflight fallback; `honours` is the route flag.
+    fn safeguards_policy(honours: bool, second_enabled_edge: bool) -> CompiledPolicy {
+        let first = candidate(
+            "first",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "one".to_owned(),
+            },
+        );
+        let second = candidate(
+            "second",
+            &ANTHROPIC_API_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "two".to_owned(),
+            },
+        );
+        let edge = CandidateEdge {
+            preflight: if second_enabled_edge {
+                FallbackPermission::Enabled
+            } else {
+                FallbackPermission::Disabled
+            },
+            post_send: vec![FailureClass::Overload],
+            billed_boundary: BoundaryConsent::Allow,
+            ambiguous_transport: BoundaryConsent::Deny,
+            cache_transition: CacheTransitionPolicy::AllowCacheLoss,
+        };
+        let mut route = route(
+            first,
+            vec![RouteStep {
+                edge,
+                candidate: second,
+            }],
+        );
+        route.honours_server_safeguards = honours;
+        compile(document(route), &OfferInventory::default())
+    }
+
+    fn marked(binding: &crate::routing::BackendBinding) -> AvailabilitySnapshot {
+        availability(true, false).with_safeguards_marks(&BTreeSet::from([binding.id().clone()]))
+    }
+
+    fn resolve_asking(
+        policy: &CompiledPolicy,
+        availability: &AvailabilitySnapshot,
+        asks: bool,
+    ) -> Result<AttemptPlan, ResolveFailure> {
+        let mut request = facts("asked");
+        request.asks_server_safeguards = asks;
+        resolve(
+            policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            None,
+            availability,
+            &request,
+        )
+    }
+
+    #[test]
+    fn an_honouring_route_skips_a_candidate_whose_effective_support_is_unsupported() {
+        let policy = safeguards_policy(true, true);
+        let plan = resolve_asking(&policy, &marked(&ANTHROPIC_SUB_MESSAGES), true).unwrap();
+        assert_eq!(plan.binding_id, *ANTHROPIC_API_MESSAGES.id());
+        assert!(plan.trace.iter().any(|event| matches!(
+            event,
+            TraceEvent::Candidate(e)
+                if e.candidate_id.as_str() == "first"
+                    && e.result == Err(SkipReason::LacksServerSafeguards)
+        )));
+        assert_eq!(
+            plan.safeguards,
+            SafeguardsPlan {
+                asked: true,
+                effective: Some(crate::routing::CapabilityEvidence::Supported),
+                marked: false,
+                skipped_candidate: true,
+                walked_again: false,
+            }
+        );
+    }
+
+    #[test]
+    fn an_unknown_effective_support_never_skips_a_candidate() {
+        let policy = safeguards_policy(true, true);
+        let mut snapshot = availability(true, false);
+        let mut bindings: BTreeMap<_, _> = snapshot
+            .iter()
+            .map(|(id, live)| (id.clone(), live.clone()))
+            .collect();
+        bindings
+            .get_mut(ANTHROPIC_SUB_MESSAGES.id())
+            .unwrap()
+            .capabilities
+            .server_safeguards = crate::routing::CapabilityEvidence::Unknown;
+        snapshot = AvailabilitySnapshot::new(bindings);
+        let plan = resolve_asking(&policy, &snapshot, true).unwrap();
+        assert_eq!(plan.binding_id, *ANTHROPIC_SUB_MESSAGES.id());
+        assert!(!plan.safeguards.skipped_candidate);
+    }
+
+    #[test]
+    fn an_honouring_route_with_no_capable_candidate_is_walked_again_without_the_requirement() {
+        // Preflight fallback is disabled, so the first candidate is the only
+        // one reachable, and it is marked.
+        let policy = safeguards_policy(true, false);
+        let plan = resolve_asking(&policy, &marked(&ANTHROPIC_SUB_MESSAGES), true).unwrap();
+        assert_eq!(plan.binding_id, *ANTHROPIC_SUB_MESSAGES.id());
+        assert!(plan.safeguards.walked_again);
+        assert!(plan.safeguards.skipped_candidate);
+        assert!(plan.safeguards.marked);
+        assert_eq!(
+            plan.safeguards.effective,
+            Some(crate::routing::CapabilityEvidence::Unsupported)
+        );
+        let kinds: Vec<_> = plan
+            .trace
+            .iter()
+            .filter(|event| matches!(event, TraceEvent::SafeguardsWalkedAgain))
+            .collect();
+        assert_eq!(kinds.len(), 1, "the second walk is recorded once");
+    }
+
+    #[test]
+    fn a_route_that_does_not_honour_the_ask_routes_as_though_it_had_not_asked() {
+        let policy = safeguards_policy(false, true);
+        let plan = resolve_asking(&policy, &marked(&ANTHROPIC_SUB_MESSAGES), true).unwrap();
+        assert_eq!(plan.binding_id, *ANTHROPIC_SUB_MESSAGES.id());
+        assert!(!plan.safeguards.skipped_candidate);
+        assert!(!plan.safeguards.walked_again);
+        assert!(plan.safeguards.asked);
+    }
+
+    #[test]
+    fn a_request_that_does_not_ask_is_never_held_to_the_requirement() {
+        let policy = safeguards_policy(true, true);
+        let plan = resolve_asking(&policy, &marked(&ANTHROPIC_SUB_MESSAGES), false).unwrap();
+        assert_eq!(plan.binding_id, *ANTHROPIC_SUB_MESSAGES.id());
+        assert!(!plan.safeguards.asked);
+        assert!(!plan.safeguards.skipped_candidate);
+    }
+
+    #[test]
+    fn a_fall_after_send_continues_under_the_same_rule() {
+        let policy = safeguards_policy(true, true);
+        // Both bindings are reachable and capable at first.
+        let first = resolve_asking(&policy, &availability(true, false), true).unwrap();
+        assert_eq!(first.binding_id, *ANTHROPIC_SUB_MESSAGES.id());
+        // By the time it falls, the second binding has been marked: nothing
+        // capable is left, so the continuation walks again and still serves it.
+        let next = resolve_after_failure(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            &marked(&ANTHROPIC_API_MESSAGES),
+            &CircuitSnapshot::default(),
+            &first,
+            FailureClass::Overload,
+        )
+        .unwrap()
+        .expect("the edge authorizes overload fallback");
+        assert_eq!(next.binding_id, *ANTHROPIC_API_MESSAGES.id());
+        assert!(next.safeguards.walked_again);
+    }
+
     #[test]
     fn preflight_edges_enforce_disabled_cost_cache_capability_and_affinity() {
         let first = candidate(
@@ -4030,6 +4332,7 @@ mod tests {
         );
         let mut doc = document(route(first, vec![]));
         doc.routes.push(Route {
+            honours_server_safeguards: false,
             id: id("compact-route"),
             display_name: "compact".to_owned(),
             description: None,

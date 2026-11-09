@@ -992,6 +992,58 @@ pub(super) const MIGRATIONS: &[&str] = &[
     ALTER TABLE lanes ADD COLUMN account_number INTEGER REFERENCES accounts(number);
 
     "#,
+    // v21 — server safeguards (spec: WSAFE). A binding that refused the ask
+    // is remembered here, across restarts, until a catalogue refresh, a
+    // credential change or the operator clears it. It is read-modify-write
+    // state, never ledger: a row is cleared, not appended.
+    //
+    // The request columns record only presence and outcome, never the ask or
+    // a result (spec: SLEDGR#fields-that-need-care). All are NULL on a row
+    // that predates them, which says nothing either way.
+    //
+    // The attempt-reason trigger is replaced to admit the one extra send a
+    // refused ask earns.
+    r#"
+    CREATE TABLE binding_safeguards_marks (
+        binding_id TEXT PRIMARY KEY,
+        marked_ms  INTEGER NOT NULL
+    );
+
+    ALTER TABLE requests ADD COLUMN safeguards_asked INTEGER
+        CHECK (safeguards_asked IN (0, 1));
+    ALTER TABLE requests ADD COLUMN safeguards_support TEXT
+        CHECK (safeguards_support IN ('supported', 'unsupported', 'unknown'));
+    ALTER TABLE requests ADD COLUMN safeguards_marked INTEGER
+        CHECK (safeguards_marked IN (0, 1));
+    ALTER TABLE requests ADD COLUMN safeguards_results_seen INTEGER
+        CHECK (safeguards_results_seen IN (0, 1));
+    ALTER TABLE requests ADD COLUMN safeguards_results_replayed INTEGER
+        CHECK (safeguards_results_replayed IN (0, 1));
+    ALTER TABLE requests ADD COLUMN safeguards_skipped_candidate INTEGER
+        CHECK (safeguards_skipped_candidate IN (0, 1));
+    ALTER TABLE requests ADD COLUMN safeguards_walked_again INTEGER
+        CHECK (safeguards_walked_again IN (0, 1));
+
+    DROP TRIGGER requests_attempt_reason_check;
+    CREATE TRIGGER requests_attempt_reason_check
+    BEFORE INSERT ON requests
+    WHEN (NEW.attempt_group_id IS NULL AND (
+              NEW.attempt_index IS NOT NULL OR NEW.fallback_reason IS NOT NULL
+          ))
+       OR (NEW.attempt_index IS NOT NULL AND NEW.fallback_reason IS NULL)
+       OR (NEW.attempt_index IS NULL AND NEW.fallback_reason IS NOT NULL)
+       OR (NEW.attempt_index = 0 AND NEW.fallback_reason != 'initial')
+       OR (NEW.attempt_index > 0 AND NEW.fallback_reason = 'initial')
+       OR (NEW.fallback_reason IS NOT NULL AND NEW.fallback_reason NOT IN (
+              'initial', 'thinking_negotiation', 'safeguards_negotiation',
+              'authentication', 'model_not_found', 'rate_limit', 'provider_quota',
+              'overload', 'server_error', 'transport_before_accept',
+              'ambiguous_transport'
+          ))
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid request attempt reason');
+    END;
+    "#,
 ];
 
 fn validate_v10_history(conn: &Connection) -> Result<()> {

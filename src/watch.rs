@@ -266,6 +266,7 @@ mod tests {
     /// A served measurement: `prompt` tokens, all of it cache read.
     fn served(ts_ms: i64, session: &str, provider: &str, model: &str, prompt: i64) -> RequestRow {
         RequestRow {
+            safeguards: Default::default(),
             id: None,
             ts_ms,
             duration_ms: None,

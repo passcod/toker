@@ -28,6 +28,7 @@ fn toker() -> Command {
 /// A measurement row with every optional column NULL.
 fn bare(ts_ms: i64) -> RequestRow {
     RequestRow {
+        safeguards: Default::default(),
         id: None,
         ts_ms,
         duration_ms: None,

@@ -697,6 +697,7 @@ fn map_row(row: &CtpRow, cost_kind: CostKind) -> Result<RequestRow, String> {
     };
 
     Ok(RequestRow {
+        safeguards: Default::default(),
         id: None,
         ts_ms,
         duration_ms: row.duration_ms,

@@ -163,6 +163,7 @@ async fn get_session(addr: SocketAddr, query: &str, verb: Option<&str>) -> reqwe
 
 fn bare_row(ts_ms: i64) -> RequestRow {
     RequestRow {
+        safeguards: Default::default(),
         id: None,
         ts_ms,
         duration_ms: None,

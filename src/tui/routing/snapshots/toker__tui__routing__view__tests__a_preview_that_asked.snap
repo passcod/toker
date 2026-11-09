@@ -1,0 +1,36 @@
+---
+source: src/tui/routing/view.rs
+expression: frame(&asked)
+---
+ ? ⇄ 1  2  3  4 pr┌ROUTING PREVIEW──────────────────────────────────────────────────────────────────┐            draft 4
+┌PREVIEW, REVISION│any key close                                                                    │──────────────────┐
+│3  {"revision_id"│SERVER SAFEGUARDS asked for                                                      │                  │
+│draft  {"policy":│  sub  codex_sub.codex_responses  unsupported  skipped: lacks server safeguards  │                  │
+│dynamic_responses│  api  anthropic_api.anthropic_messages  supported                               │                  │
+│codex_sub.codex_r│  serving binding: supported, rejection mark held                                │                  │
+│openrouter.openro│                                                                                 │                  │
+│lane_impacts  {"t│{                                                                                │                  │
+│diagnostic  {"cod│  "toker": "routing-preview",                                                    │                  │
+│                 │  "ok": true,                                                                    │                  │
+│                 │  "result": {                                                                    │                  │
+│                 │    "outcome": "selected",                                                       │                  │
+│                 │    "route_id": "mixed",                                                         │                  │
+│                 │    "server_safeguards": {                                                       │                  │
+│                 │      "asked": true,                                                             │                  │
+│                 │      "effective": "supported",                                                  │                  │
+│                 │      "marked": true,                                                            │                  │
+│                 │      "skipped_candidate": true,                                                 │                  │
+│                 │      "walked_again": false                                                      │                  │
+│                 │    },                                                                           │                  │
+│                 │    "trace": [                                                                   │                  │
+│                 │      {                                                                          │                  │
+│                 │        "kind": "candidate",                                                     │                  │
+│                 │        "candidate_id": "sub",                                                   │                  │
+│                 │        "binding_id": "codex_sub.codex_responses",                               │                  │
+│                 │        "server_safeguards": "unsupported",                                      │                  │
+│                 │        "result": {                                                              │                  │
+│                 │          "Err": "LacksServerSafeguards"                                         │                  │
+│                 │        }                                                                        │                  │
+│                 │      },                                                                         │                  │
+│                 │      {                                                                          │                  │
+└─────────────────└─────────────────────────────────────────────────────────────────────────────────┘──────────────────┘
