@@ -16,7 +16,8 @@ Implement the account model described by ACCT and thread it through credential r
 - [ ] Resolve Anthropic subscription credentials from local accounts and capture a non-secret digest for every credential sent upstream.
   - [x] Capture the credential only after provider-specific cleanup and injection, then attribute completed Anthropic attempts to its digest.
   - [x] Parse a bounded local multi-account credential file into digest and email facts without retaining token values.
-- [ ] Discover and resolve account identities without delaying requests, then retroactively attribute rows for a resolved digest.
+- [x] Discover and resolve account identities without delaying requests, then retroactively attribute rows for a resolved digest.
+  The local source re-reads itself when it cannot answer, so a refreshed token resolves to the same login without a restart. The operator names a digest no source resolved, from the accounts page. Asking the upstream is the chain's second step and is a MAY, so it is not built.
 - [ ] Key cache identity, meter state, quota fitting, allowances and pings by account.
 - [x] Migrate historical unattributed rows through setup and refuse other commands until setup completes.
 - [x] Render the account-aware dashboard and the accounts page.

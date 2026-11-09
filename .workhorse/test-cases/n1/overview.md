@@ -7,6 +7,8 @@ Most of what is worth checking is therefore a pair: the figure an account should
 
 - [x] A credential is recognised by its digest, and the digest is what an unresolved row is attributed to (verifies spec: ACCT#an-account-not-yet-known)
 - [x] Resolving a digest backfills every older row that carried it, and a digest already resolving to the same account sweeps nothing
+- [x] A refreshed token presents a new digest and resolves to the same login, without restarting the service
+- [x] A half-written local source does not erase a login toker already knows the name of
 - [x] A number is assigned in discovery order and never reused (verifies spec: ACCT#identity)
 - [x] An account matched by upstream id takes an offered address; one matched by address alone fills an absent id, and refuses a different one
 - [x] The ledger export carries the credential digest as a prefix, never the value (verifies spec: SEC#a-credential-is-never-logged-or-displayed)

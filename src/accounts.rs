@@ -116,9 +116,174 @@ pub fn refuse_while_rows_are_unattributed() -> anyhow::Result<()> {
     std::process::exit(EXIT_ROWS_UNATTRIBUTED);
 }
 
+/// How long a miss waits before the file is read again. A credential the
+/// file genuinely does not name would otherwise re-read it on every
+/// request that carries it.
+const RELOAD_AFTER_MS: i64 = 5_000;
+
+/// The local identity source, re-read when it cannot answer.
+///
+/// Another program rewrites this file whenever it refreshes a token, and
+/// a refreshed credential presents a digest toker has not seen
+/// (spec: ACCT#coming-to-know-an-account). Read once at startup, the map
+/// would stop answering at the first refresh and every request after it
+/// would be attributed to a digest with no account until a restart.
+///
+/// The read is a bounded local file and happens only on a digest the map
+/// cannot answer, which is once per refresh rather than once per request.
+/// Token values do not survive it.
+pub struct LocalAccounts {
+    path: Option<std::path::PathBuf>,
+    known: std::sync::RwLock<Known>,
+}
+
+#[derive(Default)]
+struct Known {
+    identities: BTreeMap<CredentialDigest, AccountIdentity>,
+    read_at_ms: i64,
+}
+
+impl std::fmt::Debug for LocalAccounts {
+    /// Deliberately only the count: the addresses are the operator's, and
+    /// a debug line is not where they belong.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let known = self.known.read().unwrap_or_else(|e| e.into_inner());
+        f.debug_struct("LocalAccounts")
+            .field("identities", &known.identities.len())
+            .finish()
+    }
+}
+
+impl LocalAccounts {
+    /// Read the source at the operator's own path, where there is one.
+    pub fn at_home(now_ms: i64) -> LocalAccounts {
+        Self::at(local_account_path(), now_ms)
+    }
+
+    pub fn at(path: Option<std::path::PathBuf>, now_ms: i64) -> LocalAccounts {
+        let accounts = LocalAccounts {
+            path,
+            known: std::sync::RwLock::new(Known::default()),
+        };
+        accounts.reload(now_ms);
+        accounts
+    }
+
+    /// The identity this digest belongs to. A miss re-reads the file,
+    /// at most once every [`RELOAD_AFTER_MS`].
+    pub fn get(&self, digest: &CredentialDigest, now_ms: i64) -> Option<AccountIdentity> {
+        {
+            let known = self.known.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(identity) = known.identities.get(digest) {
+                return Some(identity.clone());
+            }
+            if now_ms.saturating_sub(known.read_at_ms) < RELOAD_AFTER_MS {
+                return None;
+            }
+        }
+        self.reload(now_ms);
+        let known = self.known.read().unwrap_or_else(|e| e.into_inner());
+        known.identities.get(digest).cloned()
+    }
+
+    fn reload(&self, now_ms: i64) {
+        let identities = match &self.path {
+            None => BTreeMap::new(),
+            Some(path) => match local_account_identities(path) {
+                Ok(identities) => identities,
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "local account identities unavailable");
+                    BTreeMap::new()
+                }
+            },
+        };
+        let mut known = self.known.write().unwrap_or_else(|e| e.into_inner());
+        // The stamp moves even on a failed read, so a missing file is not
+        // re-opened on every request that misses.
+        known.read_at_ms = now_ms;
+        // A read that came back empty does not erase what was known: the
+        // file is rewritten in place by another program, so an empty read
+        // is as likely to be a half-written file as an emptied one.
+        if !identities.is_empty() {
+            known.identities = identities;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_source(path: &Path, entries: &[(&str, &str)]) {
+        let accounts: Vec<String> = entries
+            .iter()
+            .map(|(email, token)| {
+                format!(r#"{{"id":"{email}","email":"{email}","token":"{token}"}}"#)
+            })
+            .collect();
+        std::fs::write(
+            path,
+            format!(r#"{{"active":"one","accounts":[{}]}}"#, accounts.join(",")),
+        )
+        .expect("write account source");
+    }
+
+    #[test]
+    fn a_refreshed_credential_is_resolved_without_a_restart() {
+        let dir = crate::test_support::tempdir("account-reload-");
+        let path = dir.join("claude-accounts.json");
+        write_source(&path, &[("one@example.test", "token-one")]);
+
+        let now = 1_000_000;
+        let accounts = LocalAccounts::at(Some(path.clone()), now);
+        assert_eq!(
+            accounts
+                .get(&credential_digest("token-one"), now)
+                .and_then(|identity| identity.email),
+            Some("one@example.test".to_owned())
+        );
+
+        // Another program refreshes the token, so the same login now
+        // presents a digest the startup read never saw.
+        write_source(&path, &[("one@example.test", "token-refreshed")]);
+        assert_eq!(
+            accounts.get(&credential_digest("token-refreshed"), now),
+            None,
+            "a miss within the reload interval does not re-read"
+        );
+        assert_eq!(
+            accounts
+                .get(&credential_digest("token-refreshed"), now + RELOAD_AFTER_MS)
+                .and_then(|identity| identity.email),
+            Some("one@example.test".to_owned()),
+            "the refreshed credential resolves to the same login"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_source_keeps_what_was_known() {
+        let dir = crate::test_support::tempdir("account-half-written-");
+        let path = dir.join("claude-accounts.json");
+        write_source(&path, &[("one@example.test", "token-one")]);
+        let now = 1_000_000;
+        let accounts = LocalAccounts::at(Some(path.clone()), now);
+
+        // The file is rewritten in place, so a read can land on a
+        // half-written one. That must not erase a login toker already
+        // knows the name of.
+        std::fs::write(&path, "{\"accounts\":").expect("truncate the source");
+        let later = now + RELOAD_AFTER_MS;
+        assert_eq!(
+            accounts
+                .get(&credential_digest("token-one"), later)
+                .and_then(|identity| identity.email),
+            Some("one@example.test".to_owned())
+        );
+        assert!(
+            !format!("{accounts:?}").contains("example.test"),
+            "a debug line is not where the operator's addresses belong"
+        );
+    }
 
     #[test]
     fn source_reduces_tokens_to_digest_email_pairs() {
