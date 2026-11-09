@@ -88,6 +88,10 @@ A session grouped with its children MUST follow [SLIN](../store/lineage.md#linea
 ### Meters across accounts
 
 The dashboard MUST show the meters of each account that served traffic within its window, and MUST NOT show the meters of an account that served none.
+Where no account served within the window, the dashboard MUST show the one that served most recently, alone.
+
+> [!NOTE]
+> Otherwise a machine left alone for longer than its window blanks the panel, which reads as a quota Toker has stopped measuring rather than as one nothing has spent.
 
 > [!NOTE]
 > The accounts worth a place are the ones the window is already about, the same rule the session rows follow, so an account the operator stopped using does not hold space forever.
@@ -113,10 +117,11 @@ One meter's readings MUST be comparable by eye across the accounts shown togethe
 
 Accounts MUST be ordered by how much of the window each served, the busiest first.
 
-That order MUST resist changing while two accounts are close, and MUST NOT be recomputed into a new order on every refresh.
+That order MUST resist changing while two accounts are close.
 
 > [!NOTE]
 > Two accounts taking turns otherwise swap places under the operator's eye each time the lead changes hands, which is motion carrying no information.
+> Comparing shares coarsely enough that a close pair falls on the same side of the comparison is one way, and needs nothing carried between refreshes.
 
 An account MUST be shown by its email address where there is room for one, and by its number otherwise.
 A view showing an account in full MUST show both, as [ACCT](../store/accounts.md#identity) requires.

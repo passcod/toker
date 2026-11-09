@@ -112,6 +112,10 @@ pub(crate) struct AccountQuota {
     /// a gate flag, so a count of rows of any kind would differ between
     /// that read and a full-row one over the same ledger.
     pub readings: usize,
+    /// How many of those fall inside the display window: what the
+    /// account's share of the window is ordered by, and what decides
+    /// whether it belongs on the panel at all.
+    pub window_readings: usize,
     /// What to call the account on screen: the address where one is
     /// known. Left unset by the aggregation, which reads rows and never
     /// the accounts table; the dashboard fills it before rendering.
@@ -132,6 +136,8 @@ pub(crate) struct AccountQuota {
     /// plan quota (`overageInUse`, read through the same typed view
     /// the gate decides on).
     pub overage_in_use: bool,
+    /// When this account's newest reading was taken.
+    pub last_reading_ms: i64,
 }
 
 /// One meter's line: the newest reading's figures plus the forecast.
@@ -215,7 +221,7 @@ pub(crate) fn aggregate(
     let mut numbers: Vec<Option<i64>> = rows.iter().map(|row| row.account_number).collect();
     numbers.sort_unstable_by_key(|number| (number.is_none(), *number));
     numbers.dedup();
-    let accounts: Vec<AccountQuota> = numbers
+    let mut accounts: Vec<AccountQuota> = numbers
         .into_iter()
         .filter_map(|number| {
             let own: Vec<MeterRow> = rows
@@ -236,6 +242,46 @@ pub(crate) fn aggregate(
     if accounts.is_empty() {
         return None;
     }
+
+    // The panel is about the window, the same rule the session rows
+    // follow, so an account the operator stopped using does not hold
+    // space forever. Where none served within it, the one that served
+    // most recently stands alone: a machine left alone for longer than
+    // its window would otherwise blank the panel, which reads as a quota
+    // toker has stopped measuring rather than one nothing has spent.
+    if accounts.iter().any(|account| account.window_readings > 0) {
+        accounts.retain(|account| account.window_readings > 0);
+    } else {
+        let newest = accounts
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, account)| account.last_reading_ms)
+            .map_or(0, |(index, _)| index);
+        accounts = vec![accounts.swap_remove(newest)];
+    }
+
+    // The busiest first, by share of the window. Compared in tenths
+    // rather than exactly: two accounts taking turns otherwise swap
+    // places under the operator's eye each time the lead changes hands,
+    // and a coarse comparison keeps a close pair in a stable order
+    // without carrying anything between refreshes. Within a tenth the
+    // tie-break is the account number, which never changes.
+    let busiest = accounts
+        .iter()
+        .map(|account| account.window_readings)
+        .max()
+        .unwrap_or(0);
+    accounts.sort_by_key(|account| {
+        let tenths = (account.window_readings * 10)
+            .checked_div(busiest)
+            .unwrap_or(0);
+        (
+            std::cmp::Reverse(tenths),
+            account.account_number.is_none(),
+            account.account_number,
+        )
+    });
+
     Some(QuotaAgg {
         accounts,
         gate_on,
@@ -342,6 +388,10 @@ fn aggregate_account(
     Some(AccountQuota {
         account_number,
         readings: rows.iter().filter(|row| row.rate_limits.is_some()).count(),
+        window_readings: rows
+            .iter()
+            .filter(|row| row.rate_limits.is_some() && row.ts_ms >= window_since_ms)
+            .count(),
         label: None,
         meters,
         spent_today,
@@ -351,6 +401,11 @@ fn aggregate_account(
             .and_then(Value::as_str)
             .map(str::to_owned),
         overage_in_use: Meters::over(last_rl).overage_in_use(),
+        last_reading_ms: sorted
+            .iter()
+            .rev()
+            .find(|row| row.rate_limits.is_some())
+            .map_or(0, |row| row.ts_ms),
     })
 }
 
@@ -614,6 +669,100 @@ mod tests {
     fn one(agg: &QuotaAgg) -> &super::AccountQuota {
         assert_eq!(agg.accounts.len(), 1, "the fixture serves one account");
         &agg.accounts[0]
+    }
+
+    /// A reading on `account` at `ts_ms`.
+    fn owned(ts_ms: i64, account: i64, util: f64) -> MeterRow {
+        let mut row = metered(
+            ts_ms,
+            json!({"util5h": util, "reset5h": (NOW + HOUR) / 1000}),
+        );
+        row.account_number = Some(account);
+        row
+    }
+
+    #[test]
+    fn each_account_is_aggregated_on_its_own() {
+        let agg = quota(&[
+            owned(NOW - 20 * MIN, 1, 0.30),
+            owned(NOW - 10 * MIN, 1, 0.40),
+            owned(NOW - 5 * MIN, 2, 0.90),
+        ])
+        .expect("readings exist");
+        assert_eq!(agg.accounts.len(), 2, "one entry per account");
+        let util = |number: i64| {
+            agg.accounts
+                .iter()
+                .find(|account| account.account_number == Some(number))
+                .expect("the account")
+                .meters
+                .iter()
+                .find(|meter| meter.key == "5h")
+                .expect("5h")
+                .util
+        };
+        // Account 2's single reading is not dragged down by account 1's
+        // newer one, nor the other way about: a window belongs to the
+        // account that spent it.
+        assert!((util(1) - 0.40).abs() < 1e-9);
+        assert!((util(2) - 0.90).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_panel_is_about_the_window_and_the_busiest_account_leads() {
+        // Account 2 served most of the window, account 1 a little, and
+        // account 3 only before it began.
+        let mut rows = vec![
+            owned(NOW - 10 * HOUR, 3, 0.50),
+            owned(NOW - 20 * MIN, 1, 0.30),
+        ];
+        for minute in 1..=4 {
+            rows.push(owned(NOW - minute * MIN, 2, 0.90));
+        }
+        let agg = quota(&rows).expect("readings exist");
+        assert_eq!(
+            agg.accounts
+                .iter()
+                .map(|account| account.account_number)
+                .collect::<Vec<_>>(),
+            vec![Some(2), Some(1)],
+            "the busiest leads, and an account that served none of the window is not shown"
+        );
+
+        // Two accounts within a tenth of each other keep their number
+        // order, so a lead changing hands does not swap them on screen.
+        let close = quota(&[
+            owned(NOW - 3 * MIN, 1, 0.30),
+            owned(NOW - 2 * MIN, 2, 0.90),
+            owned(NOW - MIN, 2, 0.91),
+            owned(NOW - MIN, 1, 0.31),
+        ])
+        .expect("readings exist");
+        assert_eq!(
+            close
+                .accounts
+                .iter()
+                .map(|account| account.account_number)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2)]
+        );
+    }
+
+    #[test]
+    fn a_window_nothing_served_shows_the_account_that_served_last() {
+        let agg = quota(&[
+            owned(NOW - 10 * HOUR, 1, 0.30),
+            owned(NOW - 2 * HOUR, 2, 0.90),
+        ])
+        .expect("readings exist");
+        assert_eq!(
+            agg.accounts
+                .iter()
+                .map(|account| account.account_number)
+                .collect::<Vec<_>>(),
+            vec![Some(2)],
+            "a machine idle longer than its window still shows a reading"
+        );
     }
 
     /// Spent comparisons with float tolerance: the deltas are sums of

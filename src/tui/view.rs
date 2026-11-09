@@ -2354,15 +2354,23 @@ fn account_columns(
     // a credential resolved to no account has neither.
     let mut header = vec![Span::raw(" ".repeat(METER_LABEL_WIDTH))];
     for account in accounts {
-        let name = match (&account.label, account.account_number) {
-            (Some(label), _) => label.clone(),
-            (None, Some(number)) => format!("acct {number}"),
-            (None, None) => "unattributed".to_owned(),
-        };
         let count = format!(" · {} req", account.readings);
+        let room = cell.saturating_sub(count.width() + ACCOUNT_GUTTER);
+        // The address where there is room for one, and the number
+        // otherwise. An address cut short is worse than a number: two
+        // logins at the same domain cut to the same prefix name each
+        // other, where the numbers never collide.
+        let numbered = match account.account_number {
+            Some(number) => format!("acct {number}"),
+            None => "unattributed".to_owned(),
+        };
+        let name = match &account.label {
+            Some(label) if label.width() <= room => label.clone(),
+            _ => numbered,
+        };
         let used = name.width() + count.width();
         header.push(Span::styled(
-            clip(&name, cell.saturating_sub(count.width())),
+            clip(&name, room),
             Style::new().fg(Color::Cyan),
         ));
         header.push(Span::styled(count, Style::new().dim()));

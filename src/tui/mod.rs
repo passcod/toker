@@ -41,6 +41,7 @@
 //! billed cost, unknown token counts) and the view renders those as
 //! explicit "no … data" / `?` strings, never as zero.
 
+mod accounts;
 mod config;
 pub(crate) mod control;
 mod detail;
@@ -130,6 +131,7 @@ enum Page {
     Dashboard,
     Routing,
     Config,
+    Accounts,
 }
 
 /// `toker tui --window-mins <m>`: open the ledger and run the dashboard
@@ -175,6 +177,7 @@ pub fn run(
     let mut page = Page::Dashboard;
     let mut routing = routing::Page::new(port, settings);
     let mut config = config::Page::new(port);
+    let mut accounts = accounts::Page::new(&store);
     // The transcript roots, resolved once: session labels read only
     // these, read-only, one tail per session per display read.
     let mut labels = labels::Labels::new(labels::transcript_roots(extra_transcript_roots));
@@ -267,6 +270,7 @@ pub fn run(
                 drawn.routing_button = routing_drawn.routing_button;
             }
             Page::Config => config.render(frame),
+            Page::Accounts => accounts.render(frame, snapshot.now_ms),
         })?;
         // The list may have shrunk under its offset since the last
         // frame: hold the offset at what the frame could show.
@@ -406,6 +410,11 @@ pub fn run(
                 config.key(key);
                 continue;
             }
+            // The naming entry takes every key while it is open, `q`
+            // included: an address with a q in it must not quit.
+            if page == Page::Accounts && accounts.key(key, &store) {
+                continue;
+            }
             match key.code {
                 crossterm::event::KeyCode::Tab => {
                     page = match page {
@@ -422,13 +431,20 @@ pub fn run(
                         }
                         Page::Config => {
                             ui.legend = false;
+                            accounts.refresh(&store);
+                            Page::Accounts
+                        }
+                        Page::Accounts => {
+                            ui.legend = false;
                             Page::Dashboard
                         }
                     };
                 }
                 crossterm::event::KeyCode::Char('?') => toggle_legend(&mut ui),
                 crossterm::event::KeyCode::Esc if ui.legend => ui.legend = false,
-                crossterm::event::KeyCode::Esc if page == Page::Routing || page == Page::Config => {
+                crossterm::event::KeyCode::Esc
+                    if matches!(page, Page::Routing | Page::Config | Page::Accounts) =>
+                {
                     page = Page::Dashboard;
                 }
                 crossterm::event::KeyCode::Char('r')
@@ -437,6 +453,15 @@ pub fn run(
                     routing.refresh()
                 }
                 crossterm::event::KeyCode::Char('r') if page == Page::Config => config.refresh(),
+                crossterm::event::KeyCode::Char('r') if page == Page::Accounts => {
+                    accounts.refresh(&store)
+                }
+                crossterm::event::KeyCode::Up if page == Page::Accounts => {
+                    accounts.move_selection(-1)
+                }
+                crossterm::event::KeyCode::Down if page == Page::Accounts => {
+                    accounts.move_selection(1)
+                }
                 crossterm::event::KeyCode::Up if page == Page::Config => config.move_selection(-1),
                 crossterm::event::KeyCode::Down if page == Page::Config => config.move_selection(1),
                 code if page == Page::Config && config::owns_key(code) => {

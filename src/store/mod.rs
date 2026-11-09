@@ -236,6 +236,17 @@ impl Store {
         accounts::load_credentials(&*self.conn()?)
     }
 
+    /// How many of a provider's rows carry `digest` — the requests held
+    /// against a credential no source has named yet.
+    pub fn rows_for_digest(&self, provider: &str, digest: &str) -> Result<i64> {
+        accounts::rows_for_digest(&*self.conn()?, provider, digest)
+    }
+
+    /// A credential digest that reaches an account, for naming it by hand.
+    pub fn credential_of(&self, account: i64) -> Result<Option<CredentialDigest>> {
+        accounts::credential_of(&*self.conn()?, account)
+    }
+
     /// How many of a provider's rows predate accounts, carrying neither an
     /// account nor a credential digest. Setup moves these onto an account,
     /// and every other command refuses while any remain.

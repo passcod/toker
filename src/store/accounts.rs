@@ -386,3 +386,31 @@ pub(super) fn attribute_unattributed_rows(
     tx.commit()?;
     Ok(moved)
 }
+
+/// How many of a provider's rows carry `digest`. The requests held
+/// against a credential no source has named yet: they move to the
+/// account the moment one does.
+pub(super) fn rows_for_digest(conn: &Connection, provider: &str, digest: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM requests WHERE provider = ?1 AND credential_digest = ?2",
+        rusqlite::params![provider, digest],
+        |row| row.get(0),
+    )?)
+}
+
+/// A credential that reaches `account`, newest first. An account is only
+/// ever named by way of a credential it served, so naming one by hand
+/// needs the digest to hang the identity off.
+pub(super) fn credential_of(conn: &Connection, account: i64) -> Result<Option<CredentialDigest>> {
+    let digest: Option<String> = conn
+        .query_row(
+            "SELECT digest FROM credential_accounts
+             WHERE account_number = ?1 ORDER BY last_seen_ms DESC, digest LIMIT 1",
+            [account],
+            |row| row.get(0),
+        )
+        .optional()?;
+    digest
+        .map(|digest| CredentialDigest::new(digest).map_err(Error::InvalidAccountState))
+        .transpose()
+}
