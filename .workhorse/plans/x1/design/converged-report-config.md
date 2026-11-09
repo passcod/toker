@@ -26,16 +26,10 @@ All six frames are 120x40, built from a small generator (not in the repo) so eve
   The brief's `2 warm lanes on rev 9 · 5 cold lanes moved` cannot hold with rev 9 live and selected, because warm lanes left behind sit on the previous revision.
   I wrote `2 warm lanes still on rev 8 · 5 cold lanes moved to rev 9`.
   The `lanes` column shows lanes currently on each revision: `5 cold` on rev 9, `2 warm` on rev 8, dim `none` elsewhere.
-- **Reactivate on the live revision** is drawn as dim `[r] already live`, per the design system's unavailable-control rule.
+- **Reactivate on the live revision** is drawn as dim `[a] already live`, per the design system's unavailable-control rule.
 - **Armed control** is plain reversed (bold), not black-on-yellow, because the brief bans coloured backgrounds.
   The prompt line's `lose their cache` clause is yellow as a spend.
-- **Position 6 in the diff.**
-  The brief's `+ rewrite anthropic_messages 6 ...` implies six rules in that scope, while the D data and the `rewrites 14` strip have five.
-  I used the brief's line as written; whoever draws 01 and 06 may want to reconcile it.
 - **Control spacing** is three spaces between controls (design system, and the brief's own edit line), not the two the brief's code spans show.
-- **`r` conflict.**
-  `r` refreshes everywhere but is `[r] reactivate` on history.
-  The overlay lists it as `refresh · reactivate on history`; this needs a real decision.
 - **`claude settings not synced`** is not in my frames: I took it to belong to 01's after-save frame, so it appears exactly once.
 - **Config header right side:** `2 providers on` on providers (from D), nothing on settings.
 - **Providers table:** `bindings` is a count (`1`, `3`); the names are in the detail.
@@ -55,3 +49,14 @@ All six frames are 120x40, built from a small generator (not in the repo) so eve
 - No `legacy`, no `green` class, no JSON, no regex notation, no `@`, no email addresses or client names in any frame body.
 - Screenshots reviewed for each frame: panels end at their content with bare ground below, no sentences under titles, controls on the panel's last content line, no coloured backgrounds (only the header chips and the reversed selection), the one yellow background-free armed control.
 - Not done: the `NO_COLOR` read-through beyond confirming that every yellow or red reading is also a word (`no cred`, `nothing catches it`, the refusal text).
+
+## Changes after review
+
+- **History:** rev 9 is now `add a fallback to claude-sub`, with the single diff line `~ route claude-sub  + candidate 2  openrouter.openrouter_messages  billed` (`billed` yellow).
+  The rewrite and default lines are gone.
+  Revs 2 to 8 are single-record edits: `add rewrite anthropic_api/${model} to anthropic_messages`, `add presentation claude-sonnet-5`, `turn off codex_sub/${model} in openai_chat`, `add family qwen`, `add upgrade newest on claude-sub`, `turn on compaction`, `move anthropic_sub/${model} above anthropic_api/${model}`.
+  Rev 1 stays `create 7 routes and 4 defaults`.
+- **Reactivate key:** `[a] make live`, dim `[a] already live` on the live revision.
+  In the overlay `r` is plain `refresh` and `IN HISTORY` lists `a  make this revision live`.
+- **Provider counts:** `anthropic_sub` is `4 rewrites · 2 defaults · 1 route` (detail `4  anthropic_messages 2 · openai_chat 1 · openai_responses 1`); `openrouter` is `3 rewrites · 2 defaults · 5 routes`.
+- Width check (120 cells on every row of all six frames), font stack and screenshots re-run on all three files.

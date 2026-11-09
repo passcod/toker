@@ -116,25 +116,25 @@
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 presentations 15 → 2 rewrites 14 → 3 defaults 4 → 4 routes 7 · 5 models 11 · </span><span class="b r">6 history 9</span>             rev 9 live 
 ┌REVISIONS─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ rev        when              what changed                                                               lanes        │
-│<span class="r">   9  </span><span class="r b">live</span><span class="r">  Tue 10 Nov 14:18  add rewrite, add claude-sub fallback, drop a default                       5 cold       </span>│
+│<span class="r">   9  </span><span class="r b">live</span><span class="r">  Tue 10 Nov 14:18  add a fallback to claude-sub                                               5 cold       </span>│
 │   8        <span class="d">Tue 10 Nov 13:07</span>  move anthropic_sub/${model} above anthropic_api/${model}                   2 warm       │
 │   7        <span class="d">Tue 10 Nov 11:21</span>  turn on compaction                                                         <span class="d">none</span>         │
 │   6        <span class="d">Tue 10 Nov 10:48</span>  add upgrade newest on claude-sub                                           <span class="d">none</span>         │
-│   5        <span class="d">Tue 10 Nov 09:03</span>  add families claude-opus, claude-sonnet, claude-haiku, gpt, qwen           <span class="d">none</span>         │
-│   4        <span class="d">Mon 09 Nov 15:20</span>  add 15 presentations                                                       <span class="d">none</span>         │
-│   3        <span class="d">Mon 09 Nov 10:41</span>  add rewrites to openai_chat and openai_responses                           <span class="d">none</span>         │
-│   2        <span class="d">Mon 09 Nov 10:29</span>  add rewrites to anthropic_messages                                         <span class="d">none</span>         │
+│   5        <span class="d">Tue 10 Nov 09:03</span>  add family qwen                                                            <span class="d">none</span>         │
+│   4        <span class="d">Mon 09 Nov 15:20</span>  turn off codex_sub/${model} in openai_chat                                 <span class="d">none</span>         │
+│   3        <span class="d">Mon 09 Nov 10:41</span>  add presentation claude-sonnet-5                                           <span class="d">none</span>         │
+│   2        <span class="d">Mon 09 Nov 10:29</span>  add rewrite anthropic_api/${model} to anthropic_messages                   <span class="d">none</span>         │
 │   1        <span class="d">Sat 07 Nov 16:05</span>  create 7 routes and 4 defaults                                             <span class="d">none</span>         │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌REVISION──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">rev 9</span><span class="d">  Tue 10 Nov 14:18 · from rev 8</span>                                                                                 │
-│ + rewrite anthropic_messages 6  claude-* → openrouter-messages                                                       │
-│ ~ route claude-sub  fallback 2 added                                                                                 │
-│ - default unprefixed/openai_chat                                                                                     │
+│ ~ route claude-sub  + candidate 2  openrouter.openrouter_messages  <span class="yellow">billed</span>                                            │
 │                                                                                                                      │
 │ 2 warm lanes still on rev 8 · 5 cold lanes moved to rev 9                                                            │
-│ <span class="d">[r] already live</span>   [m] move running lanes   [c] compare a request                                                    │
+│ <span class="d">[a] already live</span>   [m] move running lanes   [c] compare a request                                                    │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                                                                                        
+                                                                                                                        
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -157,26 +157,26 @@
 <pre class="frame"><span class="gray r"> ? </span><span class="blue r">⇄</span>  <span class="d">1 presentations 15 → 2 rewrites 14 → 3 defaults 4 → 4 routes 7 · 5 models 11 · </span><span class="b r">6 history 9</span>             rev 9 live 
 ┌REVISIONS─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ rev        when              what changed                                                               lanes        │
-│<span class="r">   9  </span><span class="r b">live</span><span class="r">  Tue 10 Nov 14:18  add rewrite, add claude-sub fallback, drop a default                       5 cold       </span>│
+│<span class="r">   9  </span><span class="r b">live</span><span class="r">  Tue 10 Nov 14:18  add a fallback to claude-sub                                               5 cold       </span>│
 │   8        <span class="d">Tue 10 Nov 13:07</span>  move anthropic_sub/${model} above anthropic_api/${model}                   2 warm       │
 │   7        <span class="d">Tue 10 Nov 11:21</span>  turn on compaction                                                         <span class="d">none</span>         │
 │   6        <span class="d">Tue 10 Nov 10:48</span>  add upgrade newest on claude-sub                                           <span class="d">none</span>         │
-│   5        <span class="d">Tue 10 Nov 09:03</span>  add families claude-opus, claude-sonnet, claude-haiku, gpt, qwen           <span class="d">none</span>         │
-│   4        <span class="d">Mon 09 Nov 15:20</span>  add 15 presentations                                                       <span class="d">none</span>         │
-│   3        <span class="d">Mon 09 Nov 10:41</span>  add rewrites to openai_chat and openai_responses                           <span class="d">none</span>         │
-│   2        <span class="d">Mon 09 Nov 10:29</span>  add rewrites to anthropic_messages                                         <span class="d">none</span>         │
+│   5        <span class="d">Tue 10 Nov 09:03</span>  add family qwen                                                            <span class="d">none</span>         │
+│   4        <span class="d">Mon 09 Nov 15:20</span>  turn off codex_sub/${model} in openai_chat                                 <span class="d">none</span>         │
+│   3        <span class="d">Mon 09 Nov 10:41</span>  add presentation claude-sonnet-5                                           <span class="d">none</span>         │
+│   2        <span class="d">Mon 09 Nov 10:29</span>  add rewrite anthropic_api/${model} to anthropic_messages                   <span class="d">none</span>         │
 │   1        <span class="d">Sat 07 Nov 16:05</span>  create 7 routes and 4 defaults                                             <span class="d">none</span>         │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌REVISION──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">rev 9</span><span class="d">  Tue 10 Nov 14:18 · from rev 8</span>                                                                                 │
-│ + rewrite anthropic_messages 6  claude-* → openrouter-messages                                                       │
-│ ~ route claude-sub  fallback 2 added                                                                                 │
-│ - default unprefixed/openai_chat                                                                                     │
+│ ~ route claude-sub  + candidate 2  openrouter.openrouter_messages  <span class="yellow">billed</span>                                            │
 │                                                                                                                      │
 │ 2 warm lanes still on rev 8 · 5 cold lanes moved to rev 9                                                            │
-│ <span class="d">[r] already live</span>   <span class="b r">[m] move running lanes</span>   [c] compare a request                                                    │
+│ <span class="d">[a] already live</span>   <span class="b r">[m] move running lanes</span>   [c] compare a request                                                    │
 │ <span class="yellow">2 warm lanes lose their cache</span> (ses-hot, ses-crow) · [m] again to move them to rev 9 · [esc] cancel                   │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                                                                                        
+                                                                                                                        
                                                                                                                         
                                                                                                                         
                                                                                                                         

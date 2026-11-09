@@ -117,10 +117,10 @@
 ┌PROVIDERS─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ provider            state     credential            bindings      used by                                            │
 │ <span class="d">anthropic_api</span>       <span class="d">off</span>       <span class="d">none</span>                         <span class="d">1</span>      <span class="d">3 rewrites · 1 route</span>                               │
-│<span class="r"> anthropic_sub       on        none                         1      5 rewrites · 2 defaults · 1 route                  </span>│
+│<span class="r"> anthropic_sub       on        none                         1      4 rewrites · 2 defaults · 1 route                  </span>│
 │ <span class="d">codex_sub</span>           <span class="d">off</span>       <span class="d">codex's own login</span>            <span class="d">1</span>      <span class="d">3 rewrites · 1 route</span>                               │
 │ <span class="d">openai_api</span>          <span class="d">off</span>       <span class="d">none</span>                         <span class="d">1</span>      <span class="d">1 rewrite · 1 route</span>                                │
-│ openrouter          on        keyring                      3      4 rewrites · 2 defaults · 4 routes                 │
+│ openrouter          on        keyring                      3      3 rewrites · 2 defaults · 5 routes                 │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌PROVIDER──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ <span class="b">anthropic_sub</span>                                                                                                        │
@@ -128,7 +128,7 @@
 │ <span class="d">credential   </span><span class="yellow">none</span>                                                                                                    │
 │ <span class="d">refresh url  (the built-in one)</span>                                                                                      │
 │ <span class="d">bindings     </span>anthropic_sub.anthropic_messages · subscription                                                         │
-│ <span class="d">rewrites     </span>5  anthropic_messages 3 · openai_chat 1 · openai_responses 1                                            │
+│ <span class="d">rewrites     </span>4  anthropic_messages 2 · openai_chat 1 · openai_responses 1                                            │
 │ <span class="d">defaults     </span>2  anthropic_messages · unprefixed/anthropic_messages                                                   │
 │ <span class="d">routes       </span>1  claude-sub                                                                                           │
 │ [e] enter key   [space] turn off   [enter] open route                                                                │
