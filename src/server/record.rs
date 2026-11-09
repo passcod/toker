@@ -366,6 +366,7 @@ fn unsent_row(
     lineage: Option<SessionLineage>,
 ) -> RequestRow {
     RequestRow {
+        safeguards: Default::default(),
         id: None,
         ts_ms: now_ms(),
         duration_ms: Some(elapsed_ms(started)),
@@ -571,6 +572,7 @@ pub(crate) fn record_openai_cold(record: ColdOpenaiRecord<'_>) {
         backend_id,
     } = record;
     let row = RequestRow {
+        safeguards: Default::default(),
         id: None,
         ts_ms: now_ms(),
         duration_ms: Some(elapsed_ms(started)),
@@ -689,6 +691,7 @@ pub(crate) fn record_openai_cold_quiet(record: ColdOpenaiRecord<'_>) {
         ..
     } = record;
     let row = RequestRow {
+        safeguards: Default::default(),
         id: None,
         ts_ms: now_ms(),
         duration_ms: Some(elapsed_ms(started)),
@@ -822,6 +825,7 @@ fn route_of(backend_id: &str) -> String {
 /// excluded from API measurements by its kind.
 pub(crate) fn record_awake(server: &Server, transition: &awake::AwakeTransition, now: i64) {
     let row = RequestRow {
+        safeguards: Default::default(),
         id: None,
         ts_ms: now,
         duration_ms: None,
@@ -1001,6 +1005,7 @@ fn measurement_row(
     let extra = (!extra_map.is_empty()).then(|| Value::Object(extra_map));
     let shape = ctx.shape.as_ref();
     RequestRow {
+        safeguards: Default::default(),
         id: None,
         ts_ms,
         duration_ms: Some(duration_ms),
@@ -1097,6 +1102,7 @@ fn error_row(
     retry_after_ms: Option<i64>,
 ) -> RequestRow {
     RequestRow {
+        safeguards: Default::default(),
         id: None,
         ts_ms,
         duration_ms: Some(duration_ms),

@@ -672,6 +672,7 @@ pub struct AttemptProvenance {
 pub enum AttemptReason {
     Initial,
     ThinkingNegotiation,
+    SafeguardsNegotiation,
     Authentication,
     ModelNotFound,
     RateLimit,
@@ -702,6 +703,7 @@ impl AttemptReason {
         match self {
             Self::Initial => "initial",
             Self::ThinkingNegotiation => "thinking_negotiation",
+            Self::SafeguardsNegotiation => "safeguards_negotiation",
             Self::Authentication => "authentication",
             Self::ModelNotFound => "model_not_found",
             Self::RateLimit => "rate_limit",
@@ -717,6 +719,7 @@ impl AttemptReason {
         Some(match value {
             "initial" => Self::Initial,
             "thinking_negotiation" => Self::ThinkingNegotiation,
+            "safeguards_negotiation" => Self::SafeguardsNegotiation,
             "authentication" => Self::Authentication,
             "model_not_found" => Self::ModelNotFound,
             "rate_limit" => Self::RateLimit,
@@ -898,6 +901,27 @@ impl PolicyRouteProvenance {
     }
 }
 
+/// The server safeguards columns of one row (spec: SLEDGR#fields-that-need-care).
+/// `asked` is absent on a row that predates the columns and on a request
+/// outside the Messages frontend; the rest are present only where it is true.
+/// None of them holds the ask or a result, only whether each happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SafeguardsRow {
+    pub asked: Option<bool>,
+    /// The serving binding's effective support.
+    pub support: Option<crate::routing::CapabilityEvidence>,
+    /// A rejection mark was held against the serving binding.
+    pub marked: Option<bool>,
+    /// The response carried results.
+    pub results_seen: Option<bool>,
+    /// The results reached the client.
+    pub results_replayed: Option<bool>,
+    /// Honouring the ask skipped a candidate.
+    pub skipped_candidate: Option<bool>,
+    /// The route was walked again without the ask.
+    pub walked_again: Option<bool>,
+}
+
 /// One `requests` row: the complete column list as a single struct. Field
 /// names match their SQL columns one-to-one. Every field except `ts_ms` is
 /// an `Option` — absence is stored and read back as NULL, never as zero or
@@ -1060,6 +1084,8 @@ pub struct RequestRow {
     /// Closed policy-routing provenance, absent on non-routing rows and on
     /// rows written before policy routing.
     pub policy_routing: Option<PolicyRouteProvenance>,
+    /// What the request's ask for server safeguards came to, content-free.
+    pub safeguards: SafeguardsRow,
     pub lineage: Option<SessionLineage>,
 }
 
@@ -1294,7 +1320,10 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
             policy_revision_id, presentation_id, rewrite_id, policy_route_id,
             route_fingerprint, candidate_id, binding_id, baseline_model,
             attempt_group_id, attempt_index, fallback_reason, routing_trace,
-            parent_session_id, child_role, relation_source
+            parent_session_id, child_role, relation_source,
+            safeguards_asked, safeguards_support, safeguards_marked,
+            safeguards_results_seen, safeguards_results_replayed,
+            safeguards_skipped_candidate, safeguards_walked_again
         ) VALUES (
             :ts_ms, :duration_ms, :kind, :frontend, :provider, :route, :session_id, :ping,
             :credential_digest, :account_number,
@@ -1311,7 +1340,10 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
             :policy_revision_id, :presentation_id, :rewrite_id, :policy_route_id,
             :route_fingerprint, :candidate_id, :binding_id, :baseline_model,
             :attempt_group_id, :attempt_index, :fallback_reason, :routing_trace,
-            :parent_session_id, :child_role, :relation_source
+            :parent_session_id, :child_role, :relation_source,
+            :safeguards_asked, :safeguards_support, :safeguards_marked,
+            :safeguards_results_seen, :safeguards_results_replayed,
+            :safeguards_skipped_candidate, :safeguards_walked_again
         )",
     )?;
     stmt.execute(rusqlite::named_params! {
@@ -1390,6 +1422,13 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
         ":parent_session_id": row.lineage.as_ref().map(|value| value.parent_session_id.as_str()),
         ":child_role": row.lineage.as_ref().map(|value| value.child_role.as_str()),
         ":relation_source": row.lineage.as_ref().map(|value| value.relation_source.as_str()),
+        ":safeguards_asked": row.safeguards.asked,
+        ":safeguards_support": row.safeguards.support.map(crate::routing::CapabilityEvidence::as_str),
+        ":safeguards_marked": row.safeguards.marked,
+        ":safeguards_results_seen": row.safeguards.results_seen,
+        ":safeguards_results_replayed": row.safeguards.results_replayed,
+        ":safeguards_skipped_candidate": row.safeguards.skipped_candidate,
+        ":safeguards_walked_again": row.safeguards.walked_again,
     })?;
     Ok(())
 }
@@ -2459,7 +2498,24 @@ fn read_row(row: &rusqlite::Row<'_>) -> Result<RequestRow> {
         binding_id,
         attempt,
         policy_routing,
+        safeguards: read_safeguards(row)?,
         lineage: read_lineage(row)?,
+    })
+}
+
+fn read_safeguards(row: &rusqlite::Row<'_>) -> Result<SafeguardsRow> {
+    Ok(SafeguardsRow {
+        asked: row.get("safeguards_asked")?,
+        support: parse_stored(
+            "safeguards_support",
+            row.get::<_, Option<String>>("safeguards_support")?,
+            crate::routing::CapabilityEvidence::parse,
+        )?,
+        marked: row.get("safeguards_marked")?,
+        results_seen: row.get("safeguards_results_seen")?,
+        results_replayed: row.get("safeguards_results_replayed")?,
+        skipped_candidate: row.get("safeguards_skipped_candidate")?,
+        walked_again: row.get("safeguards_walked_again")?,
     })
 }
 

@@ -185,6 +185,7 @@ mod tests {
 
     fn bare(ts_ms: i64) -> RequestRow {
         RequestRow {
+            safeguards: Default::default(),
             id: None,
             ts_ms,
             duration_ms: None,
@@ -256,6 +257,15 @@ mod tests {
     /// A measurement with every column set: the export must carry each.
     fn full(ts_ms: i64) -> RequestRow {
         RequestRow {
+            safeguards: crate::store::SafeguardsRow {
+                asked: Some(true),
+                support: Some(crate::routing::CapabilityEvidence::Unknown),
+                marked: Some(false),
+                results_seen: Some(true),
+                results_replayed: Some(true),
+                skipped_candidate: Some(false),
+                walked_again: Some(false),
+            },
             id: None,
             ts_ms,
             duration_ms: Some(4_392),

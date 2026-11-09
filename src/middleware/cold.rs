@@ -2370,6 +2370,7 @@ mod tests {
     /// modules' shape, local copy for brevity).
     fn bare_row(ts_ms: i64) -> RequestRow {
         RequestRow {
+            safeguards: Default::default(),
             id: None,
             ts_ms,
             duration_ms: None,

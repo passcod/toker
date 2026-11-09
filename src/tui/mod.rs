@@ -1156,6 +1156,7 @@ pub(crate) mod testrows {
     /// A measurement row with every optional column NULL, at `ts_ms`.
     pub(crate) fn bare(ts_ms: i64) -> RequestRow {
         RequestRow {
+            safeguards: Default::default(),
             id: None,
             ts_ms,
             duration_ms: None,

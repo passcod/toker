@@ -111,6 +111,23 @@ impl CapabilityEvidence {
     pub const fn is_supported(self) -> bool {
         matches!(self, Self::Supported)
     }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::Unsupported => "unsupported",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "supported" => Self::Supported,
+            "unsupported" => Self::Unsupported,
+            "unknown" => Self::Unknown,
+            _ => return None,
+        })
+    }
 }
 
 /// Evidence for semantics a backend binding may need to represent.

@@ -2065,6 +2065,54 @@ fn read_ping(row: &rusqlite::Row<'_>) -> Result<PingRecord> {
     })
 }
 
+/// A binding that refused the server safeguards ask, and when (spec:
+/// WSAFE#a-rejection-mark).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeguardsMark {
+    pub binding_id: BindingId,
+    pub marked_ms: i64,
+}
+
+/// Mark a binding, keeping the first time it was marked.
+pub(super) fn set_safeguards_mark(
+    conn: &Connection,
+    binding_id: &BindingId,
+    now_ms: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO binding_safeguards_marks (binding_id, marked_ms) VALUES (?1, ?2)
+         ON CONFLICT (binding_id) DO NOTHING",
+        (binding_id.as_str(), now_ms),
+    )?;
+    Ok(())
+}
+
+/// Clear the marks held against `bindings`; how many were held.
+pub(super) fn clear_safeguards_marks(conn: &Connection, bindings: &[&BindingId]) -> Result<u64> {
+    let mut cleared = 0;
+    for binding in bindings {
+        cleared += conn.execute(
+            "DELETE FROM binding_safeguards_marks WHERE binding_id = ?1",
+            [binding.as_str()],
+        )? as u64;
+    }
+    Ok(cleared)
+}
+
+pub(super) fn load_safeguards_marks(conn: &Connection) -> Result<Vec<SafeguardsMark>> {
+    rows_of(
+        conn,
+        "SELECT binding_id, marked_ms FROM binding_safeguards_marks ORDER BY binding_id",
+        [],
+        |row| {
+            Ok(SafeguardsMark {
+                binding_id: parse_id("binding_safeguards_marks.binding_id", row.get(0)?)?,
+                marked_ms: row.get(1)?,
+            })
+        },
+    )
+}
+
 pub(super) fn save_meters(
     conn: &Connection,
     provider_id: &str,

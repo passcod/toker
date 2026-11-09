@@ -464,6 +464,7 @@ fn measurement_row(
     };
     let shape = ctx.shape.as_ref();
     RequestRow {
+        safeguards: Default::default(),
         id: None,
         ts_ms,
         duration_ms: Some(duration_ms),
@@ -617,6 +618,7 @@ fn error_row(
     let (ts_ms, duration_ms) = timing;
     let (error_type, error_message) = error;
     RequestRow {
+        safeguards: Default::default(),
         id: None,
         ts_ms,
         duration_ms: Some(duration_ms),
@@ -802,6 +804,7 @@ pub(crate) fn record_quota_blocked(record: QuotaBlockedRecord<'_>) {
         frontend,
     } = record;
     let row = RequestRow {
+        safeguards: Default::default(),
         id: None,
         ts_ms: now_ms(),
         duration_ms: Some(elapsed_ms(started)),
@@ -937,6 +940,7 @@ fn write_cold_row(record: ColdRecord<'_>, kind: RowKind, verb: &str) {
     } = record;
     let outlook = outlook.cloned();
     let row = RequestRow {
+        safeguards: Default::default(),
         id: None,
         ts_ms: now_ms(),
         duration_ms: Some(elapsed_ms(started)),
@@ -1099,6 +1103,7 @@ pub(crate) fn record_anthropic_cold_quiet(record: ColdRecord<'_>) {
     } = record;
     let outlook = outlook.cloned();
     let row = RequestRow {
+        safeguards: Default::default(),
         id: None,
         ts_ms: now_ms(),
         duration_ms: Some(elapsed_ms(started)),
@@ -1287,6 +1292,7 @@ pub(crate) fn record_responses_measurement(
         }
     }
     let row = RequestRow {
+        safeguards: Default::default(),
         id: None,
         ts_ms,
         duration_ms: Some(duration_ms),
@@ -1454,6 +1460,7 @@ pub(crate) fn record_codex_error(
         extra.insert("translation_losses".to_owned(), losses);
     }
     let row = RequestRow {
+        safeguards: Default::default(),
         id: None,
         ts_ms,
         duration_ms: Some(elapsed_ms(ctx.started)),

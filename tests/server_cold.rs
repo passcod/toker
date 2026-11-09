@@ -372,6 +372,7 @@ fn poison_cold_lane(store: &Store, body: &[u8], idle_ms: i64) {
 
 fn bare_row(ts_ms: i64) -> RequestRow {
     RequestRow {
+        safeguards: Default::default(),
         id: None,
         ts_ms,
         duration_ms: None,

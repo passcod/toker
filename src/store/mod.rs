@@ -40,9 +40,9 @@ pub use ledger::{
     DisplayRow, JSON_TEXT_COLUMNS, KindFilter, LaneSystemRow, LocalisationRow,
     MAX_ROUTING_TRACE_EVENTS, MeterRow, PolicyRouteProvenance, PolicyRoutingOutcome, RebuildRow,
     RelationSource, RequestFilter, RequestLookupProvenance, RequestRow, ResolvedRoute, RowKind,
-    SessionCostGroup, SessionLineage, SessionSummary, StoredCandidateState, StoredLadders,
-    StoredLookupSource, StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason,
-    StoredTransitionDenied, is_api_measurement,
+    SafeguardsRow, SessionCostGroup, SessionLineage, SessionSummary, StoredCandidateState,
+    StoredLadders, StoredLookupSource, StoredRoutingTrace, StoredRoutingTraceEvent,
+    StoredSkipReason, StoredTransitionDenied, is_api_measurement,
 };
 pub use state::{
     ActivatePolicyRevision, ActivatedPolicyRevision, Allowance, BindingLearning,
@@ -50,7 +50,7 @@ pub use state::{
     MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction, PingRecord, PolicyCompilerOrigin,
     PolicyDraft, PolicyRevision, PolicyRevisionSource, PublicationAdapter, PublicationCasResult,
     PublicationKey, PublicationResultUpdate, PublicationState, RevisionOneActivation,
-    RoutingPolicyState, RoutingPublication, local_day, publication_targets,
+    RoutingPolicyState, RoutingPublication, SafeguardsMark, local_day, publication_targets,
 };
 
 use std::env;
@@ -812,6 +812,25 @@ impl Store {
         state::pings_since(&*self.conn()?, ts_ms, limit)
     }
 
+    /// Mark a binding as having refused the server safeguards ask.
+    pub fn set_safeguards_mark(
+        &self,
+        binding_id: &crate::policy::BindingId,
+        now_ms: i64,
+    ) -> Result<()> {
+        state::set_safeguards_mark(&*self.conn()?, binding_id, now_ms)
+    }
+
+    /// Clear the marks held against these bindings; how many were held.
+    pub fn clear_safeguards_marks(&self, bindings: &[&crate::policy::BindingId]) -> Result<u64> {
+        state::clear_safeguards_marks(&*self.conn()?, bindings)
+    }
+
+    /// Every binding holding a server safeguards rejection mark.
+    pub fn load_safeguards_marks(&self) -> Result<Vec<SafeguardsMark>> {
+        state::load_safeguards_marks(&*self.conn()?)
+    }
+
     /// Overwrite one meter-source backend's last snapshot, keyed by
     /// provider id (migration v3): the anthropic sub's quota meters and
     /// the codex sub's usage limits each keep their own slot.
@@ -1178,6 +1197,7 @@ mod tests {
     /// A row with every field set, covering every column's Some path.
     fn full_row() -> RequestRow {
         RequestRow {
+            safeguards: Default::default(),
             id: None,
             ts_ms: 1_769_000_000_012,
             duration_ms: Some(3_456),
@@ -1257,6 +1277,7 @@ mod tests {
     /// A row with only `ts_ms` — every other column NULL.
     fn bare_row(ts_ms: i64) -> RequestRow {
         RequestRow {
+            safeguards: Default::default(),
             id: None,
             ts_ms,
             duration_ms: None,

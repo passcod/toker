@@ -27,6 +27,7 @@ const ROW_CAP: usize = 10_000;
 /// A measurement row with every optional column NULL, at `ts_ms`.
 fn bare_row(ts_ms: i64) -> RequestRow {
     RequestRow {
+        safeguards: Default::default(),
         id: None,
         ts_ms,
         duration_ms: None,

@@ -251,6 +251,8 @@ struct PreviewRequest {
     #[serde(default)]
     required_capabilities: CapabilityFlags,
     #[serde(default)]
+    asks_server_safeguards: bool,
+    #[serde(default)]
     binding_affinity: Option<BindingId>,
 }
 
@@ -276,6 +278,7 @@ pub(crate) async fn preview(State(server): State<Server>, request: Request) -> R
         message_count: request.message_count,
         tool_count: request.tool_count,
         required_capabilities: request.required_capabilities,
+        asks_server_safeguards: request.asks_server_safeguards,
         binding_affinity: request.binding_affinity,
     }) {
         Ok(preview) => (

@@ -464,6 +464,10 @@ pub struct Server {
     /// The active policy and the live evidence it resolves against, captured
     /// atomically.
     pub(crate) policy_runtime: Arc<crate::policy::PolicyRuntime>,
+    /// Bindings that refused the server safeguards ask (spec:
+    /// WSAFE#a-rejection-mark), mirrored from the store so the resolver and
+    /// the renderer read them without I/O.
+    safeguards_marks: Arc<std::sync::RwLock<std::collections::BTreeSet<crate::policy::BindingId>>>,
 }
 
 impl Server {
@@ -614,6 +618,11 @@ impl Server {
             Arc::new(inventory),
             availability,
         ));
+        let safeguards_marks = store
+            .load_safeguards_marks()?
+            .into_iter()
+            .map(|mark| mark.binding_id)
+            .collect();
         let catalog_dir = Arc::new(std::sync::OnceLock::new());
         if let Some(initial_catalog_dir) = initial_catalog_dir {
             let _ = catalog_dir.set(initial_catalog_dir);
@@ -639,7 +648,60 @@ impl Server {
             quota_events: Arc::default(),
             routing_control: Arc::default(),
             policy_runtime,
+            safeguards_marks: Arc::new(std::sync::RwLock::new(safeguards_marks)),
         })
+    }
+
+    /// The bindings holding a server safeguards rejection mark.
+    pub(crate) fn safeguards_marks(&self) -> std::collections::BTreeSet<crate::policy::BindingId> {
+        self.safeguards_marks
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Remember that a binding refused the ask. A store failure keeps the
+    /// mark for this process and is logged: the worst case is one more refused
+    /// send after a restart.
+    pub(crate) fn mark_safeguards_rejected(&self, binding_id: &crate::policy::BindingId) {
+        if let Err(error) = self.store.set_safeguards_mark(binding_id, now_ms()) {
+            tracing::error!(%error, "server safeguards mark could not be stored");
+        }
+        self.safeguards_marks
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(binding_id.clone());
+    }
+
+    /// Clear the marks held against `bindings`; how many were held.
+    pub(crate) fn clear_safeguards_marks<'a>(
+        &self,
+        bindings: impl IntoIterator<Item = &'a crate::policy::BindingId>,
+    ) -> usize {
+        let bindings: Vec<_> = bindings.into_iter().collect();
+        if let Err(error) = self.store.clear_safeguards_marks(&bindings) {
+            tracing::error!(%error, "server safeguards marks could not be cleared in the store");
+        }
+        let mut marks = self
+            .safeguards_marks
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        bindings
+            .into_iter()
+            .filter(|binding| marks.remove(*binding))
+            .count()
+    }
+
+    /// Clear every mark held against a provider's bindings, as a change of its
+    /// credential does.
+    pub(crate) fn clear_safeguards_marks_for_provider(&self, provider: &str) -> usize {
+        let bindings: Vec<_> = self
+            .registry
+            .bindings()
+            .filter(|binding| binding.provider() == provider)
+            .map(|binding| binding.id().clone())
+            .collect();
+        self.clear_safeguards_marks(bindings.iter())
     }
 
     /// Mark one selected binding and effective target immediately before an
@@ -967,7 +1029,7 @@ impl Server {
             message_count: request.message_count,
             tool_count: request.tool_count,
             required_capabilities: request.required_capabilities,
-            asks_server_safeguards: false,
+            asks_server_safeguards: request.asks_server_safeguards,
             binding_affinity: request.binding_affinity,
             class: RequestClass::Inference,
             legacy_compaction: None,
@@ -975,7 +1037,8 @@ impl Server {
         };
         let availability = snapshot
             .availability
-            .at(now, crate::catalog::fetched::CACHE_TTL_MS);
+            .at(now, crate::catalog::fetched::CACHE_TTL_MS)
+            .with_safeguards_marks(&self.safeguards_marks());
         let learning = crate::policy::LearningView::snapshot(self.binding_learning.as_ref());
         let result = crate::policy::resolve(
             &policy,
@@ -988,7 +1051,7 @@ impl Server {
         Ok(RoutingDraftPreview {
             generation: snapshot.state.draft_generation,
             diagnostics: Vec::new(),
-            result: preview_result_body(result),
+            result: preview_result_body(result, &availability),
         })
     }
 
@@ -1290,7 +1353,8 @@ impl Server {
         let availability = snapshot
             .availability()
             .at(facts.now_ms, crate::catalog::fetched::CACHE_TTL_MS)
-            .with_credentials(credentials);
+            .with_credentials(credentials)
+            .with_safeguards_marks(&self.safeguards_marks());
         let learning = crate::policy::LearningView::snapshot(self.binding_learning.as_ref());
         let circuits = runtime.open_circuits(&snapshot, facts.now_ms);
         crate::policy::resolve_first_candidate(
@@ -1320,7 +1384,8 @@ impl Server {
         let availability = snapshot
             .availability()
             .at(facts.now_ms, crate::catalog::fetched::CACHE_TTL_MS)
-            .with_credentials(credentials);
+            .with_credentials(credentials)
+            .with_safeguards_marks(&self.safeguards_marks());
         crate::policy::resolve_model_free(snapshot.policy(), &availability, facts).map_err(
             |failure| PolicyAttemptError::Resolve {
                 revision_id,
@@ -1343,7 +1408,8 @@ impl Server {
             let availability = snapshot
                 .availability()
                 .at(facts.now_ms, crate::catalog::fetched::CACHE_TTL_MS)
-                .with_credentials(credentials);
+                .with_credentials(credentials)
+                .with_safeguards_marks(&self.safeguards_marks());
             let circuits = runtime.open_circuits(&snapshot, facts.now_ms);
             let plan = crate::policy::resolve_first_candidate(
                 snapshot.policy(),
@@ -1642,7 +1708,8 @@ impl Server {
         let availability = snapshot
             .availability()
             .at(facts.now_ms, crate::catalog::fetched::CACHE_TTL_MS)
-            .with_credentials(credentials);
+            .with_credentials(credentials)
+            .with_safeguards_marks(&self.safeguards_marks());
         let learning = crate::policy::LearningView::snapshot(self.binding_learning.as_ref());
         let circuits = runtime.open_circuits(snapshot, facts.now_ms);
         let plan = crate::policy::resolve::resolve_with_activation_cache_consent(
@@ -2157,6 +2224,13 @@ impl Server {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let changed_catalogue_bindings =
             changed_catalogue_bindings(&self.registry, &catalogs, &next);
+        // A refresh clears the mark even where the listing came back the
+        // same: the next ask then probes the upstream again.
+        self.clear_safeguards_marks(&refreshed_catalogue_bindings(
+            &self.registry,
+            &catalogs,
+            &next,
+        ));
         let runtime = &self.policy_runtime;
         // Model-list readers retain this catalogue guard through their
         // comparison, so they can observe only the old pair or new pair.
@@ -2468,6 +2542,26 @@ fn changed_catalogue_bindings(
         .collect()
 }
 
+/// The bindings whose catalogue source was fetched again, whether or not its
+/// listing changed.
+fn refreshed_catalogue_bindings(
+    registry: &RouteRegistry,
+    previous: &FetchedCatalogs,
+    next: &FetchedCatalogs,
+) -> Vec<crate::policy::BindingId> {
+    registry
+        .bindings()
+        .filter(|binding| {
+            let Some(source) = FetchedCatalogs::source_of(binding.provider()) else {
+                return false;
+            };
+            effective_catalogue(previous, source).map(|catalog| catalog.fetched_at_ms)
+                != effective_catalogue(next, source).map(|catalog| catalog.fetched_at_ms)
+        })
+        .map(|binding| binding.id().clone())
+        .collect()
+}
+
 fn effective_catalogue<'a>(
     catalogs: &'a FetchedCatalogs,
     source: &str,
@@ -2519,6 +2613,8 @@ pub(crate) struct RoutingPreviewRequest {
     pub(crate) message_count: Option<u64>,
     pub(crate) tool_count: u64,
     pub(crate) required_capabilities: crate::policy::CapabilityFlags,
+    /// The invented request asks for server safeguards.
+    pub(crate) asks_server_safeguards: bool,
     pub(crate) binding_affinity: Option<crate::policy::BindingId>,
 }
 
@@ -2582,6 +2678,7 @@ fn require_cache_consent(
 
 fn preview_result_body(
     result: Result<crate::policy::AttemptPlan, crate::policy::ResolveFailure>,
+    availability: &AvailabilitySnapshot,
 ) -> serde_json::Value {
     match result {
         Ok(plan) => serde_json::json!({
@@ -2596,7 +2693,14 @@ fn preview_result_body(
             "upgraded_model": plan.upgraded_model,
             "effective_model": plan.effective_model,
             "cache_transition": plan.cache_transition.map(|value| format!("{:?}", value)),
-            "trace": plan.trace.into_iter().map(preview_trace_event).collect::<Vec<_>>(),
+            "server_safeguards": {
+                "asked": plan.safeguards.asked,
+                "effective": plan.safeguards.effective.map(crate::routing::CapabilityEvidence::as_str),
+                "marked": plan.safeguards.marked,
+                "skipped_candidate": plan.safeguards.skipped_candidate,
+                "walked_again": plan.safeguards.walked_again,
+            },
+            "trace": plan.trace.into_iter().map(|event| preview_trace_event(event, availability)).collect::<Vec<_>>(),
         }),
         Err(crate::policy::ResolveFailure::RouteUnavailable {
             route_id,
@@ -2608,7 +2712,7 @@ fn preview_result_body(
             "route_id": route_id,
             "route_fingerprint": route_fingerprint.to_string(),
             "provenance": format!("{:?}", provenance),
-            "trace": trace.into_iter().map(preview_trace_event).collect::<Vec<_>>(),
+            "trace": trace.into_iter().map(|event| preview_trace_event(event, availability)).collect::<Vec<_>>(),
         }),
         Err(error) => serde_json::json!({
             "outcome": "unresolved",
@@ -2617,7 +2721,10 @@ fn preview_result_body(
     }
 }
 
-fn preview_trace_event(event: crate::policy::TraceEvent) -> serde_json::Value {
+fn preview_trace_event(
+    event: crate::policy::TraceEvent,
+    availability: &AvailabilitySnapshot,
+) -> serde_json::Value {
     match event {
         crate::policy::TraceEvent::Lookup(provenance) => serde_json::json!({
             "kind": "lookup",
@@ -2627,6 +2734,9 @@ fn preview_trace_event(event: crate::policy::TraceEvent) -> serde_json::Value {
             "kind": "candidate",
             "candidate_id": candidate.candidate_id,
             "crossed_from": candidate.crossed_from,
+            "server_safeguards": availability
+                .get(&candidate.binding_id)
+                .map(|live| live.capabilities.server_safeguards.as_str()),
             "binding_id": candidate.binding_id,
             "model": candidate.model,
             "result": candidate.result.map_err(|reason| format!("{:?}", reason)),
