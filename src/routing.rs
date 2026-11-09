@@ -1082,7 +1082,7 @@ mod tests {
                 ProtocolId::AnthropicMessages,
                 DialectId::AnthropicMessages,
                 BackendAdapterId::AnthropicMessages,
-                Capabilities::MESSAGES,
+                Capabilities::ANTHROPIC_MESSAGES,
                 None,
             ),
             (
@@ -1091,7 +1091,7 @@ mod tests {
                 ProtocolId::AnthropicMessages,
                 DialectId::AnthropicMessages,
                 BackendAdapterId::AnthropicMessages,
-                Capabilities::MESSAGES,
+                Capabilities::ANTHROPIC_MESSAGES,
                 None,
             ),
             (
