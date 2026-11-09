@@ -137,6 +137,7 @@ Toker MUST carry provider extensions across the canonical boundary opaquely, in 
 | an unmodelled field of a request or of a node within it | request |
 | an unmodelled field of a complete response or of a node within it | response |
 | an unmodelled field of a stream event Toker models | response |
+| a content block of a kind Toker does not model | response |
 | a stream event of a kind Toker does not model | response |
 
 Each extension MUST be tagged with the dialect it came from, and MUST keep its wire position, so that a renderer can place it where it stood.
