@@ -112,6 +112,8 @@ A ledger row MUST carry the account its request was served on, by that account's
 > The number is assigned here and never reused, so a row keeps pointing at the same account when an address changes or an upstream identifier arrives to replace one, and stitching two sightings together rewrites no rows.
 > It also keeps addresses out of the ledger's own columns, which is what an export carries and nothing else, as [DCONF](../service/config.md#credentials) requires.
 
+A row the proxy writes about a request it stopped itself, such as a block, MUST carry the credential digest and account of the credential that request carried.
+
 A meter reading MUST be held per account.
 A reading from one account MUST NOT replace another's.
 
@@ -132,6 +134,15 @@ Toker MUST NOT move a client's request to another account.
 > [!NOTE]
 > An account is an identity the ledger and the gates are keyed on, and a candidate choosing between accounts is a separate thing that nothing yet does.
 
+A gate that decides on a request before it is sent MUST read the account named by the credential that request will be sent with.
+It MUST NOT read the account off the session's earlier rows or off the provider's most recent traffic.
+
+> [!NOTE]
+> A login switched partway through a session leaves the session's earlier rows on the account it left.
+> A request the gate stops sends nothing upstream, so the only row it writes is the block itself, and reading the account from earlier rows would keep stopping the session on a window that is no longer its own.
+
+A request whose credential resolves to no account has no account for the gate to read, and MUST NOT be stopped on another account's reading.
+
 A request Toker originates with no client behind it carries a credential Toker chose, and so names the account Toker chose.
 A ping is such a request, as [GPING](../gates/pinging.md#a-window-belongs-to-an-account) specifies.
 
@@ -142,7 +153,11 @@ A ping is such a request, as [GPING](../gates/pinging.md#a-window-belongs-to-an-
 
 A store holding request rows from before accounts were recorded is moved by setup, the way a machine whose configuration was a file is moved by it, as [DCONF](../service/config.md#moving-a-machine-off-the-file) specifies.
 
-Such a row carries neither an account nor a digest.
+Such a row carries neither an account nor a digest, and is a measurement from a request the provider served.
+A row the proxy wrote about a request it never sent, such as a block, a release or a cold notice, is not one of them.
+
+> [!NOTE]
+> Those rows carry no credential whenever they are written, so counting them would make a gate event logged after accounts began read as history from before, and every command would refuse to run over it.
 
 Every command other than setup, the service included, MUST refuse to run while the store holds such a row, and MUST say that setup attributes them.
 

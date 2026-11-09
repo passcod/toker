@@ -776,6 +776,9 @@ pub(crate) struct QuotaBlockedRecord<'a> {
     pub(crate) session_id: Option<&'a str>,
     /// The backend the request would have reached (the gate's own).
     pub(crate) backend_id: &'a str,
+    /// The credential the request carried and the account it names, which
+    /// the row is attributed to.
+    pub(crate) credential: &'a super::quota_gate::RequestCredential,
     /// The client protocol stopped by the gate.
     pub(crate) frontend_protocol: &'static str,
     /// Which meter hit its limit.
@@ -810,6 +813,7 @@ pub(crate) fn record_quota_blocked(record: QuotaBlockedRecord<'_>) {
         path,
         session_id,
         backend_id,
+        credential,
         frontend_protocol,
         meter,
         resets_at,
@@ -828,8 +832,8 @@ pub(crate) fn record_quota_blocked(record: QuotaBlockedRecord<'_>) {
         route: Some(format!("{frontend_protocol}:{backend_id}")),
         session_id: session_id.map(str::to_owned),
         ping: None,
-        credential_digest: None,
-        account_number: None,
+        credential_digest: credential.digest.clone(),
+        account_number: credential.account_number,
         model: None,
         raw_model: None,
         requested_model: None,

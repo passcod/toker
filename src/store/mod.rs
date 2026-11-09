@@ -884,20 +884,22 @@ impl Store {
         state::load_meters_by_account(&*self.conn()?, provider_id)
     }
 
-    /// The account a request on this provider is about: the one the
-    /// session is already being served on, and for a session with no row
-    /// yet the one the provider served last.
+    /// The account a session is being served on, as far as the ledger says:
+    /// the one the session's newest served row names, and for a session with
+    /// no row yet the one the provider served last.
     ///
-    /// Every quota read takes its account from here, so the gate, a
-    /// release and a revoke all agree about whose window is in question.
+    /// This is a guess from earlier traffic, for readers with no request in
+    /// hand: the TUI showing a session, a release or revoke from it, and the
+    /// lane pin. The quota gate does not use it. A request in flight names
+    /// its account by its credential, and a gate that read it from here
+    /// stayed on the account a login had been switched away from, because a
+    /// blocked request writes no served row to correct it
+    /// (spec: ACCT#routing-does-not-select-an-account).
+    ///
     /// `None` is the answer when nothing has been served yet or no source
     /// has named the credential — an absence each caller handles, rather
     /// than a zero it could spend against (spec: ACCT#an-account-not-yet-known).
     ///
-    /// A machine with one account answers both ways the same. A machine
-    /// with several can answer a session's very first request with the
-    /// wrong one; that request writes the row that settles it, so the
-    /// window of error is one request and it does not recur.
     pub fn account_for(&self, provider_id: &str, session_id: Option<&str>) -> Result<Option<i64>> {
         if let Some(session_id) = session_id
             && let Some(account) = self.session_account(provider_id, session_id)?
@@ -1949,6 +1951,13 @@ mod tests {
         pending.credential_digest =
             Some(CredentialDigest::new("ab".repeat(32)).expect("a well-formed digest"));
         store.record_request(&pending).expect("record");
+
+        // A block the gate wrote after accounts began names neither, since
+        // it sent nothing upstream. It is not history from before accounts,
+        // and counting it would stop every command from running.
+        let mut blocked = window_row(4_000, "anthropic_sub", 500);
+        blocked.kind = Some(RowKind::Blocked);
+        store.record_request(&blocked).expect("record");
 
         assert_eq!(
             store

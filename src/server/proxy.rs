@@ -292,16 +292,20 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     };
     let gate_model = Some(policy_attempt.plan.effective_model.clone());
     let backend = target.provider().clone();
-    let meters = super::quota_gate::load_meters_for(
+    let credential = super::quota_gate::request_credential(
         &server,
-        backend.id(),
-        super::quota_gate::gate_account(&server, backend.id(), session_id.as_deref()),
+        backend.as_ref(),
+        &parts.headers,
+        ProtocolId::OpenAiChat,
     );
+    let meters =
+        super::quota_gate::load_meters_for(&server, backend.id(), credential.account_number);
     let release = crate::middleware::canonical::release_marker(&inference.canonical());
     if let Some((release, grant)) = super::quota_gate::grant_release(
         &server,
         session_id.as_deref(),
         backend.id(),
+        credential.account_number,
         release,
         meters.as_ref(),
     ) {
@@ -325,6 +329,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         &server,
         backend.id(),
         session_id.as_deref(),
+        credential.account_number,
         frontend.as_deref(),
         meters,
     ) {
@@ -340,6 +345,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             path: "/v1/chat/completions",
             session_id: session_id.as_deref(),
             backend_id: backend.id(),
+            credential: &credential,
             frontend_protocol: "openai_chat",
             meter: block.meter,
             resets_at: block.resets_at,
@@ -603,6 +609,49 @@ pub(crate) async fn send_upstream(
     .await
 }
 
+/// The headers a request leaves with: cleaned, with the provider's own
+/// credential rules applied. The send and the quota gate both read the
+/// credential off this, so the gate is about the account the request will be
+/// served on rather than a guess at it.
+pub(crate) fn outgoing_headers(
+    provider: &dyn Provider,
+    incoming: &HeaderMap,
+    session_header_names: &[String],
+    frontend: ProtocolId,
+) -> HeaderMap {
+    // Pass-through-when-present: a frontend that
+    // brings its own credential keeps it verbatim; the stored credential
+    // is injected only when the request carries none. If neither exists
+    // the request goes unauthenticated and the upstream's 401 body passes
+    // through — visibly verifying the wiring.
+    let mut headers = upstream_request_headers(incoming, session_header_names);
+    // Before injection, so a dropped foreign credential leaves room for
+    // the provider's own.
+    provider.strip_foreign_credentials_for(&mut headers, frontend);
+    if !provider.credential_present(&headers) {
+        provider.inject_auth(&mut headers);
+    }
+    provider.prepare_protocol_headers(&mut headers);
+    headers
+}
+
+/// The digest of the credential in `headers`, if they carry one.
+pub(crate) fn outgoing_credential_digest(headers: &HeaderMap) -> Option<CredentialDigest> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|token| !token.is_empty())
+        .map(credential_digest)
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                .filter(|key| !key.is_empty())
+                .map(credential_digest)
+        })
+}
+
 /// The same provider-owned auth and transport path for a cross-protocol
 /// binding. `frontend` lets a provider distinguish a native credential from
 /// a different client's bearer; `path` is the selected backend endpoint.
@@ -616,32 +665,8 @@ pub(crate) async fn send_upstream_to(
     path: &str,
 ) -> Result<UpstreamResponse, reqwest::Error> {
     let url = provider.endpoint(path);
-    // Pass-through-when-present: a frontend that
-    // brings its own credential keeps it verbatim; the stored credential
-    // is injected only when the request carries none. If neither exists
-    // the request goes unauthenticated and the upstream's 401 body passes
-    // through — visibly verifying the wiring.
-    let mut headers = upstream_request_headers(&parts.headers, session_header_names);
-    // Before injection, so a dropped foreign credential leaves room for
-    // the provider's own.
-    provider.strip_foreign_credentials_for(&mut headers, frontend);
-    if !provider.credential_present(&headers) {
-        provider.inject_auth(&mut headers);
-    }
-    provider.prepare_protocol_headers(&mut headers);
-    let credential_digest = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .filter(|token| !token.is_empty())
-        .map(credential_digest)
-        .or_else(|| {
-            headers
-                .get("x-api-key")
-                .and_then(|value| value.to_str().ok())
-                .filter(|key| !key.is_empty())
-                .map(credential_digest)
-        });
+    let headers = outgoing_headers(provider, &parts.headers, session_header_names, frontend);
+    let credential_digest = outgoing_credential_digest(&headers);
     let response = server
         .http
         .request(parts.method.clone(), url)
