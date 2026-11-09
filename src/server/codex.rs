@@ -189,22 +189,14 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         );
     };
     let (target, policy_attempt) = {
-        let binding_affinity = if canonical_request.requires_binding_affinity() {
-            // Provider-owned state belongs to the binding that produced it,
-            // which only a pin records.
-            let Some(binding) = pinned_binding.clone() else {
-                return frontend_error_response(
-                    CodexFrontendWire::OpenAiResponses,
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    "the request contains provider-owned state with unknown binding affinity",
-                    false,
-                );
-            };
-            Some(binding)
-        } else {
-            None
-        };
+        // Provider-owned state belongs to the binding that produced it,
+        // which only a pin records. A lane with no pin resolves as a new one
+        // does: refusing instead would never recover, since the client
+        // replays the same history on every retry and only a served response
+        // pins the lane.
+        let binding_affinity = pinned_binding
+            .clone()
+            .filter(|_| canonical_request.requires_binding_affinity());
         let facts = server.request_facts(
             ProtocolId::OpenAiResponses,
             frontend.as_deref(),

@@ -198,19 +198,11 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     let affinity_binding = pinned_binding_id
         .as_ref()
         .and_then(|binding_id| server.registry.binding(binding_id));
-    let binding_affinity = if canonical.requires_binding_affinity() {
-        // Provider-owned state belongs to the binding that produced it,
-        // which only a pin records.
-        let Some(binding) = pinned_binding_id else {
-            return compatibility_error(
-                "the request contains provider-owned state with unknown binding affinity",
-                canonical.stream == Some(true),
-            );
-        };
-        Some(binding)
-    } else {
-        None
-    };
+    // Provider-owned state belongs to the binding that produced it, which
+    // only a pin records. A lane with no pin resolves as a new one does:
+    // refusing instead would never recover, since the client replays the
+    // same history on every retry and only a served response pins the lane.
+    let binding_affinity = pinned_binding_id.filter(|_| canonical.requires_binding_affinity());
     let facts = server.request_facts(
         ProtocolId::OpenAiChat,
         frontend.as_deref(),

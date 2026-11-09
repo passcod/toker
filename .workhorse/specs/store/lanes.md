@@ -124,7 +124,11 @@ Toker MUST NOT seed a pin from anything but a served response.
 
 A proven-cold temperature MUST be kept for such a lane, because the compaction route needs it.
 
-A request carrying provider-owned state on a lane with no pin MUST be refused, since only the binding that produced that state can replay it and nothing records which that was.
+A request carrying provider-owned state on a lane with no pin MUST resolve as a new lane does, with no binding affinity, as [RSOLV](../routing/resolver.md) specifies.
+
+> [!NOTE]
+> Nothing records which binding produced that state, so it replays to whichever binding wins, which is the producer wherever routing has not changed since.
+> Where it is not, the upstream refuses the state, and the lane stays unpinned.
 
 A pin MUST live in the lane row, so that pruning a lane drops its pin.
 

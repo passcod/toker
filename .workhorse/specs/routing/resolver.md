@@ -35,8 +35,11 @@ The facts the resolver receives MUST be content-free.
 | the request's class |
 | the present moment |
 
-A request carrying provider-owned state, such as signed or redacted thinking or a provider's encrypted reasoning, MUST set a binding affinity, because only the binding that produced that state can replay it.
-Such a request on a lane with no pin MUST be refused.
+A request carrying provider-owned state, such as signed or redacted thinking or a provider's encrypted reasoning, on a pinned lane MUST set a binding affinity, because only the binding that produced that state can replay it.
+Such a request on a lane with no pin MUST set none and MUST resolve as a new lane does.
+
+> [!NOTE]
+> Refusing it would never recover, since the client replays the same history on every retry and only a served response pins the lane.
 
 ## Provider prefixes
 

@@ -555,21 +555,14 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 .as_ref()
                 .and_then(|lane| lane.pin.as_ref())
                 .map(|pin| pin.binding_id.clone());
-            let binding_affinity = if request.requires_binding_affinity() {
-                // Provider-owned state belongs to the binding that produced
-                // it, which only a pin records.
-                let Some(binding) = pinned_binding.clone() else {
-                    return super::codex::anthropic_error_response(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_request_error",
-                        "the request contains provider-owned state with unknown binding affinity",
-                        request.stream == Some(true),
-                    );
-                };
-                Some(binding)
-            } else {
-                None
-            };
+            // Provider-owned state belongs to the binding that produced it,
+            // which only a pin records. A lane with no pin resolves as a new
+            // one does: refusing instead would never recover, since the
+            // client replays the same history on every retry and only a
+            // served response pins the lane.
+            let binding_affinity = pinned_binding
+                .clone()
+                .filter(|_| request.requires_binding_affinity());
             let class = if shape.is_compaction() {
                 crate::policy::RequestClass::Compaction
             } else {
