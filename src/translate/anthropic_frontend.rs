@@ -80,6 +80,7 @@ use crate::ir::canonical::{
 };
 use crate::observe::sse::SseEvent;
 use crate::routing::DialectId;
+use crate::translate::anthropic_backend::mentions_safeguard_results;
 use crate::translate::{TranslateError, TranslationLoss, TranslationLossReason, TranslationReport};
 use std::collections::BTreeMap;
 
@@ -897,6 +898,8 @@ pub struct AnthropicRenderer {
     opaque_blocks: BTreeMap<u64, usize>,
     /// What this rendering omitted, content-free.
     report: TranslationReport,
+    /// Whether an emitted event carried server safeguards results.
+    results_replayed: bool,
 }
 
 /// Unmodelled fields of one object of a wire event not yet emitted.
@@ -955,7 +958,13 @@ impl AnthropicRenderer {
             pending_fields: Vec::new(),
             opaque_blocks: BTreeMap::new(),
             report: TranslationReport::default(),
+            results_replayed: false,
         }
+    }
+
+    /// Whether an event emitted so far carried server safeguards results.
+    pub fn results_replayed(&self) -> bool {
+        self.results_replayed
     }
 
     /// The content-free losses so far, drained.
@@ -982,6 +991,7 @@ impl AnthropicRenderer {
                 }
             }
         }
+        self.results_replayed |= mentions_safeguard_results(&data);
         sse_event(name, data)
     }
 

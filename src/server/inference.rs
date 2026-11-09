@@ -6,8 +6,8 @@
 
 use std::sync::Arc;
 
-use axum::http::StatusCode;
 use axum::http::request::Parts;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde_json::Value;
 
@@ -142,6 +142,50 @@ impl InferenceAttempt {
 
     pub(crate) fn stream(&self) -> Option<bool> {
         self.canonical.stream
+    }
+
+    /// The serving binding's effective support for server safeguards: the
+    /// resolver's reading, which already carries any rejection mark, or the
+    /// binding's declaration where the plan has none.
+    fn effective_safeguards(&self) -> crate::routing::CapabilityEvidence {
+        self.policy_plan.safeguards.effective.unwrap_or_else(|| {
+            self.binding()
+                .canonical_backend()
+                .map_or(crate::routing::CapabilityEvidence::Unknown, |backend| {
+                    backend.capabilities().server_safeguards
+                })
+        })
+    }
+
+    /// What the request's ask for server safeguards came to, as far as it is
+    /// known before the send. Content-free: only whether each thing happened.
+    pub(crate) fn safeguards_row(&self) -> crate::store::SafeguardsRow {
+        let plan = &self.policy_plan.safeguards;
+        if !plan.asked {
+            return crate::store::SafeguardsRow {
+                asked: Some(false),
+                ..Default::default()
+            };
+        }
+        crate::store::SafeguardsRow {
+            asked: Some(true),
+            support: Some(self.effective_safeguards()),
+            marked: Some(plan.marked),
+            results_seen: None,
+            results_replayed: None,
+            skipped_candidate: Some(plan.skipped_candidate),
+            walked_again: Some(plan.walked_again),
+        }
+    }
+
+    /// Withhold the ask, and the beta announcing it, from a binding whose
+    /// effective support is unsupported. The two go together or not at all
+    /// (spec: WSAFE#which-bindings-receive-it).
+    pub(crate) fn withhold_unsupported_safeguards(&mut self, headers: &mut HeaderMap) {
+        if self.effective_safeguards().is_unsupported() {
+            crate::translate::withhold_server_safeguards(&mut self.canonical);
+            super::anthropic::strip_safeguards_beta(headers);
+        }
     }
 
     pub(crate) fn prepare_messages_transport(&mut self, stream: bool, max_tokens: u64) {
@@ -1100,8 +1144,8 @@ impl ReadyBackendAttempt {
 }
 
 fn prepare_messages(
-    parts: Parts,
-    attempt: InferenceAttempt,
+    mut parts: Parts,
+    mut attempt: InferenceAttempt,
     mut record: Option<AnthropicRecordCtx>,
     in_flight: Option<InFlightGuard>,
 ) -> Result<ReadyMessagesAttempt, Box<Response>> {
@@ -1110,6 +1154,10 @@ fn prepare_messages(
     let expected_stream = attempt.stream().unwrap_or(false);
     let response_projection =
         crate::ir::canonical::ResponseProjection::for_request(&attempt.canonical());
+    if let Some(ctx) = record.as_mut() {
+        ctx.safeguards = attempt.safeguards_row();
+    }
+    attempt.withhold_unsupported_safeguards(&mut parts.headers);
     let rendered = attempt.render_json().map_err(|error| {
         Box::new(super::record::refused(
             super::codex::anthropic_error_response(

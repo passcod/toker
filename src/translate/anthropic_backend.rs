@@ -371,6 +371,68 @@ fn report_incompatible(extension: &CanonicalExtension, report: &mut TranslationR
     ));
 }
 
+// ── server safeguards ───────────────────────────────────────────────
+//
+// The one place that knows the provider's spellings (spec: WSAFE). Recognition
+// only associates a request or a response with the capability: nothing here
+// reads, checks or rewrites what the field or a result holds.
+
+/// The request body field by which a client asks for server safeguards.
+const SAFEGUARDS_FIELD: &str = "safeguards";
+
+/// The response member carrying the provider's verdicts.
+const SAFEGUARD_RESULTS_FIELD: &str = "safeguard_results";
+
+/// An `anthropic-beta` value announces the field by this prefix; the date
+/// after it is the provider's to change.
+const SAFEGUARDS_BETA_PREFIX: &str = "dangerous-tool-use-";
+
+/// Whether the request asks for server safeguards: its body carries the field.
+/// A beta value arriving without the field is not an ask.
+pub fn asks_server_safeguards(request: &CanonicalRequest) -> bool {
+    request.extensions.iter().any(|extension| {
+        extension.wire_name() == Some(SAFEGUARDS_FIELD)
+            && extension
+                .source()
+                .shares_replay_domain(DialectId::AnthropicMessages)
+    })
+}
+
+/// Remove the field from a request, for a binding that does not receive the
+/// pair. The caller removes the announcing beta value with it.
+pub fn withhold_server_safeguards(request: &mut CanonicalRequest) -> bool {
+    let before = request.extensions.len();
+    request
+        .extensions
+        .retain(|extension| extension.wire_name() != Some(SAFEGUARDS_FIELD));
+    request.extensions.len() != before
+}
+
+/// Whether one comma-separated `anthropic-beta` value announces the field.
+pub fn is_safeguards_beta(value: &str) -> bool {
+    value.trim().starts_with(SAFEGUARDS_BETA_PREFIX)
+}
+
+/// Whether an upstream's refusal message names the field or the beta value
+/// announcing it.
+pub fn is_safeguards_refusal(message: &str) -> bool {
+    message.contains(SAFEGUARDS_FIELD) || message.contains(SAFEGUARDS_BETA_PREFIX)
+}
+
+/// Whether a wire value, however deep, carries the provider's verdicts: a
+/// member of that name, or an object of that type. A boolean only.
+pub fn mentions_safeguard_results(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            object.contains_key(SAFEGUARD_RESULTS_FIELD)
+                || object.get("type").and_then(Value::as_str) == Some(SAFEGUARD_RESULTS_FIELD)
+                || object.values().any(mentions_safeguard_results)
+        }
+        Value::Array(items) => items.iter().any(mentions_safeguard_results),
+        _ => false,
+    }
+}
+
 // ── response interpretation ─────────────────────────────────────────
 
 /// What the interpreter hands the canonical form as MODELLED, per wire
@@ -423,6 +485,7 @@ pub struct AnthropicResponseStream {
     blocks: BTreeMap<u64, IncomingBlock>,
     start_usage: Option<Map<String, Value>>,
     serving_provider: Option<String>,
+    results_seen: bool,
 }
 
 impl Default for AnthropicResponseStream {
@@ -466,7 +529,13 @@ impl AnthropicResponseStream {
             blocks: BTreeMap::new(),
             start_usage: None,
             serving_provider: None,
+            results_seen: false,
         }
+    }
+
+    /// Whether any event so far carried server safeguards results.
+    pub fn results_seen(&self) -> bool {
+        self.results_seen
     }
 
     /// Interpret one already-split SSE event. Invalid JSON and unknown event
@@ -480,6 +549,7 @@ impl AnthropicResponseStream {
 
     /// Interpret one Anthropic event data object.
     pub fn feed(&mut self, event: &Value) -> Vec<CanonEvent> {
+        self.results_seen |= mentions_safeguard_results(event);
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") => self.message_start(event),
             Some("content_block_start") => self.block_start(event),

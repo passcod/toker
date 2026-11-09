@@ -131,8 +131,22 @@ pub(crate) struct AnthropicRecordCtx {
     pub(crate) frontend: Option<String>,
     /// Content-free semantic omissions made by canonical rendering.
     pub(crate) translation_report: Option<TranslationReport>,
+    /// What the request's ask for server safeguards came to, content-free.
+    pub(crate) safeguards: crate::store::SafeguardsRow,
     /// Clears matching health circuits only after canonical success completes.
     pub(crate) policy_attempt: Option<Arc<super::PolicyAttempt>>,
+}
+
+impl AnthropicRecordCtx {
+    /// Note whether the response carried server safeguards results and
+    /// whether they reached the client. Only a request that asked records
+    /// either: a response to one that did not has nothing to say about them.
+    pub(crate) fn note_safeguards_results(&mut self, seen: bool, replayed: bool) {
+        if self.safeguards.asked == Some(true) {
+            self.safeguards.results_seen = Some(seen);
+            self.safeguards.results_replayed = Some(replayed);
+        }
+    }
 }
 
 /// Record a completed anthropic usage-path response: the measurement row
@@ -464,7 +478,7 @@ fn measurement_row(
     };
     let shape = ctx.shape.as_ref();
     RequestRow {
-        safeguards: Default::default(),
+        safeguards: ctx.safeguards,
         id: None,
         ts_ms,
         duration_ms: Some(duration_ms),
@@ -618,7 +632,7 @@ fn error_row(
     let (ts_ms, duration_ms) = timing;
     let (error_type, error_message) = error;
     RequestRow {
-        safeguards: Default::default(),
+        safeguards: ctx.safeguards,
         id: None,
         ts_ms,
         duration_ms: Some(duration_ms),
@@ -1292,7 +1306,7 @@ pub(crate) fn record_responses_measurement(
         }
     }
     let row = RequestRow {
-        safeguards: Default::default(),
+        safeguards: ctx.safeguards,
         id: None,
         ts_ms,
         duration_ms: Some(duration_ms),
@@ -1460,7 +1474,7 @@ pub(crate) fn record_codex_error(
         extra.insert("translation_losses".to_owned(), losses);
     }
     let row = RequestRow {
-        safeguards: Default::default(),
+        safeguards: ctx.safeguards,
         id: None,
         ts_ms,
         duration_ms: Some(elapsed_ms(ctx.started)),

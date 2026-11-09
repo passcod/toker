@@ -258,8 +258,9 @@ pub mod to_anthropic;
 pub mod to_codex;
 
 pub use anthropic_backend::{
-    AnthropicResponseStream, canonical_turn_from_anthropic, canonical_turn_from_messages,
-    render_anthropic,
+    AnthropicResponseStream, asks_server_safeguards, canonical_turn_from_anthropic,
+    canonical_turn_from_messages, is_safeguards_beta, is_safeguards_refusal,
+    mentions_safeguard_results, render_anthropic, withhold_server_safeguards,
 };
 pub use anthropic_frontend::from_anthropic;
 pub use codex_backend::{codex_from_canonical, render_codex};

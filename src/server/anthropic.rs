@@ -587,6 +587,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 binding_affinity,
                 class,
             );
+            facts.asks_server_safeguards = translate::asks_server_safeguards(request);
             if class == crate::policy::RequestClass::Compaction {
                 facts.legacy_compaction = Some(legacy_compaction_facts(
                     &server,
@@ -861,6 +862,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 .map(|(_, to)| to),
             model_mappings: batch_model_mappings.take(),
             translation_report: None,
+            safeguards: Default::default(),
             policy_attempt: policy_attempt.clone().map(Arc::new),
         });
         gate_shape = shape;
@@ -1399,6 +1401,40 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         },
     )
     .await
+}
+
+/// Remove the `anthropic-beta` values announcing server safeguards, leaving
+/// every other value where it was. The header goes only if nothing else is
+/// left in it.
+pub(crate) fn strip_safeguards_beta(headers: &mut HeaderMap) {
+    let announces = |value: &HeaderValue| {
+        value
+            .to_str()
+            .is_ok_and(|value| value.split(',').any(translate::is_safeguards_beta))
+    };
+    if !headers.get_all("anthropic-beta").iter().any(announces) {
+        return;
+    }
+    let kept: Vec<HeaderValue> = headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|value| {
+            let Ok(text) = value.to_str() else {
+                return Some(value.clone());
+            };
+            let remaining: Vec<&str> = text
+                .split(',')
+                .filter(|flag| !translate::is_safeguards_beta(flag))
+                .collect();
+            (!remaining.is_empty())
+                .then(|| HeaderValue::from_str(&remaining.join(",")).ok())
+                .flatten()
+        })
+        .collect();
+    headers.remove("anthropic-beta");
+    for value in kept {
+        headers.append("anthropic-beta", value);
+    }
 }
 
 pub(crate) fn required_capabilities(request: &CanonicalRequest) -> crate::policy::CapabilityFlags {
@@ -2035,7 +2071,13 @@ pub(crate) async fn forward_canonical_messages(
             );
         }
     };
-    if let Some(ctx) = record.as_ref() {
+    let results_seen = serde_json::from_slice::<serde_json::Value>(&buffered.bytes)
+        .is_ok_and(|body| translate::mentions_safeguard_results(&body));
+    response_projection.apply(&mut turn);
+    let body = translate::anthropic_frontend::anthropic_from_canonical(model, &turn);
+    let mut record = record;
+    if let Some(ctx) = record.as_mut() {
+        ctx.note_safeguards_results(results_seen, translate::mentions_safeguard_results(&body));
         let mut observer = AnthropicObserver::new();
         observer.observe_json(&buffered.bytes);
         let (reported_model, capture) = observer.finish_parts();
@@ -2047,8 +2089,6 @@ pub(crate) async fn forward_canonical_messages(
             status.as_u16(),
         );
     }
-    response_projection.apply(&mut turn);
-    let body = translate::anthropic_frontend::anthropic_from_canonical(model, &turn);
     anthropic_json_response(status, &upstream_headers, &body)
 }
 
@@ -2159,7 +2199,11 @@ impl CanonicalMessagesStream {
     }
 
     fn finish_recording(&mut self) {
-        if let Some(ctx) = self.ctx.take() {
+        if let Some(mut ctx) = self.ctx.take() {
+            ctx.note_safeguards_results(
+                self.backend.results_seen(),
+                self.frontend.results_replayed(),
+            );
             let (reported_model, capture) = std::mem::take(&mut self.observer).finish_parts();
             record_anthropic_measurement(
                 &ctx,

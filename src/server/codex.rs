@@ -340,6 +340,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         model_mappings: None,
         frontend,
         translation_report: None,
+        safeguards: Default::default(),
         policy_attempt: policy_record,
     });
 
@@ -664,6 +665,11 @@ pub(crate) async fn prepare(
     let response_model = attempt.requested_model().to_owned();
     let canonical = attempt.canonical();
     let response_projection = ResponseProjection::for_request(&canonical);
+    if matches!(frontend_wire, CodexFrontendWire::Anthropic)
+        && let Some(ctx) = record.as_mut()
+    {
+        ctx.safeguards = attempt.safeguards_row();
+    }
     let prompt_cache_key = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let thread_id = thread_id.unwrap_or_else(|| prompt_cache_key.clone());
     let request_id = request_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
