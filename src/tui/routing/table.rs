@@ -449,3 +449,38 @@ pub(super) fn widest<'a>(texts: impl IntoIterator<Item = &'a str>) -> usize {
         .max()
         .unwrap_or(0)
 }
+
+/// Mark the rows a trace passed through, in the gutter each draws at its
+/// left: the catching row `>`, the rows fallen past `↓`. A table with no
+/// gutter of its own is given one, where `gutter` says so.
+pub(super) fn mark_rows(
+    table: &mut Table,
+    marks: &std::collections::BTreeMap<usize, char>,
+    gutter: bool,
+) {
+    let mark = |line: &mut Line<'static>, mark: Option<char>| {
+        let bold = Style::new().add_modifier(Modifier::BOLD);
+        if gutter {
+            let cell = match mark {
+                Some(mark) => span(format!("{mark} "), bold),
+                None => Span::raw("  "),
+            };
+            line.spans.insert(0, cell);
+        } else if let Some(mark) = mark
+            && let Some(first) = line.spans.first_mut()
+        {
+            let mut rest = first.content.chars();
+            rest.next();
+            let rest = rest.as_str().to_owned();
+            first.content = rest.into();
+            line.spans.insert(0, span(mark.to_string(), bold));
+        }
+    };
+    if gutter {
+        mark(&mut table.header, None);
+    }
+    for body in &mut table.body {
+        let mark_of = body.entry.and_then(|entry| marks.get(&entry).copied());
+        mark(&mut body.line, mark_of);
+    }
+}

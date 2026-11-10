@@ -450,6 +450,20 @@ const COMPACTION: &[Field] = &[
 
 const DESCRIPTION: &[Field] = &[field("description", "description", Node::OptText)];
 
+/// An invented request to trace: what the resolver reads of one, less the
+/// parts that only matter to a lane that already exists.
+const TRACE: &[Field] = &[
+    field("profile", "profile", Node::OptText),
+    field("protocol", "protocol", PROTOCOL),
+    field("model", "model", Node::OptText),
+    field("prompt_bound", "prompt tokens", Node::OptInt),
+    field(
+        "asks_server_safeguards",
+        "asks for safeguards",
+        Node::Bool(false),
+    ),
+];
+
 const PROMOTE: &[Field] = &[
     field("binding_id", "binding", Node::Binding),
     field("model_id", "model", Node::Model),
@@ -484,6 +498,8 @@ pub(super) enum Purpose {
     },
     Description,
     Promote,
+    /// An invented request, to be traced through the policy.
+    Trace,
     /// Removing or moving something: a form with no fields, which only
     /// carries the refusals a check finds.
     Fieldless,
@@ -515,6 +531,7 @@ impl Purpose {
             Purpose::Candidate { with_edge: false } => "first candidate",
             Purpose::Description => "edit description",
             Purpose::Promote => "promote learned model",
+            Purpose::Trace => "trace an invented request",
             Purpose::Fieldless => "",
         }
     }
@@ -535,6 +552,7 @@ impl Purpose {
             Purpose::Candidate { with_edge: false } => PRIMARY,
             Purpose::Description => DESCRIPTION,
             Purpose::Promote => PROMOTE,
+            Purpose::Trace => TRACE,
             Purpose::Fieldless => &[],
         }
     }
@@ -542,13 +560,17 @@ impl Purpose {
     /// Short forms answer one question and Enter submits them. A record form
     /// has many fields, so Enter there moves on.
     fn enter_submits(self) -> bool {
-        matches!(self, Purpose::Description | Purpose::Promote)
+        matches!(
+            self,
+            Purpose::Description | Purpose::Promote | Purpose::Trace
+        )
     }
 
     fn help(self) -> &'static str {
         match self {
             Purpose::Description => "enter save · esc cancel",
             Purpose::Promote => "tab complete from a daemon offer · enter record · esc cancel",
+            Purpose::Trace => "↑/↓ field · ←/→ change · enter trace · esc cancel",
             _ => "↑/↓ field · ←/→ change · tab complete · ctrl+s save · esc cancel",
         }
     }

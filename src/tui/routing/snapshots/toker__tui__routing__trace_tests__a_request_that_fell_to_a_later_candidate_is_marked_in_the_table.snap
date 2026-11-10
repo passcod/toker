@@ -1,0 +1,41 @@
+---
+source: src/tui/routing/trace_tests.rs
+expression: "frame(&state, 120, 40)"
+---
+ ?   dashboard   routing   config   accounts   1 presentations → 2 rewrites 14 → 3 defaults → 4 routes ›      rev 9 live
+┌REWRITES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│       match                              route                                     reach                    hits 24h │
+│ ┌─ anthropic_messages  5 rules · prefix · sends ${model} ─────────────────────────────────────────────────────────── │
+│ ↓  1  anthropic/${model}               → claude-sub                                no cred · billed fallback       - │
+│ >  2  anthropic_sub/${model}           → claude-sub                                no cred · billed fallback      ≥1 │
+│ │  3  anthropic_api/${model}           → claude-api                                off                             - │
+│ │  4  openrouter/${model}              → openrouter-messages                       ok                             41 │
+│ │  5  codex_sub/${model}               → codex                                     off · billed fallback           - │
+│ └─ else  default                       → claude-sub                                no cred · billed fallback      ≥3 │
+│ ┌─ openai_chat  5 rules · prefix · sends ${model} ────────────────────────────────────────────────────────────────── │
+│ │  1  openrouter/${model}              → openrouter-chat                           ok                              9 │
+│ │  2  openai_api/${model}              → openai-chat                               off                             - │
+│ │  3  codex_sub/${model}               → codex                                     off · billed fallback           - │
+│ │  4  anthropic_api/${model}           → claude-api                                off                             - │
+│ │  5  anthropic_sub/${model}           → claude-sub                                no cred · billed fallback       - │
+│ └─ else  default                       → openrouter-chat                           ok                              - │
+│ ┌─ openai_responses  4 rules · prefix · sends ${model} ───────────────────────────────────────────────────────────── │
+│ │  1  codex_sub/${model}               → codex                                     off · billed fallback          ≥2 │
+│ │  2  anthropic_api/${model}           → claude-api                                off                             - │
+│ │  3  anthropic_sub/${model}           → claude-sub                                no cred · billed fallback       - │
+│ │  4  openrouter/${model}              → openrouter-responses                      ok                              - │
+│ └─ else  no default                    → refused · no route                                                        - │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌TRACE─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ trace  claude/anthropic_messages · model anthropic_sub/claude-sonnet-5 · 6,883 tokens                                │
+│ goes to  openrouter.openrouter_messages as anthropic/claude-sonnet-5 · billed                                        │
+│ 1 presentations  ↓ fell past  no slug equals it                                                                      │
+│ 2 rewrites       > caught     rule 2 in anthropic_messages  anthropic_sub/${model} → claude-sub                      │
+│ 3 defaults       not reached                                                                                         │
+│ 4 route          claude-sub                                                                                          │
+│ 5 candidate 1    ↓ fell past  anthropic_sub.anthropic_messages  no cred                                              │
+│ 6 candidate 2    > serves     openrouter.openrouter_messages  billed  alias → anthropic/claude-sonnet-5              │
+│ 7 upgrade        none                                                                                                │
+│ 8 provider       on           openrouter                                                                             │
+│ [t] trace another   [enter] open link   [esc] close                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

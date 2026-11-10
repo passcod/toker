@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use super::data::{self, array, text};
 use super::editing::{Editing, What};
 use super::form::{Context, Form, Outcome, Purpose};
+use super::trace::{Picking, Subject, Trace};
 use super::{models_tab, routes, rules, template};
 use crate::tui::control::{Command, Reply, Response};
 
@@ -146,6 +147,8 @@ pub(super) enum Modal {
     Reactivate {
         revision_id: i64,
     },
+    /// Which request to trace.
+    Trace(Box<Picking>),
 }
 
 impl Modal {
@@ -158,6 +161,7 @@ impl Modal {
             Self::None => String::new(),
             Self::Form(form) => form.title().to_uppercase(),
             Self::Reactivate { .. } => "REACTIVATE REVISION".to_owned(),
+            Self::Trace(_) => "TRACE A REQUEST".to_owned(),
         }
     }
 }
@@ -195,6 +199,10 @@ pub(super) struct State {
     notice: Option<String>,
     /// The snapshot is out of date: a save found another revision live.
     refresh_wanted: bool,
+    /// The trace on show, over whichever tab is open.
+    trace: Option<Trace>,
+    /// The revision the invented request being filled in is traced under.
+    tracing_under: Option<i64>,
 }
 
 impl Default for State {
@@ -218,6 +226,8 @@ impl Default for State {
             saved: false,
             notice: None,
             refresh_wanted: false,
+            trace: None,
+            tracing_under: None,
         }
     }
 }
@@ -352,6 +362,11 @@ impl State {
         } else {
             None
         }
+    }
+
+    /// The trace on show.
+    pub(super) fn trace(&self) -> Option<&Trace> {
+        self.trace.as_ref()
     }
 
     pub(super) fn notice(&self) -> Option<&str> {
@@ -752,6 +767,23 @@ impl State {
                         _ => {}
                     }
                 }
+                match (command.name, &mut self.trace, &mut self.modal) {
+                    ("trace", Some(trace), _) => {
+                        trace.failed(format!("trace: {error}"));
+                        return;
+                    }
+                    ("recent", _, Modal::Trace(picking)) => {
+                        picking.receive(
+                            &Response {
+                                status: 0,
+                                body: Value::Null,
+                            },
+                            format!("recent requests: {error}"),
+                        );
+                        return;
+                    }
+                    _ => {}
+                }
                 self.error = Some(format!("{}: {error}", command.name));
             }
         }
@@ -763,7 +795,7 @@ impl State {
     fn settle(&mut self, name: &str) {
         match name {
             "snapshot" | "revisions" => self.loading = false,
-            "validate" | "preview" => {}
+            "validate" | "preview" | "trace" | "recent" => {}
             _ => self.in_flight = false,
         }
     }
@@ -785,6 +817,11 @@ impl State {
             ("preview", Some(editing)) => {
                 editing.replaying = false;
                 editing.replay_requested = None;
+            }
+            // A trace or a listing is not an edit: its own panel says it
+            // was not taken, and nothing else is waiting on it.
+            ("trace" | "recent", _) => {
+                self.error = Some(format!("{name}: routing command queue is busy"));
             }
             _ => {
                 self.in_flight = false;
@@ -811,6 +848,20 @@ impl State {
         }
         if matches!(command.name, "validate" | "preview") {
             self.receive_check(&command, &response);
+            return;
+        }
+        if command.name == "trace" {
+            if let Some(trace) = &mut self.trace {
+                let error = control_error(&command, &response);
+                trace.receive(&command, &response, error);
+            }
+            return;
+        }
+        if command.name == "recent" {
+            if let Modal::Trace(picking) = &mut self.modal {
+                let error = control_error(&command, &response);
+                picking.receive(&response, error);
+            }
             return;
         }
         if command.name == "save"
@@ -1051,12 +1102,18 @@ impl State {
                 self.open_promote();
                 None
             }
+            KeyCode::Char('t') => self.open_trace(None),
             KeyCode::Enter => {
-                self.open();
+                if !self.follow_trace() {
+                    self.open();
+                }
                 None
             }
+            // The trace closes before the page it is over does.
             KeyCode::Esc => {
-                self.close();
+                if self.trace.take().is_none() {
+                    self.close();
+                }
                 None
             }
             KeyCode::PageDown => {
@@ -1521,6 +1578,72 @@ impl State {
         ));
     }
 
+    /// Ask which request to trace, reading the recent ones to choose from.
+    fn open_trace(&mut self, under: Option<i64>) -> Option<Command> {
+        self.modal = Modal::Trace(Box::new(Picking::new(under)));
+        Some(Picking::command())
+    }
+
+    /// What the invented request's form starts from: the request the
+    /// selected record catches, where it catches one.
+    fn invented_start(&self) -> Value {
+        let mut start = json!({ "protocol": "anthropic_messages" });
+        let record = self
+            .active()
+            .and_then(|active| {
+                rules::entries(active, self.tab)
+                    .into_iter()
+                    .nth(self.selected_in(self.tab))
+            })
+            .map(|entry| entry.record().clone());
+        if let Some(record) = record {
+            if let Some(protocol) = record.get("protocol").filter(|value| value.is_string()) {
+                start["protocol"] = protocol.clone();
+            }
+            if let Some(profile) = record.get("profile").filter(|value| value.is_string()) {
+                start["profile"] = profile.clone();
+            }
+            let model = record
+                .get("example")
+                .and_then(|example| example.get("in"))
+                .or_else(|| record.get("slug"))
+                .filter(|value| value.is_string());
+            if let Some(model) = model {
+                start["model"] = model.clone();
+            }
+        }
+        start
+    }
+
+    /// With a trace on show, `enter` follows it to the record that caught the
+    /// request, in its own table; once there it opens the route as it does
+    /// without a trace. Returns whether it went anywhere.
+    fn follow_trace(&mut self) -> bool {
+        let Some(trace) = &self.trace else {
+            return false;
+        };
+        let Some(active) = self.active() else {
+            return false;
+        };
+        let Some((tab, at)) = trace.catch(active, self.active_revision_id) else {
+            return false;
+        };
+        if self.tab == tab && self.mode == Mode::Table && self.selected_in(tab) == at {
+            return false;
+        }
+        self.set_tab(tab);
+        self.selected[tab.index()] = at;
+        true
+    }
+
+    /// Start tracing, the answer to follow.
+    fn start_trace(&mut self, subject: Subject, under: Option<i64>) -> Option<Command> {
+        let trace = Trace::new(subject, under);
+        let command = trace.command();
+        self.trace = Some(trace);
+        Some(command)
+    }
+
     fn open_reactivate(&mut self) {
         let revision_id = self
             .revisions
@@ -1566,6 +1689,28 @@ impl State {
                     (Modal::Form(form), action)
                 }
             },
+            Modal::Trace(mut picking) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    picking.step(-1);
+                    (Modal::Trace(picking), ModalAction::None)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    picking.step(1);
+                    (Modal::Trace(picking), ModalAction::None)
+                }
+                KeyCode::Enter => {
+                    let under = picking.under;
+                    match picking.chosen() {
+                        Some(id) => (
+                            Modal::None,
+                            ModalAction::Trace(Subject::Recorded(id), under),
+                        ),
+                        None => (Modal::None, ModalAction::Invent(under)),
+                    }
+                }
+                KeyCode::Esc => return None,
+                _ => (Modal::Trace(picking), ModalAction::None),
+            },
             Modal::Reactivate { revision_id } => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => (
                     Modal::Reactivate { revision_id },
@@ -1581,6 +1726,21 @@ impl State {
             ModalAction::Edit(edits) => self.edit(edits),
             ModalAction::Reactivate { revision_id } => self.reactivate(revision_id),
             ModalAction::Promote { binding, model } => self.promote(&binding, &model),
+            ModalAction::Trace(subject, under) => {
+                // The form that asked for it is done with.
+                self.modal = Modal::None;
+                let under = under.or_else(|| self.tracing_under.take());
+                self.start_trace(subject, under)
+            }
+            ModalAction::Invent(under) => {
+                self.tracing_under = under;
+                self.modal = Modal::Form(Box::new(Form::new(
+                    Purpose::Trace,
+                    self.invented_start(),
+                    Context::default(),
+                )));
+                None
+            }
         }
     }
 
@@ -1641,8 +1801,17 @@ fn candidate_ids(route: &Value) -> Vec<String> {
 enum ModalAction {
     None,
     Edit(Vec<Value>),
-    Reactivate { revision_id: i64 },
-    Promote { binding: String, model: String },
+    Reactivate {
+        revision_id: i64,
+    },
+    Promote {
+        binding: String,
+        model: String,
+    },
+    /// Trace this request, under this revision where not the live one.
+    Trace(Subject, Option<i64>),
+    /// Ask for an invented request to trace.
+    Invent(Option<i64>),
 }
 
 fn command(
@@ -1673,9 +1842,29 @@ fn form_action(form: &Form) -> ModalAction {
             binding: text_of(value, "binding_id"),
             model: text_of(value, "model_id"),
         },
+        Purpose::Trace => ModalAction::Trace(Subject::Invented(invented(value)), None),
         // Records and candidates are edited in place, not by a small form.
         _ => ModalAction::None,
     }
+}
+
+/// The request a filled-in trace form describes: only what was said, so the
+/// resolver reads nothing the operator did not ask about.
+fn invented(form: &Value) -> Value {
+    let mut request = json!({ "kind": "invented", "protocol": text_of(form, "protocol") });
+    for key in ["profile", "model"] {
+        let said = text_of(form, key);
+        if !said.trim().is_empty() {
+            request[key] = json!(said.trim());
+        }
+    }
+    if let Some(tokens) = form.get("prompt_bound").and_then(Value::as_u64) {
+        request["prompt_bound"] = json!(tokens);
+    }
+    if form.get("asks_server_safeguards") == Some(&Value::Bool(true)) {
+        request["asks_server_safeguards"] = json!(true);
+    }
+    request
 }
 
 fn text_of(value: &Value, key: &str) -> String {

@@ -15,6 +15,9 @@ mod table;
 mod template;
 #[cfg(test)]
 mod testing;
+mod trace;
+#[cfg(test)]
+mod trace_tests;
 mod view;
 mod words;
 
@@ -52,7 +55,7 @@ fn activated(reply: &Reply) -> bool {
 pub(super) fn owns_key(code: crossterm::event::KeyCode) -> bool {
     matches!(
         code,
-        crossterm::event::KeyCode::Char('e' | 'n' | 'd' | 'm' | 'a' | 'p')
+        crossterm::event::KeyCode::Char('e' | 'n' | 'd' | 'm' | 'a' | 'p' | 't')
             | crossterm::event::KeyCode::Enter
             | crossterm::event::KeyCode::PageUp
             | crossterm::event::KeyCode::PageDown
@@ -125,7 +128,7 @@ impl Page {
     /// Whether `esc` has something of the page's own to close before it
     /// leaves the page: a route opened whole.
     pub(super) fn captures_esc(&self) -> bool {
-        self.state.mode() == model::Mode::Route
+        self.state.mode() == model::Mode::Route || self.state.trace().is_some()
     }
 
     /// Handle a key owned by the routing page.  Only this page owns its form
@@ -243,7 +246,7 @@ mod tests {
 
     #[test]
     fn every_key_the_legend_documents_reaches_the_page() {
-        for key in ['e', 'n', 'd', 'm', 'a', 'p'] {
+        for key in ['e', 'n', 'd', 'm', 'a', 'p', 't'] {
             assert!(owns_key(KeyCode::Char(key)), "{key}");
         }
         for key in [KeyCode::PageUp, KeyCode::PageDown] {

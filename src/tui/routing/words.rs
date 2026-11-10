@@ -389,3 +389,17 @@ pub(super) fn matched_by_phrase(counts: &Value) -> String {
         parts.join(" · ")
     }
 }
+
+/// A moment as the history and the recent requests write it: `Tue 10 Nov
+/// 14:41`, in the operator's time zone.
+pub(super) fn when(ms: i64) -> String {
+    let Ok(at) = jiff::Timestamp::from_millisecond(ms) else {
+        return "-".to_owned();
+    };
+    // A frame under test must not depend on where it is run.
+    #[cfg(test)]
+    let zone = jiff::tz::TimeZone::UTC;
+    #[cfg(not(test))]
+    let zone = jiff::tz::TimeZone::system();
+    at.to_zoned(zone).strftime("%a %d %b %H:%M").to_string()
+}

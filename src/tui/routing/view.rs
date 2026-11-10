@@ -84,7 +84,24 @@ pub(super) fn render(frame: &mut Frame, state: &State, overlay: bool) -> Drawn {
             (Tab::Models, _) if state.editing().is_some() => {
                 edit_page(frame, body, state, active, &mut drawn);
             }
-            (Tab::Models, _) => models_tab::render(frame, body, state, active),
+            (Tab::Models, _) => {
+                // A trace sits under the stack of panels, which gives up the
+                // room it takes.
+                let trace = state.trace().map(|trace| {
+                    trace.lines(snapshot, state.active_revision_id(), content_width(body))
+                });
+                match trace {
+                    Some(trace) => {
+                        let split =
+                            table::split(body, body.height.saturating_sub(2).into(), trace.len());
+                        models_tab::render(frame, split.table, state, active);
+                        if split.detail.height > 0 {
+                            table::draw_detail(frame, split.detail, "TRACE", split.chrome, trace);
+                        }
+                    }
+                    None => models_tab::render(frame, body, state, active),
+                }
+            }
             (Tab::History, _) => history_tab(frame, body, snapshot, state, &mut drawn),
             _ => lookup_tab(frame, body, snapshot, active, state, &mut drawn),
         },
@@ -223,7 +240,8 @@ fn lookup_tab(
             "DEFAULT",
         ),
         Tab::Routes => (
-            routes::routes_table(active, width),
+            // A trace marks the route it walked, which takes a gutter.
+            routes::routes_table(active, width - 2 * usize::from(state.trace().is_some())),
             array(active, "routes")
                 .get(selected)
                 .map(|route| routes::route_detail(snapshot, route))
@@ -233,6 +251,15 @@ fn lookup_tab(
         Tab::Models | Tab::History => unreachable!("drawn by their own tabs"),
     };
     let mut title = title;
+    let live = state.active_revision_id();
+    if let Some(trace) = state.trace() {
+        let marks = trace.marks(active, tab, live);
+        table::mark_rows(&mut table, &marks, tab == Tab::Routes);
+        if editing.is_none() {
+            detail = trace.lines(snapshot, live, width);
+            title = "TRACE";
+        }
+    }
     if let Some(editing) = editing {
         // The form opens under the row it belongs to, and the preview takes
         // the detail's place.
@@ -325,6 +352,17 @@ fn route_page(
         .collect();
     let Some(editing) = editing else {
         lines.extend(routes::route_rest(route).into_iter().map(BodyLine::plain));
+        if let Some(trace) = state.trace() {
+            let trace = trace.lines(snapshot, state.active_revision_id(), width);
+            let split = table::split(body, lines.len(), trace.len());
+            drawn.entries = split.table;
+            drawn.detail = split.detail;
+            table::draw_page(frame, split.table, "ROUTE", split.chrome, lines);
+            if split.detail.height > 0 {
+                table::draw_detail(frame, split.detail, "TRACE", split.chrome, trace);
+            }
+            return;
+        }
         let framing = Chrome::fitting(lines.len(), body.height);
         let area = Rect {
             height: (lines.len() as u16 + framing.cost()).min(body.height),
@@ -374,11 +412,16 @@ fn history_tab(frame: &mut Frame, body: Rect, snapshot: &Value, state: &State, d
     }
     let selected = state.selected_in(Tab::History);
     let table = history::table(snapshot, revisions, live, content_width(body));
-    let detail = history::detail(
+    let mut detail = history::detail(
         snapshot,
         &revisions[selected.min(revisions.len() - 1)],
         live,
     );
+    let mut detail_title = "REVISION";
+    if let Some(trace) = state.trace() {
+        detail = trace.lines(snapshot, live, content_width(body));
+        detail_title = "TRACE";
+    }
     let split = table::split(body, 1 + table.body.len(), detail.len());
     drawn.entries = split.table;
     drawn.detail = split.detail;
@@ -392,12 +435,12 @@ fn history_tab(frame: &mut Frame, body: Rect, snapshot: &Value, state: &State, d
     )
     .rows;
     if split.detail.height > 0 {
-        table::draw_detail(frame, split.detail, "REVISION", split.chrome, detail);
+        table::draw_detail(frame, split.detail, detail_title, split.chrome, detail);
     }
 }
 
 /// The page's keys, in its `?` overlay.
-const KEYS: [(&str, &str); 14] = [
+const KEYS: [(&str, &str); 15] = [
     ("↑/↓ j/k", "select a record, or a candidate on a route"),
     ("←/→ h/l 1–6", "switch tab; ←/→ also step between routes"),
     ("enter", "open the route a record sends to"),
@@ -409,6 +452,7 @@ const KEYS: [(&str, &str); 14] = [
     ("d", "remove the selected record, or candidate"),
     ("a", "reactivate the selected revision"),
     ("p", "promote"),
+    ("t", "trace a request, invented or a recent one"),
     ("r", "refresh"),
     ("click", "select a record, or focus a form field"),
     ("q", "quit"),
@@ -544,6 +588,15 @@ fn modal_lines(modal: &Modal) -> Vec<String> {
         Modal::None => Vec::new(),
         // A form draws itself.
         Modal::Form(_) => Vec::new(),
+        Modal::Trace(picking) => {
+            let mut lines = picking.text();
+            lines.push(chrome::hints(&[
+                ("↑/↓", "choose"),
+                ("enter", "trace"),
+                ("esc", "cancel"),
+            ]));
+            lines
+        }
         Modal::Reactivate { revision_id } => vec![
             format!("Create a forward revision from revision {revision_id}?"),
             "The active pointer never moves backwards.".to_owned(),
