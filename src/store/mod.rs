@@ -6188,7 +6188,10 @@ mod tests {
         let counts = store.routing_hit_counts(now).unwrap();
         assert_eq!(counts.coverage, super::HitCoverage::NotRecorded);
         assert_eq!(counts.unrecorded_requests, 1);
-        assert!(counts.rewrites.is_empty(), "never inferred for old rows");
+        // The row names the rewrite that caught it, so it is counted; the
+        // default and the scope it matched in are what such a row lacks.
+        assert_eq!(counts.rewrites.get(&rewrite("sonnet")), Some(&1));
+        assert!(counts.defaults.is_empty(), "never inferred for old rows");
 
         // Requests after it, under two revisions: counted by the record's
         // identifier across both, and the older row makes it a floor.
@@ -6250,7 +6253,7 @@ mod tests {
         assert_eq!(counts.coverage, super::HitCoverage::Floor);
         assert_eq!(counts.recorded_requests, 5);
         assert_eq!(counts.unrecorded_requests, 1);
-        assert_eq!(counts.rewrites.get(&rewrite("sonnet")), Some(&2));
+        assert_eq!(counts.rewrites.get(&rewrite("sonnet")), Some(&3));
         assert_eq!(
             counts
                 .presentations
