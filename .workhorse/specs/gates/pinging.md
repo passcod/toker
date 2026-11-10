@@ -27,6 +27,44 @@ The service MUST bring the marker in line when it starts, whenever a provider is
 
 Every requirement below is about such a provider's windows.
 
+## The schedule
+
+The schedule is a list of slots, each a time of day on the local clock with the days of the week it runs on.
+
+Each slot MUST name at least one day.
+Two slots MUST NOT share a time of day.
+
+At each slot, Toker MUST hold the machine awake long enough for that slot's ping to fire, and MUST send the ping a few minutes after the slot.
+A ping carried past midnight by that delay MUST run on the day after each of its slot's days.
+
+> [!NOTE]
+> A machine just woken needs a moment for its network to settle, and one left to itself would doze off again before the ping.
+
+A slot MUST be refused where its ping would fall within five hours of another slot's ping on a day both run, or across the midnight between two days they run.
+
+> [!NOTE]
+> The later ping would always find its account's window already open, and be skipped as [sending a ping](#sending-a-ping) requires.
+
+The schedule MUST NOT be turned on while it has no slots.
+
+### Waking the machine
+
+The schedule is in one of three positions: off, pinging while the machine is awake, or waking the machine from suspend at each slot to ping.
+The machine MUST be woken only in the third.
+
+> [!NOTE]
+> A ping schedule is useful on a machine that is up anyway, and on one that sleeps, but a wake with no ping behind it only spends battery.
+
+### Where the schedule is kept
+
+The installed timer units MUST be the record of the slots, their days, and whether the machine is woken, and the store MUST NOT hold a copy of any of them.
+
+> [!NOTE]
+> The units are what fires, so a copy kept beside them is a second answer that can disagree, and the service is sandboxed away from the units it would need to repair one.
+
+Waking the machine needs the system manager, so placing the wake, changing its slots or days, and removing it MUST ask the platform for elevation.
+Turning the schedule on or off, and editing its slots while the machine is not woken, MUST NOT.
+
 ## Where a boundary falls
 
 A five-hour window's reset falls at the fire time of the request that opened it, floored to a ten-minute grid, plus five hours.

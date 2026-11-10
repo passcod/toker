@@ -1,0 +1,212 @@
+<!-- spec: tui/dashboard.md -->
+<!-- spec: gates/pinging.md -->
+<!DOCTYPE html>
+<html lang="en-NZ">
+<head>
+<meta charset="utf-8">
+<title>Schedule page</title>
+<style>
+  /* Ghostty's stock palette, the reference ground toker is developed
+     against. The TUI sets no RGB anywhere: it names the ANSI sixteen, so
+     these are the reference theme's answer, not values from the code. */
+  :root {
+    --bg: #282c34;  /* background      */  --fg: #ffffff;  /* foreground   */
+    --c0: #1d1f21;  /* black           */  --c8: #666666;  /* dark gray    */
+    --c1: #cc6666;  /* red             */  --c9: #d54e53;  /* bright red   */
+    --c2: #b5bd68;  /* green           */  --c10:#b9ca4a;  /* bright green */
+    --c3: #f0c674;  /* yellow          */  --c11:#e7c547;  /* bright yellow*/
+    --c4: #81a2be;  /* blue            */  --c12:#7aa6da;  /* bright blue  */
+    --c5: #b294bb;  /* magenta         */  --c13:#c397d8;  /* bright mag.  */
+    --c6: #8abeb7;  /* cyan            */  --c14:#70c0b1;  /* bright cyan  */
+    --c7: #c5c8c6;  /* white           */  --c15:#eaeaea;  /* bright white */
+  }
+
+  body {
+    background: #14161a;
+    color: var(--c7);
+    font-family: system-ui, sans-serif;
+    margin: 0;
+    padding: 2rem;
+  }
+
+  /* One terminal frame. The frame takes its width from its own longest
+     row, so every row must advance the same number of cells or the grid
+     tears and the panel borders stop lining up with the content.
+
+     Term, never plain Iosevka. The default Iosevka family leaves the
+     characters Unicode calls ambiguous or wide at their natural width,
+     so the glyphs the TUI actually emits here -- the proportion bar's
+     mark, the four arrows and the em dash -- each advance two cells
+     instead of one. That tore the dashboard's cache-read row out to 187
+     cells against its neighbours' 120. Iosevka Term and Iosevka Fixed
+     force every glyph to a single cell; the generic fallbacks below are
+     strictly monospaced and behave.
+
+     All three Iosevka families set post.isFixedPitch, so the font
+     declares itself monospace whichever one is picked, and counting
+     characters cannot tell them apart. Only measuring the rendered
+     advance does. */
+  .frame {
+    font-family: "Iosevka Term", "Iosevka Fixed", "DejaVu Sans Mono", monospace;
+    font-size: 15px;
+    line-height: 1.2;
+    background: var(--bg);
+    color: var(--fg);
+    padding: 0.6rem 1rem;
+    margin: 0 0 0.5rem;
+    white-space: pre;
+    overflow-x: auto;
+    width: max-content;
+    /* The terminal runs Iosevka with calt on, but every arrow and
+       comparison the TUI emits is a precomposed character rather than an
+       ASCII sequence, so there is nothing here for a ligature to join.
+       Off, because a browser ligature need not stay cell-aligned and the
+       grid matters more than a feature nothing triggers. */
+    font-variant-ligatures: none;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Foreground colours. Each sets --now as well, so .r can swap them. */
+  .black   { color: var(--c0); --now: var(--c0); }
+  .red     { color: var(--c1); --now: var(--c1); }
+  .green   { color: var(--c2); --now: var(--c2); }
+  .yellow  { color: var(--c3); --now: var(--c3); }
+  .blue    { color: var(--c4); --now: var(--c4); }
+  .cyan    { color: var(--c6); --now: var(--c6); }
+  .gray    { color: var(--c8); --now: var(--c8); }
+
+  /* Modifiers. Compose them: class="green b", class="cyan d". */
+
+  /* BOLD is the emphasis channel, since colour is not. It keeps its
+     colour: the reference terminal leaves bold-color unset, so bold does
+     not remap onto the bright palette. */
+  .b { font-weight: 700; }
+
+  /* DIM at exactly the terminal's faint-opacity, so it keeps the colour
+     underneath rather than flattening to grey. A dim green mark is still
+     a green mark. */
+  .d { opacity: 0.5; }
+
+  /* REVERSED swaps foreground and background. --now carries whatever
+     colour class came before; plain text falls back to the foreground. */
+  .r { color: var(--bg); background-color: var(--now, var(--fg)); }
+
+  /* The one explicit pair in the TUI: an armed burn control. */
+  .on-yellow { color: var(--c0); background-color: var(--c3); }
+
+  /* A key rather than a screen, so its rows are deliberately ragged.
+     Anything claiming to be a frame has rows of equal width. */
+  .swatch { width: auto; }
+
+  /* Annotation outside the frame. Never inside it: a terminal has no
+     room for a note, and a mockup that puts one there is not a frame. */
+  .note {
+    font-size: 0.85rem;
+    color: #8b8f96;
+    margin: 0 0 1.5rem;
+    max-width: 70ch;
+    line-height: 1.5;
+  }
+  .note strong { color: var(--c7); font-weight: 600; }
+  h1 { font-size: 1.1rem; font-weight: 600; color: var(--fg); margin: 0 0 0.25rem; }
+  h2 { font-size: 0.95rem; font-weight: 600; color: var(--c7); margin: 2rem 0 0.5rem; }
+</style>
+<body>
+<h1>Schedule page</h1>
+<h2>At rest, waking the machine</h2>
+<pre class="frame"><span class="gray r"> ? </span>  <span class="gray">dashboard</span>   <span class="gray">routing</span>   <span class="blue r">config</span>   <span class="gray">accounts</span>   1 providers 5 · 2 settings · <span class="b r">3 schedule</span>                    2 providers on
+┌SCHEDULE──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│   setting               value                                                                                        │
+│ ┌─ schedule ───────────────────────────────────────────────────────────────────────────────────────────────────────  │
+│ │ position              <span class="b">wake then ping</span>   <span class="d">off · while awake · </span>wake then ping                                          │
+│ ┌─ slots  3 ───────────────────────────────────────────────────────────────────────────────────────────────────────  │
+│   slot   days       ping   last run         account                   did       boundary                             │
+│ │ 07:20  Mon–Fri    07:31  today 07:31      alex@example.org          sent      <span class="green">matched</span> 12:30                        │
+│ │                          today 07:32      sam@example.net           skipped   <span class="green">matched</span> 12:00                        │
+│ │ 12:20  Mon–Fri    12:31  yesterday 12:31  alex@example.org          sent      <span class="yellow">missed</span> 17:30 → 17:40                 │
+│ │                          yesterday 12:31  sam@example.net           <span class="red">failed</span>    <span class="d">-</span>                                    │
+│ │ 09:40  Sat Sun    09:51  <span class="d">never run</span>                                                                                 │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</pre>
+<p class="note">
+  The schedule page is the third configuration tab. <strong>space</strong> moves the position through
+  off, while awake and wake then ping. Moving into or out of wake then ping hands the terminal to the
+  platform's elevation prompt and takes it back afterwards. A refusal leaves the position as it was and
+  is reported in the header's error line. Each slot lists its newest run for every account it pinged.
+  A missed boundary shows the predicted boundary and then the one the ledger reported.
+</p>
+<h2>Waking with nothing to ping, and a refused slot</h2>
+<pre class="frame"><span class="gray r"> ? </span>  <span class="gray">dashboard</span>   <span class="gray">routing</span>   <span class="blue r">config</span>   <span class="gray">accounts</span>   1 providers 5 · 2 settings · <span class="b r">3 schedule</span>                    2 providers on
+┌SCHEDULE──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│   setting               value                                                                                        │
+│ ┌─ schedule ───────────────────────────────────────────────────────────────────────────────────────────────────────  │
+│ │ position              <span class="b">wake then ping</span>   <span class="yellow">wakes with nothing to ping: anthropic_sub is off</span>   <span class="b">x</span> stop waking            │
+│ ┌─ slots  3 ───────────────────────────────────────────────────────────────────────────────────────────────────────  │
+│   slot   days       ping   last run         account                   did       boundary                             │
+│ │ 07:20  Mon–Fri    07:31  today 07:31      alex@example.org          sent      <span class="green">matched</span> 12:30                        │
+│ │ 12:20  Mon–Fri    12:31  yesterday 12:31  alex@example.org          sent      <span class="green">matched</span> 17:30                        │
+│ │ 09:40  Sat Sun    09:51  <span class="d">never run</span>                                                                                 │
+│ │ <span class="r">15:00</span>  Mon–Fri    15:11  <span class="red">within 5 h of 12:20's ping at 12:31, so it would always be skipped</span>                        │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</pre>
+<p class="note">
+  The Anthropic subscription was turned off on the providers page while the machine was set to wake,
+  so the marker dropped and the wake still fires. The position row flags it and offers
+  <strong>x</strong> to stop waking, which asks for elevation. Below it, a slot being added is refused
+  beside itself and cannot be saved, because its ping lands inside the window the 12:20 ping opens.
+</p>
+</body>
+</html>
