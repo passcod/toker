@@ -18,6 +18,15 @@ The supervisor MUST NOT retry that refusal.
 
 A stored setting Toker cannot use MUST NOT prevent it from starting, as [DCONF](config.md#configuration-never-refuses-a-start) requires.
 
+## Keeping to its store
+
+The service MUST stop once the store path no longer names the file it opened, so that its supervisor starts an instance on the file that is there.
+It MUST check before each write a control operation makes, and regularly while it serves.
+A control write it refuses for this reason MUST answer that the store was replaced, and MUST NOT be applied.
+
+> [!NOTE]
+> Deleting the state dir under a running service otherwise sends every later write into a file nothing can read again, while the dashboard shows each edit as saved.
+
 ## Binding
 
 Toker MUST bind loopback only.

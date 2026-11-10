@@ -275,6 +275,11 @@ A recent request that cannot be replayed MUST be shown as such rather than trace
 A record MUST be edited in place, in the table that shows it, as a form of fields.
 A record MUST be able to be added by the same form, in the table that will show it, and to be removed.
 A rewrite MUST be able to be moved earlier or later within its scope, and a route's candidates added, removed and reordered.
+A record MUST be able to be duplicated, opening the add form filled from it, with a fresh identifier and, for a rewrite, the next free priority in its scope.
+
+A field naming another record MUST offer the records it can name as a list to pick from, each with enough to tell them apart, and MUST also accept typing.
+Choosing the route a reference sends to MUST fill in one argument for each parameter that route declares, leaving only each value to choose.
+A form MUST NOT ask for an identifier the page does not show, and MUST generate one instead.
 
 Each field MUST be checked as it changes, against the same compilation an activation runs.
 A field that is refused MUST say beside itself why, and how to make it acceptable.
