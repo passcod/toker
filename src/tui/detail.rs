@@ -24,7 +24,7 @@ use crate::catalog::windows::ContextWindow;
 use crate::ir::Release;
 use crate::middleware::quota::{Meters, grant_ahead};
 use crate::release::GATED_BACKEND;
-use crate::store::{Allowance, RequestRow, SessionSummary, Store};
+use crate::store::{Allowance, InFlightStage, RequestRow, SessionSummary, Store};
 
 /// One session's detail, as of its last read.
 #[derive(Debug, Clone, PartialEq)]
@@ -207,6 +207,32 @@ pub(crate) fn availability(
     }
 }
 
+/// The stage a request in flight is at, as the idle column says it.
+fn stage_name(stage: InFlightStage) -> &'static str {
+    match stage {
+        InFlightStage::Held => "held",
+        InFlightStage::Waiting => "sent",
+        InFlightStage::Streaming => "recv",
+    }
+}
+
+/// `first`, `second`, and on, for a zero-based attempt index.
+fn ordinal(index: i64) -> String {
+    const NAMES: [&str; 5] = ["first", "second", "third", "fourth", "fifth"];
+    usize::try_from(index)
+        .ok()
+        .and_then(|index| NAMES.get(index))
+        .map_or_else(|| format!("#{}", index + 1), |name| (*name).to_owned())
+}
+
+/// Whether the binding bills per token, as against a subscription.
+fn bills(binding_id: &str) -> bool {
+    crate::routing::BACKEND_BINDINGS
+        .iter()
+        .find(|binding| binding.id_str() == binding_id)
+        .is_some_and(|binding| binding.cost_class() == crate::policy::CostClass::Billed)
+}
+
 /// The popup's content above the controls: who the session is, which
 /// models it asked for and got, its context, its activity, and its gate.
 /// Anything the store does not know is said to be unknown, never zero.
@@ -384,6 +410,43 @@ pub(crate) fn lines(
         }
         Some(_) => out.push(field("session", vec![Span::styled("no measurements", dim)])),
         None => out.push(field("session", vec![Span::styled("unknown", dim)])),
+    }
+
+    // Each request in flight: how far it has got and for how long, then
+    // where its current attempt went.
+    if let Some(agg) = &detail.agg {
+        let live: Vec<[String; 2]> = agg
+            .in_flight
+            .iter()
+            .map(|request| {
+                [
+                    format!(
+                        "{} {}",
+                        stage_name(request.stage),
+                        super::view::in_flight_age(now_ms - request.started_ms)
+                    ),
+                    request.provider.clone().unwrap_or_default(),
+                ]
+            })
+            .collect();
+        let widths = [0, 1].map(|i| live.iter().map(|cells| cells[i].len()).max().unwrap_or(0));
+        for (index, (request, cells)) in agg.in_flight.iter().zip(&live).enumerate() {
+            let mut spans = vec![Span::raw(format!("{:<w$}", cells[0], w = widths[0]))];
+            if request.provider.is_some() {
+                spans.push(Span::raw(format!("  {:<w$}", cells[1], w = widths[1])));
+            }
+            if let Some(model) = &request.effective_model {
+                spans.push(Span::raw(format!("  {model}")));
+            }
+            if let Some(attempt) = request.attempt_index {
+                let mut said = format!("  {} attempt", ordinal(attempt.get()));
+                if request.binding_id.as_deref().is_some_and(bills) {
+                    said.push_str(", billed");
+                }
+                spans.push(Span::styled(said, dim));
+            }
+            out.push(field(if index == 0 { "live" } else { "" }, spans));
+        }
     }
 
     // The gate: armed or not, the meters it reads, and what this

@@ -60,6 +60,7 @@ use super::rebuilds::REBUILD_MIN;
 use crate::catalog::windows::ContextWindow;
 use crate::ir::Release;
 use crate::middleware::cold::Verdict;
+use crate::store::InFlightStage;
 
 /// The most lines SPEND claims beside CACHE REBUILDS: the total line,
 /// the never-dropped "no cost data" line, and a few breakdown lines;
@@ -470,7 +471,7 @@ pub(crate) fn render(
 }
 
 /// The legend's rows: a glyph or marker, and what it means.
-const LEGEND: [(&str, &str); 21] = [
+const LEGEND: [(&str, &str); 25] = [
     (
         "↑",
         "served on a newer model: bright on the latest turn, dim earlier",
@@ -484,6 +485,11 @@ const LEGEND: [(&str, &str); 21] = [
         "!",
         "stopped: the last thing this session got was a gate notice",
     ),
+    (
+        "✗",
+        "failed: this session's newest finished request ended in failure",
+    ),
+    ("~", "routed to this model, none served yet"),
     ("↺", "compactions so far; - for none"),
     ("-", "not reported, which is not zero"),
     ("?", "unknown: model, context ceiling, or token count"),
@@ -513,6 +519,11 @@ const LEGEND: [(&str, &str); 21] = [
     ("last req", "green under 30s, yellow under 5m, red beyond"),
     ("ctx", "green: native 1M; yellow: another known ceiling"),
     ("idle", "dim once a session has been quiet 3m"),
+    (
+        "held sent recv",
+        "in flight: not yet sent, awaiting a reply, or streaming; timed from arrival",
+    ),
+    ("+N", "N more requests in flight in that session"),
 ];
 
 /// The dashboard's keys, under its marks in the same overlay: with no
@@ -1092,7 +1103,7 @@ fn session_cells(session: &SessionAgg, now_ms: i64, fmt: &Fmt) -> [Line<'static>
     let idle = now_ms - session.latest_ts_ms >= IDLE_SECS * 1_000;
     let last = rel_age(now_ms - session.latest_ts_ms);
     Col::ALL.map(|col| match col {
-        Col::Ctx => ctx_cell(session.ctx),
+        Col::Ctx => ctx_cell(session.ctx, session.model_unserved),
         Col::Model => model_cell(session),
         Col::Reqs => Line::raw(session.requests.to_string()),
         Col::PromptNow => Line::raw(unknown_or_grouped(fmt, session.input_now)),
@@ -1111,13 +1122,18 @@ fn session_cells(session: &SessionAgg, now_ms: i64, fmt: &Fmt) -> [Line<'static>
             None => Line::styled("-", Style::new().dim()),
         },
         Col::Out => Line::raw(unknown_or_grouped(fmt, session.output_total)),
-        Col::Idle => {
-            if idle {
-                Line::styled(last.clone(), Style::new().dim())
-            } else {
-                Line::raw(last.clone())
-            }
-        }
+        // A request in flight takes the place of the idle age: how far it
+        // has got and how long it has been going, the longest first, and
+        // how many more there are.
+        Col::Idle => match session.in_flight.first() {
+            Some(request) => Line::raw(in_flight_cell(
+                request.stage,
+                now_ms - request.started_ms,
+                session.in_flight.len() - 1,
+            )),
+            None if idle => Line::styled(last.clone(), Style::new().dim()),
+            None => Line::raw(last.clone()),
+        },
     })
 }
 
@@ -1178,11 +1194,39 @@ fn session_cell(session: &SessionAgg, width: u16) -> Cell<'static> {
     Cell::new(short_id(&session.session))
 }
 
+/// The idle column's cell for a session with a request in flight: `held`,
+/// `sent` or `recv` for how far the longest-running one has got, its age,
+/// and `+N` for the others.
+fn in_flight_cell(stage: InFlightStage, age_ms: i64, more: usize) -> String {
+    let stage = match stage {
+        InFlightStage::Held => "held",
+        InFlightStage::Waiting => "sent",
+        InFlightStage::Streaming => "recv",
+    };
+    let mut cell = format!("{stage} {}", in_flight_age(age_ms));
+    if more > 0 {
+        cell.push_str(&format!(" +{more}"));
+    }
+    cell
+}
+
+/// How long a request has been in flight: seconds up to a minute, where
+/// [`rel_age`] would say `now` for the first ten of them.
+pub(super) fn in_flight_age(age_ms: i64) -> String {
+    let secs = age_ms.max(0) / 1_000;
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        rel_age(age_ms)
+    }
+}
+
 /// The CTX cell: `1M`/`200k`/`872k` for a known ceiling, a dim `?` for
 /// none — green and bright for a native exact 1M, yellow otherwise
-/// (the reference's context colouring).
-fn ctx_cell(ctx: ContextWindow) -> Line<'static> {
-    match ctx {
+/// (the reference's context colouring). Dim throughout where the ceiling
+/// is of a model no response has yet confirmed.
+fn ctx_cell(ctx: ContextWindow, unserved: bool) -> Line<'static> {
+    let line = match ctx {
         ContextWindow::Unknown => Line::styled("?", Style::new().dim()),
         ContextWindow::Exact { tokens } if tokens >= 1_000_000 => Line::styled(
             short_tokens(tokens),
@@ -1191,16 +1235,22 @@ fn ctx_cell(ctx: ContextWindow) -> Line<'static> {
         ContextWindow::Exact { tokens } | ContextWindow::Declared { tokens } => {
             Line::styled(short_tokens(tokens), Style::new().fg(Color::Yellow))
         }
-    }
+    };
+    if unserved { line.dim() } else { line }
 }
 
-/// The MODEL cell with its `↑`/`$`/`%`/`!` markers, coloured per marker. The
-/// `claude-` prefix goes: every anthropic model carries it, so it
-/// distinguishes nothing and costs seven cells a row.
+/// The MODEL cell with its `↑`/`$`/`%`/`!`/`✗` markers, coloured per marker.
+/// The `claude-` prefix goes: every anthropic model carries it, so it
+/// distinguishes nothing and costs seven cells a row. A model no response
+/// has confirmed yet, only routed to, is dim with a `~` before it.
 fn model_cell(session: &SessionAgg) -> Line<'static> {
     let model = session.model.as_deref().unwrap_or("?");
-    let model = model.strip_prefix("claude-").unwrap_or(model).to_owned();
-    let mut line = vec![Span::raw(model)];
+    let model = model.strip_prefix("claude-").unwrap_or(model);
+    let mut line = vec![if session.model_unserved {
+        Span::styled(format!("~{model}"), Style::new().dim())
+    } else {
+        Span::raw(model.to_owned())
+    }];
     if session.forced_any {
         let style = if session.forced_latest {
             Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
@@ -1219,6 +1269,9 @@ fn model_cell(session: &SessionAgg) -> Line<'static> {
             " !",
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
+    }
+    if session.failed {
+        line.push(Span::styled(" ✗", Style::new().fg(Color::Red)));
     }
     Line::from(line)
 }
