@@ -1712,8 +1712,11 @@ impl State {
     /// one that loses nothing goes at once.
     fn move_lanes(&mut self, armed: Option<Armed>) -> Option<Command> {
         let live = self.active_revision_id?;
-        if armed.is_some() {
-            return self.widen(live, true);
+        // The consent was given for the lanes of the revision that was
+        // named, so that is the one it is sent against: a revision that went
+        // live since is refused as stale rather than moved onto unseen.
+        if let Some(armed) = armed {
+            return self.widen(armed.revision, true);
         }
         let snapshot = self.snapshot.as_ref()?;
         let activation = snapshot.get("activation").unwrap_or(&Value::Null);

@@ -244,6 +244,22 @@ fn a_second_m_moves_the_lanes_with_the_consent_it_asked_for() {
 }
 
 #[test]
+fn a_confirmation_is_for_the_revision_it_named_not_one_that_went_live_since() {
+    let mut state = after_a_save();
+    key(&mut state, 'm');
+    // A refresh lands between the two presses with another revision live.
+    let mut snapshot = testing::snapshot(World::SAVED);
+    snapshot["active_revision"]["revision_id"] = json!(11);
+    reply(&mut state, "snapshot", 200, snapshot);
+    let command = key(&mut state, 'm').expect("confirmed");
+    assert_eq!(
+        command.body.unwrap()["expected_revision_id"],
+        10,
+        "consent was given for rev 10's lanes, so rev 11 is refused as stale"
+    );
+}
+
+#[test]
 fn esc_or_any_other_key_cancels_the_arming_and_sends_nothing() {
     let mut state = after_a_save();
     key(&mut state, 'm');
