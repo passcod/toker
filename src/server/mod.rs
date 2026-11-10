@@ -2346,43 +2346,68 @@ fn require_cache_consent(
     Ok(())
 }
 
+/// A preview's result: where a request would go and how the resolver got
+/// there, in stable names a terminal can read without parsing Rust's `Debug`.
+///
+/// The cost is read from the same availability the resolver was given, so a
+/// binding whose cost is not known says so rather than reading as unbilled.
 fn preview_result_body(
     result: Result<crate::policy::AttemptPlan, crate::policy::ResolveFailure>,
     availability: &AvailabilitySnapshot,
 ) -> serde_json::Value {
+    let trace = |events: Vec<crate::policy::TraceEvent>| -> Vec<serde_json::Value> {
+        events
+            .into_iter()
+            .map(|event| preview_trace_event(event, availability))
+            .collect()
+    };
     match result {
-        Ok(plan) => serde_json::json!({
-            "outcome": "selected",
-            "policy_revision": plan.policy_revision,
-            "route_id": plan.route_id,
-            "route_fingerprint": plan.route_fingerprint.map(|value| value.to_string()),
-            "provenance": format!("{:?}", plan.provenance),
-            "candidate_id": plan.candidate_id,
-            "binding_id": plan.binding_id,
-            "baseline_model": plan.baseline_model,
-            "upgraded_model": plan.upgraded_model,
-            "effective_model": plan.effective_model,
-            "cache_transition": plan.cache_transition.map(|value| format!("{:?}", value)),
-            "server_safeguards": {
-                "asked": plan.safeguards.asked,
-                "effective": plan.safeguards.effective.map(crate::routing::CapabilityEvidence::as_str),
-                "marked": plan.safeguards.marked,
-                "skipped_candidate": plan.safeguards.skipped_candidate,
-                "walked_again": plan.safeguards.walked_again,
-            },
-            "trace": plan.trace.into_iter().map(|event| preview_trace_event(event, availability)).collect::<Vec<_>>(),
-        }),
+        Ok(plan) => {
+            let (cost, billed) = match availability
+                .get(&plan.binding_id)
+                .map(|live| live.cost_class)
+            {
+                Some(crate::policy::CostClass::Billed) => ("billed", Some(true)),
+                Some(crate::policy::CostClass::Subscription) => ("subscription", Some(false)),
+                _ => ("unknown", None),
+            };
+            serde_json::json!({
+                "outcome": "selected",
+                "policy_revision": plan.policy_revision,
+                "route_id": plan.route_id,
+                "route_fingerprint": plan.route_fingerprint.map(|value| value.to_string()),
+                "provenance": routing_ops::provenance_body(&plan.provenance),
+                "candidate_id": plan.candidate_id,
+                "binding_id": plan.binding_id,
+                "provider": plan.provider,
+                "cost": cost,
+                "billed": billed,
+                "baseline_model": plan.baseline_model,
+                "upgraded_model": plan.upgraded_model,
+                "aliased_model": plan.aliased_model,
+                "effective_model": plan.effective_model,
+                "cache_transition": plan.cache_transition.map(|value| format!("{:?}", value)),
+                "server_safeguards": {
+                    "asked": plan.safeguards.asked,
+                    "effective": plan.safeguards.effective.map(crate::routing::CapabilityEvidence::as_str),
+                    "marked": plan.safeguards.marked,
+                    "skipped_candidate": plan.safeguards.skipped_candidate,
+                    "walked_again": plan.safeguards.walked_again,
+                },
+                "trace": trace(plan.trace),
+            })
+        }
         Err(crate::policy::ResolveFailure::RouteUnavailable {
             route_id,
             route_fingerprint,
             provenance,
-            trace,
+            trace: events,
         }) => serde_json::json!({
             "outcome": "unavailable",
             "route_id": route_id,
             "route_fingerprint": route_fingerprint.to_string(),
-            "provenance": format!("{:?}", provenance),
-            "trace": trace.into_iter().map(|event| preview_trace_event(event, availability)).collect::<Vec<_>>(),
+            "provenance": routing_ops::provenance_body(&provenance),
+            "trace": trace(events),
         }),
         Err(error) => serde_json::json!({
             "outcome": "unresolved",
@@ -2391,6 +2416,8 @@ fn preview_result_body(
     }
 }
 
+/// One step of the resolver's walk. A candidate that was passed over says
+/// why by the code the reach uses; one that was not has `skipped` null.
 fn preview_trace_event(
     event: crate::policy::TraceEvent,
     availability: &AvailabilitySnapshot,
@@ -2398,7 +2425,7 @@ fn preview_trace_event(
     match event {
         crate::policy::TraceEvent::Lookup(provenance) => serde_json::json!({
             "kind": "lookup",
-            "provenance": format!("{:?}", provenance),
+            "provenance": routing_ops::provenance_body(&provenance),
         }),
         crate::policy::TraceEvent::Candidate(candidate) => serde_json::json!({
             "kind": "candidate",
@@ -2408,8 +2435,11 @@ fn preview_trace_event(
                 .get(&candidate.binding_id)
                 .map(|live| live.capabilities.server_safeguards.as_str()),
             "binding_id": candidate.binding_id,
+            "provider": availability
+                .get(&candidate.binding_id)
+                .map(|live| live.provider.as_str()),
             "model": candidate.model,
-            "result": candidate.result.map_err(|reason| format!("{:?}", reason)),
+            "skipped": candidate.result.err().map(|reason| reason.code()),
         }),
         crate::policy::TraceEvent::Upgrade { from, to } => serde_json::json!({
             "kind": "upgrade",

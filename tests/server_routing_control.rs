@@ -573,7 +573,23 @@ async fn preview_resolves_against_the_live_revision_an_unsaved_edit_or_a_kept_re
     assert!(!active.to_string().contains("never accepted"));
     let active_route = active["result"]["route_id"].clone();
     assert!(active_route.is_string(), "{active}");
-    assert!(active["result"]["matched"].is_object() || active["result"]["provenance"].is_string());
+    // What caught the request is named in stable words, not Debug output, and
+    // each candidate the walk passed says why by the reach's own codes.
+    assert!(
+        active["result"]["provenance"]["kind"].is_string(),
+        "{active}"
+    );
+    assert!(active["result"]["provider"].is_string(), "{active}");
+    assert!(active["result"]["cost"].is_string(), "{active}");
+    let steps = active["result"]["trace"].as_array().unwrap();
+    assert_eq!(steps[0]["kind"], "lookup");
+    assert!(steps[0]["provenance"]["kind"].is_string());
+    let candidate = steps
+        .iter()
+        .find(|step| step["kind"] == "candidate")
+        .unwrap();
+    assert!(candidate["binding_id"].is_string());
+    assert!(candidate["skipped"].is_null(), "{candidate}");
 
     // An unsaved edit, which changes where the request goes and nothing live.
     let (status, edited) = post(
