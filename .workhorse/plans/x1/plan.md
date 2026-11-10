@@ -97,8 +97,8 @@ The README's routing paragraph describes the draft, validate and activate flow, 
 ### Routing page
 
 - [x] `tui/routing/model.rs`: tabs presentations, rewrites, defaults, routes, models, history, each with its count; lookup tabs drawn as a sequence with arrows, set apart from models and history by `·`; open on the first tab holding a refused reach.
-- [ ] Remove the draft from the TUI's state: `generation`, `conflicted_edits` and the Conflict modal become the save's moved-revision handling, keeping the form as entered and naming the live revision.
-- [ ] Remove `import.rs`, `Modal::Import`, the `i` key and `State.legacy_policy`.
+- [x] Remove the draft from the TUI's state: `generation`, `conflicted_edits` and the Conflict modal become the save's moved-revision handling, keeping the form as entered and naming the live revision.
+- [x] Remove `import.rs`, `Modal::Import`, the `i` key and `State.legacy_policy`.
 - [x] Rewrites table (`converged-01` rewrites at rest, 135×50): grouped by scope, profile ahead of protocol, ascending priority; group head stating shared values; rows as match → route with reach and hits; a profile group ending by passing to its protocol; the protocol group ending with its defaults, or refused where none catches.
 - [x] Matchers drawn in their own notation (prefix with its capture, glob, exact), regex only for a regex.
 - [x] Rule detail as a bullet list: match with a worked example, what it sends on, route and candidates, reach with its reason, shadowing, recent catches; controls on its last line.
@@ -106,9 +106,9 @@ The README's routing paragraph describes the draft, validate and activate flow, 
 - [x] Routes table and the route page (`converged-02`): candidates with edge conditions, blocks handling it with disabled ones named dimly, inbound references; `←`/`→` steps between routes, `esc` returns with the selection kept.
 - [x] Models tab (`converged-03` models, models-families): families, upgrades with evidence bar and the move now, compaction line with bindings, offers as a scrolled window; focus moves between panels at their edges; `p` promotes.
 - [ ] Trace (`converged-01` trace): from any routing tab, an invented request or one picked from recent requests; outcome first, then one line per lookup stage and route step; the table marks the catching row `>` and rows fallen past `↓`; an unreplayable request says so.
-- [ ] Editing in place (`converged-01` editing, `converged-08`): the form opens under the row, one line per field with its reading beside it; validate on each change against the active revision; refusals in red with the fix; warnings beside the field without blocking; cross-record refusals shown with the form naming the records; `ctrl+s` labelled with what is in the way while refused.
-- [ ] Add, remove and `m` to move a rewrite within its scope; add, remove and reorder a route's candidates (`converged-02` add-fallback).
-- [ ] Edit preview under the table: changed requests from the last 24 hours, now and with the change, and the unreplayable count.
+- [x] Editing in place (`converged-01` editing, `converged-08`): the form opens under the row, one line per field with its reading beside it; validate on each change against the active revision; refusals in red with the fix; warnings beside the field without blocking; cross-record refusals shown with the form naming the records; `ctrl+s` labelled with what is in the way while refused.
+- [x] Add, remove and `m` to move a rewrite within its scope; add, remove and reorder a route's candidates (`converged-02` add-fallback).
+- [x] Edit preview under the table: changed requests from the last 24 hours, now and with the change, and the unreplayable count.
 - [x] Header status: live revision, lanes on earlier revisions, publication pending, failed or unsupported with its detail (`converged-01` after-save).
 - [ ] History tab (`converged-04`): revisions newest first with a summary and pinned lanes; detail as the diff in words; `a` reactivates, `c` traces under the selected revision, `m` widens to move running lanes, arming first and naming the lanes whose warm cache it would lose.
 - [ ] Empty policy (`converged-07` empty): every protocol group drawn with its refused `else` row, and the add control pointing at routes first.

@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn every_key_the_legend_documents_reaches_the_page() {
-        for key in ['e', 'n', 'd', 'v', 'a', 'p'] {
+        for key in ['e', 'n', 'd', 'm', 'a', 'p'] {
             assert!(owns_key(KeyCode::Char(key)), "{key}");
         }
         for key in [KeyCode::PageUp, KeyCode::PageDown] {
