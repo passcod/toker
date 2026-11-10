@@ -51,7 +51,7 @@ On a store with no provider configured, setup MUST enable the providers whose cr
 Setup MUST NOT ask for a credential, and MUST NOT read a keyring entry's value to find out whether it exists.
 A store that already configures a provider MUST keep its providers as they are.
 
-Setup MUST complete whether or not it found a provider: it writes the configuration, installs the units, offers the schedule slots and points the clients at the proxy all the same.
+Setup MUST complete whether or not it found a provider: it writes the configuration, installs the units, offers the schedule slots where they apply and points the clients at the proxy all the same.
 
 > [!NOTE]
 > Everything else about providers is edited on the dashboard's providers page, which setup hands off to, so a machine set up once never needs setup again for a provider to be added.
