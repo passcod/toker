@@ -10,6 +10,7 @@
 use serde_json::{Value, json};
 
 use super::model::{Panel, Tab};
+use crate::policy::MAX_ID_BYTES;
 
 /// The kind of record a tab adds. The models tab holds several, by the
 /// panel the focus is in.
@@ -101,9 +102,37 @@ pub(super) fn template(kind: &str, route_id: Option<&str>) -> Value {
     }
 }
 
+/// Room kept at the end of a made identifier for the suffix that tells it
+/// apart from one already taken.
+const SUFFIX_ROOM: usize = 8;
+
+/// An identifier for a copy of the record `id` names, unlike any in `taken`
+/// and within the length the document allows.
+pub(super) fn fresh_id(id: &str, taken: &[&str]) -> String {
+    let stem = clip(id, MAX_ID_BYTES - SUFFIX_ROOM - "-copy".len());
+    unique(format!("{stem}-copy"), taken)
+}
+
+/// `base`, or `base-2`, `base-3` and so on: the first that is not taken.
+fn unique(base: String, taken: &[&str]) -> String {
+    if !taken.contains(&base.as_str()) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|id| !taken.contains(&id.as_str()))
+        .expect("an unused suffix exists")
+}
+
+/// The first `bytes` of an identifier, which is ASCII, without a separator
+/// left dangling at the end.
+fn clip(id: &str, bytes: usize) -> &str {
+    id[..id.len().min(bytes)].trim_end_matches(['-', '_', '.'])
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{kind_for, template};
+    use super::{fresh_id, kind_for, template};
     use crate::policy::{PolicyDocument, PolicyEdit};
     use crate::tui::routing::editing::add_edit;
     use crate::tui::routing::model::{Panel, Tab};
@@ -142,5 +171,18 @@ mod tests {
         assert_eq!(default["target"]["route_id"], "my-route");
         let default = template("defaults", None);
         assert_eq!(default["target"]["route_id"], "route-id");
+    }
+
+    #[test]
+    fn a_copy_gets_an_identifier_no_record_has() {
+        assert_eq!(fresh_id("fast", &["fast"]), "fast-copy");
+        assert_eq!(
+            fresh_id("fast", &["fast", "fast-copy", "fast-copy-2"]),
+            "fast-copy-3"
+        );
+        // A copy of a long identifier still fits the document's bound.
+        let long = "a".repeat(crate::policy::MAX_ID_BYTES);
+        let copy = fresh_id(&long, &[long.as_str()]);
+        assert!(crate::policy::StableId::new(copy.clone()).is_ok(), "{copy}");
     }
 }

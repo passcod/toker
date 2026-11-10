@@ -1170,6 +1170,10 @@ impl State {
                 self.open_add();
                 None
             }
+            KeyCode::Char('y') => {
+                self.open_duplicate();
+                None
+            }
             KeyCode::Char('d') => {
                 self.open_remove();
                 None
@@ -1501,6 +1505,57 @@ impl State {
         {
             value["scope"] = scope.clone();
         }
+        self.start_adding(kind, value);
+    }
+
+    /// Open the add form filled from the selected record (spec: UTUI#editing),
+    /// as a record of its own: a fresh identifier and, for a rewrite, the
+    /// next free priority in its scope, so the copy lands just after the
+    /// rule it was copied from where there is room.
+    fn open_duplicate(&mut self) {
+        let Some(target) = self.target() else {
+            self.error = Some("select a record to duplicate".to_owned());
+            return;
+        };
+        if target.kind == "compaction" {
+            self.error = Some("there is one compaction policy: edit it".to_owned());
+            return;
+        }
+        let Some(mut value) = self.record(&target).cloned() else {
+            self.error = Some("select a record to duplicate".to_owned());
+            return;
+        };
+        let records = self
+            .snapshot
+            .as_ref()
+            .and_then(data::policy)
+            .map_or(&[][..], |policy| array(policy, target.kind));
+        if let Some(id) = value.get("id").and_then(Value::as_str) {
+            let taken: Vec<&str> = records.iter().map(|record| text(record, "id")).collect();
+            let fresh = template::fresh_id(id, &taken);
+            value["id"] = Value::from(fresh);
+        }
+        if target.kind == "rewrites" {
+            // A priority is unique within its scope (spec: RDOC#collections).
+            let scope = value.get("scope");
+            let taken: Vec<i64> = records
+                .iter()
+                .filter(|record| record.get("scope") == scope)
+                .filter_map(|record| record.get("priority").and_then(Value::as_i64))
+                .collect();
+            let from = value.get("priority").and_then(Value::as_i64).unwrap_or(0);
+            let next = (from + 1..)
+                .find(|priority| !taken.contains(priority))
+                .unwrap_or(from + 1);
+            value["priority"] = Value::from(next);
+        }
+        // A route copied from its own page is added in the routes table.
+        self.mode = Mode::Table;
+        self.start_adding(target.kind, value);
+    }
+
+    /// Open the add form for a new record of `kind`, starting from `value`.
+    fn start_adding(&mut self, kind: &'static str, value: Value) {
         let owner = (kind != "compaction").then(|| {
             self.snapshot
                 .as_ref()
@@ -2053,6 +2108,7 @@ mod tests {
 
     use super::{Modal, Mode, Panel, State, Tab};
     use crate::tui::control::{Command, Reply, Response};
+    use crate::tui::routing::data::{self, array};
     use crate::tui::routing::editing::{What, add_edit, remove_edit, replace_edit};
     use crate::tui::routing::form::Purpose;
     use crate::tui::routing::testing::{self, World};
@@ -2821,6 +2877,123 @@ mod tests {
         let mut state = on(Tab::Defaults);
         press(&mut state, KeyCode::Char('n'));
         assert_eq!(form_value(&state)["target"]["route_id"], "claude-sub");
+    }
+
+    /// A duplicate is the add form filled from the selected rewrite, with an
+    /// id no rewrite has and the next priority its scope leaves free.
+    #[test]
+    fn y_duplicates_a_rewrite_into_the_add_form_after_it() {
+        let mut state = on(Tab::Rewrites);
+        state.move_selection(1);
+        let original = state
+            .record(&state.target().expect("a rewrite"))
+            .cloned()
+            .expect("its record");
+        assert!(press(&mut state, KeyCode::Char('y')).is_none());
+        assert!(matches!(
+            state.editing().expect("editing").what,
+            What::Record {
+                kind: "rewrites",
+                adding: true
+            }
+        ));
+        let copy = form_value(&state);
+        for name in ["scope", "model_matcher", "target"] {
+            assert_eq!(copy[name], original[name], "{name}");
+        }
+        assert_ne!(copy["id"], original["id"]);
+        let rewrites = array(
+            data::policy(state.snapshot().expect("snapshot")).expect("policy"),
+            "rewrites",
+        );
+        assert!(
+            rewrites.iter().all(|rule| rule["id"] != copy["id"]),
+            "{copy}"
+        );
+        // The world's priorities step by ten, so the next one is free.
+        let priority = original["priority"].as_i64().expect("a priority");
+        assert_eq!(copy["priority"], priority + 1);
+        accepted(&mut state);
+        assert_eq!(
+            ops(&state.key(CTRL_S).expect("save"))[0]["kind"],
+            "add_rewrite"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_takes_the_next_priority_its_scope_leaves_free() {
+        let mut snapshot = testing::snapshot(World::AT_REST);
+        let policy = &mut snapshot["active_revision"]["policy"];
+        let scope = policy["rewrites"][0]["scope"].clone();
+        let first = policy["rewrites"][0]["priority"]
+            .as_i64()
+            .expect("priority");
+        // Its scope has the next two priorities taken.
+        for (at, priority) in [(1, first + 1), (2, first + 2)] {
+            policy["rewrites"][at]["scope"] = scope.clone();
+            policy["rewrites"][at]["priority"] = priority.into();
+        }
+        let mut state = State::default();
+        state.receive(reply("snapshot", 200, snapshot));
+        state.set_tab(Tab::Rewrites);
+        let at = (0..state.entry_count(Tab::Rewrites))
+            .find(|at| {
+                state.selected[Tab::Rewrites.index()] = *at;
+                state
+                    .target()
+                    .and_then(|target| state.record(&target).cloned())
+                    .is_some_and(|record| record["priority"] == first && record["scope"] == scope)
+            })
+            .expect("the first rule's row");
+        state.selected[Tab::Rewrites.index()] = at;
+        press(&mut state, KeyCode::Char('y'));
+        assert_eq!(form_value(&state)["priority"], first + 3);
+    }
+
+    #[test]
+    fn y_duplicates_a_route_from_its_table_or_its_own_page() {
+        let mut state = on(Tab::Routes);
+        press(&mut state, KeyCode::Char('y'));
+        assert_eq!(form_value(&state)["id"], "claude-sub-copy");
+        assert_eq!(
+            form_value(&state)["chain"],
+            state
+                .record(&state.target().expect("route"))
+                .expect("record")["chain"]
+        );
+        accepted(&mut state);
+        assert_eq!(
+            ops(&state.key(CTRL_S).expect("save"))[0]["kind"],
+            "add_route"
+        );
+
+        let mut state = on(Tab::Routes);
+        press(&mut state, KeyCode::Enter);
+        assert_eq!(state.mode(), Mode::Route);
+        press(&mut state, KeyCode::Char('y'));
+        assert_eq!(state.mode(), Mode::Table, "added in the routes table");
+        assert!(matches!(
+            state.editing().expect("editing").what,
+            What::Record {
+                kind: "routes",
+                adding: true
+            }
+        ));
+    }
+
+    #[test]
+    fn there_is_nothing_to_duplicate_in_history_or_the_compaction_line() {
+        let mut state = on(Tab::History);
+        press(&mut state, KeyCode::Char('y'));
+        assert!(!state.capturing());
+        assert!(state.error().is_some());
+
+        let mut state = on(Tab::Models);
+        state.move_selection(99);
+        assert_eq!(state.models().focus, Panel::Compaction);
+        press(&mut state, KeyCode::Char('y'));
+        assert!(!state.capturing());
+        assert!(state.error().is_some_and(|error| error.contains("edit it")));
     }
 
     /// Adding a rule needs somewhere to send it, so with no routes the page

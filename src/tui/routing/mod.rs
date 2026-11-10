@@ -71,7 +71,7 @@ fn activated(reply: &Reply) -> bool {
 pub(super) fn owns_key(code: crossterm::event::KeyCode) -> bool {
     matches!(
         code,
-        crossterm::event::KeyCode::Char('e' | 'n' | 'd' | 'm' | 'a' | 'p' | 't' | 'c')
+        crossterm::event::KeyCode::Char('e' | 'n' | 'y' | 'd' | 'm' | 'a' | 'p' | 't' | 'c')
             | crossterm::event::KeyCode::Enter
             | crossterm::event::KeyCode::PageUp
             | crossterm::event::KeyCode::PageDown
@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn every_key_the_legend_documents_reaches_the_page() {
-        for key in ['e', 'n', 'd', 'm', 'a', 'p', 't', 'c'] {
+        for key in ['e', 'n', 'y', 'd', 'm', 'a', 'p', 't', 'c'] {
             assert!(owns_key(KeyCode::Char(key)), "{key}");
         }
         for key in [KeyCode::PageUp, KeyCode::PageDown] {
