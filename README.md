@@ -55,14 +55,15 @@ When using opencode, a custom sidebar and footer plugin augments the context and
 ## Routing
 
 Which backend serves a model, which models appear in Claude Code's `/model` picker, and the rest of Toker's routing live in the database.
-Edit them in the routing page of `toker tui`: changes go into a draft, which you validate, preview and then activate, without restarting anything.
+Edit them in the routing page of `toker tui`: each field is checked as you type, the page shows which recent requests an edit would route differently, and saving applies it to the live routing without restarting anything.
+A save reaches new sessions and any whose cache has gone cold; the history tab can move running sessions onto it too, naming the ones that would lose a warm cache.
 The providers, their credentials and the gates live there too, on the providers and settings pages.
 
 `toker setup` writes that configuration and, the first time, compiles your routing choices (and any routing fields a `toker.toml` from an older version carried: protocol defaults, model maps, picker rules) into the first active revision.
 After that it never replaces the active routing.
 
 Claude Code's `/model` picker follows the active routing.
-Setup installs a daily timer that keeps the rows current, and the routing page syncs them after each activation.
+Setup installs a daily timer that keeps the rows current, and the routing page syncs them after each save.
 Run `toker picker sync --dry-run` to see what it would offer.
 Rows for OpenRouter models route that session through OpenRouter on your OpenRouter key; everything else stays on your subscription.
 Only models that take tools are offered, but OpenRouter only guarantees Claude Code's tool use on Anthropic's models, so others may stumble on its more advanced requests.
@@ -74,7 +75,7 @@ read it from `OPENAI_API_KEY`, or leave authentication to the frontend.
 You can
 also switch it on afterwards from the providers page of `toker tui`.
 
-Make it the Chat default in the routing page: in the routes view (`2`), select
+Make it the Chat default in the routing page: in the defaults tab (`3`), select
 the default whose scope is `openai_chat`, press `e`, set its route to
 `route-openai_api-openai_chat_completions` (Tab completes it) and save
 with Ctrl+S.
@@ -83,7 +84,7 @@ frontend without a `/f/<name>` prefix uses and which wins over the protocol
 default, so change that one the same way.
 If there is no default to change,
 `n` adds one.
-Then `V` validates and `a` activates.
+Saving makes it live.
 Bare Chat model names then
 use `https://api.openai.com/v1`; with several Chat backends enabled,
 `openai_api/<model>` selects it for one request.

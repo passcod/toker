@@ -128,4 +128,4 @@ The README's routing paragraph describes the draft, validate and activate flow, 
 
 ### Docs
 
-- [ ] `README.md`: rewrite the routing paragraph and the direct OpenAI API walkthrough for save in place, without the draft, `V` or `a`.
+- [x] `README.md`: rewrite the routing paragraph and the direct OpenAI API walkthrough for save in place, without the draft, `V` or `a`.
