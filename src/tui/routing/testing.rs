@@ -23,6 +23,9 @@ pub(super) struct World {
     /// A default for the `unprefixed` profile of the messages and chat
     /// protocols, ahead of each protocol's own.
     pub(super) profile_defaults: bool,
+    /// A rule of its own for the `unprefixed` profile of the messages
+    /// protocol, so that its group ends by passing to the protocol's.
+    pub(super) profile_rules: bool,
     /// The state after a save: a glob rule added to the messages protocol,
     /// revision 10 live, two warm lanes still on revision 9 and the claude
     /// settings not yet written.
@@ -36,9 +39,17 @@ impl World {
         profile_defaults: false,
         saved: false,
         empty: false,
+        profile_rules: false,
     };
     pub(super) const FULL: World = World {
         profile_defaults: true,
+        saved: false,
+        empty: false,
+        profile_rules: false,
+    };
+    pub(super) const PROFILED: World = World {
+        profile_defaults: true,
+        profile_rules: true,
         saved: false,
         empty: false,
     };
@@ -46,11 +57,13 @@ impl World {
         profile_defaults: false,
         saved: true,
         empty: false,
+        profile_rules: false,
     };
     pub(super) const EMPTY: World = World {
         profile_defaults: false,
         saved: false,
         empty: true,
+        profile_rules: false,
     };
 }
 
@@ -242,6 +255,18 @@ fn rules(world: World) -> Vec<Rule> {
         ),
         prefixed("anthropic_messages", "codex_sub", "codex", none()),
     ];
+    if world.profile_rules {
+        rules.insert(
+            0,
+            Rule {
+                scope: "unprefixed/anthropic_messages",
+                matcher: matcher_glob("claude-haiku-*"),
+                route: "claude-sub",
+                sends: "as_asked",
+                hits: none(),
+            },
+        );
+    }
     if world.saved {
         rules.push(Rule {
             scope: "anthropic_messages",

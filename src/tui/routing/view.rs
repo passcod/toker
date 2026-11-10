@@ -17,7 +17,7 @@ use super::form::Form;
 use super::model::{Modal, Mode, State, Tab};
 use super::rules::{self, Entry};
 use super::table::{self, BodyLine, Table};
-use super::{history, models_tab, routes, status};
+use super::{history, keys, models_tab, routes, status};
 use crate::tui::chrome::{self, Chrome, RowHit};
 
 /// The page areas that the loop needs for click handling.
@@ -128,19 +128,16 @@ pub(super) fn render(frame: &mut Frame, state: &State, overlay: bool) -> Drawn {
 
     chrome::chips(frame, &drawn.header);
     if overlay {
-        chrome::overlay(
+        // Under the header, so the buttons stay in view.
+        let area = frame.area();
+        let used = drawn.header.keys.height;
+        keys::render(
             frame,
-            "KEYS",
-            &[
-                chrome::Section {
-                    heading: None,
-                    rows: &KEYS,
-                },
-                chrome::Section {
-                    heading: Some("IN A FORM"),
-                    rows: &FORM_KEYS,
-                },
-            ],
+            Rect {
+                y: area.y + used,
+                height: area.height - used,
+                ..area
+            },
         );
     }
     if state.modal().active() {
@@ -449,42 +446,6 @@ fn history_tab(frame: &mut Frame, body: Rect, snapshot: &Value, state: &State, d
     }
 }
 
-/// The page's keys, in its `?` overlay.
-const KEYS: [(&str, &str); 16] = [
-    ("↑/↓ j/k", "select a record, or a candidate on a route"),
-    ("←/→ h/l 1–6", "switch tab; ←/→ also step between routes"),
-    ("enter", "open the route a record sends to"),
-    ("esc", "back from a route, then to the dashboard"),
-    ("pgup/pgdn", "move a page of records"),
-    ("n", "add a record to the table, or a fallback to a route"),
-    ("e", "edit the selected record in place"),
-    (
-        "m",
-        "move a rewrite within its scope, or a candidate; in history, the running lanes onto the live revision",
-    ),
-    ("d", "remove the selected record, or candidate"),
-    ("a", "reactivate the selected revision"),
-    ("c", "trace a request under the selected revision"),
-    ("p", "promote"),
-    ("t", "trace a request, invented or a recent one"),
-    ("r", "refresh"),
-    ("click", "select a record, or focus a form field"),
-    ("q", "quit"),
-];
-
-/// A form's keys. A form takes every key, `?` included, so the common
-/// ones are also on its own last line.
-const FORM_KEYS: [(&str, &str); 8] = [
-    ("↑/↓", "move between fields"),
-    ("←/→", "change the value"),
-    ("tab", "complete"),
-    ("space", "toggle"),
-    ("alt+↑/↓", "move a list item or candidate"),
-    ("ctrl+d", "remove a list item"),
-    ("ctrl+s", "save, once nothing is refused"),
-    ("esc", "abandon"),
-];
-
 /// A small question over the page: a promotion's or a description's form,
 /// or the confirmation of a reactivation.
 fn render_modal(frame: &mut Frame, state: &State) -> Option<FormHit> {
@@ -740,66 +701,6 @@ mod tests {
             code,
             crossterm::event::KeyModifiers::NONE,
         ));
-    }
-
-    /// The page with the overlay open, as text.
-    fn overlay_at(state: &State, width: u16, height: u16) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
-        terminal
-            .draw(|frame| {
-                render(frame, state, true);
-            })
-            .expect("draw");
-        terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>()
-    }
-
-    #[test]
-    fn page_names_edit_and_activation_controls() {
-        let state = page(World::AT_REST, Tab::Rewrites);
-        let plain = frame(&state, 140, 40);
-        assert!(!plain.contains("n new\n"), "no page carries a footer");
-        let text = overlay_at(&state, 140, 40);
-        assert!(text.contains("edit the selected record"), "{text}");
-        assert!(text.contains("reactivate the selected revision"), "{text}");
-    }
-
-    /// Every key the page acts on is named in its overlay, so a key that
-    /// was added cannot stay undocumented (spec: UTUI#finding-the-keys).
-    #[test]
-    fn the_overlay_names_every_key_the_page_takes() {
-        use crossterm::event::KeyCode;
-        let named = |key: &str| {
-            super::KEYS
-                .iter()
-                .any(|(keys, _)| keys.split([' ', '/']).any(|token| token == key))
-        };
-        for key in [
-            'e', 'n', 'd', 'v', 'a', 'p', 'r', 'h', 'j', 'k', 'l', 't', 'c',
-        ] {
-            assert!(
-                !super::super::owns_key(KeyCode::Char(key)) || named(&key.to_string()),
-                "{key} is taken but not named"
-            );
-        }
-        assert!(named("pgup") && named("pgdn") && named("enter") && named("esc"));
-        for key in ["tab", "alt+↑", "ctrl+d", "ctrl+s", "space"] {
-            assert!(
-                super::FORM_KEYS
-                    .iter()
-                    .any(|(keys, _)| keys.split([' ', '/']).any(|token| token == key)),
-                "{key} in a form"
-            );
-        }
-        let text = overlay_at(&State::default(), 140, 40);
-        for heading in ["KEYS", "IN A FORM", "? or esc close"] {
-            assert!(text.contains(heading), "{heading}: {text}");
-        }
     }
 
     /// The tabs scroll around the current one before the strip clips, and

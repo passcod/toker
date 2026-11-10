@@ -31,5 +31,5 @@ expression: "frame(&state, 120, 40)"
 │ as        sonnet  shown as glm-5.1                                                                                   │
 │ overlaps  none                                                                                                       │
 │ published yes                                                                                                        │
-│ [e] edit   [n] new   [m] move   [space] turn off   [d] delete   [t] trace   [enter] open route                       │
+│ [e] edit   [n] new   [d] delete   [t] trace   [enter] open route                                                     │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

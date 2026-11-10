@@ -11,7 +11,7 @@ use super::testing::{self, CODEX, OR_MESSAGES, SUB, World};
 use super::view::render;
 use crate::tui::control::{Command, Reply, Response};
 
-fn loaded(world: World, tab: Tab) -> State {
+pub(super) fn loaded(world: World, tab: Tab) -> State {
     let mut state = State::default();
     let mut reply = |name: &'static str, body| {
         let mut command = Command::snapshot("routing-snapshot");
@@ -94,7 +94,7 @@ fn candidate(binding: &str, provider: &str, skipped: Option<&str>) -> Value {
 
 /// The request of the design's trace frame: caught by a rule whose route
 /// falls to its second candidate.
-fn fell_to_the_second() -> Value {
+pub(super) fn fell_to_the_second() -> Value {
     walked(
         facts(
             json!("claude"),
@@ -165,7 +165,7 @@ fn nothing_can_serve() -> Value {
 
 /// Ask for a trace of the first (invented) choice and answer the form with
 /// `walk`.
-fn trace_invented(state: &mut State, walk: Value) -> Command {
+pub(super) fn trace_invented(state: &mut State, walk: Value) -> Command {
     let listing = press(state, KeyCode::Char('t')).expect("the recent requests are asked for");
     assert_eq!(listing.name, "recent");
     answer(state, listing, 200, recent());

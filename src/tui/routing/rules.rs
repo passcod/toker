@@ -470,20 +470,18 @@ pub(super) fn needs_a_route() -> BodyLine {
 }
 
 /// What the `?` overlay and the controls line call a rule's controls.
-const RULE_CONTROLS: [(&str, &str); 7] = [
+const RULE_CONTROLS: [(&str, &str); 6] = [
     ("e", "edit"),
     ("n", "new"),
     ("m", "move"),
-    ("space", "turn off"),
     ("d", "delete"),
     ("t", "trace"),
     ("enter", "open route"),
 ];
 
-const DEFAULT_CONTROLS: [(&str, &str); 6] = [
+const DEFAULT_CONTROLS: [(&str, &str); 5] = [
     ("e", "edit"),
     ("n", "new"),
-    ("space", "turn off"),
     ("d", "delete"),
     ("t", "trace"),
     ("enter", "open route"),
@@ -889,7 +887,9 @@ pub(super) fn presentations_table(active: &Value, width: usize) -> Table {
     Table { header, body }
 }
 
-const PRESENTATION_CONTROLS: [(&str, &str); 7] = RULE_CONTROLS;
+/// A presentation is edited, added and removed as a rewrite is, but it has no
+/// place within its scope to be moved to.
+const PRESENTATION_CONTROLS: [(&str, &str); 5] = DEFAULT_CONTROLS;
 
 /// The detail for a presentation.
 pub(super) fn presentation_detail(active: &Value, record: &Value) -> Vec<Line<'static>> {

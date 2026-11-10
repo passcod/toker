@@ -16,5 +16,5 @@ expression: "frame(&state, 120, 40)"
 │ sends to  claude-sub  2 candidates · anthropic_sub → openrouter                                                      │
 │ reach     no cred · billed fallback  anthropic_sub has no credential, so openrouter serves it, billed                │
 │ recent    -                                                                                                          │
-│ [e] edit   [n] new   [space] turn off   [d] delete   [t] trace   [enter] open route                                  │
+│ [e] edit   [n] new   [d] delete   [t] trace   [enter] open route                                                     │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

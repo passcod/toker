@@ -53,3 +53,218 @@ fn a_fresh_install_draws_every_protocol_refused() {
     let state = page(World::EMPTY, Tab::Rewrites);
     insta::assert_snapshot!(frame(&state, 120, 40, false));
 }
+
+/// The overlay at 120×40: the keys grouped by where they apply beside the
+/// marks, under a header whose buttons stay in view.
+#[test]
+fn the_keys_overlay_groups_the_keys_beside_the_marks_120x40() {
+    let state = page(World::AT_REST, Tab::Rewrites);
+    insta::assert_snapshot!(frame(&state, 120, 40, true));
+}
+
+/// A page that has drawn `state` with the overlay open: its first row.
+fn header_row(state: &State, width: u16, overlay: bool) -> String {
+    frame(state, width, 40, overlay)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The overlay opens under the header, so the buttons that go to a page, and
+/// the one that closes the overlay again, stay where they were
+/// (spec: UTUI#finding-the-keys).
+#[test]
+fn the_overlay_leaves_the_header_showing() {
+    let state = page(World::AT_REST, Tab::Rewrites);
+    for width in [80, 100, 120, 200] {
+        assert_eq!(
+            header_row(&state, width, true),
+            header_row(&state, width, false),
+            "at {width}"
+        );
+    }
+}
+
+/// Every row of the overlay, keys and marks.
+fn overlay_rows() -> Vec<(&'static str, &'static str)> {
+    use super::keys;
+    [
+        &keys::ANYWHERE[..],
+        &keys::IN_HISTORY,
+        &keys::IN_A_TRACE,
+        &keys::IN_AN_EDIT,
+        &keys::ROWS,
+        &keys::READINGS,
+        &keys::PRESENTATIONS,
+        &keys::REVISIONS,
+    ]
+    .concat()
+}
+
+/// Every key the page acts on is named in the overlay, so a key that was
+/// added cannot stay undocumented (spec: UTUI#finding-the-keys).
+#[test]
+fn the_overlay_names_every_key_the_page_takes() {
+    use crossterm::event::KeyCode;
+    let rows = overlay_rows();
+    let named = |key: &str| {
+        rows.iter()
+            .any(|(keys, _)| keys.split([' ', '/']).any(|token| token == key))
+    };
+    for key in 'a'..='z' {
+        assert!(
+            !super::owns_key(KeyCode::Char(key)) || named(&key.to_string()),
+            "{key} is taken but not named"
+        );
+    }
+    // The keys the dashboard's loop routes to the page, and a form's own.
+    for key in [
+        "pgup", "pgdn", "enter", "esc", "tab", "q", "r", "h", "j", "k", "l", "1–6", "space",
+        "alt+↑", "ctrl+d", "ctrl+s",
+    ] {
+        assert!(named(key), "{key} is not named");
+    }
+}
+
+/// Every word and glyph the overlay explains is one the page draws, and
+/// every glyph the page draws is explained: the overlay is the operator's
+/// dictionary, and an entry with nothing behind it is a claim about a screen
+/// that does not exist (spec: UTUI#marks).
+#[test]
+fn the_overlay_explains_every_mark_the_page_draws_and_no_other() {
+    use super::keys;
+    use super::{history_tests, trace_tests};
+    let mut frames: Vec<String> = Vec::new();
+    for (world, tab) in [
+        (World::PROFILED, Tab::Presentations),
+        (World::PROFILED, Tab::Rewrites),
+        (World::PROFILED, Tab::Defaults),
+        (World::SAVED, Tab::Rewrites),
+        (World::AT_REST, Tab::Routes),
+        (World::AT_REST, Tab::Models),
+        (World::EMPTY, Tab::Rewrites),
+    ] {
+        let mut state = page(world, tab);
+        frames.push(frame(&state, 120, 40, false));
+        // A short table cut, and its selection reached.
+        state.move_selection(1);
+        frames.push(frame(&state, 120, 12, false));
+        // A narrow header, with its tabs scrolled.
+        frames.push(frame(&state, 70, 24, false));
+    }
+    let mut route = page(World::AT_REST, Tab::Routes);
+    route.open();
+    frames.push(frame(&route, 120, 40, false));
+    let mut traced = trace_tests::loaded(World::AT_REST, Tab::Rewrites);
+    trace_tests::trace_invented(&mut traced, trace_tests::fell_to_the_second());
+    frames.push(frame(&traced, 120, 40, false));
+    frames.push(frame(&history_tests::after_a_save(), 120, 40, false));
+    let drawn = frames.join("\n");
+
+    // What the overlay says it explains, and where on the page to see it.
+    let probes: [(&str, &[&str]); 30] = [
+        (">", &["> caught"]),
+        ("↓", &["↓ fell past"]),
+        ("┌─ │ └─", &["┌─ ", "└─ else"]),
+        ("else", &["else  default"]),
+        ("tries X next", &["tries anthropic_messages next"]),
+        ("${model}", &["sends     ${model}"]),
+        ("as asked", &["as asked"]),
+        ("ok", &["  ok  "]),
+        ("no cred", &["no cred"]),
+        ("off", &["  off  "]),
+        ("billed fallback", &["billed fallback"]),
+        ("refused", &["refused"]),
+        ("refused · no route", &["refused · no route"]),
+        ("- ≥N", &["  - ", "≥1"]),
+        (
+            "… N more",
+            &["more record", "record above", "records above"],
+        ),
+        ("slug", &["slug openrouter"]),
+        ("${model_id}", &["${model_id}"]),
+        ("as", &["  as  "]),
+        ("published", &["published"]),
+        ("unprefixed", &["unprefixed/"]),
+        ("+ ~ - ↕", &["+ rewrite"]),
+        ("live", &["10 live"]),
+        ("warm · cold", &["2 warm", "8 cold"]),
+        ("[m] reversed", &["[m] move running lanes"]),
+        ("N lanes on rev M", &["2 lanes on rev 9"]),
+        ("claude pending", &["claude pending"]),
+        ("no policy yet", &["no policy yet"]),
+        ("→ ·", &["→ 2 rewrites", "· 5 models"]),
+        ("‹ ›", &["‹"]),
+        // The rest are read off the vocabulary rather than a frame.
+        ("unbilled fallback", &[]),
+    ];
+    let mut explained: Vec<&str> = [
+        &keys::ROWS[..],
+        &keys::READINGS,
+        &keys::PRESENTATIONS,
+        &keys::REVISIONS,
+    ]
+    .concat()
+    .into_iter()
+    .map(|(mark, _)| mark)
+    .collect();
+    for (mark, seen) in probes {
+        let at = explained.iter().position(|have| *have == mark);
+        assert!(at.is_some(), "{mark:?} is not explained in the overlay");
+        explained.remove(at.unwrap_or_default());
+        if !seen.is_empty() {
+            assert!(
+                seen.iter().any(|probe| drawn.contains(probe)),
+                "{mark:?} is explained but none of {seen:?} is drawn"
+            );
+        }
+    }
+    assert!(
+        explained.is_empty(),
+        "marks in the overlay with no probe here: {explained:?}"
+    );
+
+    // Every glyph drawn that is not a letter, a border or a plain ASCII
+    // character is one of the overlay's.
+    let said: String = overlay_rows()
+        .iter()
+        .flat_map(|(key, meaning)| [*key, *meaning])
+        .collect();
+    for glyph in drawn.chars().filter(|glyph| {
+        !glyph.is_ascii()
+            && !glyph.is_alphanumeric()
+            && !glyph.is_whitespace()
+            && !('\u{2500}'..='\u{257f}').contains(glyph)
+    }) {
+        assert!(said.contains(glyph), "{glyph:?} is drawn but not explained");
+    }
+}
+
+/// The reach words an overlay explains are the ones the vocabulary writes.
+#[test]
+fn the_reach_words_the_overlay_explains_are_the_ones_the_page_writes() {
+    use super::words::reach_text;
+    use serde_json::json;
+    let later = |billed| {
+        json!({"outcome": "served_later", "serving": {"billed": billed},
+            "skipped": [{"reason": "no_credential", "provider": "p"}]})
+    };
+    let said = |reach| reach_text(&reach);
+    assert_eq!(said(json!({"outcome": "served_first"})), "ok");
+    assert_eq!(said(later(true)), "no cred · billed fallback");
+    assert_eq!(said(later(false)), "no cred · unbilled fallback");
+    assert!(
+        said(json!({"outcome": "refused_edge", "edge": {"setting": "billed_boundary"}}))
+            .starts_with("refused")
+    );
+    assert_eq!(
+        said(json!({"outcome": "refused_unavailable",
+            "skipped": [{"reason": "provider_off"}, {"reason": "no_credential"}]})),
+        "off · no cred"
+    );
+    assert_eq!(
+        said(json!({"outcome": "refused_no_route", "cause": "no_default"})),
+        "refused · no route"
+    );
+}

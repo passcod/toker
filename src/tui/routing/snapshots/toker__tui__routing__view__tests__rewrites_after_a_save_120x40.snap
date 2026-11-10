@@ -36,5 +36,5 @@ expression: "frame(&state, 120, 40)"
 │ reach     ok                                                                                                         │
 │ overlaps  none: no rule above catches claude-*                                                                       │
 │ recent    -                                                                                                          │
-│ [e] edit   [n] new   [m] move   [space] turn off   [d] delete   [t] trace   [enter] open route                       │
+│ [e] edit   [n] new   [m] move   [d] delete   [t] trace   [enter] open route                                          │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

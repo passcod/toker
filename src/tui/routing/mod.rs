@@ -9,6 +9,7 @@ mod frames_tests;
 mod history;
 #[cfg(test)]
 mod history_tests;
+mod keys;
 mod model;
 mod models_tab;
 mod reconcile;

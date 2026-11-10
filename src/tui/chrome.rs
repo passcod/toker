@@ -641,6 +641,12 @@ pub(super) struct Section<'a> {
 /// the bottom border, so it shows at any size the border does; rows that
 /// do not fit are counted rather than cut at the edge.
 pub(super) fn overlay(frame: &mut Frame, title: &str, sections: &[Section]) {
+    overlay_in(frame, frame.area(), title, &[sections], false);
+}
+
+/// One column of an overlay: its sections' lines, the key column set to the
+/// widest key, and a blank line between sections where `spaced`.
+fn overlay_lines(sections: &[Section], spaced: bool) -> Vec<Line<'static>> {
     let key_w = sections
         .iter()
         .flat_map(|section| section.rows.iter())
@@ -648,7 +654,10 @@ pub(super) fn overlay(frame: &mut Frame, title: &str, sections: &[Section]) {
         .max()
         .unwrap_or(0);
     let mut lines: Vec<Line> = Vec::new();
-    for section in sections {
+    for (at, section) in sections.iter().enumerate() {
+        if spaced && at > 0 {
+            lines.push(Line::raw(""));
+        }
         if let Some(heading) = section.heading {
             lines.push(Line::styled(heading.to_owned(), Style::new().bold()));
         }
@@ -660,14 +669,65 @@ pub(super) fn overlay(frame: &mut Frame, title: &str, sections: &[Section]) {
             ])
         }));
     }
+    lines
+}
+
+/// An overlay in `area`: columns side by side where `area` is wide enough
+/// for them, one over the next where it is not. Under a page's header, an
+/// `area` that starts below it leaves the header's buttons showing.
+pub(super) fn overlay_in(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    columns: &[&[Section]],
+    spaced: bool,
+) {
+    let built: Vec<Vec<Line>> = columns
+        .iter()
+        .map(|sections| overlay_lines(sections, spaced))
+        .collect();
+    let widest = |lines: &[Line]| lines.iter().map(Line::width).max().unwrap_or(0);
     let close = hints(&[("? or esc", "close")]);
+    let floor = close.width().max(title.width());
+    const GAP: usize = 3;
+    let side_by_side = built.iter().map(|lines| widest(lines)).sum::<usize>()
+        + GAP * built.len().saturating_sub(1)
+        + 4
+        <= usize::from(area.width);
+    let mut lines: Vec<Line> = if side_by_side {
+        let widths: Vec<usize> = built.iter().map(|lines| widest(lines)).collect();
+        let rows = built.iter().map(Vec::len).max().unwrap_or(0);
+        (0..rows)
+            .map(|row| {
+                let mut spans: Vec<Span> = Vec::new();
+                for (column, lines) in built.iter().enumerate() {
+                    let used = lines.get(row).map_or(0, Line::width);
+                    if let Some(line) = lines.get(row) {
+                        spans.extend(line.spans.iter().cloned());
+                    }
+                    if column + 1 < built.len() {
+                        spans.push(Span::raw(" ".repeat(widths[column] - used + GAP)));
+                    }
+                }
+                Line::from(spans)
+            })
+            .collect()
+    } else {
+        let mut stacked: Vec<Line> = Vec::new();
+        for (at, lines) in built.into_iter().enumerate() {
+            if at > 0 && spaced {
+                stacked.push(Line::raw(""));
+            }
+            stacked.extend(lines);
+        }
+        stacked
+    };
     let text_w = lines
         .iter()
         .map(Line::width)
-        .chain([close.width(), title.width()])
+        .chain([floor])
         .max()
         .unwrap_or(0) as u16;
-    let area = frame.area();
     let width = text_w.saturating_add(4).min(area.width);
     let height = (lines.len() as u16).saturating_add(2).min(area.height);
     let room = usize::from(height.saturating_sub(2));

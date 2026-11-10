@@ -35,5 +35,5 @@ expression: "frame(&state, 120, 40)"
 │ reach     no cred · billed fallback  anthropic_sub has no credential, so openrouter serves it, billed                │
 │ overlaps  none: no rule above catches anthropic/${model}                                                             │
 │ recent    -                                                                                                          │
-│ [e] edit   [n] new   [m] move   [space] turn off   [d] delete   [t] trace   [enter] open route                       │
+│ [e] edit   [n] new   [m] move   [d] delete   [t] trace   [enter] open route                                          │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

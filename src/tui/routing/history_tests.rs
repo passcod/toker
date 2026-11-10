@@ -20,7 +20,7 @@ fn reply(state: &mut State, name: &'static str, status: u16, body: Value) {
 
 /// The page on the history tab, after a save, with two warm lanes left on
 /// the revision before it.
-fn after_a_save() -> State {
+pub(super) fn after_a_save() -> State {
     let mut state = State::default();
     reply(&mut state, "snapshot", 200, testing::snapshot(World::SAVED));
     reply(
