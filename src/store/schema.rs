@@ -1488,6 +1488,16 @@ pub(super) fn migrate(conn: &mut Connection) -> Result<()> {
     for (index, script) in MIGRATIONS.iter().enumerate() {
         let version = index as i64 + 1;
         if version > current {
+            // Another process may be migrating the same store: the dashboard
+            // opened right after a restart once re-ran a migration the
+            // service had just committed and failed on its duplicate column.
+            // The version is read again under the write lock, and what the
+            // other opener applied is skipped.
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            current = tx.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
+            if version <= current {
+                continue;
+            }
             // v7 had no normal writer for attempt provenance. If raw fixtures
             // populated non-NULL attempt fields in a shape v8 cannot constrain,
             // v8 aborts atomically for explicit repair rather than rewriting
@@ -1495,7 +1505,6 @@ pub(super) fn migrate(conn: &mut Connection) -> Result<()> {
             //
             // The script and its user_version bump commit together, so a
             // crash mid-migration leaves the database at the prior version.
-            let tx = conn.transaction()?;
             if version == 10 {
                 validate_v10_history(&tx)?;
             } else if version == 12 {
