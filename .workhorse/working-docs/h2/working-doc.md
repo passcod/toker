@@ -50,3 +50,4 @@ Add one rewrite per Claude tier, each sending its requests to the codex route wi
 
 - No way to configure a second key or login for the same provider.
 - A codex-only Anthropic default passes `claude-*` names to codex, and nothing on the routing page flags it.
+- No way to duplicate a record, so each tier's rewrite is entered from the blank template.
