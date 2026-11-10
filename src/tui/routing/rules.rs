@@ -290,6 +290,31 @@ fn group_head(name: &str, clauses: &str, width: usize) -> BodyLine {
     BodyLine::plain(Line::from(spans))
 }
 
+/// `active` with the rewrite at `from` among the rules of `scope_label`
+/// put at `to`, as a move in progress shows it: the rules in the order they
+/// would have, and numbered by it.
+pub(super) fn with_move(active: &Value, scope_label: &str, from: usize, to: usize) -> Value {
+    let mut moved = active.clone();
+    if let Some(rewrites) = moved.get_mut("rewrites").and_then(Value::as_array_mut) {
+        let slots: Vec<usize> = rewrites
+            .iter()
+            .enumerate()
+            .filter(|(_, rule)| text(rule, "scope_label") == scope_label)
+            .map(|(at, _)| at)
+            .collect();
+        let mut rules: Vec<Value> = slots.iter().map(|at| rewrites[*at].clone()).collect();
+        if from < rules.len() && to < rules.len() {
+            let lifted = rules.remove(from);
+            rules.insert(to, lifted);
+        }
+        for (place, (slot, mut rule)) in slots.into_iter().zip(rules).enumerate() {
+            rule["position"] = Value::from(place + 1);
+            rewrites[slot] = rule;
+        }
+    }
+    moved
+}
+
 /// The rewrites table.
 pub(super) fn rewrites_table(active: &Value, width: usize) -> Table {
     let groups = rewrite_groups(active);

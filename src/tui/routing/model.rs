@@ -5,13 +5,14 @@
 //! selected one's detail beneath it; the routes tab can open one route whole;
 //! the models tab is a stack of panels with one focus among them.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use reqwest::Method;
 use serde_json::{Value, json};
 
 use super::data::{self, array, text};
+use super::editing::{Editing, What};
 use super::form::{Context, Form, Outcome, Purpose};
-use super::{models_tab, routes, rules};
+use super::{models_tab, routes, rules, template};
 use crate::tui::control::{Command, Reply, Response};
 
 /// How many rows a page key moves a selection.
@@ -134,24 +135,14 @@ impl Default for Models {
     }
 }
 
-/// A modal editing or safety-confirmation state.
+/// A small question the page asks over itself: a promotion's or a
+/// description's one-line form, or the confirmation of a reactivation.
+/// Records are edited in place, not here (see [`Editing`]).
 #[derive(Debug, Clone, Default)]
 pub(super) enum Modal {
     #[default]
     None,
-    /// A typed form: a record's fields, the policy description, a promotion
-    /// or a preview's request facts.
     Form(Box<Form>),
-    /// Which kind of record to add, in a view that lists several.
-    NewKind {
-        kinds: &'static [&'static str],
-        preselected: usize,
-    },
-    Remove {
-        key: String,
-        value: Value,
-    },
-    PreviewResult(Value),
     Reactivate {
         revision_id: i64,
     },
@@ -162,14 +153,11 @@ impl Modal {
         !matches!(self, Self::None)
     }
 
-    pub(super) fn title(&self) -> &'static str {
+    pub(super) fn title(&self) -> String {
         match self {
-            Self::None => "",
-            Self::Form(form) => form.title(),
-            Self::NewKind { .. } => "ADD POLICY RECORD",
-            Self::Remove { .. } => "REMOVE POLICY RECORD",
-            Self::PreviewResult(_) => "ROUTING PREVIEW",
-            Self::Reactivate { .. } => "REACTIVATE REVISION",
+            Self::None => String::new(),
+            Self::Form(form) => form.title().to_uppercase(),
+            Self::Reactivate { .. } => "REACTIVATE REVISION".to_owned(),
         }
     }
 }
@@ -194,11 +182,19 @@ pub(super) struct State {
     /// The outcome of the last post-activation Claude settings sync.
     settings_note: Option<String>,
     loading: bool,
+    /// A save, a promotion or a reactivation is on its way.
     in_flight: bool,
     modal: Modal,
-    /// Whether the preview shown asked for server safeguards. The result of
-    /// a route with no candidate left does not say, so the page remembers.
-    preview_asked: bool,
+    /// The record, candidate or move being edited where it is shown.
+    editing: Option<Editing>,
+    /// The selected candidate of the open route.
+    candidate: usize,
+    /// Whether the last thing done was a save that landed.
+    saved: bool,
+    /// What the last promotion did, said once.
+    notice: Option<String>,
+    /// The snapshot is out of date: a save found another revision live.
+    refresh_wanted: bool,
 }
 
 impl Default for State {
@@ -217,7 +213,11 @@ impl Default for State {
             loading: false,
             in_flight: false,
             modal: Modal::None,
-            preview_asked: false,
+            editing: None,
+            candidate: 0,
+            saved: false,
+            notice: None,
+            refresh_wanted: false,
         }
     }
 }
@@ -328,8 +328,39 @@ impl State {
         self.in_flight
     }
 
-    pub(super) fn preview_asked(&self) -> bool {
-        self.preview_asked
+    pub(super) fn editing(&self) -> Option<&Editing> {
+        self.editing.as_ref()
+    }
+
+    /// The selected candidate of the open route.
+    pub(super) fn candidate(&self) -> usize {
+        self.candidate
+    }
+
+    /// Whether a form owns the keys, an edit in place or a small question.
+    pub(super) fn capturing(&self) -> bool {
+        self.editing.is_some() || self.modal.active()
+    }
+
+    /// What the page leads its header status with: that something is being
+    /// edited, or that the last save landed.
+    pub(super) fn lead(&self) -> Option<&'static str> {
+        if self.editing.is_some() {
+            Some("editing")
+        } else if self.saved {
+            Some("saved")
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    /// Whether the snapshot should be read again, once.
+    pub(super) fn take_refresh_wanted(&mut self) -> bool {
+        std::mem::take(&mut self.refresh_wanted)
     }
 
     /// How many records a tab holds, for the strip. Models counts its
@@ -390,6 +421,14 @@ impl State {
     /// past a panel's edge.
     pub(super) fn move_selection(&mut self, delta: isize) {
         match (self.tab, self.mode) {
+            (Tab::Routes, Mode::Route) => {
+                let count = self.route_candidates();
+                self.candidate = if count == 0 {
+                    0
+                } else {
+                    self.candidate.saturating_add_signed(delta).min(count - 1)
+                };
+            }
             (_, Mode::Route) => {}
             (Tab::Models, _) => self.move_models(delta),
             (tab, _) => {
@@ -435,6 +474,7 @@ impl State {
         };
         if let Some(route) = route {
             self.selected[Tab::Routes.index()] = route;
+            self.candidate = 0;
             self.tab = Tab::Routes;
             self.mode = Mode::Route;
         }
@@ -455,6 +495,17 @@ impl State {
         }
         let at = &mut self.selected[Tab::Routes.index()];
         *at = (*at as isize + delta).rem_euclid(count as isize) as usize;
+        self.candidate = 0;
+    }
+
+    /// The open route's derived record.
+    fn open_route(&self) -> Option<&Value> {
+        array(self.active()?, "routes").get(self.selected_in(Tab::Routes))
+    }
+
+    fn route_candidates(&self) -> usize {
+        self.open_route()
+            .map_or(0, |route| array(route, "candidates").len())
     }
 
     fn move_models(&mut self, delta: isize) {
@@ -572,16 +623,25 @@ impl State {
         offers
     }
 
+    /// The form that has the focus, whichever kind it is.
+    fn form_mut(&mut self) -> Option<&mut Form> {
+        match (&mut self.editing, &mut self.modal) {
+            (Some(editing), _) => Some(&mut editing.form),
+            (None, Modal::Form(form)) => Some(form),
+            _ => None,
+        }
+    }
+
     /// Focus a field of the open form, as a click does.
     pub(super) fn focus_form_row(&mut self, row: usize) {
-        if let Modal::Form(form) = &mut self.modal {
+        if let Some(form) = self.form_mut() {
             form.focus_row(row);
         }
     }
 
     /// Move the open form's focus, as the wheel does.
     pub(super) fn step_form(&mut self, delta: isize) {
-        if let Modal::Form(form) = &mut self.modal {
+        if let Some(form) = self.form_mut() {
             form.step(delta);
         }
     }
@@ -682,18 +742,29 @@ impl State {
             Reply::Command(command, Ok(response)) => self.receive_response(command, response),
             Reply::Command(command, Err(error)) => {
                 self.settle(command.name);
+                if let Some(editing) = &mut self.editing {
+                    match command.name {
+                        "validate" => {
+                            editing.validating = false;
+                            editing.unchecked = Some(error.clone());
+                        }
+                        "preview" => editing.replaying = false,
+                        _ => {}
+                    }
+                }
                 self.error = Some(format!("{}: {error}", command.name));
             }
         }
     }
 
     /// A reply ends only what its own command began: a snapshot or revisions
-    /// read queued before an edit must not release the edit's busy guard.
+    /// read queued before an edit must not release the edit's busy guard, and
+    /// a check belongs to the edit it was asked about.
     fn settle(&mut self, name: &str) {
-        if matches!(name, "snapshot" | "revisions") {
-            self.loading = false;
-        } else {
-            self.in_flight = false;
+        match name {
+            "snapshot" | "revisions" => self.loading = false,
+            "validate" | "preview" => {}
+            _ => self.in_flight = false,
         }
     }
 
@@ -705,8 +776,21 @@ impl State {
 
     /// The worker queue refused an operation, so no reply will ever come.
     pub(super) fn command_refused(&mut self, name: &str) {
-        self.in_flight = false;
-        self.error = Some(format!("{name}: routing command queue is busy"));
+        match (name, &mut self.editing) {
+            // A check that was not taken is asked again at the next change.
+            ("validate", Some(editing)) => {
+                editing.validating = false;
+                editing.requested = None;
+            }
+            ("preview", Some(editing)) => {
+                editing.replaying = false;
+                editing.replay_requested = None;
+            }
+            _ => {
+                self.in_flight = false;
+                self.error = Some(format!("{name}: routing command queue is busy"));
+            }
+        }
     }
 
     fn receive_response(&mut self, command: Command, response: Response) {
@@ -725,30 +809,148 @@ impl State {
             self.clamp_selection();
             return;
         }
+        if matches!(command.name, "validate" | "preview") {
+            self.receive_check(&command, &response);
+            return;
+        }
+        if command.name == "save"
+            && response.status == 409
+            && response.body.get("error").and_then(Value::as_str) == Some("stale_revision")
+        {
+            // The form stays as entered; it says which revision is live
+            // now, and the page reads it.
+            self.moved(&response.body);
+            return;
+        }
         if response.status / 100 != 2 {
             self.error = Some(control_error(&command, &response));
             return;
         }
         match command.name {
-            "preview" => {
-                self.preview_asked = command.body.as_ref().is_some_and(|body| {
-                    body.get("request")
-                        .and_then(|request| request.get("asks_server_safeguards"))
-                        == Some(&Value::Bool(true))
-                });
-                self.modal = Modal::PreviewResult(response.body);
+            "save" => {
+                self.merge_activation(response.body);
+                self.editing = None;
+                self.modal = Modal::None;
+                self.saved = true;
             }
-            "save" | "reactivate" => {
+            "reactivate" => {
                 self.merge_activation(response.body);
                 self.modal = Modal::None;
             }
-            "promote" => self.modal = Modal::PreviewResult(response.body),
+            "promote" => {
+                self.notice = Some(format!(
+                    "promoted {} on {}",
+                    text_of(&command.body.clone().unwrap_or_default(), "model_id"),
+                    text_of(&command.body.clone().unwrap_or_default(), "binding_id"),
+                ));
+                self.modal = Modal::None;
+                self.error = None;
+            }
             _ => self.error = None,
         }
     }
 
+    /// A check came back. It is kept for the edit that is open if it is for
+    /// the operations that edit makes now; an answer to an older form is
+    /// dropped, and the next change asks again.
+    fn receive_check(&mut self, command: &Command, response: &Response) {
+        let ops = command
+            .body
+            .as_ref()
+            .and_then(|body| body.get("edit"))
+            .and_then(|edit| edit.get("operations"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let stale = response.status == 409
+            && response.body.get("error").and_then(Value::as_str) == Some("stale_revision");
+        if stale {
+            self.moved(&response.body);
+        }
+        let Some(editing) = &mut self.editing else {
+            return;
+        };
+        match command.name {
+            "validate" => {
+                editing.validating = false;
+                if response.status / 100 == 2 {
+                    editing.checked_with(ops, &response.body);
+                } else if !stale {
+                    editing.unchecked = Some(control_error(command, response));
+                }
+            }
+            _ => {
+                editing.replaying = false;
+                if response.status / 100 == 2 {
+                    editing.replayed_with(ops, &response.body);
+                }
+            }
+        }
+    }
+
+    /// The live revision is not the one the open edit was made against.
+    fn moved(&mut self, body: &Value) {
+        let live = body.get("live_revision_id").and_then(Value::as_i64);
+        if let Some(editing) = &mut self.editing {
+            editing.moved_to = live;
+        }
+        self.refresh_wanted = true;
+    }
+
+    /// The next check to ask the daemon for, if the open edit needs one: its
+    /// operations against the live revision, and once those are accepted,
+    /// how recent requests would route under them. One of each at a time.
+    pub(super) fn next_check(&mut self) -> Option<Command> {
+        if self.in_flight {
+            return None;
+        }
+        let revision = self.active_revision_id?;
+        let editing = self.editing.as_mut()?;
+        let ops = Value::Array(editing.operations());
+        if ops.as_array().is_none_or(Vec::is_empty) {
+            return None;
+        }
+        if !editing.validating && editing.requested.as_ref() != Some(&ops) {
+            editing.requested = Some(ops.clone());
+            editing.validating = true;
+            return Some(command(
+                "validate",
+                Method::POST,
+                "validate",
+                "routing-validate",
+                json!({ "expected_revision_id": revision, "edit": { "operations": ops } }),
+            ));
+        }
+        if !editing.validating
+            && !editing.replaying
+            && editing.accepted(&ops)
+            && editing.replay_requested.as_ref() != Some(&ops)
+        {
+            editing.replay_requested = Some(ops.clone());
+            editing.replaying = true;
+            return Some(command(
+                "preview",
+                Method::POST,
+                "preview",
+                "routing-preview",
+                json!({
+                    "mode": "replay_recent",
+                    "expected_revision_id": revision,
+                    "edit": { "operations": ops },
+                }),
+            ));
+        }
+        None
+    }
+
     fn receive_snapshot(&mut self, snapshot: Value) {
-        self.active_revision_id = data::revision_id(&snapshot);
+        let revision = data::revision_id(&snapshot);
+        if revision != self.active_revision_id
+            && let Some(editing) = &mut self.editing
+        {
+            // What was checked was checked against a policy that is not live.
+            editing.recheck();
+        }
+        self.active_revision_id = revision;
         // The page opens where something is refused, once: a later refresh
         // must not move an operator off the tab they chose
         // (spec: UTUI#the-routing-page).
@@ -807,16 +1009,23 @@ impl State {
 
     /// Handle a routing-page key.  Returned commands must be sent by the page's
     /// bounded worker; commands never perform synchronous I/O in this state.
+    /// The checks an edit asks for follow from [`State::next_check`].
     pub(super) fn key(&mut self, key: KeyEvent) -> Option<Command> {
+        self.saved = false;
         if self.in_flight {
             if key.code == KeyCode::Esc {
                 self.modal = Modal::None;
+                self.cancel_edit();
             }
             return None;
+        }
+        if self.editing.is_some() {
+            return self.editing_key(key);
         }
         if self.modal.active() {
             return self.modal_key(key);
         }
+        self.notice = None;
         match key.code {
             KeyCode::Char('e') => {
                 self.open_edit();
@@ -830,8 +1039,8 @@ impl State {
                 self.open_remove();
                 None
             }
-            KeyCode::Char('v') => {
-                self.open_preview();
+            KeyCode::Char('m') => {
+                self.open_move();
                 None
             }
             KeyCode::Char('a') if self.tab == Tab::History => {
@@ -862,6 +1071,116 @@ impl State {
         }
     }
 
+    /// A key in the open edit: the form's, or, in a move, the arrows that
+    /// carry the lifted row.
+    fn editing_key(&mut self, key: KeyEvent) -> Option<Command> {
+        let moving = matches!(
+            self.editing.as_ref()?.what,
+            What::MoveRule { .. } | What::MoveCandidate { .. }
+        );
+        if moving {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.step_move(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.step_move(1),
+                KeyCode::Esc => self.cancel_edit(),
+                KeyCode::Enter => return self.save_edit(),
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return self.save_edit();
+                }
+                _ => {}
+            }
+            return None;
+        }
+        match self.editing.as_mut()?.form.key(key) {
+            Outcome::Cancel => self.cancel_edit(),
+            Outcome::Submit => return self.save_edit(),
+            Outcome::Keep => {}
+        }
+        None
+    }
+
+    /// Abandon the open edit, putting back what a move displaced.
+    fn cancel_edit(&mut self) {
+        match self.editing.take().map(|editing| editing.what) {
+            Some(What::MoveRule { from, to, .. }) => {
+                let at = &mut self.selected[Tab::Rewrites.index()];
+                *at = at.saturating_add_signed(from as isize - to as isize);
+            }
+            Some(What::MoveCandidate { from, .. }) => self.candidate = from,
+            _ => {}
+        }
+    }
+
+    /// Lift the moved row a place up or down, its scope or route being all
+    /// it can move within.
+    fn step_move(&mut self, delta: isize) {
+        let Some(editing) = &mut self.editing else {
+            return;
+        };
+        match &mut editing.what {
+            What::MoveRule { rules, to, .. } => {
+                let next = to.saturating_add_signed(delta).min(rules.len() - 1);
+                let moved = next as isize - *to as isize;
+                *to = next;
+                let at = &mut self.selected[Tab::Rewrites.index()];
+                *at = at.saturating_add_signed(moved);
+            }
+            What::MoveCandidate { ids, to, .. } => {
+                *to = to.saturating_add_signed(delta).min(ids.len() - 1);
+                self.candidate = *to;
+            }
+            _ => {}
+        }
+    }
+
+    /// Save the open edit, if the daemon has accepted it as it stands.
+    fn save_edit(&mut self) -> Option<Command> {
+        let revision = self.active_revision_id?;
+        let editing = self.editing.as_ref()?;
+        if !editing.saveable() {
+            return None;
+        }
+        let operations = editing.operations();
+        self.in_flight = true;
+        Some(command(
+            "save",
+            Method::POST,
+            "save",
+            "routing-save",
+            json!({ "expected_revision_id": revision, "edit": { "operations": operations } }),
+        ))
+    }
+
+    /// Where a record sits in its collection of the document.
+    fn document_index(&self, target: &Target) -> Option<usize> {
+        let policy = data::policy(self.snapshot.as_ref()?)?;
+        match (target.kind, &target.scope, &target.id) {
+            ("compaction", ..) => None,
+            ("defaults", Some(scope), _) => array(policy, "defaults")
+                .iter()
+                .position(|record| record.get("scope") == Some(scope)),
+            (kind, _, Some(id)) => array(policy, kind)
+                .iter()
+                .position(|record| text(record, "id") == id),
+            _ => None,
+        }
+    }
+
+    /// The document's route the open route page shows.
+    fn document_route(&self) -> Option<(usize, &Value)> {
+        let id = text(self.open_route()?, "id");
+        let policy = data::policy(self.snapshot.as_ref()?)?;
+        array(policy, "routes")
+            .iter()
+            .enumerate()
+            .find(|(_, route)| text(route, "id") == id)
+    }
+
+    /// Whether the open route page is the one in view.
+    fn on_route_page(&self) -> bool {
+        (self.tab, self.mode) == (Tab::Routes, Mode::Route)
+    }
+
     fn open_edit(&mut self) {
         // The live revision's description is edited from the top of history.
         if self.tab == Tab::History && self.selected_in(Tab::History) == 0 {
@@ -879,25 +1198,65 @@ impl State {
             )));
             return;
         }
-        let selected = self
-            .target()
-            .and_then(|target| Some((target.kind, self.record(&target)?.clone())));
-        if let Some((kind, value)) = selected {
-            let context = self.form_context();
-            self.modal = Modal::Form(Box::new(Form::new(
-                Purpose::Record {
-                    kind,
-                    adding: false,
-                },
-                value,
-                context,
-            )));
+        if self.on_route_page() {
+            self.edit_candidate();
+            return;
         }
+        let Some(target) = self.target() else {
+            return;
+        };
+        let Some(record) = self.record(&target).cloned() else {
+            return;
+        };
+        let owner = self.document_index(&target);
+        let form = Form::new(
+            Purpose::Record {
+                kind: target.kind,
+                adding: false,
+            },
+            record,
+            self.form_context(),
+        );
+        self.editing = Some(Editing::new(
+            What::Record {
+                kind: target.kind,
+                adding: false,
+            },
+            form,
+            owner,
+            None,
+        ));
+    }
+
+    /// The selected candidate of the open route, and the edge into it.
+    fn edit_candidate(&mut self) {
+        let Some((owner, route)) = self.document_route() else {
+            return;
+        };
+        let route = route.clone();
+        let index = self.candidate;
+        let (edge, candidate) = if index == 0 {
+            (Value::Null, route["chain"]["first"].clone())
+        } else {
+            let step = &route["chain"]["steps"][index - 1];
+            (step["edge"].clone(), step["candidate"].clone())
+        };
+        let (value, with_edge) = if index == 0 {
+            (json!({ "candidate": candidate }), false)
+        } else {
+            (json!({ "edge": edge, "candidate": candidate }), true)
+        };
+        let form = Form::new(Purpose::Candidate { with_edge }, value, self.form_context());
+        self.editing = Some(Editing::new(
+            What::EditCandidate { route, index },
+            form,
+            Some(owner),
+            Some(index),
+        ));
     }
 
     /// What a form completes from: the bindings toker implements, what the
-    /// catalogues offer, the policy's record ids, and the daemon's findings on
-    /// the record being edited, keyed by their path inside it.
+    /// catalogues offer, the policy's record ids and what its routes are.
     fn form_context(&self) -> Context {
         let mut context = Context {
             bindings: crate::routing::BACKEND_BINDINGS
@@ -926,62 +1285,232 @@ impl State {
                 );
             }
         }
+        if let Some(active) = data::active(snapshot) {
+            for route in array(active, "routes") {
+                let id = data::text(route, "id");
+                let said: String = rules::route_summary(active, id)
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                context.routes.insert(id.to_owned(), said);
+            }
+        }
         context
     }
 
-    /// Start adding a record. A tab that holds one kind goes straight to its
-    /// template; one that holds several asks which kind first.
+    /// Start adding a record to the table that shows it, or a fallback to
+    /// the open route.
     fn open_add(&mut self) {
-        let kinds = super::template::kinds(self.tab, self.models.focus);
-        match kinds {
-            [] => {
-                self.error = Some("there is nothing to add in this view".to_owned());
-            }
-            [kind] => self.open_template(kind),
-            _ => {
-                let preselected = self
-                    .target()
-                    .and_then(|target| kinds.iter().position(|kind| *kind == target.kind))
-                    .unwrap_or(0);
-                self.modal = Modal::NewKind { kinds, preselected };
-            }
+        if self.on_route_page() {
+            self.add_candidate();
+            return;
         }
-    }
-
-    fn open_template(&mut self, kind: &'static str) {
-        let route_id = self
+        let Some(kind) = template::kind_for(self.tab, self.models.focus) else {
+            self.error = Some("there is nothing to add in this view".to_owned());
+            return;
+        };
+        let routes = self
             .snapshot
             .as_ref()
             .and_then(data::policy)
-            .and_then(|policy| array(policy, "routes").first())
-            .and_then(|route| route.get("id"))
-            .and_then(Value::as_str);
-        let context = self.form_context();
-        self.modal = Modal::Form(Box::new(Form::new(
-            Purpose::Record { kind, adding: true },
-            super::template::template(kind, route_id),
-            context,
-        )));
-    }
-
-    fn open_remove(&mut self) {
-        let selected = self
-            .target()
-            .and_then(|target| Some((target.kind, self.record(&target)?.clone())));
-        if let Some((kind, value)) = selected {
-            self.modal = Modal::Remove {
-                key: kind.to_owned(),
-                value,
-            };
+            .map_or(&[][..], |policy| array(policy, "routes"));
+        // A rule, a default and a compaction policy send somewhere, so
+        // there is nowhere to start until there is a route.
+        if routes.is_empty() && matches!(kind, "rewrites" | "defaults" | "compaction") {
+            self.error = Some(format!(
+                "a {} needs a route to send to: add one in routes first (press 4)",
+                template::singular(kind)
+            ));
+            return;
         }
+        if kind == "compaction"
+            && self
+                .snapshot
+                .as_ref()
+                .and_then(data::policy)
+                .is_some_and(|policy| policy.get("compaction").is_some_and(|c| !c.is_null()))
+        {
+            self.error = Some("there is a compaction policy already: edit it".to_owned());
+            return;
+        }
+        let route_id = routes.first().map(|route| text(route, "id").to_owned());
+        let mut value = template::template(kind, route_id.as_deref());
+        // A new record starts in the scope of the one under the selection.
+        if matches!(kind, "rewrites" | "defaults" | "presentations")
+            && let Some(active) = self.active()
+            && let Some(scope) = rules::entries(active, self.tab)
+                .get(self.selected_in(self.tab))
+                .and_then(|entry| entry.record().get("scope"))
+                .filter(|scope| !scope.is_null())
+        {
+            value["scope"] = scope.clone();
+        }
+        let owner = (kind != "compaction").then(|| {
+            self.snapshot
+                .as_ref()
+                .and_then(data::policy)
+                .map_or(0, |policy| array(policy, kind).len())
+        });
+        let form = Form::new(
+            Purpose::Record { kind, adding: true },
+            value,
+            self.form_context(),
+        );
+        self.editing = Some(Editing::new(
+            What::Record { kind, adding: true },
+            form,
+            owner,
+            None,
+        ));
     }
 
-    fn open_preview(&mut self) {
-        self.modal = Modal::Form(Box::new(Form::new(
-            Purpose::Preview,
-            json!({ "protocol": "anthropic_messages", "prompt_bound": 0, "tool_count": 0 }),
-            Context::default(),
-        )));
+    /// A new fallback at the end of the open route.
+    fn add_candidate(&mut self) {
+        let Some((owner, route)) = self.document_route() else {
+            return;
+        };
+        let route_id = text(route, "id").to_owned();
+        let ids = candidate_ids(route);
+        let after = ids.last().cloned().unwrap_or_default();
+        let unused = (1..)
+            .map(|n| format!("fallback-{n}"))
+            .find(|id| !ids.contains(id))
+            .unwrap_or_default();
+        let mut candidate = template::template("routes", None)["chain"]["first"].clone();
+        candidate["id"] = Value::from(unused);
+        let value = json!({ "edge": super::form::default_edge(), "candidate": candidate });
+        let form = Form::new(
+            Purpose::Candidate { with_edge: true },
+            value,
+            self.form_context(),
+        );
+        let step = ids.len();
+        self.editing = Some(Editing::new(
+            What::AddCandidate { route_id, after },
+            form,
+            Some(owner),
+            Some(step),
+        ));
+    }
+
+    /// Start removing the selected record, or the open route's selected
+    /// candidate. A removal is checked like an edit: what still depends on
+    /// the record refuses it.
+    fn open_remove(&mut self) {
+        if self.on_route_page() {
+            let Some((owner, route)) = self.document_route() else {
+                return;
+            };
+            let ids = candidate_ids(route);
+            let Some(candidate_id) = ids.get(self.candidate).cloned() else {
+                return;
+            };
+            let what = What::RemoveCandidate {
+                route_id: text(route, "id").to_owned(),
+                candidate_id,
+            };
+            self.editing = Some(Editing::new(
+                what,
+                Form::new(Purpose::Fieldless, Value::Null, Context::default()),
+                Some(owner),
+                None,
+            ));
+            return;
+        }
+        let Some(target) = self.target() else {
+            return;
+        };
+        let Some(record) = self.record(&target).cloned() else {
+            return;
+        };
+        let what = What::Remove {
+            kind: target.kind,
+            record,
+        };
+        self.editing = Some(Editing::new(
+            what,
+            Form::new(Purpose::Fieldless, Value::Null, Context::default()),
+            None,
+            None,
+        ));
+    }
+
+    /// Lift the selected rewrite, or the open route's selected candidate, to
+    /// be put somewhere else with the arrows.
+    fn open_move(&mut self) {
+        let what = if self.on_route_page() {
+            let Some((_, route)) = self.document_route() else {
+                return;
+            };
+            let ids = candidate_ids(route);
+            let edges: Vec<Value> = array(&route["chain"], "steps")
+                .iter()
+                .map(|step| step["edge"].clone())
+                .collect();
+            let from = self.candidate.min(ids.len().saturating_sub(1));
+            if ids.len() < 2 {
+                self.error = Some("a route with one candidate has nothing to reorder".to_owned());
+                return;
+            }
+            What::MoveCandidate {
+                route_id: text(route, "id").to_owned(),
+                ids,
+                edges,
+                from,
+                to: from,
+            }
+        } else if self.tab == Tab::Rewrites {
+            let Some(active) = self.active() else {
+                return;
+            };
+            let Some(rules::Entry::Rewrite(rule)) = rules::entries(active, self.tab)
+                .get(self.selected_in(self.tab))
+                .copied()
+            else {
+                self.error = Some("only a rewrite can be moved: select one".to_owned());
+                return;
+            };
+            let scope_label = text(rule, "scope_label").to_owned();
+            let ids: Vec<&str> = array(active, "rewrites")
+                .iter()
+                .filter(|other| text(other, "scope_label") == scope_label)
+                .map(|other| text(other, "id"))
+                .collect();
+            let from = ids
+                .iter()
+                .position(|id| *id == text(rule, "id"))
+                .unwrap_or(0);
+            let records: Vec<Value> = ids
+                .iter()
+                .filter_map(|id| {
+                    self.record(&Target {
+                        kind: "rewrites",
+                        id: Some((*id).to_owned()),
+                        scope: None,
+                    })
+                    .cloned()
+                })
+                .collect();
+            if records.len() < 2 {
+                self.error = Some("it is the only rewrite in its scope".to_owned());
+                return;
+            }
+            What::MoveRule {
+                scope_label,
+                rules: records,
+                from,
+                to: from,
+            }
+        } else {
+            self.error = Some("only a rewrite, or a route's candidate, can be moved".to_owned());
+            return;
+        };
+        self.editing = Some(Editing::new(
+            what,
+            Form::new(Purpose::Fieldless, Value::Null, Context::default()),
+            None,
+            None,
+        ));
     }
 
     fn open_reactivate(&mut self) {
@@ -1029,46 +1558,6 @@ impl State {
                     (Modal::Form(form), action)
                 }
             },
-            Modal::NewKind { kinds, preselected } => {
-                let chosen = match key.code {
-                    KeyCode::Esc => return None,
-                    KeyCode::Enter => Some(preselected),
-                    KeyCode::Char(digit) => digit
-                        .to_digit(10)
-                        .and_then(|digit| usize::try_from(digit).ok())
-                        .and_then(|digit| digit.checked_sub(1))
-                        .filter(|index| *index < kinds.len()),
-                    _ => None,
-                };
-                match chosen.and_then(|index| kinds.get(index)) {
-                    Some(kind) => {
-                        self.open_template(kind);
-                        return None;
-                    }
-                    None => (Modal::NewKind { kinds, preselected }, ModalAction::None),
-                }
-            }
-            Modal::Remove {
-                key: record_key,
-                value,
-            } => match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => (
-                    Modal::Remove {
-                        key: record_key.clone(),
-                        value: value.clone(),
-                    },
-                    ModalAction::Edit(vec![remove_edit(&record_key, &value)]),
-                ),
-                KeyCode::Esc | KeyCode::Char('n') => (Modal::None, ModalAction::None),
-                _ => (
-                    Modal::Remove {
-                        key: record_key,
-                        value,
-                    },
-                    ModalAction::None,
-                ),
-            },
-            Modal::PreviewResult(_) => (Modal::None, ModalAction::None),
             Modal::Reactivate { revision_id } => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => (
                     Modal::Reactivate { revision_id },
@@ -1082,15 +1571,13 @@ impl State {
         match action {
             ModalAction::None => None,
             ModalAction::Edit(edits) => self.edit(edits),
-            ModalAction::Preview(facts) => self.preview(&facts),
             ModalAction::Reactivate { revision_id } => self.reactivate(revision_id),
             ModalAction::Promote { binding, model } => self.promote(&binding, &model),
         }
     }
 
-    /// Save the typed edits against the revision the page last saw live. The
-    /// daemon refuses a save made against a revision that has since moved, and
-    /// the form stays open as entered.
+    /// Save typed edits against the revision the page last saw live. The
+    /// daemon refuses a save made against a revision that has since moved.
     fn edit(&mut self, edits: Vec<Value>) -> Option<Command> {
         let revision = self.active_revision_id?;
         self.in_flight = true;
@@ -1100,44 +1587,6 @@ impl State {
             "save",
             "routing-save",
             json!({ "expected_revision_id": revision, "edit": { "operations": edits } }),
-        ))
-    }
-
-    /// The preview request from the form's facts: only what was filled in.
-    fn preview(&mut self, facts: &Value) -> Option<Command> {
-        self.in_flight = true;
-        let mut request = json!({
-            "kind": "invented",
-            "protocol": facts.get("protocol").cloned().unwrap_or(Value::Null),
-        });
-        for key in ["profile", "model", "lane_key"] {
-            if let Some(text) = facts
-                .get(key)
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-            {
-                request[key] = Value::String(text.to_owned());
-            }
-        }
-        for key in ["prompt_bound", "message_count", "tool_count"] {
-            if let Some(number) = facts.get(key).and_then(Value::as_u64) {
-                request[key] = Value::from(number);
-            }
-        }
-        if facts.get("asks_server_safeguards") == Some(&Value::Bool(true)) {
-            request["asks_server_safeguards"] = Value::Bool(true);
-        }
-        let body = json!({
-            "mode": "resolve",
-            "expected_revision_id": self.active_revision_id,
-            "request": request,
-        });
-        Some(command(
-            "preview",
-            Method::POST,
-            "preview",
-            "routing-preview",
-            body,
         ))
     }
 
@@ -1169,11 +1618,21 @@ impl State {
     }
 }
 
+/// The ids of a document route's candidates, in order.
+fn candidate_ids(route: &Value) -> Vec<String> {
+    let mut ids = vec![text(&route["chain"]["first"], "id").to_owned()];
+    ids.extend(
+        array(&route["chain"], "steps")
+            .iter()
+            .map(|step| text(&step["candidate"], "id").to_owned()),
+    );
+    ids
+}
+
 #[derive(Debug)]
 enum ModalAction {
     None,
     Edit(Vec<Value>),
-    Preview(Value),
     Reactivate { revision_id: i64 },
     Promote { binding: String, model: String },
 }
@@ -1194,87 +1653,10 @@ fn command(
     }
 }
 
-fn replace_edit(key: &str, value: Value) -> Value {
-    let id = value.get("id").cloned().unwrap_or(Value::Null);
-    match key {
-        "defaults" => {
-            let scope = value.get("scope").cloned().unwrap_or(Value::Null);
-            json!({ "kind": "replace_default", "scope": scope, "default": value })
-        }
-        "compaction" => json!({ "kind": "replace_compaction", "compaction": value }),
-        "presentations" => {
-            json!({ "kind": "replace_presentation", "id": id, "presentation": value })
-        }
-        "routes" => json!({ "kind": "replace_route", "id": id, "route": value }),
-        "rewrites" => json!({ "kind": "replace_rewrite", "id": id, "rewrite": value }),
-        "classifiers" => json!({ "kind": "replace_classifier", "id": id, "classifier": value }),
-        "upgrades" => json!({ "kind": "replace_upgrade", "id": id, "upgrade": value }),
-        _ => Value::Null,
-    }
-}
-
-/// The typed addition of a new record. It carries no id of its own to
-/// compare against: the daemon refuses an id or scope already taken.
-pub(super) fn add_edit(key: &str, value: Value) -> Value {
-    match key {
-        "presentations" => json!({ "kind": "add_presentation", "presentation": value }),
-        "routes" => json!({ "kind": "add_route", "route": value }),
-        "defaults" => json!({ "kind": "add_default", "default": value }),
-        "rewrites" => json!({ "kind": "add_rewrite", "rewrite": value }),
-        "classifiers" => json!({ "kind": "add_classifier", "classifier": value }),
-        "upgrades" => json!({ "kind": "add_upgrade", "upgrade": value }),
-        "compaction" => json!({ "kind": "add_compaction", "compaction": value }),
-        _ => Value::Null,
-    }
-}
-
-fn remove_edit(key: &str, value: &Value) -> Value {
-    let id = value.get("id").cloned().unwrap_or(Value::Null);
-    match key {
-        "defaults" => {
-            let scope = value.get("scope").cloned().unwrap_or(Value::Null);
-            json!({ "kind": "remove_default", "scope": scope })
-        }
-        "compaction" => json!({ "kind": "remove_compaction" }),
-        "presentations" => json!({ "kind": "remove_presentation", "id": id }),
-        "routes" => json!({ "kind": "remove_route", "id": id }),
-        "rewrites" => json!({ "kind": "remove_rewrite", "id": id }),
-        "classifiers" => json!({ "kind": "remove_classifier", "id": id }),
-        "upgrades" => json!({ "kind": "remove_upgrade", "id": id }),
-        _ => Value::Null,
-    }
-}
-
-/// The edit a submitted form sends, or what it asks for.
+/// The edit a submitted small form sends, or what it asks for.
 fn form_action(form: &Form) -> ModalAction {
     let value = form.value();
     match form.purpose() {
-        Purpose::Record { kind, adding } => {
-            let mut record = value.clone();
-            // The flag is the one route field with its own operation, which
-            // is what raises the document to the format that carries it, so
-            // the record travels without it and the operation follows.
-            let honours = (kind == "routes")
-                .then(|| {
-                    record
-                        .as_object_mut()
-                        .and_then(|route| route.remove("honours_server_safeguards"))
-                })
-                .flatten();
-            let mut edits = vec![if adding {
-                add_edit(kind, record)
-            } else {
-                replace_edit(kind, record)
-            }];
-            if kind == "routes" {
-                edits.push(json!({
-                    "kind": "set_route_server_safeguards",
-                    "route_id": value.get("id").cloned().unwrap_or(Value::Null),
-                    "honours": honours == Some(Value::Bool(true)),
-                }));
-            }
-            ModalAction::Edit(edits)
-        }
         Purpose::Description => ModalAction::Edit(vec![json!({
             "kind": "set_description",
             "description": value.get("description").cloned().unwrap_or(Value::Null),
@@ -1283,7 +1665,8 @@ fn form_action(form: &Form) -> ModalAction {
             binding: text_of(value, "binding_id"),
             model: text_of(value, "model_id"),
         },
-        Purpose::Preview => ModalAction::Preview(value.clone()),
+        // Records and candidates are edited in place, not by a small form.
+        _ => ModalAction::None,
     }
 }
 
@@ -1310,16 +1693,6 @@ fn control_error(command: &Command, response: &Response) -> String {
         })
         .collect::<Vec<_>>();
     let mut message = format!("{}: {code} (HTTP {})", command.name, response.status);
-    if code == "stale_revision"
-        && let Some(live) = response
-            .body
-            .get("live_revision_id")
-            .and_then(Value::as_i64)
-    {
-        message.push_str(&format!(
-            ": revision {live} is now live; reload, then save again"
-        ));
-    }
     if let Some(detail) = response.body.get("detail").and_then(Value::as_str) {
         message.push_str(&format!(": {detail}"));
     }
@@ -1336,10 +1709,11 @@ mod tests {
 
     use super::{Modal, Mode, Panel, State, Tab};
     use crate::tui::control::{Command, Reply, Response};
+    use crate::tui::routing::editing::{What, add_edit, remove_edit, replace_edit};
     use crate::tui::routing::form::Purpose;
     use crate::tui::routing::testing::{self, World};
 
-    const CTRL_ENTER: KeyEvent = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+    const CTRL_S: KeyEvent = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
 
     fn reply(name: &'static str, status: u16, body: serde_json::Value) -> Reply {
         let mut command = Command::snapshot("routing-snapshot");
@@ -1371,27 +1745,45 @@ mod tests {
         }
     }
 
-    /// The open form's purpose, if a form is open.
-    fn form_purpose(state: &State) -> Option<Purpose> {
-        match state.modal() {
-            Modal::Form(form) => Some(form.purpose()),
-            _ => None,
-        }
-    }
-
-    fn record_form(kind: &'static str, adding: bool) -> Option<Purpose> {
-        Some(Purpose::Record { kind, adding })
-    }
-
+    /// The open edit's form value.
     fn form_value(state: &State) -> serde_json::Value {
-        let Modal::Form(form) = state.modal() else {
-            panic!("a form is open");
-        };
-        form.value().clone()
+        state
+            .editing()
+            .expect("an edit is open")
+            .form
+            .value()
+            .clone()
     }
 
-    fn first_operation(command: Command) -> serde_json::Value {
-        command.body.expect("body")["edit"]["operations"][0].clone()
+    /// The typed operations of a command's edit.
+    fn ops(command: &Command) -> serde_json::Value {
+        command.body.as_ref().expect("body")["edit"]["operations"].clone()
+    }
+
+    /// Answer `command` as the daemon would, with `status` and `body`.
+    fn answer(state: &mut State, command: Command, status: u16, body: serde_json::Value) {
+        state.receive(Reply::Command(command, Ok(Response { status, body })));
+    }
+
+    /// What the daemon says of an edit it finds nothing wrong with.
+    fn fine() -> serde_json::Value {
+        serde_json::json!({"valid": true, "diagnostics": [], "refusal": null})
+    }
+
+    /// Ask for the check the open edit is due, and have the daemon accept the
+    /// edit. Returns the check that was sent.
+    fn accepted(state: &mut State) -> Command {
+        let check = state.next_check().expect("a check is due");
+        assert_eq!(check.name, "validate");
+        answer(state, check.clone(), 200, fine());
+        check
+    }
+
+    /// Open the edit by `key`, have it accepted, and save it.
+    fn saved_by(state: &mut State, key: char) -> Command {
+        press(state, KeyCode::Char(key));
+        accepted(state);
+        state.key(CTRL_S).expect("a save")
     }
 
     // --- navigation -------------------------------------------------------
@@ -1533,91 +1925,1034 @@ mod tests {
         assert_eq!(state.models().offers_at, 0, "a catalogue starts at its top");
     }
 
-    // --- editing ----------------------------------------------------------
+    // --- editing in place -----------------------------------------------------
 
     #[test]
-    fn escape_cancels_every_confirmation_without_a_command() {
+    fn a_row_is_edited_where_it_is_with_every_key_going_to_its_form() {
         let mut state = loaded(World::AT_REST);
-        for key in ['d', 'p', 'v'] {
-            press(&mut state, KeyCode::Char(key));
-            assert!(state.modal().active(), "{key} opens a form");
-            assert!(press(&mut state, KeyCode::Esc).is_none());
-            assert!(!state.modal().active(), "{key} closes on Esc");
-        }
+        assert!(!state.capturing());
         press(&mut state, KeyCode::Char('e'));
-        assert_eq!(form_purpose(&state), record_form("presentations", false));
+        assert!(state.capturing(), "the form owns the keys");
+        assert!(!state.modal().active(), "it is not a popup");
+        assert_eq!(form_value(&state)["id"], "pick-1");
+        assert!(matches!(
+            state.editing().expect("editing").what,
+            What::Record {
+                kind: "presentations",
+                adding: false
+            }
+        ));
+        assert_eq!(state.lead(), Some("editing"));
+        // Escape abandons it, and sends nothing.
+        assert!(press(&mut state, KeyCode::Esc).is_none());
+        assert!(!state.capturing());
+        assert_eq!(state.lead(), None);
+    }
+
+    /// One check at a time, always of the form as it stands: a change made
+    /// while one is out is asked about when it comes back.
+    #[test]
+    fn a_change_is_checked_one_at_a_time_and_the_newest_form_wins() {
+        let mut state = loaded(World::AT_REST);
+        press(&mut state, KeyCode::Char('e'));
+        let first = state.next_check().expect("a check on opening");
+        assert_eq!(first.name, "validate");
+        assert_eq!(first.path, "validate");
+        let body = first.body.clone().expect("body");
+        assert_eq!(body["expected_revision_id"], 9);
+        assert_eq!(
+            body["edit"]["operations"][0]["kind"],
+            "replace_presentation"
+        );
+        assert!(state.next_check().is_none(), "one in flight");
+
+        press(&mut state, KeyCode::Down);
+        typed(&mut state, "x");
+        assert!(state.next_check().is_none(), "still the first one's turn");
+        // Its answer is for a form that has moved on: not accepted.
+        answer(&mut state, first, 200, fine());
+        assert!(!state.editing().expect("editing").saveable());
+        let second = state.next_check().expect("the changed form is asked about");
+        assert_eq!(second.name, "validate");
+        assert_ne!(ops(&second), body["edit"]["operations"]);
+        answer(&mut state, second, 200, fine());
+        assert!(state.editing().expect("editing").saveable());
+        // Nothing changed since: nothing to ask but what recent traffic did.
+        assert_eq!(state.next_check().expect("replay").name, "preview");
+    }
+
+    #[test]
+    fn nothing_can_be_saved_until_the_daemon_has_accepted_it() {
+        let mut state = loaded(World::AT_REST);
+        press(&mut state, KeyCode::Char('e'));
+        assert!(state.key(CTRL_S).is_none(), "not yet checked");
+        assert_eq!(state.editing().expect("editing").save_label(), "checking");
+        let check = state.next_check().expect("check");
+        assert!(state.key(CTRL_S).is_none(), "still being checked");
+        answer(&mut state, check, 200, fine());
+        assert_eq!(state.editing().expect("editing").save_label(), "save");
+        let save = state.key(CTRL_S).expect("saveable");
+        assert_eq!(save.name, "save");
+        assert!(state.in_flight());
+    }
+
+    #[test]
+    fn a_refusal_stops_the_save_and_says_which_field_to_fix() {
+        let mut state = on(Tab::Rewrites);
+        state.move_selection(1);
+        press(&mut state, KeyCode::Char('e'));
+        let index = state
+            .document_index(&state.target().expect("target"))
+            .expect("the rule's place");
+        let check = state.next_check().expect("check");
+        answer(
+            &mut state,
+            check,
+            200,
+            serde_json::json!({
+                "valid": false, "refusal": null,
+                "diagnostics": [{
+                    "code": "missing-route", "severity": "error",
+                    "record_id": "anthropic-messages-2",
+                    "path": format!("/rewrites/{index}/target/route_id"),
+                    "sentence": "The route does not exist.",
+                    "fix": "Choose a route in the policy.",
+                }],
+            }),
+        );
+        assert!(state.key(CTRL_S).is_none());
+        let editing = state.editing().expect("editing");
+        assert!(!editing.saveable());
+        assert_eq!(editing.save_label(), "fix route to save");
+        let route = editing
+            .form
+            .lines()
+            .into_iter()
+            .find(|line| line.text.contains("route:"))
+            .expect("the route field");
+        assert_eq!(route.notes.len(), 2, "the sentence and the fix: {route:?}");
+        // The form is still open: it is fixed in place.
+        assert!(state.capturing());
+    }
+
+    /// A finding about a record the form is not for names that record, and
+    /// still stops the save.
+    #[test]
+    fn a_refusal_that_belongs_to_another_record_names_it() {
+        let mut state = on(Tab::Routes);
+        press(&mut state, KeyCode::Char('d'));
+        let check = state.next_check().expect("check");
+        assert_eq!(ops(&check)[0]["kind"], "remove_route");
+        answer(
+            &mut state,
+            check,
+            200,
+            serde_json::json!({
+                "valid": false, "refusal": null,
+                "diagnostics": [{
+                    "code": "missing-route", "severity": "error",
+                    "record_id": "anthropic-messages-1",
+                    "path": "/rewrites/0/target/route_id",
+                    "sentence": "The route it sends to is not in the policy.",
+                    "fix": "Send it to another route first.",
+                }],
+            }),
+        );
+        let editing = state.editing().expect("editing");
+        assert_eq!(
+            editing.save_label(),
+            "fix rewrite anthropic-messages-1 to save"
+        );
+        assert!(!editing.saveable());
+        let checked = editing.checked.as_ref().expect("checked");
+        assert_eq!(checked.elsewhere.len(), 1);
+        assert!(state.key(CTRL_S).is_none());
+    }
+
+    #[test]
+    fn a_warning_is_shown_beside_the_field_and_does_not_block_the_save() {
+        let mut state = on(Tab::Routes);
+        press(&mut state, KeyCode::Char('e'));
+        let index = state
+            .document_index(&state.target().expect("target"))
+            .expect("place");
+        let check = state.next_check().expect("check");
+        answer(
+            &mut state,
+            check,
+            200,
+            serde_json::json!({
+                "valid": true, "refusal": null,
+                "diagnostics": [
+                    {"code": "binding-unconfigured", "severity": "warning",
+                     "record_id": "claude-sub",
+                     "path": format!("/routes/{index}/chain/first/binding_id"),
+                     "sentence": "The provider is not configured.",
+                     "fix": "Configure it, or leave it: it is skipped until it is."},
+                    // Another record's warning is not this form's business.
+                    {"code": "binding-unconfigured", "severity": "warning",
+                     "record_id": "codex", "path": "/routes/3/chain/first/binding_id",
+                     "sentence": "elsewhere", "fix": "elsewhere"},
+                ],
+            }),
+        );
+        let editing = state.editing().expect("editing");
+        assert!(editing.saveable());
+        let warned: Vec<_> = editing
+            .form
+            .lines()
+            .into_iter()
+            .filter(|line| !line.notes.is_empty())
+            .collect();
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(warned[0].text.contains("binding"));
+        assert!(state.key(CTRL_S).is_some());
+    }
+
+    #[test]
+    fn an_edit_the_daemon_cannot_apply_is_refused_with_its_words() {
+        let mut state = loaded(World::AT_REST);
+        press(&mut state, KeyCode::Char('n'));
+        let check = state.next_check().expect("check");
+        answer(
+            &mut state,
+            check,
+            200,
+            serde_json::json!({
+                "valid": false, "diagnostics": [],
+                "refusal": {"error": "invalid_policy_edit", "detail": "presentation `new-presentation` already exists"},
+            }),
+        );
+        let editing = state.editing().expect("the form stays");
+        assert_eq!(editing.save_label(), "fix the refusal to save");
+        assert!(state.key(CTRL_S).is_none());
+    }
+
+    #[test]
+    fn a_blank_id_is_refused_by_the_form_before_the_daemon_is_asked() {
+        let mut state = loaded(World::AT_REST);
+        press(&mut state, KeyCode::Char('n'));
+        for _ in 0.."new-presentation".len() {
+            press(&mut state, KeyCode::Backspace);
+        }
+        let check = state.next_check().expect("check");
+        answer(&mut state, check, 200, fine());
+        let editing = state.editing().expect("editing");
+        assert_eq!(editing.form.refused().0, ["id"]);
+        assert_eq!(editing.save_label(), "fix id to save");
+        assert!(state.key(CTRL_S).is_none(), "even though the daemon agreed");
         press(&mut state, KeyCode::Esc);
+        assert!(!state.capturing());
+    }
+
+    #[test]
+    fn a_record_is_saved_as_the_typed_replacement_against_the_live_revision() {
+        let mut state = on(Tab::Routes);
+        press(&mut state, KeyCode::Char('e'));
+        assert_eq!(form_value(&state)["id"], "claude-sub");
+        // The id names the record the edit replaces, so it is fixed.
+        typed(&mut state, "x");
+        assert_eq!(form_value(&state)["id"], "claude-sub");
+        press(&mut state, KeyCode::Down);
+        typed(&mut state, "named");
+        accepted(&mut state);
+        let save = state.key(CTRL_S).expect("save");
+        assert_eq!(save.method, Method::POST);
+        assert_eq!(save.path, "save");
+        assert_eq!(save.body.as_ref().expect("body")["expected_revision_id"], 9);
+        let operations = ops(&save);
+        assert_eq!(operations[0]["kind"], "replace_route");
+        assert_eq!(operations[0]["id"], "claude-sub");
+        assert_eq!(operations[0]["route"]["display_name"], "claude-subnamed");
+        // What the schema does not name is carried through as it was.
+        assert_eq!(operations[0]["route"]["chain"]["first"]["id"], "sub");
+    }
+
+    #[test]
+    fn a_save_that_lands_closes_the_form_and_says_so() {
+        let mut state = loaded(World::AT_REST);
+        let save = saved_by(&mut state, 'e');
+        assert!(state.in_flight());
+        assert!(press(&mut state, KeyCode::Char('x')).is_none());
+        answer(
+            &mut state,
+            save,
+            200,
+            serde_json::json!({"active_revision": {"revision_id": 10}}),
+        );
+        assert!(!state.in_flight());
+        assert!(!state.capturing());
+        assert_eq!(state.active_revision_id(), Some(10));
+        assert_eq!(state.lead(), Some("saved"));
+        press(&mut state, KeyCode::Down);
+        assert_eq!(state.lead(), None, "said once");
+    }
+
+    /// A save made against a revision that is not live any more keeps the
+    /// form as entered and says which revision is live; the page reads the
+    /// new one and the form is checked against it.
+    #[test]
+    fn a_save_moved_past_keeps_the_form_and_names_the_live_revision() {
+        let mut state = loaded(World::AT_REST);
+        press(&mut state, KeyCode::Char('n'));
+        typed(&mut state, "");
+        accepted(&mut state);
+        let save = state.key(CTRL_S).expect("add");
+        assert_eq!(save.body.as_ref().expect("body")["expected_revision_id"], 9);
+        answer(
+            &mut state,
+            save,
+            409,
+            serde_json::json!({"error": "stale_revision", "live_revision_id": 12}),
+        );
+        assert!(!state.in_flight());
+        let editing = state.editing().expect("the form is kept");
+        assert_eq!(editing.moved_to, Some(12));
+        assert_eq!(editing.save_label(), "save onto rev 12");
+        assert_eq!(form_value(&state)["id"], "new-presentation");
+        assert!(state.error().is_none(), "the form says it, not the banner");
+        assert!(state.take_refresh_wanted());
+        assert!(!state.take_refresh_wanted(), "once");
+
+        // The snapshot of the live revision arrives: the form is checked
+        // against it, and saved onto it.
+        let mut snapshot = testing::snapshot(World::AT_REST);
+        snapshot["active_revision"]["revision_id"] = serde_json::json!(12);
+        answer(
+            &mut state,
+            Command::snapshot("routing-snapshot"),
+            200,
+            snapshot,
+        );
+        let check = state.next_check().expect("asked again");
+        assert_eq!(
+            check.body.as_ref().expect("body")["expected_revision_id"],
+            12
+        );
+        answer(&mut state, check, 200, fine());
+        let save = state.key(CTRL_S).expect("save");
+        assert_eq!(
+            save.body.as_ref().expect("body")["expected_revision_id"],
+            12
+        );
+    }
+
+    #[test]
+    fn a_save_the_daemon_refuses_leaves_the_form_open() {
+        let mut state = loaded(World::AT_REST);
+        let save = saved_by(&mut state, 'e');
+        answer(
+            &mut state,
+            save,
+            422,
+            serde_json::json!({"error": "invalid_policy", "diagnostics": [
+                {"code": "unknown_binding", "path": "/routes/0/chain/first"}
+            ]}),
+        );
+        assert!(state.capturing());
+        assert!(!state.in_flight());
+        let error = state.error().expect("error").to_owned();
+        assert!(
+            error.contains("unknown_binding at /routes/0/chain/first"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_read_reply_does_not_release_a_pending_save() {
+        let mut state = loaded(World::AT_REST);
+        let save = saved_by(&mut state, 'e');
+        assert!(state.in_flight());
+        // The page's earlier reads land first, and a check's answer too.
+        answer(
+            &mut state,
+            Command::snapshot("x"),
+            200,
+            testing::revisions(World::AT_REST),
+        );
+        state.receive(reply(
+            "revisions",
+            200,
+            serde_json::json!({"revisions": []}),
+        ));
+        state.receive(reply("snapshot", 200, testing::snapshot(World::AT_REST)));
+        state.receive(reply("validate", 200, fine()));
+        assert!(state.in_flight());
+        assert!(state.next_check().is_none(), "no checks while it saves");
+        answer(
+            &mut state,
+            save,
+            200,
+            serde_json::json!({"active_revision": {"revision_id": 4}}),
+        );
+        assert!(!state.in_flight());
+    }
+
+    #[test]
+    fn a_refused_queue_slot_releases_the_busy_guards_and_asks_the_check_again() {
+        let mut state = loaded(World::AT_REST);
+        assert!(state.begin_refresh());
+        state.refresh_refused();
+        assert!(state.begin_refresh(), "a refused refresh can be retried");
+        press(&mut state, KeyCode::Char('e'));
+        let check = state.next_check().expect("check");
+        state.command_refused(check.name);
+        assert!(state.error().is_none(), "a check is not worth a banner");
+        assert!(state.next_check().is_some(), "asked again");
+        let save = {
+            accepted_after_retry(&mut state);
+            state.key(CTRL_S).expect("save")
+        };
+        state.command_refused(save.name);
+        assert!(!state.in_flight());
+        assert!(state.error().is_some_and(|error| error.contains("busy")));
+    }
+
+    /// Answer whichever check is outstanding as fine.
+    fn accepted_after_retry(state: &mut State) {
+        let ops = serde_json::Value::Array(state.editing().expect("editing").operations());
+        let mut check = Command::snapshot("routing-snapshot");
+        check.name = "validate";
+        check.body = Some(serde_json::json!({"edit": {"operations": ops}}));
+        answer(state, check, 200, fine());
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_the_last_snapshot_readable() {
+        let mut state = loaded(World::AT_REST);
+        assert!(state.begin_refresh());
+        assert!(!state.begin_refresh(), "one refresh at a time");
+        state.receive(Reply::Command(
+            Command::snapshot("routing-snapshot"),
+            Err("down".to_owned()),
+        ));
+        assert!(state.error().is_some_and(|error| error.contains("down")));
+        assert_eq!(state.entry_count(Tab::Rewrites), 14 + 3);
+        assert!(state.begin_refresh(), "refresh can resume once it settled");
+    }
+
+    #[test]
+    fn what_recent_requests_would_do_is_asked_once_the_edit_is_accepted() {
+        let mut state = on(Tab::Rewrites);
+        press(&mut state, KeyCode::Char('n'));
+        let check = accepted(&mut state);
+        let replay = state.next_check().expect("the replay");
+        assert_eq!(replay.name, "preview");
+        let body = replay.body.clone().expect("body");
+        assert_eq!(body["mode"], "replay_recent");
+        assert_eq!(body["expected_revision_id"], 9);
+        assert_eq!(body["edit"]["operations"], ops(&check));
+        assert!(state.next_check().is_none(), "one at a time");
+        answer(
+            &mut state,
+            replay,
+            200,
+            serde_json::json!({
+                "replayed": 5, "unreplayable": 2, "truncated": false, "changed_total": 3,
+                "window": {"since_ms": 0, "until_ms": 1_000_000},
+                "changed": [{"request_id": 1, "ts_ms": 940_000,
+                    "request": {"model": "claude-sonnet-5"},
+                    "under_active": {"outcome": "selected", "route_id": "claude-sub",
+                                     "matched": {"kind": "default", "scope": "protocol", "id": null}},
+                    "under_edit": {"outcome": "selected", "route_id": "openrouter-messages",
+                                   "matched": {"kind": "rewrite", "scope": "protocol", "id": "new-rewrite"}}}],
+            }),
+        );
+        let replay = state
+            .editing()
+            .expect("editing")
+            .replay
+            .clone()
+            .expect("kept");
+        assert_eq!((replay.replayed, replay.unreplayable), (5, 2));
+        assert_eq!(replay.changed_total, 3);
+        // A change asks about the form again, not about traffic first.
+        typed(&mut state, "");
+        press(&mut state, KeyCode::Down);
+        typed(&mut state, "9");
+        assert_eq!(state.next_check().expect("check").name, "validate");
+    }
+
+    // --- adding, removing, moving ------------------------------------------
+
+    #[test]
+    fn adding_a_presentation_sends_the_typed_addition_against_the_live_revision() {
+        let mut state = loaded(World::AT_REST);
+        assert!(press(&mut state, KeyCode::Char('n')).is_none());
+        assert!(matches!(
+            state.editing().expect("editing").what,
+            What::Record {
+                kind: "presentations",
+                adding: true
+            }
+        ));
+        assert_eq!(form_value(&state)["id"], "new-presentation");
+        accepted(&mut state);
+        let save = state.key(CTRL_S).expect("add command");
+        assert_eq!(save.body.as_ref().expect("body")["expected_revision_id"], 9);
+        let operations = ops(&save);
+        assert_eq!(operations[0]["kind"], "add_presentation");
+        assert_eq!(operations[0]["presentation"]["id"], "new-presentation");
+    }
+
+    #[test]
+    fn an_added_record_is_what_was_typed_into_the_form() {
+        let mut state = loaded(World::AT_REST);
+        press(&mut state, KeyCode::Char('n'));
+        for _ in 0.."new-presentation".len() {
+            press(&mut state, KeyCode::Backspace);
+        }
+        typed(&mut state, "mine");
+        accepted(&mut state);
+        let operation = ops(&state.key(CTRL_S).expect("add"))[0].clone();
+        assert_eq!(operation["presentation"]["id"], "mine");
+        assert_eq!(operation["presentation"]["slug"], "new-model");
+    }
+
+    #[test]
+    fn every_kind_of_record_is_added_from_the_tab_that_shows_it() {
+        for (tab, focus, kind, operation) in [
+            (Tab::Presentations, 0, "presentations", "add_presentation"),
+            (Tab::Rewrites, 0, "rewrites", "add_rewrite"),
+            (Tab::Defaults, 0, "defaults", "add_default"),
+            (Tab::Routes, 0, "routes", "add_route"),
+            (Tab::Models, 0, "upgrades", "add_upgrade"),
+        ] {
+            let mut state = on(tab);
+            let _ = focus;
+            press(&mut state, KeyCode::Char('n'));
+            assert!(
+                matches!(&state.editing().expect("editing").what, What::Record { kind: k, adding: true } if *k == kind),
+                "{tab:?}"
+            );
+            accepted(&mut state);
+            assert_eq!(
+                ops(&state.key(CTRL_S).expect("save"))[0]["kind"],
+                operation,
+                "{tab:?}"
+            );
+        }
+        // The kind follows the panel the models focus is in.
+        let mut state = on(Tab::Models);
+        state.move_selection(-1);
+        press(&mut state, KeyCode::Char('n'));
+        assert!(matches!(
+            state.editing().expect("editing").what,
+            What::Record {
+                kind: "classifiers",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_new_rewrite_starts_in_the_scope_of_the_row_it_is_added_under() {
+        let mut state = on(Tab::Rewrites);
+        state.move_selection(8);
+        let scope = rules_scope(&state);
+        press(&mut state, KeyCode::Char('n'));
+        assert_eq!(form_value(&state)["scope"], scope);
+    }
+
+    fn rules_scope(state: &State) -> serde_json::Value {
+        let active = state.active().expect("active");
+        crate::tui::routing::rules::entries(active, state.tab())[state.selected_in(state.tab())]
+            .record()["scope"]
+            .clone()
+    }
+
+    #[test]
+    fn a_new_default_starts_from_the_first_route() {
+        let mut state = on(Tab::Defaults);
+        press(&mut state, KeyCode::Char('n'));
+        assert_eq!(form_value(&state)["target"]["route_id"], "claude-sub");
+    }
+
+    /// Adding a rule needs somewhere to send it, so with no routes the page
+    /// points at routes first.
+    #[test]
+    fn adding_where_there_is_no_route_points_at_routes_first() {
+        let mut snapshot = testing::snapshot(World::AT_REST);
+        snapshot["active_revision"]["policy"]["routes"] = serde_json::json!([]);
+        let mut state = State::default();
+        state.receive(reply("snapshot", 200, snapshot));
+        for tab in [Tab::Rewrites, Tab::Defaults] {
+            state.set_tab(tab);
+            press(&mut state, KeyCode::Char('n'));
+            assert!(!state.capturing(), "{tab:?}");
+            let error = state.error().expect("said");
+            assert!(error.contains("needs a route"), "{error}");
+            assert!(error.contains("press 4"), "{error}");
+        }
+        // A presentation sends nowhere, and a route is the thing wanted.
+        state.set_tab(Tab::Routes);
+        press(&mut state, KeyCode::Char('n'));
+        assert!(state.capturing());
+    }
+
+    #[test]
+    fn adding_is_not_offered_in_history_or_while_busy() {
+        let mut state = on(Tab::History);
+        assert!(press(&mut state, KeyCode::Char('n')).is_none());
+        assert!(!state.capturing());
+        assert!(state.error().is_some());
+        state.set_tab(Tab::Presentations);
+        let _save = saved_by(&mut state, 'e');
+        assert!(state.in_flight());
+        press(&mut state, KeyCode::Char('n'));
+        assert!(
+            state
+                .editing()
+                .is_some_and(|editing| matches!(editing.what, What::Record { adding: false, .. }))
+        );
+    }
+
+    #[test]
+    fn a_removal_is_checked_like_an_edit_and_saved_by_the_records_id() {
+        let mut state = on(Tab::Rewrites);
+        state.move_selection(1);
+        press(&mut state, KeyCode::Char('d'));
+        assert!(matches!(
+            state.editing().expect("editing").what,
+            What::Remove {
+                kind: "rewrites",
+                ..
+            }
+        ));
+        let check = accepted(&mut state);
+        let operation = ops(&check)[0].clone();
+        assert_eq!(operation["kind"], "remove_rewrite");
+        assert_eq!(operation["id"], "anthropic-messages-2");
+        let save = state.key(CTRL_S).expect("save");
+        assert_eq!(ops(&save), ops(&check));
+    }
+
+    #[test]
+    fn a_default_is_replaced_and_removed_by_its_scope() {
+        let mut state = loaded(World::FULL);
+        state.set_tab(Tab::Defaults);
+        // Unprefixed messages, messages, chat, unprefixed chat, responses.
+        state.move_selection(3);
+        let save = saved_by(&mut state, 'e');
+        let operation = ops(&save)[0].clone();
+        assert_eq!(operation["kind"], "replace_default");
+        assert_eq!(operation["scope"]["profile"], "unprefixed");
+        assert_eq!(
+            operation["default"]["target"]["route_id"],
+            "openrouter-chat"
+        );
+        answer(&mut state, save, 200, serde_json::json!({}));
+
+        press(&mut state, KeyCode::Char('d'));
+        let operation = ops(&accepted(&mut state))[0].clone();
+        assert_eq!(operation["kind"], "remove_default");
+        assert_eq!(operation["scope"]["profile"], "unprefixed");
+    }
+
+    #[test]
+    fn a_protocol_with_no_default_has_none_to_edit_or_remove() {
+        let mut state = loaded(World::AT_REST);
+        state.set_tab(Tab::Defaults);
+        state.move_selection(2);
+        press(&mut state, KeyCode::Char('e'));
+        press(&mut state, KeyCode::Char('d'));
+        assert!(!state.capturing());
+    }
+
+    #[test]
+    fn compaction_is_replaced_and_removed_without_an_id() {
+        let mut state = on(Tab::Models);
+        state.move_selection(5);
+        assert_eq!(state.models().focus, Panel::Compaction);
+        press(&mut state, KeyCode::Char('d'));
+        let operation = ops(&accepted(&mut state))[0].clone();
+        assert_eq!(operation["kind"], "remove_compaction");
+        press(&mut state, KeyCode::Esc);
+        let save = saved_by(&mut state, 'e');
+        let operation = ops(&save)[0].clone();
+        assert_eq!(operation["kind"], "replace_compaction");
+        assert_eq!(operation["compaction"]["target"]["kind"], "substitution");
+    }
+
+    /// A rewrite is lifted with `m`, carried with the arrows, and saved as
+    /// the priorities that put it there.
+    #[test]
+    fn a_rewrite_is_moved_within_its_scope_as_new_priorities() {
+        let mut state = on(Tab::Rewrites);
+        state.move_selection(1);
+        press(&mut state, KeyCode::Char('m'));
+        assert!(
+            state.next_check().is_none(),
+            "a move that has not moved is nothing to check"
+        );
+        assert_eq!(
+            state.editing().expect("editing").save_label(),
+            "move it to save"
+        );
+        press(&mut state, KeyCode::Down);
+        assert_eq!(state.selected_in(Tab::Rewrites), 2, "the selection follows");
+        let check = accepted(&mut state);
+        // Priorities 10, 20, 30...: the two that swapped swap theirs.
+        let operations = ops(&check);
+        assert_eq!(operations.as_array().expect("array").len(), 2);
+        assert_eq!(operations[0]["kind"], "replace_rewrite");
+        assert_eq!(operations[0]["id"], "anthropic-messages-3");
+        assert_eq!(operations[0]["rewrite"]["priority"], 20);
+        assert_eq!(operations[1]["id"], "anthropic-messages-2");
+        assert_eq!(operations[1]["rewrite"]["priority"], 30);
+        // It stops at the edge of its scope.
+        press(&mut state, KeyCode::Down);
+        press(&mut state, KeyCode::Down);
+        press(&mut state, KeyCode::Down);
+        press(&mut state, KeyCode::Down);
+        assert_eq!(state.selected_in(Tab::Rewrites), 4, "the last of five");
+        let save = state.key(CTRL_S);
+        assert!(save.is_none(), "this form has not been checked yet");
+        // Abandoning puts the selection back.
+        press(&mut state, KeyCode::Esc);
+        assert_eq!(state.selected_in(Tab::Rewrites), 1);
+        assert!(!state.capturing());
+    }
+
+    #[test]
+    fn a_move_of_rules_that_share_a_priority_tells_them_apart() {
+        let rule = |id: &str, priority: i64| serde_json::json!({"id": id, "priority": priority});
+        let rules = [rule("a", 5), rule("b", 5), rule("c", 5)];
+        let operations = super::super::editing::Editing::new(
+            What::MoveRule {
+                scope_label: "x".to_owned(),
+                rules: rules.to_vec(),
+                from: 0,
+                to: 2,
+            },
+            crate::tui::routing::form::Form::new(
+                Purpose::Fieldless,
+                serde_json::Value::Null,
+                Default::default(),
+            ),
+            None,
+            None,
+        )
+        .operations();
+        let priorities: Vec<_> = operations
+            .iter()
+            .map(|operation| {
+                (
+                    operation["id"].as_str().unwrap().to_owned(),
+                    operation["rewrite"]["priority"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        // b, c, a in that order, with priorities that are strictly rising.
+        assert_eq!(priorities, [("c".to_owned(), 6), ("a".to_owned(), 7)]);
+    }
+
+    #[test]
+    fn only_a_rewrite_can_be_moved_in_a_table() {
+        let mut state = loaded(World::AT_REST);
+        press(&mut state, KeyCode::Char('m'));
+        assert!(!state.capturing());
+        assert!(state.error().is_some());
+    }
+
+    // --- a route's candidates ------------------------------------------------
+
+    /// The first route opened whole.
+    fn route_open() -> State {
+        let mut state = on(Tab::Routes);
+        press(&mut state, KeyCode::Enter);
+        assert_eq!((state.tab(), state.mode()), (Tab::Routes, Mode::Route));
+        state
+    }
+
+    #[test]
+    fn the_arrows_choose_a_candidate_on_the_route_page() {
+        let mut state = route_open();
+        assert_eq!(state.candidate(), 0);
+        state.move_selection(1);
+        assert_eq!(state.candidate(), 1);
+        state.move_selection(9);
+        assert_eq!(state.candidate(), 1, "the last of two");
+        // Another route starts at its first candidate.
+        state.move_view(1);
+        assert_eq!(state.candidate(), 0);
+    }
+
+    #[test]
+    fn a_fallback_is_added_after_the_last_candidate_with_its_edge() {
+        let mut state = route_open();
+        press(&mut state, KeyCode::Char('n'));
+        let editing = state.editing().expect("editing");
+        let What::AddCandidate { route_id, after } = &editing.what else {
+            panic!("a fallback is being added: {:?}", editing.what);
+        };
+        assert_eq!(route_id, "claude-sub");
+        let candidate = form_value(&state)["candidate"]["id"].clone();
+        assert_eq!(candidate, "fallback-1");
+        let last = state.document_route().expect("route").1["chain"]["steps"][0]["candidate"]["id"]
+            .clone();
+        assert_eq!(&serde_json::Value::from(after.clone()), &last);
+        let check = accepted(&mut state);
+        let operation = ops(&check)[0].clone();
+        assert_eq!(operation["kind"], "add_candidate");
+        assert_eq!(operation["route_id"], "claude-sub");
+        assert_eq!(operation["after"], last);
+        assert_eq!(operation["candidate"]["id"], "fallback-1");
+        assert!(
+            operation["edge"]["billed_boundary"].is_string(),
+            "{operation}"
+        );
+        assert!(state.key(CTRL_S).is_some());
+    }
+
+    #[test]
+    fn a_candidates_own_findings_land_beside_its_fields() {
+        let mut state = route_open();
+        press(&mut state, KeyCode::Char('n'));
+        let (index, step) = (
+            state.document_route().expect("route").0,
+            state.document_route().expect("route").1["chain"]["steps"]
+                .as_array()
+                .expect("steps")
+                .len(),
+        );
+        let check = state.next_check().expect("check");
+        answer(
+            &mut state,
+            check,
+            200,
+            serde_json::json!({"valid": false, "refusal": null, "diagnostics": [{
+                "code": "model-not-offered", "severity": "error", "record_id": "claude-sub",
+                "path": format!("/routes/{index}/chain/steps/{step}/candidate/model/model_id"),
+                "sentence": "The provider does not offer the model.",
+                "fix": "Choose a model it offers.",
+            }]}),
+        );
+        let editing = state.editing().expect("editing");
+        assert_eq!(editing.save_label(), "fix model to save");
+        assert!(
+            editing
+                .checked
+                .as_ref()
+                .expect("checked")
+                .elsewhere
+                .is_empty()
+        );
+        // The same finding on another candidate is not this form's.
+        let other = serde_json::json!({"valid": false, "refusal": null, "diagnostics": [{
+            "code": "model-not-offered", "severity": "error", "record_id": "claude-sub",
+            "path": format!("/routes/{index}/chain/first/model/model_id"),
+            "sentence": "x", "fix": "y",
+        }]});
+        let check = {
+            typed(&mut state, "z");
+            state.next_check().expect("check")
+        };
+        answer(&mut state, check, 200, other);
+        let checked = state
+            .editing()
+            .expect("editing")
+            .checked
+            .clone()
+            .expect("checked");
+        assert_eq!(checked.elsewhere.len(), 1);
+    }
+
+    #[test]
+    fn a_candidate_is_removed_by_its_id() {
+        let mut state = route_open();
+        state.move_selection(1);
+        press(&mut state, KeyCode::Char('d'));
+        let operation = ops(&accepted(&mut state))[0].clone();
+        assert_eq!(operation["kind"], "remove_candidate");
+        assert_eq!(operation["route_id"], "claude-sub");
+        let second =
+            state.document_route().expect("route").1["chain"]["steps"][0]["candidate"]["id"]
+                .clone();
+        assert_eq!(operation["candidate_id"], second);
+    }
+
+    #[test]
+    fn a_candidate_is_reordered_with_the_edge_made_explicit() {
+        let mut state = route_open();
+        press(&mut state, KeyCode::Char('m'));
+        press(&mut state, KeyCode::Down);
+        assert_eq!(
+            state.candidate(),
+            1,
+            "the lifted candidate is the selection"
+        );
+        let operation = ops(&accepted(&mut state))[0].clone();
+        assert_eq!(operation["kind"], "move_candidate");
+        assert_eq!(operation["candidate_id"], "sub");
+        assert_eq!(operation["destination"]["kind"], "after");
+        assert!(operation["destination"]["edge"]["billed_boundary"].is_string());
+        // Moving it back is nothing to do.
+        press(&mut state, KeyCode::Up);
+        assert!(ops_of(&state).is_empty());
+        // And another way: the second to the front.
+        press(&mut state, KeyCode::Esc);
+        state.move_selection(1);
+        press(&mut state, KeyCode::Char('m'));
+        press(&mut state, KeyCode::Up);
+        let operation = ops_of(&state)[0].clone();
+        assert_eq!(operation["destination"]["kind"], "first");
+    }
+
+    fn ops_of(state: &State) -> Vec<serde_json::Value> {
+        state.editing().expect("editing").operations()
+    }
+
+    #[test]
+    fn a_candidate_is_edited_as_the_route_with_it_replaced() {
+        let mut state = route_open();
+        press(&mut state, KeyCode::Char('e'));
+        assert_eq!(form_value(&state)["candidate"]["id"], "sub");
+        assert!(
+            form_value(&state).get("edge").is_none(),
+            "the first has no edge"
+        );
+        typed(&mut state, "x");
+        let operations = ops(&accepted(&mut state));
+        assert_eq!(operations[0]["kind"], "replace_route");
+        assert_eq!(operations[0]["route"]["chain"]["first"]["id"], "subx");
+        assert_eq!(
+            operations.as_array().expect("array").len(),
+            1,
+            "no safeguards flag to carry"
+        );
+
+        // A later candidate comes with the edge into it.
+        press(&mut state, KeyCode::Esc);
+        state.move_selection(1);
+        press(&mut state, KeyCode::Char('e'));
+        assert!(form_value(&state)["edge"]["billed_boundary"].is_string());
+        assert!(matches!(
+            state.editing().expect("editing").what,
+            What::EditCandidate { index: 1, .. }
+        ));
+    }
+
+    // --- the route's safeguards flag and the daemon's vocabulary -------------
+
+    #[test]
+    fn a_route_save_sets_or_clears_its_honour_flag_by_its_own_operation() {
+        let mut state = on(Tab::Routes);
+        press(&mut state, KeyCode::Char('e'));
+        // Down to the last field and switch it on.
+        for _ in 0..200 {
+            press(&mut state, KeyCode::Down);
+        }
+        press(&mut state, KeyCode::Char(' '));
+        assert_eq!(form_value(&state)["honours_server_safeguards"], true);
+        accepted(&mut state);
+        let save = state.key(CTRL_S).expect("save");
+        let operations = ops(&save);
+        assert_eq!(operations[0]["kind"], "replace_route");
+        // The flag does not travel inside the route: its own operation
+        // carries it, and raises the document's format with it.
+        assert!(
+            operations[0]["route"]
+                .get("honours_server_safeguards")
+                .is_none()
+        );
+        assert_eq!(operations[1]["kind"], "set_route_server_safeguards");
+        assert_eq!(operations[1]["route_id"], "claude-sub");
+        assert_eq!(operations[1]["honours"], true);
+        answer(&mut state, save, 200, serde_json::json!({}));
+
+        // Left off, the same save clears it.
+        press(&mut state, KeyCode::Char('e'));
+        let operations = ops(&accepted(&mut state));
+        assert_eq!(operations[1]["honours"], false);
+    }
+
+    #[test]
+    fn only_a_route_save_carries_the_honour_flag_operation() {
+        let mut state = loaded(World::AT_REST);
+        press(&mut state, KeyCode::Char('e'));
+        let operations = ops(&accepted(&mut state));
+        assert_eq!(operations.as_array().expect("operations").len(), 1);
+    }
+
+    /// The terminal builds its edits by hand; the daemon's typed vocabulary is
+    /// the authority on whether they are the edits it understands.
+    #[test]
+    fn every_operation_the_page_builds_is_one_the_daemon_understands() {
+        use crate::policy::PolicyEdit;
+        let record = serde_json::json!({"id": "some-id"});
+        let default = serde_json::json!({
+            "scope": {"kind": "protocol", "protocol": "openai_chat"},
+            "target": {"route_id": "route-a"},
+        });
+        let compaction = serde_json::json!({
+            "target": {"route_id": "route-a"},
+            "lane_transition": "move_when_cold",
+            "cache_transition": "allow_when_cold",
+        });
+        let edge = crate::tui::routing::form::default_edge();
+        let mut operations: Vec<_> = [
+            "presentations",
+            "routes",
+            "rewrites",
+            "classifiers",
+            "upgrades",
+        ]
+        .into_iter()
+        .map(|key| remove_edit(key, &record))
+        .collect();
+        operations.extend([
+            serde_json::json!({"kind": "set_description", "description": null}),
+            replace_edit("defaults", default.clone()),
+            remove_edit("defaults", &default),
+            replace_edit("compaction", compaction.clone()),
+            remove_edit("compaction", &compaction),
+            serde_json::json!({"kind": "remove_candidate", "route_id": "r", "candidate_id": "c"}),
+            serde_json::json!({"kind": "add_candidate", "route_id": "r", "after": "c",
+                "edge": edge, "candidate": {"id": "d", "binding_id": "x.y",
+                "model": {"kind": "requested_model"}}}),
+            serde_json::json!({"kind": "move_candidate", "route_id": "r", "candidate_id": "c",
+                "destination": {"kind": "first", "edge": edge}}),
+            serde_json::json!({"kind": "move_candidate", "route_id": "r", "candidate_id": "c",
+                "destination": {"kind": "after", "candidate_id": "d", "edge": edge}}),
+        ]);
+        let count = operations.len();
+        let edit: PolicyEdit =
+            serde_json::from_value(serde_json::json!({ "operations": operations }))
+                .expect("every emitted operation is a typed PolicyEdit operation");
+        assert_eq!(edit.operations.len(), count);
+        // And the addition of each kind, which the templates exercise.
+        let _ = add_edit("routes", serde_json::json!({}));
+    }
+
+    // --- the small questions that remain ----------------------------------
+
+    #[test]
+    fn escape_cancels_each_small_question_without_a_command() {
+        let mut state = loaded(World::AT_REST);
+        press(&mut state, KeyCode::Char('p'));
+        assert!(state.modal().active());
+        assert!(press(&mut state, KeyCode::Esc).is_none());
         assert!(!state.modal().active());
         state.set_tab(Tab::History);
         // The top of history is the live revision, whose description is
         // edited.
         press(&mut state, KeyCode::Char('e'));
-        assert_eq!(form_purpose(&state), Some(Purpose::Description));
+        assert!(matches!(
+            state.modal(),
+            Modal::Form(form) if form.purpose() == Purpose::Description
+        ));
         press(&mut state, KeyCode::Esc);
-        assert!(
-            !state.modal().active(),
-            "the description form closes on Esc"
-        );
+        assert!(!state.modal().active());
     }
 
     #[test]
-    fn removal_needs_a_yes_and_names_the_record() {
+    fn keys_are_ignored_while_a_save_is_in_flight() {
         let mut state = loaded(World::AT_REST);
-        press(&mut state, KeyCode::Char('d'));
-        assert!(
-            press(&mut state, KeyCode::Char('x')).is_none(),
-            "other keys do nothing"
-        );
-        let command = press(&mut state, KeyCode::Char('y')).expect("confirmed");
-        let operation = first_operation(command);
-        assert_eq!(operation["kind"], "remove_presentation");
-        assert_eq!(operation["id"], "pick-1");
-    }
-
-    #[test]
-    fn a_rule_is_edited_and_removed_by_its_id() {
-        let mut state = on(Tab::Rewrites);
-        state.move_selection(1);
-        press(&mut state, KeyCode::Char('e'));
-        assert_eq!(form_purpose(&state), record_form("rewrites", false));
-        assert_eq!(form_value(&state)["id"], "anthropic-messages-2");
-        press(&mut state, KeyCode::Esc);
-        press(&mut state, KeyCode::Char('d'));
-        let operation = first_operation(press(&mut state, KeyCode::Char('y')).expect("sent"));
-        assert_eq!(operation["kind"], "remove_rewrite");
-        assert_eq!(operation["id"], "anthropic-messages-2");
-    }
-
-    #[test]
-    fn a_record_edit_sends_the_typed_replacement() {
-        let mut state = on(Tab::Routes);
-        press(&mut state, KeyCode::Char('e'));
-        assert_eq!(form_purpose(&state), record_form("routes", false));
-        assert_eq!(form_value(&state)["id"], "claude-sub");
-        // The id names the record the edit replaces, so it is fixed.
-        typed(&mut state, "x");
-        assert_eq!(form_value(&state)["id"], "claude-sub");
-        // Move to the route's name and change it.
-        press(&mut state, KeyCode::Down);
-        typed(&mut state, "named");
-        let command = state.key(CTRL_ENTER).expect("edit command");
-        assert_eq!(command.method, Method::POST);
-        let operation = first_operation(command);
-        assert_eq!(operation["kind"], "replace_route");
-        assert_eq!(operation["id"], "claude-sub");
-        assert_eq!(operation["route"]["display_name"], "claude-subnamed");
-        // What the schema does not name is carried through as it was.
-        assert_eq!(operation["route"]["chain"]["first"]["id"], "sub");
-    }
-
-    #[test]
-    fn keys_are_ignored_while_a_command_is_in_flight() {
-        let mut state = loaded(World::AT_REST);
-        press(&mut state, KeyCode::Char('d'));
-        press(&mut state, KeyCode::Char('y'));
+        let _save = saved_by(&mut state, 'e');
         assert!(state.in_flight());
         assert!(press(&mut state, KeyCode::Char('y')).is_none());
-        assert!(press(&mut state, KeyCode::Char('n')).is_none());
+        assert!(state.key(CTRL_S).is_none());
         state.receive(reply(
             "save",
             200,
@@ -1642,42 +2977,6 @@ mod tests {
         assert_eq!(
             State::default().activation_summary(),
             ["no daemon snapshot loaded"]
-        );
-    }
-
-    #[test]
-    fn a_save_moved_past_names_the_live_revision_and_keeps_the_form() {
-        let mut state = loaded(World::AT_REST);
-        press(&mut state, KeyCode::Char('n'));
-        let command = state.key(CTRL_ENTER).expect("add command");
-        assert_eq!(command.body.expect("body")["expected_revision_id"], 9);
-        state.receive(reply(
-            "save",
-            409,
-            serde_json::json!({"error": "stale_revision", "live_revision_id": 12}),
-        ));
-        assert_eq!(form_purpose(&state), record_form("presentations", true));
-        assert!(!state.in_flight());
-        let error = state.error().expect("the refusal is shown");
-        assert!(error.contains("revision 12 is now live"), "{error}");
-    }
-
-    #[test]
-    fn an_invalid_save_names_its_diagnostics() {
-        let mut state = loaded(World::AT_REST);
-        press(&mut state, KeyCode::Char('d'));
-        press(&mut state, KeyCode::Char('y'));
-        state.receive(reply(
-            "save",
-            422,
-            serde_json::json!({"error": "invalid_policy", "diagnostics": [
-                {"code": "unknown_binding", "path": "/routes/0/chain/first"}
-            ]}),
-        ));
-        let error = state.error().expect("error").to_owned();
-        assert!(
-            error.contains("unknown_binding at /routes/0/chain/first"),
-            "{error}"
         );
     }
 
@@ -1716,19 +3015,31 @@ mod tests {
                 .error()
                 .is_some_and(|error| error.contains("both required"))
         );
-        assert_eq!(form_purpose(&state), Some(Purpose::Promote));
         // A binding is typed, or completed from the ones toker implements;
         // a model completes from what that binding offers.
         typed(&mut state, testing::OR_CHAT);
         press(&mut state, KeyCode::Down);
         press(&mut state, KeyCode::Tab);
-        assert_eq!(form_value(&state)["model_id"], "anthropic/model-000");
+        let Modal::Form(form) = state.modal() else {
+            panic!("a form is open");
+        };
+        assert_eq!(form.value()["model_id"], "anthropic/model-000");
         // A second Tab moves to the next offer.
         press(&mut state, KeyCode::Tab);
         let command = press(&mut state, KeyCode::Enter).expect("promotion");
-        let body = command.body.expect("body");
+        let body = command.body.clone().expect("body");
         assert_eq!(body["binding_id"], testing::OR_CHAT);
         assert_eq!(body["model_id"], "anthropic/model-001");
+        // It is said once it lands, not shown as a document.
+        answer(&mut state, command, 200, serde_json::json!({"ok": true}));
+        assert!(!state.modal().active());
+        assert!(
+            state
+                .notice()
+                .is_some_and(|notice| notice.contains("anthropic/model-001")),
+            "{:?}",
+            state.notice()
+        );
     }
 
     /// An upgrade whose evidence bar is holding a model back starts the
@@ -1744,442 +3055,23 @@ mod tests {
         state.set_tab(Tab::Models);
         state.move_selection(1);
         press(&mut state, KeyCode::Char('p'));
-        let value = form_value(&state);
-        assert_eq!(value["binding_id"], testing::API);
-        assert_eq!(value["model_id"], "claude-sonnet-5");
-    }
-
-    #[test]
-    fn the_preview_form_sends_only_the_facts_that_were_filled_in() {
-        let mut state = loaded(World::AT_REST);
-        press(&mut state, KeyCode::Char('v'));
-        assert_eq!(form_purpose(&state), Some(Purpose::Preview));
-        // protocol, then profile, model, lane key, prompt bound.
-        press(&mut state, KeyCode::Right);
-        assert_eq!(form_value(&state)["protocol"], "openai_chat");
-        press(&mut state, KeyCode::Down);
-        typed(&mut state, "work");
-        for _ in 0..3 {
-            press(&mut state, KeyCode::Down);
-        }
-        typed(&mut state, "5000");
-        let command = press(&mut state, KeyCode::Enter).expect("preview");
-        let body = command.body.expect("body");
-        assert_eq!(command.name, "preview");
-        assert_eq!(body["mode"], "resolve");
-        assert_eq!(body["request"]["kind"], "invented");
-        assert_eq!(body["request"]["protocol"], "openai_chat");
-        assert_eq!(body["request"]["profile"], "work");
-        assert_eq!(body["request"]["prompt_bound"], 5000);
-        assert!(body["request"].get("model").is_none());
-        assert!(body["request"].get("message_count").is_none());
-    }
-
-    #[test]
-    fn the_preview_form_can_ask_for_server_safeguards() {
-        let mut state = loaded(World::AT_REST);
-        press(&mut state, KeyCode::Char('v'));
-        // Down to the last field: protocol, profile, model, lane key,
-        // prompt bound, message count, tool count, then the switch.
-        for _ in 0..7 {
-            press(&mut state, KeyCode::Down);
-        }
-        press(&mut state, KeyCode::Char(' '));
-        assert_eq!(form_value(&state)["asks_server_safeguards"], true);
-        let command = state.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-        let body = command.expect("preview").body.expect("body");
-        assert_eq!(body["request"]["asks_server_safeguards"], true);
-        assert!(
-            !state.preview_asked(),
-            "only a reply settles what was shown"
-        );
-
-        // The page remembers the ask, since a result with no candidate
-        // left does not say whether it was made.
-        let mut ask = Command::snapshot("routing-snapshot");
-        ask.name = "preview";
-        ask.body = Some(body);
-        state.receive(Reply::Command(
-            ask,
-            Ok(Response {
-                status: 200,
-                body: serde_json::json!({"result": {"outcome": "unavailable"}}),
-            }),
-        ));
-        assert!(state.preview_asked());
-    }
-
-    #[test]
-    fn a_preview_that_does_not_ask_sends_no_such_fact() {
-        let mut state = loaded(World::AT_REST);
-        press(&mut state, KeyCode::Char('v'));
-        let body = state
-            .key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
-            .expect("preview")
-            .body
-            .expect("body");
-        assert!(body["request"].get("asks_server_safeguards").is_none());
-    }
-
-    #[test]
-    fn a_route_save_sets_or_clears_its_honour_flag_by_its_own_operation() {
-        let mut state = on(Tab::Routes);
-        press(&mut state, KeyCode::Char('e'));
-        // Down to the last field and switch it on.
-        for _ in 0..200 {
-            press(&mut state, KeyCode::Down);
-        }
-        press(&mut state, KeyCode::Char(' '));
-        assert_eq!(form_value(&state)["honours_server_safeguards"], true);
-        let command = state.key(CTRL_ENTER).expect("edit command");
-        let operations = command.body.expect("body")["edit"]["operations"].clone();
-        assert_eq!(operations[0]["kind"], "replace_route");
-        // The flag does not travel inside the route: its own operation
-        // carries it, and raises the document's format with it.
-        assert!(
-            operations[0]["route"]
-                .get("honours_server_safeguards")
-                .is_none()
-        );
-        assert_eq!(operations[1]["kind"], "set_route_server_safeguards");
-        assert_eq!(operations[1]["route_id"], "claude-sub");
-        assert_eq!(operations[1]["honours"], true);
-        state.receive(reply("save", 200, serde_json::json!({})));
-
-        // Left off, the same save clears it.
-        press(&mut state, KeyCode::Char('e'));
-        let command = state.key(CTRL_ENTER).expect("edit command");
-        let operations = command.body.expect("body")["edit"]["operations"].clone();
-        assert_eq!(operations[1]["honours"], false);
-    }
-
-    #[test]
-    fn only_a_route_save_carries_the_honour_flag_operation() {
-        let mut state = loaded(World::AT_REST);
-        press(&mut state, KeyCode::Char('e'));
-        let command = state.key(CTRL_ENTER).expect("edit command");
-        let operations = command.body.expect("body")["edit"]["operations"].clone();
-        assert_eq!(operations.as_array().expect("operations").len(), 1);
-    }
-
-    /// The terminal builds its edits by hand; the daemon's typed vocabulary is
-    /// the authority on whether they are the edits it understands.
-    #[test]
-    fn removals_and_descriptions_are_the_daemons_typed_operations() {
-        use crate::policy::PolicyEdit;
-        let record = serde_json::json!({"id": "some-id"});
-        let operations: Vec<_> = [
-            "presentations",
-            "routes",
-            "rewrites",
-            "classifiers",
-            "upgrades",
-        ]
-        .into_iter()
-        .map(|key| super::remove_edit(key, &record))
-        .chain([serde_json::json!({"kind": "set_description", "description": null})])
-        .collect();
-        let edit: PolicyEdit =
-            serde_json::from_value(serde_json::json!({ "operations": operations }))
-                .expect("every emitted operation is a typed PolicyEdit operation");
-        assert_eq!(edit.operations.len(), 6);
-    }
-
-    #[test]
-    fn a_read_reply_does_not_release_a_pending_edit() {
-        let mut state = loaded(World::AT_REST);
-        press(&mut state, KeyCode::Char('d'));
-        press(&mut state, KeyCode::Char('y'));
-        assert!(state.in_flight());
-        // The page's earlier snapshot and revisions reads land first.
-        state.receive(reply(
-            "revisions",
-            200,
-            serde_json::json!({"revisions": []}),
-        ));
-        state.receive(reply("snapshot", 200, testing::snapshot(World::AT_REST)));
-        assert!(state.in_flight());
-        assert!(press(&mut state, KeyCode::Char('y')).is_none());
-        state.receive(reply(
-            "save",
-            200,
-            serde_json::json!({"active_revision": {"revision_id": 4}}),
-        ));
-        assert!(!state.in_flight());
-    }
-
-    #[test]
-    fn a_refused_queue_slot_releases_the_busy_guards() {
-        let mut state = loaded(World::AT_REST);
-        assert!(state.begin_refresh());
-        state.refresh_refused();
-        assert!(state.begin_refresh(), "a refused refresh can be retried");
-        press(&mut state, KeyCode::Char('d'));
-        press(&mut state, KeyCode::Char('y'));
-        state.command_refused("save");
-        assert!(!state.in_flight());
-        assert!(state.error().is_some_and(|error| error.contains("busy")));
-    }
-
-    #[test]
-    fn a_failed_refresh_keeps_the_last_snapshot_readable() {
-        let mut state = loaded(World::AT_REST);
-        assert!(state.begin_refresh());
-        assert!(!state.begin_refresh(), "one refresh at a time");
-        state.receive(Reply::Command(
-            Command::snapshot("routing-snapshot"),
-            Err("down".to_owned()),
-        ));
-        assert!(state.error().is_some_and(|error| error.contains("down")));
-        assert_eq!(state.entry_count(Tab::Rewrites), 14 + 3);
-        assert!(state.begin_refresh(), "refresh can resume once it settled");
-    }
-
-    #[test]
-    fn a_default_is_replaced_and_removed_by_its_scope() {
-        let mut state = loaded(World::FULL);
-        state.set_tab(Tab::Defaults);
-        // Unprefixed messages, messages, chat, unprefixed chat, responses.
-        state.move_selection(3);
-        press(&mut state, KeyCode::Char('e'));
-        let command = state.key(CTRL_ENTER).expect("replace command");
-        let operation = first_operation(command);
-        assert_eq!(operation["kind"], "replace_default");
-        assert_eq!(operation["scope"]["profile"], "unprefixed");
-        assert_eq!(
-            operation["default"]["target"]["route_id"],
-            "openrouter-chat"
-        );
-        state.receive(reply("save", 200, serde_json::json!({})));
-
-        press(&mut state, KeyCode::Char('d'));
-        let operation = first_operation(press(&mut state, KeyCode::Char('y')).expect("confirmed"));
-        assert_eq!(operation["kind"], "remove_default");
-        assert_eq!(operation["scope"]["profile"], "unprefixed");
-    }
-
-    #[test]
-    fn a_protocol_with_no_default_has_none_to_edit_or_remove() {
-        let mut state = loaded(World::AT_REST);
-        state.set_tab(Tab::Defaults);
-        state.move_selection(2);
-        press(&mut state, KeyCode::Char('e'));
-        press(&mut state, KeyCode::Char('d'));
-        assert!(!state.modal().active());
-    }
-
-    #[test]
-    fn compaction_is_replaced_and_removed_without_an_id() {
-        let mut state = on(Tab::Models);
-        state.move_selection(5);
-        assert_eq!(state.models().focus, Panel::Compaction);
-        press(&mut state, KeyCode::Char('d'));
-        let operation = first_operation(press(&mut state, KeyCode::Char('y')).expect("confirmed"));
-        assert_eq!(operation["kind"], "remove_compaction");
-        state.receive(reply("save", 200, serde_json::json!({})));
-        press(&mut state, KeyCode::Char('e'));
-        let operation = first_operation(state.key(CTRL_ENTER).expect("replace command"));
-        assert_eq!(operation["kind"], "replace_compaction");
-        assert_eq!(operation["compaction"]["target"]["kind"], "substitution");
-    }
-
-    /// The terminal builds default and compaction edits by hand as well; the
-    /// daemon's typed vocabulary is the authority on what it understands.
-    #[test]
-    fn default_and_compaction_edits_are_the_daemons_typed_operations() {
-        use crate::policy::PolicyEdit;
-        let default = serde_json::json!({
-            "scope": {"kind": "protocol", "protocol": "openai_chat"},
-            "target": {"route_id": "route-a"},
-        });
-        let compaction = serde_json::json!({
-            "target": {"route_id": "route-a"},
-            "lane_transition": "move_when_cold",
-            "cache_transition": "allow_when_cold",
-        });
-        let operations = [
-            super::replace_edit("defaults", default.clone()),
-            super::remove_edit("defaults", &default),
-            super::replace_edit("compaction", compaction.clone()),
-            super::remove_edit("compaction", &compaction),
-        ];
-        let edit: PolicyEdit =
-            serde_json::from_value(serde_json::json!({ "operations": operations }))
-                .expect("every emitted operation is a typed PolicyEdit operation");
-        assert_eq!(edit.operations.len(), 4);
-    }
-
-    #[test]
-    fn adding_a_presentation_sends_the_typed_addition_against_the_live_revision() {
-        let mut state = loaded(World::AT_REST);
-        assert!(press(&mut state, KeyCode::Char('n')).is_none());
-        assert_eq!(
-            form_purpose(&state),
-            record_form("presentations", true),
-            "a one-kind tab opens the template directly"
-        );
-        assert_eq!(form_value(&state)["id"], "new-presentation");
-        let command = state.key(CTRL_ENTER).expect("add command");
-        assert_eq!(command.name, "save");
-        assert_eq!(command.method, Method::POST);
-        let body = command.body.expect("body");
-        assert_eq!(body["expected_revision_id"], 9);
-        let operation = &body["edit"]["operations"][0];
-        assert_eq!(operation["kind"], "add_presentation");
-        assert_eq!(operation["presentation"]["id"], "new-presentation");
-        assert!(state.in_flight());
-        // The activation the daemon answers with closes the form.
-        state.receive(reply("save", 200, serde_json::json!({})));
-        assert!(!state.modal().active());
-    }
-
-    #[test]
-    fn an_added_record_is_what_was_typed_into_the_form() {
-        let mut state = loaded(World::AT_REST);
-        press(&mut state, KeyCode::Char('n'));
-        for _ in 0.."new-presentation".len() {
-            press(&mut state, KeyCode::Backspace);
-        }
-        typed(&mut state, "mine");
-        let command = state.key(CTRL_ENTER).expect("add command");
-        let operation = first_operation(command);
-        assert_eq!(operation["presentation"]["id"], "mine");
-        assert_eq!(operation["presentation"]["slug"], "new-model");
-    }
-
-    #[test]
-    fn a_blank_id_stays_open_and_sends_nothing() {
-        let mut state = loaded(World::AT_REST);
-        press(&mut state, KeyCode::Char('n'));
-        for _ in 0.."new-presentation".len() {
-            press(&mut state, KeyCode::Backspace);
-        }
-        assert!(state.key(CTRL_ENTER).is_none());
         let Modal::Form(form) = state.modal() else {
-            panic!("the form stays open");
+            panic!("a form is open");
         };
-        assert_eq!(form.note(), Some("id is empty"));
-        assert!(!state.in_flight());
-        press(&mut state, KeyCode::Esc);
-        assert!(!state.modal().active());
+        assert_eq!(form.value()["binding_id"], testing::API);
+        assert_eq!(form.value()["model_id"], "claude-sonnet-5");
     }
 
     #[test]
-    fn adding_a_record_whose_id_exists_shows_the_daemons_refusal_in_the_form() {
-        let mut state = on(Tab::Routes);
-        press(&mut state, KeyCode::Char('n'));
-        assert!(state.key(CTRL_ENTER).is_some());
-        // The refusal text is the daemon's own: the template's route added
-        // to a policy that already holds a route of that id.
-        let record = crate::tui::routing::template::template("routes", None);
-        let live: crate::policy::PolicyDocument = serde_json::from_value(serde_json::json!({
-            "format_version": 3, "routes": [record.clone()],
-        }))
-        .expect("document");
-        let duplicate: crate::policy::PolicyEdit = serde_json::from_value(
-            serde_json::json!({ "operations": [super::add_edit("routes", record)] }),
-        )
-        .expect("edit");
-        let refusal = duplicate.apply(&live).expect_err("the id is taken");
-        state.receive(reply(
-            "save",
-            422,
-            serde_json::json!({
-                "error": "invalid_policy_edit",
-                "detail": refusal.to_string(),
-            }),
-        ));
-        assert_eq!(
-            form_purpose(&state),
-            record_form("routes", true),
-            "the form stays open so the id can be changed"
-        );
-        assert!(!state.in_flight());
-        let error = state.error().expect("the refusal is shown");
-        assert!(error.contains("invalid_policy_edit"), "{error}");
-        assert!(error.contains("already exists"), "{error}");
-        // Fixing the id and saving again is an ordinary second attempt.
-        assert!(state.key(CTRL_ENTER).is_some());
-    }
-
-    #[test]
-    fn the_models_tab_asks_which_kind_to_add_by_the_panel_it_is_in() {
-        let mut state = on(Tab::Models);
-        // The focus is in upgrades: an upgrade is the preselected kind.
-        press(&mut state, KeyCode::Char('n'));
-        assert!(matches!(
-            state.modal(),
-            Modal::NewKind { preselected: 0, .. }
-        ));
-        assert!(press(&mut state, KeyCode::Char('x')).is_none());
-        assert!(matches!(state.modal(), Modal::NewKind { .. }));
-        press(&mut state, KeyCode::Enter);
-        assert_eq!(form_purpose(&state), record_form("upgrades", true));
-        press(&mut state, KeyCode::Esc);
-
-        // In the compaction line, the compaction is.
-        state.move_selection(5);
-        press(&mut state, KeyCode::Char('n'));
-        assert!(matches!(
-            state.modal(),
-            Modal::NewKind { preselected: 1, .. }
-        ));
-        // A number picks a kind whatever the focus is on.
-        press(&mut state, KeyCode::Char('9'));
-        assert!(matches!(state.modal(), Modal::NewKind { .. }));
-        press(&mut state, KeyCode::Char('1'));
-        assert_eq!(form_purpose(&state), record_form("upgrades", true));
-    }
-
-    #[test]
-    fn every_kind_of_record_can_be_added_from_the_tab_that_shows_it() {
-        for (tab, digits, kind, operation) in [
-            (Tab::Presentations, "", "presentations", "add_presentation"),
-            (Tab::Rewrites, "", "rewrites", "add_rewrite"),
-            (Tab::Defaults, "", "defaults", "add_default"),
-            (Tab::Routes, "", "routes", "add_route"),
-            (Tab::Models, "1", "upgrades", "add_upgrade"),
-            (Tab::Models, "2", "compaction", "add_compaction"),
-        ] {
-            let mut state = on(tab);
-            press(&mut state, KeyCode::Char('n'));
-            for digit in digits.chars() {
-                press(&mut state, KeyCode::Char(digit));
-            }
-            assert_eq!(form_purpose(&state), record_form(kind, true), "{tab:?}");
-            let operation_sent = first_operation(state.key(CTRL_ENTER).expect("add command"));
-            assert_eq!(operation_sent["kind"], operation, "{tab:?}");
+    fn nothing_in_the_page_mentions_a_draft_or_the_old_preview() {
+        // The draft, its validation and its activation are gone, and so is
+        // the popup that showed a preview as a document.
+        let state = loaded(World::AT_REST);
+        let _ = &state;
+        for key in ['v', 'i'] {
+            let mut state = loaded(World::AT_REST);
+            assert!(press(&mut state, KeyCode::Char(key)).is_none());
+            assert!(!state.capturing(), "{key} opens nothing");
         }
-        // A family is added with the focus in families.
-        let mut state = on(Tab::Models);
-        state.move_selection(-1);
-        press(&mut state, KeyCode::Char('n'));
-        assert_eq!(form_purpose(&state), record_form("classifiers", true));
-    }
-
-    #[test]
-    fn a_new_default_starts_from_the_first_route_and_adds_by_scope() {
-        let mut state = on(Tab::Defaults);
-        press(&mut state, KeyCode::Char('n'));
-        let template = form_value(&state);
-        assert_eq!(template["target"]["route_id"], "claude-sub");
-        let command = state.key(CTRL_ENTER).expect("add command");
-        let operation = first_operation(command);
-        assert_eq!(operation["kind"], "add_default");
-        assert_eq!(operation["default"], template);
-    }
-
-    #[test]
-    fn adding_is_not_offered_in_history_or_while_busy() {
-        let mut state = on(Tab::History);
-        assert!(press(&mut state, KeyCode::Char('n')).is_none());
-        assert!(!state.modal().active());
-        assert!(state.error().is_some());
-        state.set_tab(Tab::Presentations);
-        press(&mut state, KeyCode::Char('d'));
-        press(&mut state, KeyCode::Char('y'));
-        assert!(state.in_flight());
-        press(&mut state, KeyCode::Char('n'));
-        assert!(form_purpose(&state).is_none());
     }
 }

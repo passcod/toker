@@ -22,19 +22,49 @@ use crate::tui::chrome::{self, Chrome, Noun, RowHit};
 pub(super) struct BodyLine {
     pub(super) line: Line<'static>,
     pub(super) entry: Option<usize>,
+    /// The field of an open form this line is, which a click on it focuses.
+    pub(super) field: Option<usize>,
+    /// Whether the line is the focused field of an open form: the one the
+    /// window follows, and the one drawn reversed.
+    pub(super) focused: bool,
 }
 
 impl BodyLine {
     pub(super) fn plain(line: Line<'static>) -> Self {
-        BodyLine { line, entry: None }
+        BodyLine {
+            line,
+            entry: None,
+            field: None,
+            focused: false,
+        }
     }
 
     pub(super) fn of(line: Line<'static>, entry: usize) -> Self {
         BodyLine {
             line,
             entry: Some(entry),
+            field: None,
+            focused: false,
         }
     }
+
+    /// A line of an open form, a field or what sits with one.
+    pub(super) fn form(line: Line<'static>, field: Option<usize>, focused: bool) -> Self {
+        BodyLine {
+            line,
+            entry: None,
+            field,
+            focused,
+        }
+    }
+}
+
+/// Where a drawn table put its lines: those a selection can rest on, and the
+/// fields of an open form.
+#[derive(Debug, Default)]
+pub(super) struct Hits {
+    pub(super) rows: Vec<RowHit>,
+    pub(super) fields: Vec<(Rect, usize)>,
 }
 
 /// A table's column heading and its lines.
@@ -136,7 +166,7 @@ pub(super) fn span(text: impl Into<String>, style: Style) -> Span<'static> {
 
 /// A line with every colour and emphasis taken off and reversed across
 /// `width`: the selected row. What colour said is still said in words.
-fn reversed(line: Line<'static>, width: usize) -> Line<'static> {
+pub(super) fn reversed(line: Line<'static>, width: usize) -> Line<'static> {
     let used = line.width();
     let mut spans: Vec<Span<'static>> = line
         .spans
@@ -216,18 +246,25 @@ pub(super) fn draw_table(
     framing: Chrome,
     table: Table,
     selected: Option<usize>,
-) -> Vec<RowHit> {
+) -> Hits {
     let inner = chrome::panel(frame, area, title, framing);
     if inner.height == 0 {
-        return Vec::new();
+        return Hits::default();
     }
     let width = usize::from(inner.width);
     frame.render_widget(padded(table.header, width), Rect { height: 1, ..inner });
     let room = usize::from(inner.height) - 1;
     let on = |line: &BodyLine| selected.is_some() && line.entry == selected;
-    let at = table.body.iter().position(on).unwrap_or(0);
+    // The window follows the focused field of an open form, and the selected
+    // row otherwise.
+    let at = table
+        .body
+        .iter()
+        .position(|line| line.focused)
+        .or_else(|| table.body.iter().position(on))
+        .unwrap_or(0);
     let window = chrome::selection_window(table.body.len(), room, at);
-    let mut rows: Vec<(Line<'static>, Option<usize>)> = Vec::new();
+    let mut rows: Vec<(Line<'static>, Option<usize>, Option<usize>)> = Vec::new();
     // The counts say how many records are out of view, not how many lines.
     let first = window.shown.start.min(table.body.len());
     let last = window.shown.end.min(table.body.len());
@@ -235,6 +272,7 @@ pub(super) fn draw_table(
         let (above, noun) = hidden(&table.body, 0..first);
         rows.push((
             Line::styled(format!("… {above} {} above", noun.of(above)), dim()),
+            None,
             None,
         ));
     }
@@ -246,21 +284,22 @@ pub(super) fn draw_table(
         if !shown.contains(&index) {
             continue;
         }
-        let line = if selected.is_some() && body.entry == selected {
+        let line = if (selected.is_some() && body.entry == selected) || body.focused {
             reversed(padded(body.line, width), width)
         } else {
             padded(body.line, width)
         };
-        rows.push((line, body.entry));
+        rows.push((line, body.entry, body.field));
     }
     if let Some((below, noun)) = below {
         rows.push((
             Line::styled(format!("… {below} more {}", noun.of(below)), dim()),
             None,
+            None,
         ));
     }
-    let mut hits = Vec::new();
-    for (row, (line, entry)) in rows.into_iter().take(room).enumerate() {
+    let mut hits = Hits::default();
+    for (row, (line, entry, field)) in rows.into_iter().take(room).enumerate() {
         let at = Rect {
             y: inner.y + 1 + row as u16,
             height: 1,
@@ -268,7 +307,10 @@ pub(super) fn draw_table(
         };
         frame.render_widget(Paragraph::new(line), at);
         if let Some(entry) = entry {
-            hits.push(RowHit { area: at, entry });
+            hits.rows.push(RowHit { area: at, entry });
+        }
+        if let Some(field) = field {
+            hits.fields.push((at, field));
         }
     }
     hits
@@ -299,6 +341,43 @@ pub(super) fn draw_detail(
             },
         );
     }
+}
+
+/// Draw a panel of lines that may hold an open form: the lines from the top,
+/// scrolled only as far as keeps the focused field in view. Returns where
+/// each field landed.
+pub(super) fn draw_page(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    framing: Chrome,
+    lines: Vec<BodyLine>,
+) -> Vec<(Rect, usize)> {
+    let inner = chrome::panel(frame, area, title, framing);
+    let room = usize::from(inner.height);
+    let width = usize::from(inner.width);
+    let focus = lines.iter().position(|line| line.focused).unwrap_or(0);
+    let start = (focus + 1)
+        .saturating_sub(room)
+        .min(lines.len().saturating_sub(room));
+    let mut fields = Vec::new();
+    for (row, body) in lines.into_iter().skip(start).take(room).enumerate() {
+        let at = Rect {
+            y: inner.y + row as u16,
+            height: 1,
+            ..inner
+        };
+        let line = if body.focused {
+            reversed(padded(body.line, width), width)
+        } else {
+            padded(body.line, width)
+        };
+        frame.render_widget(Paragraph::new(line), at);
+        if let Some(field) = body.field {
+            fields.push((at, field));
+        }
+    }
+    fields
 }
 
 /// A label and value row of a detail: the label dim in a column of

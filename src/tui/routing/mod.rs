@@ -1,7 +1,8 @@
 //! Routing policy page.
 
 mod data;
-mod detail;
+mod edit_view;
+mod editing;
 mod form;
 mod history;
 mod model;
@@ -51,7 +52,7 @@ fn activated(reply: &Reply) -> bool {
 pub(super) fn owns_key(code: crossterm::event::KeyCode) -> bool {
     matches!(
         code,
-        crossterm::event::KeyCode::Char('e' | 'n' | 'd' | 'v' | 'a' | 'p')
+        crossterm::event::KeyCode::Char('e' | 'n' | 'd' | 'm' | 'a' | 'p')
             | crossterm::event::KeyCode::Enter
             | crossterm::event::KeyCode::PageUp
             | crossterm::event::KeyCode::PageDown
@@ -93,6 +94,7 @@ impl Page {
         while let Some(reply) = self.client.poll() {
             let activated = activated(&reply);
             self.state.receive(reply);
+            self.check();
             if activated {
                 // The reply carries the activation; the derived facts and the
                 // history behind it are read again.
@@ -126,18 +128,31 @@ impl Page {
         self.state.mode() == model::Mode::Route
     }
 
-    /// Handle a key owned by the routing page.  Only this page owns its modal
-    /// state, so closing a dialog never alters dashboard dialogs or controls.
+    /// Handle a key owned by the routing page.  Only this page owns its form
+    /// state, so closing one never alters dashboard dialogs or controls.
     pub(super) fn key(&mut self, key: KeyEvent) -> bool {
-        let active = self.state.modal().active();
+        let active = self.state.capturing();
         if let Some(command) = self.state.key(key) {
             self.send(command);
         }
+        self.check();
         active
     }
 
+    /// Whether a form owns every key.
     pub(super) fn modal_active(&self) -> bool {
-        self.state.modal().active()
+        self.state.capturing()
+    }
+
+    /// Ask the daemon what an edit in progress needs checking, and read the
+    /// snapshot again where a save found it out of date.
+    fn check(&mut self) {
+        if let Some(command) = self.state.next_check() {
+            self.send(command);
+        }
+        if self.state.take_refresh_wanted() {
+            self.refresh();
+        }
     }
 
     fn send(&mut self, command: Command) {
@@ -167,14 +182,12 @@ impl Page {
     pub(super) fn click(&mut self, at: ratatui::layout::Position) {
         let drawn = self.drawn.borrow().clone();
         if let Some(hit) = &drawn.form {
-            if hit.body.contains(at)
-                && let Some(Some(row)) = hit.rows.get(usize::from(at.y - hit.body.y))
-            {
+            if let Some((_, row)) = hit.fields.iter().find(|(area, _)| area.contains(at)) {
                 self.state.focus_form_row(*row);
             }
             return;
         }
-        if self.state.modal().active() {
+        if self.state.capturing() {
             return;
         }
         if let Some(tab) = drawn.tabs.iter().position(|tab| tab.contains(at)) {
@@ -190,7 +203,7 @@ impl Page {
         let drawn = self.drawn.borrow().clone();
         if drawn.form.is_some() {
             self.state.step_form(delta as isize);
-        } else if self.state.modal().active() {
+        } else if self.state.capturing() {
         } else if drawn.entries.contains(at) {
             self.state.move_selection(delta as isize);
         }

@@ -11,23 +11,24 @@ use serde_json::{Value, json};
 
 use super::model::{Panel, Tab};
 
-/// The record kinds a tab holds, in the order the add chooser offers them.
-/// The models tab holds several, by the panel the focus is in.
-pub(super) fn kinds(tab: Tab, focus: Panel) -> &'static [&'static str] {
+/// The kind of record a tab adds. The models tab holds several, by the
+/// panel the focus is in.
+pub(super) fn kind_for(tab: Tab, focus: Panel) -> Option<&'static str> {
     match tab {
-        Tab::Presentations => &["presentations"],
-        Tab::Rewrites => &["rewrites"],
-        Tab::Defaults => &["defaults"],
-        Tab::Routes => &["routes"],
-        Tab::Models => match focus {
-            Panel::Families => &["classifiers"],
-            Panel::Upgrades | Panel::Compaction | Panel::Offers => &["upgrades", "compaction"],
-        },
-        Tab::History => &[],
+        Tab::Presentations => Some("presentations"),
+        Tab::Rewrites => Some("rewrites"),
+        Tab::Defaults => Some("defaults"),
+        Tab::Routes => Some("routes"),
+        Tab::Models => Some(match focus {
+            Panel::Families => "classifiers",
+            Panel::Upgrades | Panel::Offers => "upgrades",
+            Panel::Compaction => "compaction",
+        }),
+        Tab::History => None,
     }
 }
 
-/// What the chooser calls a kind.
+/// What a kind of record is called, one of them.
 pub(super) fn singular(kind: &str) -> &'static str {
     match kind {
         "presentations" => "presentation",
@@ -116,9 +117,10 @@ pub(super) fn template(kind: &str, route_id: Option<&str>) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{kinds, template};
+    use super::{kind_for, template};
     use crate::policy::{PolicyDocument, PolicyEdit};
-    use crate::tui::routing::model::{Panel, Tab, add_edit};
+    use crate::tui::routing::editing::add_edit;
+    use crate::tui::routing::model::{Panel, Tab};
 
     fn empty() -> PolicyDocument {
         serde_json::from_value(serde_json::json!({ "format_version": 3 })).expect("document")
@@ -135,8 +137,9 @@ mod tests {
             (Tab::Routes, Panel::Upgrades),
             (Tab::Models, Panel::Families),
             (Tab::Models, Panel::Upgrades),
+            (Tab::Models, Panel::Compaction),
         ] {
-            for kind in kinds(tab, focus) {
+            if let Some(kind) = kind_for(tab, focus) {
                 let operation = add_edit(kind, template(kind, None));
                 let edit: PolicyEdit =
                     serde_json::from_value(serde_json::json!({ "operations": [operation] }))

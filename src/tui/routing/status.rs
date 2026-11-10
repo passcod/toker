@@ -78,9 +78,11 @@ pub(super) fn text_of(
     snapshot: Option<&Value>,
     revision: Option<i64>,
     working: bool,
+    lead: Option<&str>,
     note: Option<&str>,
 ) -> String {
-    let mut parts = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
+    parts.extend(lead.map(str::to_owned));
     if let Some(revision) = revision {
         parts.push(format!("rev {revision} live"));
     }

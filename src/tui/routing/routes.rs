@@ -242,8 +242,8 @@ pub(super) fn candidate_lines(snapshot: &Value, route: &Value) -> Vec<Line<'stat
 
 const ROUTE_CONTROLS: [(&str, &str); 5] = [
     ("e", "edit"),
-    ("n", "add fallback"),
-    ("m", "move"),
+    ("n", "new"),
+    ("d", "delete"),
     ("t", "trace"),
     ("enter", "open route"),
 ];
@@ -259,10 +259,11 @@ pub(super) fn route_detail(snapshot: &Value, route: &Value) -> Vec<Line<'static>
 
 // --- the route page -------------------------------------------------------
 
-const PAGE_CONTROLS: [(&str, &str); 6] = [
+const PAGE_CONTROLS: [(&str, &str); 7] = [
     ("e", "edit"),
     ("n", "add fallback"),
     ("m", "move"),
+    ("d", "remove"),
     ("t", "trace"),
     ("←/→", "other routes"),
     ("esc", "back"),
@@ -280,9 +281,11 @@ const BLOCKS: [(&str, &str); 7] = [
     ("health circuits", "health_circuits"),
 ];
 
-/// One route, whole. `width` is the room a line has, for setting the
-/// position at the right of the name.
-pub(super) fn route_page(
+/// The top of the route page: its name and place, and the candidates it is
+/// sent to, which is where a candidate is edited. Candidate `n` is the
+/// line `2 * n` past [`CANDIDATES_AT`], the edge to the next being the one
+/// between.
+pub(super) fn route_top(
     snapshot: &Value,
     route: &Value,
     place: usize,
@@ -307,8 +310,31 @@ pub(super) fn route_page(
         vec![Span::raw(counted(candidates, "candidate", "candidates"))],
     ));
     lines.extend(candidate_lines(snapshot, route));
-    lines.push(Line::raw(""));
+    lines
+}
 
+/// `route` with its candidate at `from` put at `to`, as a move in progress
+/// shows it. The edges stay where they are: they lie between places, not
+/// candidates.
+pub(super) fn with_move(route: &Value, from: usize, to: usize) -> Value {
+    let mut moved = route.clone();
+    if let Some(candidates) = moved.get_mut("candidates").and_then(Value::as_array_mut)
+        && from < candidates.len()
+        && to < candidates.len()
+    {
+        let lifted = candidates.remove(from);
+        candidates.insert(to, lifted);
+    }
+    moved
+}
+
+/// Where the first candidate's line is in [`route_top`].
+pub(super) const CANDIDATES_AT: usize = 3;
+
+/// The rest of the route page: what handles a request on the route and what
+/// sends one to it, with the controls.
+pub(super) fn route_rest(route: &Value) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::raw("")];
     let handled = route.get("handled_by").unwrap_or(&Value::Null);
     let on = |key: &str| handled.get(key).is_some_and(|block| flag(block, "enabled"));
     let (enabled, disabled): (Vec<_>, Vec<_>) = BLOCKS.iter().partition(|(_, key)| on(key));
