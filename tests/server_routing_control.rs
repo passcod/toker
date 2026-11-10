@@ -1277,6 +1277,45 @@ async fn the_revision_history_is_read_a_page_at_a_time() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
 }
 
+/// The revision's own description is not part of the document, so the
+/// handlers bound it themselves.
+#[tokio::test]
+async fn a_revision_description_is_bounded_at_both_mutating_paths() {
+    let (server, store) = server();
+    let app = server.router();
+    let long = "x".repeat(toker::policy::MAX_DESCRIPTION_BYTES + 1);
+
+    let (status, refused) = post(
+        &app,
+        "save",
+        "routing-save",
+        json!({"expected_revision_id": 1, "edit": describe("second"), "description": long}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(store.load_policy_revisions().unwrap().len(), 1);
+
+    let (status, saved) = post(
+        &app,
+        "save",
+        "routing-save",
+        json!({"expected_revision_id": 1, "edit": describe("second"),
+               "description": "x".repeat(toker::policy::MAX_DESCRIPTION_BYTES)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+
+    let (status, refused) = post(
+        &app,
+        "reactivate",
+        "routing-reactivate",
+        json!({"expected_revision_id": 2, "revision_id": 1, "description": long}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(store.load_policy_revisions().unwrap().len(), 2);
+}
+
 fn snapshot_policy_description(store: &Store, revision: i64) -> Value {
     let revision = store.load_policy_revision(revision).unwrap().unwrap();
     let bytes = toker::policy::policy_bytes(&revision.document).unwrap();

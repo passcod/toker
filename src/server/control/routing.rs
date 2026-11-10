@@ -133,7 +133,7 @@ pub(crate) async fn save(State(server): State<Server>, request: Request) -> Resp
         Ok(request) => request,
         Err(response) => return *response,
     };
-    if request.edit.operations.is_empty() {
+    if request.edit.operations.is_empty() || !description_fits(request.description.as_deref()) {
         return invalid_request("routing-save");
     }
     match server.save_routing_edit(
@@ -438,6 +438,9 @@ pub(crate) async fn reactivate(State(server): State<Server>, request: Request) -
         Ok(request) => request,
         Err(response) => return *response,
     };
+    if !description_fits(request.description.as_deref()) {
+        return invalid_request("routing-reactivate");
+    }
     match server.reactivate_routing_policy(
         request.expected_revision_id,
         request.revision_id,
@@ -854,6 +857,12 @@ fn invalid_policy(diagnostics: Vec<crate::policy::Diagnostic>) -> Response {
         "invalid_policy",
         Some(json!({ "diagnostics": diagnostics_body(diagnostics) })),
     )
+}
+
+/// The revision's own description is not part of the document, so it is
+/// bounded here, by the bound the descriptions inside the document carry.
+fn description_fits(description: Option<&str>) -> bool {
+    description.is_none_or(|value| value.len() <= crate::policy::MAX_DESCRIPTION_BYTES)
 }
 
 fn invalid_request(operation: &str) -> Response {
