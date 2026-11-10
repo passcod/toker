@@ -239,9 +239,7 @@ fn block_value(
             return None;
         }
         CanonBlock::Text(text) => json!({"type": "text", "text": text}),
-        CanonBlock::Image { url } => {
-            json!({"type": "image", "source": {"type": "url", "url": url}})
-        }
+        CanonBlock::Image { url } => json!({"type": "image", "source": image_source(url)}),
         CanonBlock::ToolUse { id, name, input } => {
             json!({"type": "tool_use", "id": id, "name": name, "input": input})
         }
@@ -272,6 +270,21 @@ fn block_value(
         }
         CanonBlock::Annotated { .. } => unreachable!("annotations handled above"),
     })
+}
+
+/// An image URL → the Messages `source` object. The canonical form
+/// of a base64 source is its `data:` URL; sent back as a `url` source
+/// the API tries to fetch it and answers 400 "Unable to download the
+/// file", so a `data:` URL goes out as the base64 source it came from.
+fn image_source(url: &str) -> Value {
+    if let Some((media_type, data)) = url
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(";base64,"))
+    {
+        json!({"type": "base64", "media_type": media_type, "data": data})
+    } else {
+        json!({"type": "url", "url": url})
+    }
 }
 
 fn tool_result_value(
@@ -1114,6 +1127,24 @@ mod tests {
             events.extend(stream.feed_sse(&event));
         }
         events
+    }
+
+    #[test]
+    fn a_base64_image_round_trips_as_a_base64_source_not_a_url_source() {
+        let image = json!({"type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "aVBONyU="}});
+        let url = json!({"type": "image",
+            "source": {"type": "url", "url": "https://x.test/i.png"}});
+        let body = json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": [image.clone(), url.clone()]}],
+        });
+        let canonical = from_anthropic(&body).expect("parses");
+        let rendered = render_anthropic(&canonical, DialectId::AnthropicMessages)
+            .expect("renders")
+            .value;
+        assert_eq!(rendered["messages"][0]["content"], json!([image, url]));
     }
 
     #[test]
