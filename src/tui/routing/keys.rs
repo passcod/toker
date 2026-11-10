@@ -38,10 +38,11 @@ pub(super) const IN_A_TRACE: [(&str, &str); 2] = [
     ("t", "trace another"),
 ];
 
-pub(super) const IN_AN_EDIT: [(&str, &str); 8] = [
+pub(super) const IN_AN_EDIT: [(&str, &str); 9] = [
     ("↑/↓", "move between fields"),
     ("←/→", "change the value"),
     ("tab", "complete a name"),
+    ("↓ enter", "pick a record from a field's list"),
     ("space", "toggle"),
     ("alt+↑/↓", "move a list item or candidate"),
     ("ctrl+d", "remove a list item"),

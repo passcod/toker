@@ -1444,15 +1444,42 @@ impl State {
                         .collect(),
                 );
             }
+            // What tells a classifier or an upgrade policy apart from the
+            // others in a field's list.
+            let about = |collection: &'static str, say: fn(&Value) -> String| {
+                array(policy, collection)
+                    .iter()
+                    .filter_map(|record| Some((text(record, "id")?, say(record))))
+                    .collect()
+            };
+            context.about.insert(
+                "classifiers",
+                about("classifiers", |classifier| {
+                    format!(
+                        "{} · {}",
+                        data::text(classifier, "binding_id"),
+                        data::text(&classifier["model_matcher"], "value")
+                    )
+                }),
+            );
+            context.about.insert(
+                "upgrades",
+                about("upgrades", |upgrade| {
+                    format!("on {}", data::text(upgrade, "classifier_id"))
+                }),
+            );
         }
         if let Some(active) = data::active(snapshot) {
+            // A route reads as the providers its candidates reach in order,
+            // as the routes tab shows it.
+            let routes = context.about.entry("routes").or_default();
             for route in array(active, "routes") {
                 let id = data::text(route, "id");
                 let said: String = rules::route_summary(active, id)
                     .iter()
                     .map(|span| span.content.as_ref())
                     .collect();
-                context.routes.insert(id.to_owned(), said);
+                routes.insert(id.to_owned(), said);
             }
         }
         context
