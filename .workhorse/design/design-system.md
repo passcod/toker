@@ -186,7 +186,7 @@ A page with one framing for several panels picks it once: boxed only while no pa
 **A page with views carries a numbered tab strip** in its header, after the chips: ` 1 providers  2 settings`.
 Tabs are lower case and two spaces apart, the current one bold and reversed, the others dim, and every tab is clickable.
 When the strip does not fit, the other tabs collapse to their number first, then the current label clips with `…`.
-A page status on the right of the header, such as routing's `draft 4 · working`, clips only once the tabs have collapsed.
+A page status on the right of the header, such as routing's `rev 10 live · 2 lanes on rev 9`, clips only once the tabs have collapsed.
 
 **A page's message sits under the header**, in red, wrapped across as many rows as it takes, and the page stays standing beneath it.
 It says what went wrong with the last thing the page tried: a refused value, a failed read.
