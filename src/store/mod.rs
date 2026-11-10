@@ -1143,7 +1143,7 @@ mod tests {
             },
             asks_server_safeguards: true,
             binding_affinity: Some(BindingId::new("anthropic_sub.anthropic_messages").unwrap()),
-            lane: crate::policy::facts::RecordedLane::Read(
+            lane: crate::policy::facts::RecordedLane::Read(Box::new(
                 crate::policy::facts::RecordedLaneState {
                     temperature: crate::policy::CacheTemperature::Warm,
                     pin: Some(crate::policy::facts::RecordedPin {
@@ -1155,7 +1155,7 @@ mod tests {
                     forced_from: Some("claude-sonnet-4".to_owned()),
                     forced_to: Some("claude-opus-5".to_owned()),
                 },
-            ),
+            )),
             class: crate::policy::RequestClass::Inference,
         }
     }

@@ -39,7 +39,9 @@ pub enum RecordedLane {
     /// The resolver was given no lane: a new one, or one the service resolves
     /// as new.
     New,
-    Read(RecordedLaneState),
+    /// Boxed: the facts travel inside a resolve error and a preview
+    /// outcome, which clippy keeps small.
+    Read(Box<RecordedLaneState>),
 }
 
 /// What the resolver reads of a lane it is given. The pin's revision and
@@ -65,7 +67,7 @@ pub struct RecordedPin {
 impl RecordedLane {
     pub fn of(lane: Option<&LaneFacts>) -> Self {
         lane.map_or(Self::New, |lane| {
-            Self::Read(RecordedLaneState {
+            Self::Read(Box::new(RecordedLaneState {
                 temperature: lane.temperature,
                 pin: lane.pinned.as_ref().map(|pin| RecordedPin {
                     route_fingerprint: pin.route_fingerprint.clone(),
@@ -75,7 +77,7 @@ impl RecordedLane {
                 }),
                 forced_from: lane.forced_from.clone(),
                 forced_to: lane.forced_to.clone(),
-            })
+            }))
         })
     }
 

@@ -146,12 +146,10 @@ fn new_lane_plan(mut plan: crate::policy::AttemptPlan) -> crate::policy::Attempt
 pub(crate) enum PolicyAttemptError {
     #[error(transparent)]
     Runtime(#[from] crate::policy::PolicyRuntimeError),
-    #[error("policy revision {revision_id} could not route the request: {failure}")]
+    #[error("policy revision {} could not route the request: {failure}", refusal.revision_id)]
     Resolve {
-        revision_id: i64,
         failure: crate::policy::ResolveFailure,
-        /// The lane the resolver was given, for the ledger to record.
-        lane: crate::policy::facts::RecordedLane,
+        refusal: Box<Refusal>,
     },
     #[error("policy revision {revision_id} could not safely transition the lane: {reason:?}")]
     Transition {
@@ -161,13 +159,23 @@ pub(crate) enum PolicyAttemptError {
         /// to a revision newer than the one running never got that far.
         route: Option<Box<DeniedRoute>>,
         /// The lane the resolver was or would have been given.
-        lane: crate::policy::facts::RecordedLane,
+        lane: Box<crate::policy::facts::RecordedLane>,
     },
     /// The caller built lane facts for a lane it had not loaded, or the other
     /// way round. That is a handler bug, and routing on half a lane would
     /// guess its cache temperature.
     #[error("the stored lane and the policy lane facts disagreed")]
     LaneFactsMismatch,
+}
+
+/// What a refused resolution records beside the failure itself: the
+/// revision that could not route the request, and the lane the resolver was
+/// given. Boxed on the error so that the failure, which is much the larger
+/// of the two, does not carry them inline on every Ok path.
+#[derive(Debug)]
+pub(crate) struct Refusal {
+    pub(crate) revision_id: i64,
+    pub(crate) lane: crate::policy::facts::RecordedLane,
 }
 
 /// The route a resolved plan chose, kept on a [`PolicyAttemptError`] so the
@@ -216,7 +224,6 @@ impl PolicyAttemptError {
         let facts = crate::policy::RecordedFacts::of(facts);
         match self {
             Self::Resolve {
-                revision_id,
                 failure:
                     crate::policy::ResolveFailure::RouteUnavailable {
                         route_id,
@@ -224,24 +231,23 @@ impl PolicyAttemptError {
                         provenance,
                         trace,
                     },
-                lane,
+                refusal,
             } => Some(PolicyRouteProvenance::from_route_unavailable(
-                *revision_id,
+                refusal.revision_id,
                 route_id.clone(),
                 route_fingerprint.clone(),
                 provenance,
                 trace,
                 group,
-                facts.with_lane(lane.clone()),
+                facts.with_lane(refusal.lane.clone()),
             )),
             Self::Resolve {
-                revision_id,
                 failure: crate::policy::ResolveFailure::NoRoute,
-                lane,
+                refusal,
             } => Some(PolicyRouteProvenance::from_no_route(
-                *revision_id,
+                refusal.revision_id,
                 group,
-                facts.with_lane(lane.clone()),
+                facts.with_lane(refusal.lane.clone()),
             )),
             Self::Transition {
                 revision_id,
@@ -260,7 +266,7 @@ impl PolicyAttemptError {
                 }),
                 *reason,
                 group,
-                facts.with_lane(lane.clone()),
+                facts.with_lane(lane.as_ref().clone()),
             )),
             _ => None,
         }
@@ -1086,9 +1092,11 @@ impl Server {
         )
         .map(|plan| new_lane_plan(plan.with_policy_revision(revision_id)))
         .map_err(|failure| PolicyAttemptError::Resolve {
-            revision_id,
             failure,
-            lane: crate::policy::facts::RecordedLane::New,
+            refusal: Box::new(Refusal {
+                revision_id,
+                lane: crate::policy::facts::RecordedLane::New,
+            }),
         })
     }
 
@@ -1108,9 +1116,11 @@ impl Server {
             .with_safeguards_marks(&self.safeguards_marks());
         crate::policy::resolve_model_free(snapshot.policy(), &availability, facts).map_err(
             |failure| PolicyAttemptError::Resolve {
-                revision_id,
                 failure,
-                lane: crate::policy::facts::RecordedLane::New,
+                refusal: Box::new(Refusal {
+                    revision_id,
+                    lane: crate::policy::facts::RecordedLane::New,
+                }),
             },
         )
     }
@@ -1142,9 +1152,11 @@ impl Server {
             )
             .map(|plan| new_lane_plan(plan.with_policy_revision(revision_id)))
             .map_err(|failure| PolicyAttemptError::Resolve {
-                revision_id,
                 failure,
-                lane: crate::policy::facts::RecordedLane::New,
+                refusal: Box::new(Refusal {
+                    revision_id,
+                    lane: crate::policy::facts::RecordedLane::New,
+                }),
             })?;
             plans.push(plan);
         }
@@ -1192,7 +1204,7 @@ impl Server {
                     revision_id: revision,
                     reason: crate::policy::TransitionDenied::StaleRevision,
                     route: None,
-                    lane: crate::policy::facts::RecordedLane::of(lane),
+                    lane: Box::new(crate::policy::facts::RecordedLane::of(lane)),
                 });
             }
             (Some(revision), _) if revision == current_revision_id => true,
@@ -1267,7 +1279,7 @@ impl Server {
                     .expect("a resolved plan carries its revision"),
                 reason,
                 route: DeniedRoute::of(&resolved.plan),
-                lane: resolved.plan.facts.lane.clone(),
+                lane: Box::new(resolved.plan.facts.lane.clone()),
             });
         }
         let continuation = PolicyContinuation {
@@ -1380,9 +1392,11 @@ impl Server {
             failure,
         )
         .map_err(|failure| PolicyAttemptError::Resolve {
-            revision_id,
             failure,
-            lane: failed.plan.facts.lane.clone(),
+            refusal: Box::new(Refusal {
+                revision_id,
+                lane: failed.plan.facts.lane.clone(),
+            }),
         })?;
         let Some(mut plan) = plan else {
             return Ok(None);
@@ -1404,7 +1418,7 @@ impl Server {
                 revision_id,
                 reason,
                 route: DeniedRoute::of(&plan),
-                lane: plan.facts.lane.clone(),
+                lane: Box::new(plan.facts.lane.clone()),
             });
         }
         Ok(Some(PolicyAttempt {
@@ -1448,9 +1462,11 @@ impl Server {
         )
         .map(|plan| plan.with_policy_revision(revision_id))
         .map_err(|failure| PolicyAttemptError::Resolve {
-            revision_id,
             failure,
-            lane: recorded_lane.clone(),
+            refusal: Box::new(Refusal {
+                revision_id,
+                lane: recorded_lane.clone(),
+            }),
         })?;
         plan.facts.lane = recorded_lane;
         Ok(ResolvedPolicySnapshot {
@@ -3906,7 +3922,7 @@ api_key = "sk-proj-test"
                 revision_id: 1,
                 reason: crate::policy::TransitionDenied::WarmCacheLoss,
                 route,
-                lane: crate::policy::facts::RecordedLane::New,
+                lane: Box::new(crate::policy::facts::RecordedLane::New),
             };
             super::record::record_unroutable(
                 &server,
@@ -3951,9 +3967,11 @@ api_key = "sk-proj-test"
             None,
             None,
             &super::PolicyAttemptError::Resolve {
-                revision_id: 1,
                 failure: crate::policy::ResolveFailure::InvalidTemplate,
-                lane: crate::policy::facts::RecordedLane::New,
+                refusal: Box::new(super::Refusal {
+                    revision_id: 1,
+                    lane: crate::policy::facts::RecordedLane::New,
+                }),
             },
             &facts,
         );

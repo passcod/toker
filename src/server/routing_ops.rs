@@ -85,7 +85,8 @@ pub(crate) struct RoutingPreview {
 pub(crate) enum PreviewOutcome {
     Resolved {
         /// The facts that were resolved, as the control body renders them.
-        facts: RecordedFacts,
+        /// Boxed so the outcome stays small beside its one-byte variant.
+        facts: Box<RecordedFacts>,
         result: serde_json::Value,
     },
     /// The row did not record the facts the resolver reads, so nothing was
@@ -598,8 +599,10 @@ impl Server {
             against_revision_id,
             diagnostics,
             outcome: PreviewOutcome::Resolved {
-                facts: RecordedFacts::of(&facts)
-                    .with_lane(crate::policy::facts::RecordedLane::of(lane.as_ref())),
+                facts: Box::new(
+                    RecordedFacts::of(&facts)
+                        .with_lane(crate::policy::facts::RecordedLane::of(lane.as_ref())),
+                ),
                 result: preview_result_body(result, &availability),
             },
         })

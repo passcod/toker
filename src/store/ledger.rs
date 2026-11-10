@@ -1418,7 +1418,7 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
         .map(|facts| serde_json::to_string(&facts.required_capabilities))
         .transpose()?;
     let lane_state = facts.and_then(|facts| match &facts.lane {
-        crate::policy::facts::RecordedLane::Read(lane) => Some(lane),
+        crate::policy::facts::RecordedLane::Read(lane) => Some(lane.as_ref()),
         _ => None,
     });
     let lane_pin = lane_state.and_then(|lane| lane.pin.as_ref());
@@ -2943,12 +2943,12 @@ fn read_recorded_lane(row: &rusqlite::Row<'_>) -> Result<crate::policy::facts::R
             })
         }
     };
-    Ok(RecordedLane::Read(RecordedLaneState {
+    Ok(RecordedLane::Read(Box::new(RecordedLaneState {
         temperature,
         pin,
         forced_from: row.get("facts_lane_forced_from")?,
         forced_to: row.get("facts_lane_forced_to")?,
-    }))
+    })))
 }
 
 fn parse_optional_id<T>(column: &'static str, value: Option<String>) -> Result<Option<T>>
