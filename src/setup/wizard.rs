@@ -866,11 +866,14 @@ fn protocol_enabled(config: &Config, protocol: ProtocolId) -> bool {
     }
 }
 
-/// What verify must see answer before the frontends step: for each
-/// protocol with a backend, the usage path of every detected frontend
-/// that speaks it, through the very prefix it will be pointed at, plus
-/// that prefix reaching toker itself ([`verify::Check::Prefix`]); the
-/// bare usage path when no frontend of the protocol was detected.
+/// What verify must see answer before the frontends step: every detected
+/// frontend's prefix reaching toker itself ([`verify::Check::Prefix`]);
+/// for each protocol with a provider, the usage path of every detected
+/// frontend that speaks it, through the very prefix it will be pointed
+/// at, or the bare usage path when no frontend of the protocol was
+/// detected. A protocol with no provider has no usage path to probe, as
+/// toker answers it as not configured, so where nothing else applies the
+/// bare listener's status stands in ([`verify::Check::Listener`]).
 fn verify_checks(config: &Config, detected: &Detected) -> Vec<verify::Check> {
     let mut checks: Vec<verify::Check> = Vec::new();
     let mut push = |check: verify::Check| {
@@ -883,24 +886,27 @@ fn verify_checks(config: &Config, detected: &Detected) -> Vec<verify::Check> {
         (ProtocolId::OpenAiChat, "/v1/chat/completions"),
         (ProtocolId::OpenAiResponses, "/v1/responses"),
     ] {
-        if !protocol_enabled(config, protocol) {
-            continue;
-        }
+        let enabled = protocol_enabled(config, protocol);
         let speakers: Vec<&Frontend> = detected
             .frontends
             .iter()
             .map(|fd| &fd.frontend)
             .filter(|frontend| frontend.protocol() == protocol)
             .collect();
-        if speakers.is_empty() {
+        if enabled && speakers.is_empty() {
             push(verify::Check::Usage(bare.to_owned()));
         }
         for frontend in speakers {
             if let Some(name) = frontend.prefix() {
                 push(verify::Check::Prefix(name.to_owned()));
             }
-            push(verify::Check::Usage(frontend.usage_path()));
+            if enabled {
+                push(verify::Check::Usage(frontend.usage_path()));
+            }
         }
+    }
+    if checks.is_empty() {
+        checks.push(verify::Check::Listener);
     }
     checks
 }
@@ -1230,9 +1236,8 @@ impl<'a> Wizard<'a> {
                 .config
                 .as_ref()
                 .is_some_and(|old| old.port == current.port);
-        if self.units_step(&current, refresh_running, &mut report)?
-            && self.verify_step(&current, &detected, &mut report).await?
-        {
+        if self.units_step(&current, refresh_running, &mut report)? {
+            self.verify_step(&current, &detected, &mut report).await?;
             self.frontends_step(&detected, &current, &mut report)?;
             self.toggles_step(&detected, &current, &mut report)?;
             // Last, after the timers: it writes claude's settings, so it
@@ -1601,7 +1606,16 @@ impl<'a> Wizard<'a> {
             }
             _ => Some(self.find_providers(detected)?),
         };
-        self.say("  other providers are configured on the providers page of `toker tui`")?;
+        // Setup goes on either way: a provider enabled on the dashboard
+        // later needs no second run (spec: USETUP#writing).
+        if found.as_ref().is_some_and(Vec::is_empty) {
+            self.say(
+                "  no provider credential found, so none is enabled — providers are \
+                 enabled on the providers page of `toker tui`",
+            )?;
+        } else {
+            self.say("  other providers are configured on the providers page of `toker tui`")?;
+        }
         let port_default = existing.map(|config| config.port).unwrap_or(DEFAULT_PORT);
         let port = self.ask_port(port_default)?;
         Ok(Choices { port, found })
@@ -1647,12 +1661,6 @@ impl<'a> Wizard<'a> {
             self.say(&format!(
                 "  the keyring could not be checked ({error:#}), so nothing is enabled from it"
             ))?;
-        }
-        if found.is_empty() {
-            self.say(
-                "  no provider credential found, so none is enabled; enable one on the \
-                 dashboard and run setup again to wire the frontends",
-            )?;
         }
         if found.contains(&"codex_sub") {
             self.say(
@@ -1734,12 +1742,6 @@ impl<'a> Wizard<'a> {
                     "keeping what {} configured, and moving it into the store",
                     file.display()
                 ))?;
-            }
-            Some(found) if found.is_empty() && !had_file => {
-                // Rows naming no provider would only activate a routing
-                // with nothing to route to.
-                self.say("no provider to configure — the store is left as it is")?;
-                return Ok(config);
             }
             Some(found) => enable_found(&mut config, found, owned.is_some(), paths),
         }
@@ -1950,36 +1952,28 @@ impl<'a> Wizard<'a> {
 
     /// [`Step::VerifyService`] — the library's wiring check, the
     /// ordering rule's enforcement point. Failure aborts the wizard:
-    /// the frontends are NOT touched, and the error says so. `false`
-    /// means no provider is enabled, so there is nothing to verify and
-    /// nothing to wire: the run goes on to hand off to the dashboard,
-    /// where providers are enabled.
+    /// the frontends are NOT touched, and the error says so.
     async fn verify_step(
         &mut self,
         config: &Config,
         detected: &Detected,
         report: &mut RunReport,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         self.step(Step::VerifyService)?;
         let checks = verify_checks(config, detected);
-        if checks.is_empty() {
-            self.say(
-                "no provider is enabled — there is nothing to verify and nothing to wire; \
-                 enable one on the providers page of `toker tui`, then run setup again",
-            )?;
-            return Ok(false);
-        }
         match verify::await_service_ready(config.port, &checks, self.verify_timeout).await {
             Ok(ready) => {
                 for (check, status) in &ready.answers {
                     let whose = match check {
                         verify::Check::Usage(_) => " (the upstream's verdict)",
-                        verify::Check::Prefix(_) => " (toker's own status)",
+                        verify::Check::Prefix(_) | verify::Check::Listener => {
+                            " (toker's own status)"
+                        }
                     };
                     self.say(&format!("{} → {status}{whose}", check.describe()))?;
                 }
                 report.verified = Some(ready);
-                Ok(true)
+                Ok(())
             }
             Err(error) => {
                 self.say("verification failed — the frontends were NOT touched:")?;
@@ -2012,17 +2006,17 @@ impl<'a> Wizard<'a> {
             let frontend = &detected.frontend;
             let url = frontend.base_url(port);
             let name = frontend.describe();
-            // A frontend whose protocol has no backend would get only
-            // not-configured errors from toker: it is left where it is.
+            // Offered all the same: the listener is up, and a provider
+            // enabled on the dashboard later serves it with no second
+            // setup run (spec: USETUP#writing). Until then toker answers
+            // it as not configured, so the operator is told before saying
+            // yes.
             if !protocol_enabled(config, frontend.protocol()) {
                 self.say(&format!(
-                    "{name}: not offered — no {} backend is enabled",
+                    "{name}: no {} provider is enabled yet — it gets not-configured errors \
+                     until one is enabled in `toker tui`",
                     frontend.protocol()
                 ))?;
-                report
-                    .left_unchanged
-                    .push(format!("{name} (no {} backend)", frontend.protocol()));
-                continue;
             }
             // Wired means this port AND this frontend's own prefix: a
             // claude still on the bare listener is re-offered, so its
@@ -3599,6 +3593,10 @@ mod tests {
             .route(
                 "/f/{name}/_toker/status",
                 axum::routing::get(|| async { StatusCode::OK }),
+            )
+            .route(
+                "/_toker/status",
+                axum::routing::get(|| async { StatusCode::OK }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -4346,45 +4344,47 @@ default_backend_anthropic = "codex_sub"
     }
 
     #[tokio::test]
-    async fn a_frontend_whose_protocol_has_no_backend_is_not_offered() {
+    async fn a_frontend_whose_protocol_has_no_provider_is_still_wired() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "no-anthropic",
             vec![
                 text(&port.to_string()),
+                confirm(true), // claude, with no anthropic provider yet
                 confirm(true), // opencode
                 confirm(true), // the opencode plugin
             ],
             with_picker(vec![inactive(), ok_empty(), ok_empty()]),
         )
         .with_keys(&["openrouter"]);
-        let before_claude = seed_claude(&rig.root);
+        seed_claude(&rig.root);
         seed_opencode(&rig.root);
 
         let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
-        // Verify probed only the openai path; claude was never asked
-        // about and never touched.
+        // Claude's prefix was verified, but no usage path of a protocol
+        // toker would answer as not configured.
         assert_eq!(
             report.verified.expect("verified").answers,
-            vec![(verify::Check::Usage("/v1/chat/completions".to_owned()), 401)]
+            vec![
+                (verify::Check::Prefix("claude".to_owned()), 200),
+                (verify::Check::Usage("/v1/chat/completions".to_owned()), 401),
+            ]
         );
         assert!(
+            rig.out().contains(
+                "no anthropic provider is enabled yet — it gets not-configured errors \
+                 until one is enabled in `toker tui`"
+            ),
+            "{}",
             rig.out()
-                .contains("not offered — no anthropic backend is enabled")
         );
-        assert!(
-            !rig.prompt
-                .asked()
-                .iter()
-                .any(|asked| asked.message.contains("claude")),
-            "{:?}",
-            rig.prompt.asked()
-        );
+        // Wired all the same: an anthropic provider enabled on the
+        // dashboard later serves it without setup running again.
         assert_eq!(
             std::fs::read(rig.root.join(".claude/settings.json")).expect("read claude"),
-            before_claude
+            claude_wired(port)
         );
-        assert_eq!(report.patched.len(), 1, "opencode alone");
+        assert_eq!(report.patched.len(), 2, "claude and opencode");
     }
 
     #[tokio::test]
@@ -4879,37 +4879,76 @@ default_backend_anthropic = "codex_sub"
     }
 
     #[tokio::test]
-    async fn with_no_credential_found_setup_enables_nothing_and_wires_nothing() {
+    async fn with_no_credential_found_setup_still_completes() {
+        // A Claude-only machine: no secret service and no codex login,
+        // so no provider is found, and setup does the whole setup anyway
+        // (spec: USETUP#writing).
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "detect-nothing",
-            vec![text("")], // the listener port: the default
-            vec![inactive(), ok_empty(), ok_empty()],
+            vec![
+                text(&port.to_string()), // the listener port
+                confirm(true),           // claude
+                confirm(true),           // shell rc
+            ],
+            with_picker(vec![inactive(), ok_empty(), ok_empty()]),
         );
-        // No secret service on this machine, and no codex login.
         rig.secrets = MemoryStore::unavailable();
-        let before_claude = seed_claude(&rig.root);
+        seed_claude(&rig.root);
+        seed_rc(&rig.root);
 
-        let report = rig
-            .run(VERIFY_TIMEOUT)
-            .await
-            .expect("the run completes, handing off to the dashboard");
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
 
-        assert!(!report.config_written && report.routing_activated.is_none());
-        assert!(report.verified.is_none());
-        assert!(report.patched.is_empty());
+        // The configuration is written, with no provider enabled.
+        assert!(report.config_written);
+        assert_eq!(report.routing_activated, Some(1));
+        assert!(rig.stored().enabled_backends().is_empty());
+        // The units are installed.
+        assert!(report.units_ok);
+        assert_eq!(report.units_installed, [SOCKET_UNIT, SERVICE_UNIT]);
+        // Verify proved claude's prefix, the one check a Toker with no
+        // provider can pass, and the clients were pointed at it.
+        assert_eq!(
+            report.verified.expect("verified").answers,
+            vec![(verify::Check::Prefix("claude".to_owned()), 200)]
+        );
         assert_eq!(
             std::fs::read(rig.root.join(".claude/settings.json")).expect("read claude"),
-            before_claude,
-            "no client is pointed at a Toker with no provider"
+            claude_wired(port)
         );
-        assert_eq!(rig.prompt.asked().len(), 1, "{:?}", rig.prompt.asked());
+        assert_eq!(report.patched.len(), 2, "claude and the shell rc");
         let out = rig.out();
         assert!(
             out.contains("the keyring could not be checked") && out.contains("no secret service"),
             "{out}"
         );
-        assert!(out.contains("no provider credential found"), "{out}");
-        assert!(out.contains("no provider is enabled"), "{out}");
+        assert!(
+            out.contains(
+                "no provider credential found, so none is enabled — providers are enabled \
+                 on the providers page of `toker tui`"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("run setup again"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn with_no_provider_and_no_frontend_verify_asks_the_listener() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "detect-nothing-bare",
+            vec![text(&port.to_string())],
+            vec![inactive(), ok_empty(), ok_empty()],
+        );
+
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+
+        assert!(report.config_written && report.units_ok);
+        assert_eq!(
+            report.verified.expect("verified").answers,
+            vec![(verify::Check::Listener, 200)]
+        );
+        assert!(rig.out().contains("no frontends detected"), "{}", rig.out());
     }
 
     #[tokio::test]
