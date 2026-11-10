@@ -141,6 +141,66 @@ fn a_field_refusing_a_value_says_so_beside_itself_120x40() {
     insta::assert_snapshot!(frame(&state, 120, 40, false));
 }
 
+/// A value longer than its cell shows its end, where the typing is, and a
+/// leading mark that the start is cut; a wide character counts for the two
+/// cells it takes.
+#[test]
+fn a_value_longer_than_its_cell_is_marked_cut_at_the_front() {
+    let mut state = loaded_with_routing();
+    press(&mut state, KeyCode::Char('u'));
+    type_in(
+        &mut state,
+        "https://calendar-gateway.example.invalid/v1/very/long/path/to/the/end",
+    );
+    let text = frame(&state, 80, 24, false);
+    let row = text
+        .lines()
+        .find(|line| line.contains("▏"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(row.contains("…") && row.contains("/the/end▏"), "{row}");
+    assert!(!row.contains("https://"), "{row}");
+}
+
+#[test]
+fn a_wide_character_in_a_value_does_not_push_the_row_past_its_cell() {
+    let mut narrow = loaded_with_routing();
+    press(&mut narrow, KeyCode::Char('u'));
+    type_in(
+        &mut narrow,
+        "gateway.invalid/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    let mut wide = loaded_with_routing();
+    press(&mut wide, KeyCode::Char('u'));
+    type_in(
+        &mut wide,
+        "gateway.invalid/日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日日",
+    );
+    // Where the cursor mark lands, in cells, so a wide character that
+    // was counted as one would push it the other way.
+    let cursor_at = |state: &State| {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|f| {
+                render(f, state, false);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..24)
+            .flat_map(|y| (0..80).map(move |x| (x, y)))
+            .find(|(x, y)| buffer[(*x, *y)].symbol() == "▏")
+            .expect("a cursor mark")
+            .0
+    };
+    // A wide character that would straddle the edge is left out, so the mark
+    // may sit one cell short, never past.
+    let at = cursor_at(&narrow);
+    assert!(
+        [at - 1, at].contains(&cursor_at(&wide)),
+        "{at} against {}",
+        cursor_at(&wide)
+    );
+}
+
 #[test]
 fn a_provider_form_opens_under_its_row_at_80x24() {
     let mut state = loaded_with_routing();

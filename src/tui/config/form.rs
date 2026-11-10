@@ -7,6 +7,8 @@ use ratatui::{
     text::{Line, Span},
 };
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use super::model::{Editing, Snapshot, Verdict};
 use crate::tui::table::{BodyLine, span, wrap};
 use crate::tui::tone::{Tone, dim, toned};
@@ -15,6 +17,26 @@ use crate::tui::tone::{Tone, dim, toned};
 const NAME: usize = 16;
 /// The least a value cell shows, so a short entry still reads as a field.
 const VALUE: usize = 12;
+
+/// The end of `text` that fits `cells`, with a leading `…` where the start was
+/// cut.
+fn tail_in(text: &str, cells: usize) -> String {
+    if text.width() <= cells {
+        return text.to_owned();
+    }
+    let mut kept: Vec<char> = Vec::new();
+    let mut used = 1;
+    for glyph in text.chars().rev() {
+        let wide = glyph.width().unwrap_or(0);
+        if used + wide > cells {
+            break;
+        }
+        kept.push(glyph);
+        used += wide;
+    }
+    kept.push('…');
+    kept.iter().rev().collect()
+}
 
 /// The form's lines, to sit under the row it edits. `prefix` is what the
 /// page puts before every line of one: its indent, and its rail where it has
@@ -34,18 +56,13 @@ pub(super) fn lines(
         editing.buffer.clone()
     };
     // The value is the tail of what was typed where it is longer than the
-    // cell: the end is where the typing is.
+    // cell: the end is where the typing is, and a leading `…` says the start
+    // is cut. Widths are in cells, as a wide character takes two.
     let room = width.saturating_sub(prefix_width + 2 + NAME);
-    let cell = (shown.chars().count() + 2)
-        .max(VALUE)
-        .min((room / 2).max(VALUE));
-    let tail: String = {
-        let keep = cell.saturating_sub(1);
-        let chars: Vec<char> = shown.chars().collect();
-        chars[chars.len().saturating_sub(keep)..].iter().collect()
-    };
+    let cell = (shown.width() + 2).max(VALUE).min((room / 2).max(VALUE));
+    let tail = tail_in(&shown, cell.saturating_sub(1));
     let typed = format!("{tail}▏");
-    let padding = cell.saturating_sub(typed.chars().count());
+    let padding = cell.saturating_sub(typed.width());
     let reversed = Style::new().add_modifier(Modifier::REVERSED);
 
     // What sits beside the field: the service's refusal of this very value,
