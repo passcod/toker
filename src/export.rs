@@ -386,7 +386,20 @@ mod tests {
                         BindingId::new("openrouter.openrouter_messages").unwrap(),
                     ),
                     class: crate::policy::RequestClass::Inference,
-                    lane: crate::policy::facts::RecordedLane::New,
+                    lane: crate::policy::facts::RecordedLane::Read(Box::new(
+                        crate::policy::facts::RecordedLaneState {
+                            temperature: crate::policy::CacheTemperature::Warm,
+                            pin: Some(crate::policy::facts::RecordedPin {
+                                route_fingerprint: "44".repeat(32).parse().unwrap(),
+                                candidate_id: CandidateId::new("candidate").unwrap(),
+                                binding_id: BindingId::new("openrouter.openrouter_messages")
+                                    .unwrap(),
+                                effective_model: "claude-opus-5".to_owned(),
+                            }),
+                            forced_from: Some("claude-sonnet-4-5".to_owned()),
+                            forced_to: Some("claude-opus-5".to_owned()),
+                        },
+                    )),
                 }),
             }),
             lineage: Some(SessionLineage::codex_guardian("guardian:parent-session").unwrap()),
