@@ -2460,11 +2460,17 @@ mod tests {
             .into_iter()
             .find(|line| line.text.contains("gpt-three"))
             .expect("the model row");
-        assert!(shown.text.contains("(not offered)"), "{}", shown.text);
+        assert_eq!(
+            shown.notes,
+            [(
+                Note::Warning,
+                "the catalogues do not offer this".to_owned()
+            )]
+        );
     }
 
     #[test]
-    fn a_record_id_completes_from_the_drafts_ids() {
+    fn a_record_id_completes_from_the_policys_ids() {
         let mut context = Context::default();
         context
             .ids

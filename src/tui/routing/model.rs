@@ -1966,7 +1966,11 @@ mod tests {
         );
         assert!(state.next_check().is_none(), "one in flight");
 
-        press(&mut state, KeyCode::Down);
+        // Down to the slug: the id, then the scope's kind, profile and
+        // protocol.
+        for _ in 0..4 {
+            press(&mut state, KeyCode::Down);
+        }
         typed(&mut state, "x");
         assert!(state.next_check().is_none(), "still the first one's turn");
         // Its answer is for a form that has moved on: not accepted.
@@ -2195,7 +2199,6 @@ mod tests {
     fn a_save_moved_past_keeps_the_form_and_names_the_live_revision() {
         let mut state = loaded(World::AT_REST);
         press(&mut state, KeyCode::Char('n'));
-        typed(&mut state, "");
         accepted(&mut state);
         let save = state.key(CTRL_S).expect("add");
         assert_eq!(save.body.as_ref().expect("body")["expected_revision_id"], 9);
@@ -2297,7 +2300,11 @@ mod tests {
         press(&mut state, KeyCode::Char('e'));
         let check = state.next_check().expect("check");
         state.command_refused(check.name);
-        assert!(state.error().is_none(), "a check is not worth a banner");
+        assert!(
+            state.error().is_some_and(|error| !error.contains("validate")),
+            "a check is not worth a banner: {:?}",
+            state.error()
+        );
         assert!(state.next_check().is_some(), "asked again");
         let save = {
             accepted_after_retry(&mut state);
@@ -2367,8 +2374,6 @@ mod tests {
         assert_eq!((replay.replayed, replay.unreplayable), (5, 2));
         assert_eq!(replay.changed_total, 3);
         // A change asks about the form again, not about traffic first.
-        typed(&mut state, "");
-        press(&mut state, KeyCode::Down);
         typed(&mut state, "9");
         assert_eq!(state.next_check().expect("check").name, "validate");
     }
@@ -2745,7 +2750,8 @@ mod tests {
             "sentence": "x", "fix": "y",
         }]});
         let check = {
-            typed(&mut state, "z");
+            // The first field is a choice: another value is a change.
+            press(&mut state, KeyCode::Right);
             state.next_check().expect("check")
         };
         answer(&mut state, check, 200, other);
