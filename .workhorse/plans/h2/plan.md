@@ -28,7 +28,7 @@ Several keys per provider is left for a card of its own.
 
 ## Verification
 
-- [ ] Review and accept the routing snapshots the form changes alter: the keys overlay (two new rows, may overflow its 44-row frame), and the three rewrite-form views that lose the id row and gain a `requested_model` argument.
+- [x] Review and accept the routing snapshots the form changes alter: the keys overlay (two new rows, may overflow its 44-row frame), and the three rewrite-form views that lose the id row and gain a `requested_model` argument.
 
 - [ ] `cargo fmt --check` and `cargo clippy --all-targets` at the end of the batch; tests left to CI.
 - [ ] On chenini: delete nothing; install, restart, run `toker setup`, and check it enables codex_sub and openrouter from the login and keyring without prompting.
