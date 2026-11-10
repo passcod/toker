@@ -2,8 +2,8 @@
 //! record already catches of a later one (spec: UTUI#reading-a-table).
 //!
 //! A document holds three matcher kinds, and a prefix is not one of them: it
-//! is a regular expression of a shape the redesigned pages show in its own
-//! notation (`anthropic_sub/${model}`). [`Shape`] recognises that shape so a
+//! is a regular expression of a shape that is written in its own notation
+//! (`anthropic_sub/${model}`). [`Shape`] recognises that shape so a
 //! prefix and an exact name can be compared by what they say. A glob or a
 //! regular expression cannot, so those are compared against the names a client
 //! could send, which are the offers the catalogues list.
