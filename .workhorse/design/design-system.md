@@ -77,7 +77,7 @@ A session's working directory in its label, and the context occupancy bar at a s
 | --- | --- | --- | --- |
 | meter utilisation | ≤ 0.80 | > 0.80 | > 0.95 |
 | cache hit rate | > 0.95 | > 0.80 | ≤ 0.80 |
-| freshness of the newest row | < 30 s | < 5 min | ≥ 5 min, and on an empty ledger |
+| freshness of the newest request | < 30 s | < 5 min | ≥ 5 min, and on an empty ledger |
 | context occupancy | — | — | > 0.80 while not idle |
 
 A session goes quiet after three minutes without a request, and a context panel listing needs at least three requests in the session's main lane before it will claim anything about occupancy.

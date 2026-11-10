@@ -83,11 +83,26 @@ Those controls MUST keep their labels at every terminal size, and a page's own t
 
 The dashboard MUST show the sessions active within its window, the cache rebuilds within it, spend, and the state of each meter.
 
+Counting rules for requests, attempts and failures are specified by [SATT](../store/attempts.md#reading-the-rows), and the measurement rules by [GCAST](../gates/forecasting.md).
+
+### Sessions
+
+A session MUST have a row where any row within the window names it, of any kind, and where it has a request in flight.
+
+> [!NOTE]
+> A session that has only been stopped by a gate is the one most in need of a release, and a release is granted from the session's row.
+
+A session grouped with its children MUST follow [SLIN](../store/lineage.md#lineage-is-for-display-and-accounting-only).
+
+A session's request count MUST count its logical requests as [SATT](../store/attempts.md#reading-the-rows) counts them, whether they completed, failed or are still in flight.
+
 A session's row MUST take its model and the context ceiling derived from it from the [served model](../routing/models.md#served-model) of the latest row that named one.
+Where no row of the session named one, the row MUST take them from the model a request in flight was sent on, and MUST mark them as not yet served.
 A session's row MUST NOT take them from the requested model.
 
 > [!NOTE]
 > A context window belongs to the model that served, not to the one that was asked for.
+> The model an attempt was sent on is the nearest thing to it before any response names one.
 
 A session detail MUST show the requested, effective and served models separately.
 A session detail MUST show the served one as absent where the response named no model.
@@ -95,12 +110,36 @@ A session detail MUST show the served one as absent where the response named no 
 > [!NOTE]
 > Showing all three is only useful because they can disagree, which is exactly what a fallback or an alias produces.
 
-Counting rules for requests, attempts and failures are specified by [SATT](../store/attempts.md#reading-the-rows), and the measurement rules by [GCAST](../gates/forecasting.md).
-
 A session MUST be marked where its newest decision was a gate stopping it, and that mark MUST be cleared by a later measurement or release.
 An error, a sleep-lock change and a withheld notice are not decisions, and MUST neither set nor clear it.
 
-A session grouped with its children MUST follow [SLIN](../store/lineage.md#lineage-is-for-display-and-accounting-only).
+A session MUST be marked where the newest of its requests to reach a final outcome failed, and that mark MUST be cleared by a later request whose outcome is not a failure.
+A request still in flight MUST neither set nor clear it.
+
+> [!NOTE]
+> A failure a fallback recovered from is not its group's final outcome, so it does not mark the session.
+> It shows in the error count instead, as [SATT](../store/attempts.md#counting-within-a-window) specifies.
+
+### Requests in flight
+
+A request MUST show on the dashboard from the first refresh after Toker begins handling it, read from its [in-flight record](../store/attempts.md#while-a-request-is-in-flight).
+
+> [!NOTE]
+> Waiting for a row would show nothing of a turn until its response ends, which on a long stream is minutes after the operator sent it.
+
+A request in flight MUST count as its session's latest activity, from when Toker began handling it.
+
+The header's freshness MUST read from the newest request Toker began handling, whether it is in flight or recorded.
+The request rate MUST count each request in the minute Toker began handling it, a request in flight included, and a request that began before the window in the window's first minute.
+A recorded request whose rows predate the [time it began](../store/ledger.md#fields-that-need-care) MUST be placed by its first row instead.
+
+While a session has a request in flight, its row MUST show that request's stage and how long it has been in flight, in place of how long the session has been idle.
+Where a session has more than one request in flight, its row MUST show the one in flight longest, and how many there are.
+
+A request in flight on the session's own conversation, rather than on a child's, MUST update the row's message count.
+Figures only a response reports, such as the prompt and the output, MUST keep their values from the session's latest completed request.
+
+A session detail MUST list each of the session's requests in flight, with its stage, how long it has been in flight, its attempt, and the provider and model its current attempt was sent on.
 
 ### Meters across accounts
 

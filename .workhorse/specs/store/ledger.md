@@ -73,6 +73,11 @@ A record of a compaction's model move and a record of its body transform MUST st
 
 Both MUST be taken from the attempt plan rather than from the body transform.
 
+A row about a request MUST carry when Toker began handling that request, as well as when the row was written.
+
+> [!NOTE]
+> A row is written as its attempt ends, so a long stream would otherwise place a request at the minute it finished rather than the one it was sent in.
+
 A row MUST record whether each gate was armed for that request.
 
 > [!NOTE]
