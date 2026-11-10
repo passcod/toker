@@ -1,24 +1,35 @@
 //! What the routing page shows beyond the policy document itself: live
 //! availability, cost-boundary edges, pinned lanes, classifier examples, the
-//! upgrade standing and per-presentation publication.
+//! upgrade standing, per-presentation publication, and the facts about each
+//! record that the tables and details read: its reach, how many requests it
+//! caught, what shadows it, what refers to it and what depends on each
+//! provider.
 //!
 //! The daemon computes it and the terminal renders it, because the page holds
-//! no store, registry or learning view. Everything here is counts, ids and
-//! model names the offers already carry; no content.
+//! no store, registry or learning view and a fact about policy is not the
+//! page's to work out. Everything here is counts, ids and model names the
+//! offers already carry; no content.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
 
 use crate::catalog::offers::{OfferInventory, PolicyPublication, render_policy};
+use crate::policy::shadow::Shape;
 use crate::policy::{
     AvailabilitySnapshot, BindingAvailability, BindingId, CatalogueAvailability, CircuitSnapshot,
     CompiledCandidateModel, CompiledClassifier, CompiledPolicy, CompiledPresentation, CostClass,
-    Evidence, FrontendProtocol, FrontendScope, LearningView, RouteId, upgrade_standing,
+    EdgeSetting, Evidence, FrontendProtocol, FrontendScope, LearningView, MatcherSpec,
+    PolicyDocument, Reach, RouteId, route_reach, upgrade_standing,
 };
 use crate::routing::{Capabilities, CapabilityEvidence};
 use crate::server::RoutingLaneImpacts;
-use crate::store::RoutingPublication;
+use crate::store::{HitCounts, HitCoverage, RoutingPublication};
+
+mod models;
+mod providers;
+mod routes;
+mod rules;
 
 /// The adapters a policy publishes through, by the frontend each serves.
 const CLAUDE_ADAPTER: &str = "claude_settings";
@@ -38,6 +49,86 @@ pub(crate) struct Inputs<'a, L> {
     pub pinned: &'a BTreeMap<RouteId, RoutingLaneImpacts>,
     pub publications: &'a [RoutingPublication],
     pub active: Option<&'a CompiledPolicy>,
+    /// The document the active policy was compiled from, which holds what
+    /// compilation drops: the defaults, and a matcher's own spelling.
+    pub document: Option<&'a PolicyDocument>,
+    pub hits: &'a HitCounts,
+    /// Lanes pinned to each revision, by revision.
+    pub revision_lanes: &'a BTreeMap<i64, RoutingLaneImpacts>,
+}
+
+/// What every fact about a record is worked out from: one policy, one
+/// availability and one inventory, so no two facts disagree about the world.
+pub(super) struct Context<'a> {
+    pub policy: &'a CompiledPolicy,
+    pub document: &'a PolicyDocument,
+    pub availability: &'a AvailabilitySnapshot,
+    pub inventory: &'a OfferInventory,
+    pub hits: &'a HitCounts,
+    /// The names a client could send, for judging a glob or a regular
+    /// expression: each offer's own name, and under its provider's prefix, and
+    /// every name a presentation publishes.
+    pub names: BTreeSet<String>,
+    /// The reach of each route walked from its first candidate.
+    pub reach: BTreeMap<RouteId, Reach>,
+}
+
+impl<'a> Context<'a> {
+    fn new(
+        policy: &'a CompiledPolicy,
+        document: &'a PolicyDocument,
+        availability: &'a AvailabilitySnapshot,
+        inventory: &'a OfferInventory,
+        hits: &'a HitCounts,
+    ) -> Self {
+        let mut names = BTreeSet::new();
+        for offer in inventory.iter() {
+            names.insert(offer.backend_model_id.clone());
+            names.insert(format!("{}/{}", offer.provider, offer.backend_model_id));
+        }
+        for (_, slug, _) in policy.all_presentations() {
+            names.insert(slug.to_owned());
+        }
+        let reach = policy
+            .routes()
+            .map(|route| {
+                (
+                    route.id().clone(),
+                    route_reach(policy, route, availability, inventory),
+                )
+            })
+            .collect();
+        Self {
+            policy,
+            document,
+            availability,
+            inventory,
+            hits,
+            names,
+            reach,
+        }
+    }
+
+    /// The provider a binding belongs to: the availability's word for it,
+    /// and failing that the binding identifier's own provider half.
+    pub(super) fn provider_of(&self, binding: &BindingId) -> String {
+        self.availability.get(binding).map_or_else(
+            || {
+                binding
+                    .as_str()
+                    .split_once('.')
+                    .map_or(binding.as_str(), |(provider, _)| provider)
+                    .to_owned()
+            },
+            |live| live.provider.clone(),
+        )
+    }
+
+    pub(super) fn cost_of(&self, binding: &BindingId) -> CostClass {
+        self.availability
+            .get(binding)
+            .map_or(CostClass::Unknown, |live| live.cost_class)
+    }
 }
 
 /// The derived content for the active revision.
@@ -59,22 +150,213 @@ pub(crate) fn build<L: LearningView>(inputs: &Inputs<'_, L>) -> Value {
                 "failure": circuit.failure,
             }))
             .collect::<Vec<_>>(),
-        "active": inputs.active.map(|policy| policy_body(policy, inputs)),
+        "active": inputs
+            .active
+            .zip(inputs.document)
+            .map(|(policy, document)| policy_body(policy, document, inputs)),
+        "revisions": inputs
+            .revision_lanes
+            .iter()
+            .map(|(revision_id, lanes)| {
+                let mut body = lanes_body(Some(lanes));
+                body["revision_id"] = json!(revision_id);
+                body
+            })
+            .collect::<Vec<_>>(),
     })
 }
 
-fn policy_body<L: LearningView>(policy: &CompiledPolicy, inputs: &Inputs<'_, L>) -> Value {
+fn policy_body<L: LearningView>(
+    policy: &CompiledPolicy,
+    document: &PolicyDocument,
+    inputs: &Inputs<'_, L>,
+) -> Value {
+    let ctx = Context::new(
+        policy,
+        document,
+        inputs.availability,
+        inputs.inventory,
+        inputs.hits,
+    );
+    let slugs = presentations_body(policy, inputs);
+    let rules = rules::build(&ctx, &slugs);
+    let upgrades = models::upgrades(&ctx, inputs);
+    let routes: Vec<Value> = policy
+        .routes()
+        .map(|route| routes::route_body(&ctx, route, inputs, &rules, &upgrades))
+        .collect();
+    let first_refused_tab = first_refused_tab(&rules, &routes);
     json!({
-        "routes": policy
-            .routes()
-            .map(|route| route_body(policy, route, inputs))
-            .collect::<Vec<_>>(),
+        "routes": routes,
         "classifiers": policy
             .classifiers()
             .map(|classifier| classifier_body(classifier, inputs.inventory))
             .collect::<Vec<_>>(),
-        "presentations": presentations_body(policy, inputs),
+        "presentations": slugs,
+        "scopes": rules.scopes,
+        "presentation_records": rules.presentations,
+        "rewrites": rules.rewrites,
+        "defaults": rules.defaults,
+        "upgrades": upgrades.body(),
+        "compaction": models::compaction(&ctx, &upgrades),
+        "providers": providers::providers_body(&ctx, &rules),
+        "first_refused_tab": first_refused_tab,
     })
+}
+
+/// The first lookup tab, in the order a request is resolved, holding a record
+/// whose reach is refused (spec: UTUI#the-routing-page). A scope with no
+/// default is not a record, so it does not count.
+fn first_refused_tab(rules: &rules::Rules, routes: &[Value]) -> Value {
+    let refused = |records: &[Value]| {
+        records
+            .iter()
+            .any(|record| record["reach"]["refused"] == json!(true))
+    };
+    let existing_defaults: Vec<Value> = rules
+        .defaults
+        .iter()
+        .filter(|default| default["exists"] == json!(true))
+        .cloned()
+        .collect();
+    [
+        ("presentations", refused(&rules.presentations)),
+        ("rewrites", refused(&rules.rewrites)),
+        ("defaults", refused(&existing_defaults)),
+        ("routes", refused(routes)),
+    ]
+    .into_iter()
+    .find_map(|(tab, any)| any.then(|| json!(tab)))
+    .unwrap_or(Value::Null)
+}
+
+/// A matcher in the notation it is shown in (spec: UTUI#the-routing-page): a
+/// prefix with the part it captures rather than the regular expression it
+/// compiles to. `value` is the pattern as stored.
+pub(super) fn matcher_body(spec: &MatcherSpec) -> Value {
+    let shape = Shape::of(spec);
+    let mut body = json!({
+        "kind": shape.kind(),
+        "text": shape.text(),
+        "value": spec.value(),
+    });
+    if let Shape::Prefix {
+        prefix, capture, ..
+    } = &shape
+    {
+        body["prefix"] = json!(prefix);
+        body["capture"] = json!(capture);
+    }
+    body
+}
+
+/// A scope as the page groups by it.
+pub(super) fn scope_fields(scope: &FrontendScope) -> Value {
+    json!({
+        "scope": scope,
+        "scope_label": scope_label(scope),
+        "protocol": super::routing::protocol_name(protocol_of(scope)),
+        "profile": match scope {
+            FrontendScope::Profile { profile, .. } => Some(profile.as_str()),
+            FrontendScope::Protocol { .. } => None,
+        },
+    })
+}
+
+/// How many requests a record caught in the last 24 hours, and how far to
+/// trust it: `exact` where every row in the window recorded what matched,
+/// `floor` where some predate that, and `not_recorded` where all do, in which
+/// case there is no count to show (spec: UTUI#reading-a-table).
+pub(super) fn hits_body(hits: &HitCounts, count: u64) -> Value {
+    let (count, state) = match hits.coverage {
+        HitCoverage::Complete => (Some(count), "exact"),
+        HitCoverage::Floor => (Some(count), "floor"),
+        HitCoverage::NotRecorded => (None, "not_recorded"),
+    };
+    json!({"count": count, "state": state})
+}
+
+fn cost_flag(cost: CostClass) -> Option<bool> {
+    match cost {
+        CostClass::Subscription => Some(false),
+        CostClass::Billed => Some(true),
+        CostClass::Unknown => None,
+    }
+}
+
+/// A reach as the page reads it: the outcome, whether it is a refusal, what
+/// serves it, which candidates were passed over and why, and the edge or
+/// setting that stopped a refused walk.
+pub(super) fn reach_body(ctx: &Context<'_>, reach: &Reach, route_id: Option<&RouteId>) -> Value {
+    let serving = |serving: &crate::policy::Serving| {
+        json!({
+            "candidate_id": serving.candidate_id,
+            "binding_id": serving.binding_id,
+            "provider": ctx.provider_of(&serving.binding_id),
+            "cost": cost_name(serving.cost),
+            // `null` where the cost is not known, which is not the same as
+            // not billed.
+            "billed": cost_flag(serving.cost),
+        })
+    };
+    let skipped = |skipped: &[crate::policy::Skipped]| {
+        skipped
+            .iter()
+            .map(|skip| {
+                json!({
+                    "candidate_id": skip.candidate_id,
+                    "binding_id": skip.binding_id,
+                    "provider": ctx.provider_of(&skip.binding_id),
+                    "reason": skip.reason.code(),
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut body = json!({
+        "outcome": reach.outcome(),
+        "refused": reach.is_refused(),
+        "route_id": route_id,
+        "serving": Value::Null,
+        "skipped": [],
+        "edge": Value::Null,
+        "cause": Value::Null,
+    });
+    match reach {
+        Reach::ServedFirst { serving: served } => body["serving"] = serving(served),
+        Reach::ServedLater {
+            serving: served,
+            skipped: passed,
+        } => {
+            body["serving"] = serving(served);
+            body["skipped"] = json!(skipped(passed));
+        }
+        Reach::RefusedEdge {
+            skipped: passed,
+            edge,
+        } => {
+            body["skipped"] = json!(skipped(passed));
+            body["edge"] = json!({
+                "from": edge.from,
+                "to": edge.to,
+                "setting": match edge.setting {
+                    EdgeSetting::Preflight => "preflight",
+                    EdgeSetting::BilledBoundary => "billed_boundary",
+                },
+                "value": match edge.setting {
+                    EdgeSetting::Preflight => "disabled",
+                    EdgeSetting::BilledBoundary => "deny",
+                },
+            });
+        }
+        Reach::RefusedUnavailable { skipped: passed } => body["skipped"] = json!(skipped(passed)),
+        Reach::RefusedNoRoute(cause) => {
+            body["cause"] = json!(match cause {
+                crate::policy::NoRoute::NoDefault => "no_default",
+                crate::policy::NoRoute::RouteMissing => "route_missing",
+            });
+        }
+    }
+    body
 }
 
 fn availability_body(binding: &BindingId, availability: &BindingAvailability) -> Value {
@@ -136,87 +418,11 @@ fn cost_name(cost: CostClass) -> &'static str {
 
 fn lanes_body(impacts: Option<&RoutingLaneImpacts>) -> Value {
     let impacts = impacts.copied().unwrap_or_default();
-    json!({"warm": impacts.warm, "cold": impacts.cold, "unknown": impacts.unknown})
-}
-
-fn route_body<L: LearningView>(
-    policy: &CompiledPolicy,
-    route: &crate::policy::CompiledRoute,
-    inputs: &Inputs<'_, L>,
-) -> Value {
-    let cost_of = |binding: &BindingId| {
-        inputs
-            .availability
-            .get(binding)
-            .map_or(CostClass::Unknown, |availability| availability.cost_class)
-    };
-    let candidates: Vec<Value> = route
-        .candidates()
-        .iter()
-        .map(|candidate| {
-            // The baseline is only known up front for a fixed model; a
-            // template, selector or requested-model candidate gets its
-            // baseline from the request.
-            let standing = match candidate.model() {
-                CompiledCandidateModel::Exact(baseline) => upgrade_standing(
-                    policy,
-                    inputs.inventory,
-                    inputs.learning,
-                    candidate,
-                    baseline,
-                )
-                .ok()
-                .flatten()
-                .map(|election| {
-                    json!({
-                        "baseline": baseline,
-                        "winner": election.winner,
-                        "rejected": election
-                            .rejected
-                            .iter()
-                            .map(|(model, reason)| json!({
-                                "model": model,
-                                "reason": rejection_name(*reason),
-                            }))
-                            .collect::<Vec<_>>(),
-                    })
-                }),
-                _ => None,
-            };
-            json!({
-                "id": candidate.id(),
-                "binding_id": candidate.binding_id(),
-                "cost_class": cost_name(cost_of(candidate.binding_id())),
-                "upgrade_policy_id": candidate.upgrade_policy_id(),
-                "upgrade": standing,
-            })
-        })
-        .collect();
-    let edges: Vec<Value> = route
-        .edges()
-        .iter()
-        .enumerate()
-        .map(|(index, edge)| {
-            let from = cost_of(route.candidates()[index].binding_id());
-            let to = cost_of(route.candidates()[index + 1].binding_id());
-            json!({
-                "from": route.candidates()[index].id(),
-                "to": route.candidates()[index + 1].id(),
-                "from_cost": cost_name(from),
-                "to_cost": cost_name(to),
-                "crosses_cost_boundary": from == CostClass::Subscription
-                    && matches!(to, CostClass::Billed | CostClass::Unknown),
-                "billed_boundary": edge.billed_boundary,
-                "cache_transition": edge.cache_transition,
-                "preflight": edge.preflight,
-            })
-        })
-        .collect();
     json!({
-        "id": route.id(),
-        "pinned_lanes": lanes_body(inputs.pinned.get(route.id())),
-        "candidates": candidates,
-        "edges": edges,
+        "warm": impacts.warm,
+        "cold": impacts.cold,
+        "unknown": impacts.unknown,
+        "total": impacts.total,
     })
 }
 
@@ -318,6 +524,7 @@ fn presentations_body<L: LearningView>(policy: &CompiledPolicy, inputs: &Inputs<
             presentation,
         );
         rows.push(json!({
+            "id": presentation.id(),
             "scope": scope_label(&scope),
             "slug": slug,
             "adapter": adapter,
