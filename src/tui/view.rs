@@ -298,8 +298,8 @@ pub(crate) struct Scroll {
 /// for hit-testing the wheel, and how far it can scroll.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Drawn {
-    /// The header's chips: `?` toggles the legend, `⇄` goes to the next
-    /// page.
+    /// The header's buttons: `?` toggles the legend, and each page's goes
+    /// to that page.
     pub header: chrome::Header,
     pub sessions: DrawnList,
     pub context: DrawnList,
@@ -373,7 +373,7 @@ pub(crate) fn render(
         height: layout.header.height.max(frame.area().height.min(1)),
         ..layout.header
     };
-    let header = chrome::header(action_header);
+    let header = chrome::header(action_header, super::Page::Dashboard);
     render_header(frame, header.rest, snap, clock);
     let (sessions_offset, sessions_rows) = render_sessions(
         frame,
@@ -517,12 +517,11 @@ const LEGEND: [(&str, &str); 21] = [
 
 /// The dashboard's keys, under its marks in the same overlay: with no
 /// footer on any page, the overlay is where a page teaches what it takes.
-const KEYS: [(&str, &str); 6] = [
+const KEYS: [(&str, &str); 5] = [
     ("click", "open a session's detail"),
     ("wheel", "scroll the list under the pointer"),
     ("←/→ h/l", "scroll the accounts in rate & quota"),
     ("r", "refresh now"),
-    ("tab or ⇄", "next page"),
     ("q", "quit"),
 ];
 
@@ -828,8 +827,9 @@ fn meter_keys(quota: &QuotaAgg) -> Vec<&'static str> {
 /// window holds rows: an empty window is exactly when it matters,
 /// because a dead proxy looks like a quiet one everywhere else.
 ///
-/// A narrow header sheds in this order: the window summary first (it
-/// clips into whatever the right side leaves), then the clock (the
+/// A narrow header sheds in this order: the window summary first (a part
+/// at a time, into whatever the page buttons and the right side leave),
+/// then the clock (the
 /// time is on every other screen; nothing else says the proxy went
 /// quiet), then the "last req" label — the coloured age goes last.
 fn render_header(frame: &mut Frame, area: Rect, snap: &Snapshot, clock: &str) {
@@ -856,9 +856,11 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &Snapshot, clock: &str) {
     let [left, right] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(right_width)]).areas(area);
 
-    let mut text = format!("last {}m", snap.window_mins);
+    // The summary sheds a part at a time, last part first, rather than
+    // clipping mid-word into the readout beside it.
+    let mut parts = vec![format!("last {}m", snap.window_mins)];
     if snap.window_empty {
-        text.push_str(" · no requests in window");
+        parts.push("no requests in window".into());
     } else {
         let sessions = snap.sessions.len();
         let idle = snap
@@ -866,15 +868,21 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &Snapshot, clock: &str) {
             .iter()
             .filter(|session| snap.now_ms - session.latest_ts_ms >= IDLE_SECS * 1_000)
             .count();
-        text.push_str(&format!(
-            " · {sessions} session{}",
+        parts.push(format!(
+            "{sessions} session{}",
             if sessions == 1 { "" } else { "s" },
         ));
         if idle > 0 {
-            text.push_str(&format!(" · {idle} idle"));
+            parts.push(format!("{idle} idle"));
         }
-        text.push_str(&format!(" · {} requests", snap.window_requests));
+        parts.push(format!("{} requests", snap.window_requests));
     }
+    let room = usize::from(left.width).saturating_sub(1);
+    let text = (1..=parts.len())
+        .rev()
+        .map(|count| parts[..count].join(" · "))
+        .find(|text| text.width() <= room)
+        .unwrap_or_default();
     frame.render_widget(Paragraph::new(text.bold()), left);
     frame.render_widget(
         Paragraph::new(right_line).alignment(Alignment::Right),
@@ -1865,7 +1873,7 @@ fn scrolled(list: Vec<Line<'static>>, window: &ListWindow) -> Vec<Line<'static>>
 
 /// Short tokens: round thousands and millions
 /// abbreviate; anything else is under a thousand, so ungrouped.
-fn short_tokens(tokens: u64) -> String {
+pub(super) fn short_tokens(tokens: u64) -> String {
     // Human-rounded, deliberately not exact: the CONTEXT panel carries
     // the precise figure (occupancy bar + exact counts), so the table's
     // cell answers "which league is this window in". ≥1M rounds to the
@@ -3303,16 +3311,26 @@ mod tests {
                     .contains(ratatui::layout::Position::new(x, 0))
             );
         }
+        let text = |range: std::ops::Range<u16>| {
+            range.map(|x| buffer[(x, 0)].symbol()).collect::<String>()
+        };
         assert_eq!(
-            drawn.header.switch,
-            ratatui::layout::Rect::new(3, 0, 1, 1),
-            "the routing chip fills the gutter"
+            drawn.header.pages[0],
+            ratatui::layout::Rect::new(4, 0, 11, 1)
         );
-        assert_eq!(buffer[(3, 0)].symbol(), "⇄");
+        assert_eq!(text(4..15), " dashboard ");
+        assert_eq!(text(16..25), " routing ");
+        assert_eq!(text(26..34), " config ");
+        assert_eq!(text(35..45), " accounts ");
+        let (current, other) = (&buffer[(5, 0)], &buffer[(17, 0)]);
+        assert_eq!(current.fg, Color::Blue);
+        assert!(current.modifier.contains(Modifier::BOLD));
+        assert_eq!(other.fg, Color::DarkGray);
+        assert!(!other.modifier.contains(Modifier::BOLD));
         assert_eq!(
-            buffer[(4, 0)].symbol(),
+            buffer[(46, 0)].symbol(),
             "l",
-            "the status follows the gutter"
+            "the status follows the buttons"
         );
     }
 
@@ -3370,7 +3388,7 @@ mod tests {
             523,
         );
         let snap = with_latest(snap, Some(NOW - 2 * 3_600_000));
-        let (row, fg) = header_fg(&snap, 100, "120m ago");
+        let (row, fg) = header_fg(&snap, 120, "120m ago");
         assert_eq!(fg, Color::Red, "in {row:?}");
         assert!(row.contains("no requests in window"), "{row:?}");
     }
@@ -3396,17 +3414,23 @@ mod tests {
     #[test]
     fn narrow_header_sheds_summary_then_clock_then_label() {
         let snap = with_latest(snapshot(), Some(NOW - 4_000));
-        // "last req 4s ago · 12:34:56" is 26 cells; one more for the gap.
-        let (row, _) = header_fg(&snap, 40, "4s ago");
+        // The page buttons take the first 46 cells, so the readout has
+        // what is left. "last req 4s ago · 12:34:56" is 26 cells; one
+        // more for the gap.
+        let (row, _) = header_fg(&snap, 90, "4s ago");
         assert!(row.contains("last req 4s ago · 12:34:56"), "{row:?}");
-        assert!(row.starts_with(" ?  last 30m"), "summary clips: {row:?}");
-        assert!(!row.contains("2 sessions"), "summary clips: {row:?}");
+        assert!(row.contains("last 30m"), "{row:?}");
+        assert!(!row.contains("2 sessions"), "summary sheds a part: {row:?}");
 
-        let (row, _) = header_fg(&snap, 20, "4s ago");
+        let (row, _) = header_fg(&snap, 80, "4s ago");
+        assert!(row.contains("last req 4s ago · 12:34:56"), "{row:?}");
+        assert!(!row.contains("last 30m"), "the summary goes: {row:?}");
+
+        let (row, _) = header_fg(&snap, 64, "4s ago");
         assert!(row.contains("last req 4s ago"), "{row:?}");
         assert!(!row.contains("12:34:56"), "the clock goes next: {row:?}");
 
-        let (row, fg) = header_fg(&snap, 10, "4s ago");
+        let (row, fg) = header_fg(&snap, 54, "4s ago");
         assert!(!row.contains("last req"), "the label goes last: {row:?}");
         assert_eq!(fg, Color::Green, "the coloured age survives");
     }
@@ -4655,7 +4679,6 @@ mod tests {
             "estimating",
             "green under 30s",
             "KEYS",
-            "next page",
             "? or esc close",
         ] {
             assert!(on.contains(expected), "{expected:?} in:\n{on}");
@@ -5029,14 +5052,5 @@ mod tests {
                 })
                 .expect("draw");
         }
-    }
-
-    #[test]
-    fn the_switch_chip_sits_in_the_legend_gutter_from_80_columns() {
-        let header = |width| chrome::header(ratatui::layout::Rect::new(0, 0, width, 24));
-        assert_eq!(header(100).switch, ratatui::layout::Rect::new(3, 0, 1, 1));
-        assert_eq!(header(100).rest.x, 4, "the status starts after the gutter");
-        assert_eq!(header(80).switch.width, 1);
-        assert_eq!(header(79).switch.width, 0);
     }
 }

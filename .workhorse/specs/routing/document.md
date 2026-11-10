@@ -104,13 +104,13 @@ A slug equal to a native model identifier reachable from that profile MUST be re
 
 ## Validation
 
-Validation compiles a draft against one captured inventory and returns diagnostics, each carrying a code, a severity, the record's identifier and a path.
+Validation compiles a document against one captured inventory and returns diagnostics, each carrying a code, a severity, the record's identifier and a path.
 
 A diagnostic's path MUST be built only from static field names and bounded indices, so that a request or a model string can never appear in one.
 
 Validation MUST report every requirement of this spec the document fails to meet.
 
-An error MUST block activation.
+An error MUST block the document from becoming active.
 
 Provider configuration and catalogue presence are evidence rather than validity.
 An unconfigured binding, an offer absent from the inventory and an unresolved selector MUST be reported without blocking.

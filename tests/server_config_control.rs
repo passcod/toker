@@ -220,6 +220,93 @@ async fn a_refused_value_leaves_the_stored_one_as_it_was() {
     );
 }
 
+/// What a client does with a snapshot row: send it back with one field
+/// changed. The service writes the row it is given whole, so everything the
+/// snapshot carries has to survive the trip.
+async fn put_back(app: &axum::Router, path: &str, mut row: Value, change: Value) -> StatusCode {
+    for (name, value) in change.as_object().expect("an object") {
+        row[name] = value.clone();
+    }
+    let object = row.as_object_mut().expect("a row");
+    object.remove("credential");
+    app.clone()
+        .oneshot(request("PUT", path, Some("config-edit"), Some(row)))
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn an_edit_sent_back_from_the_snapshot_leaves_every_other_field_as_it_was() {
+    let (server, _store) = server();
+    let app = server.router();
+
+    // Fields the page does not show: the refresh endpoint, the session
+    // header names and the transcript roots.
+    let status = put_back(
+        &app,
+        "/_toker/config/provider",
+        provider(&snapshot(&app).await, "codex_sub").clone(),
+        json!({"enabled": true, "refresh_url": "http://login.invalid/token"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let status = put_back(
+        &app,
+        "/_toker/config/settings",
+        snapshot(&app).await["settings"].clone(),
+        json!({
+            "session_headers": ["x-session-id"],
+            "transcript_roots": ["/harness/repos/.claude"]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Toggle one thing on each, the way the page does.
+    let before = snapshot(&app).await;
+    assert_eq!(
+        put_back(
+            &app,
+            "/_toker/config/provider",
+            provider(&before, "codex_sub").clone(),
+            json!({"enabled": false}),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        put_back(
+            &app,
+            "/_toker/config/settings",
+            before["settings"].clone(),
+            json!({"quota_enabled": false}),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    let after = snapshot(&app).await;
+    let mut expected = provider(&before, "codex_sub").clone();
+    expected["enabled"] = json!(false);
+    assert_eq!(provider(&after, "codex_sub"), &expected);
+    assert_eq!(
+        provider(&after, "codex_sub")["refresh_url"],
+        json!("http://login.invalid/token")
+    );
+    let mut expected = before["settings"].clone();
+    expected["quota_enabled"] = json!(false);
+    assert_eq!(after["settings"], expected);
+    assert_eq!(
+        after["settings"]["session_headers"],
+        json!(["x-session-id"])
+    );
+    assert_eq!(
+        after["settings"]["transcript_roots"],
+        json!(["/harness/repos/.claude"])
+    );
+}
+
 #[tokio::test]
 async fn a_provider_toker_does_not_know_is_refused() {
     let (server, _store) = server();
@@ -432,4 +519,168 @@ async fn the_configuration_operations_are_gated_like_every_other_control() {
             "{uri} wrong method"
         );
     }
+}
+
+/// A server whose openrouter is on and whose listing names one model with
+/// the given window, or none.
+fn server_listing(window: Option<u64>, on: bool) -> (Server, Arc<Store>) {
+    let mut config = config();
+    if on {
+        config.default_backend_openai_chat = Some("openrouter".to_owned());
+        config.openrouter = Some(toker::config::OpenRouterConfig {
+            upstream: "http://127.0.0.1:9/v1".parse().unwrap(),
+            api_key_env: "TOKER_TEST_KEY_UNSET_CONFIG_CONTROL".to_owned(),
+            api_key_keyring: false,
+            api_key: None,
+            picker: None,
+        });
+    }
+    let store = Arc::new(Store::open(&config.db_path).unwrap());
+    let mut catalogs = toker::catalog::FetchedCatalogs::default();
+    catalogs.set(
+        "openrouter",
+        toker::catalog::FetchedCatalog {
+            fetched_at_ms: 1,
+            models: vec![toker::catalog::FetchedModel {
+                id: "vendor/model-a".to_owned(),
+                context_window: window,
+                chronology: None,
+                raw: json!({"id": "vendor/model-a"}),
+            }],
+        },
+    );
+    (
+        Server::with_seams(
+            config,
+            store.clone(),
+            toker::server::Seams::isolated().with_catalogs(catalogs),
+        )
+        .expect("authoritative server"),
+        store,
+    )
+}
+
+async fn set_cold_minimum(app: &axum::Router, tokens: u64) -> (StatusCode, Value) {
+    let mut row = snapshot(app).await["settings"].clone();
+    row["cold_min_tokens"] = json!(tokens);
+    let response = app
+        .clone()
+        .oneshot(request(
+            "PUT",
+            "/_toker/config/settings",
+            Some("config-edit"),
+            Some(row),
+        ))
+        .await
+        .unwrap();
+    (response.status(), body(response).await)
+}
+
+#[tokio::test]
+async fn a_cold_minimum_beyond_every_resolved_window_is_refused_naming_the_largest() {
+    let (server, store) = server_listing(Some(128_000), true);
+    let app = server.router();
+
+    // The page checks a minimum as it is typed against the same figure.
+    assert_eq!(snapshot(&app).await["largest_context_window"], 128_000);
+
+    let (status, refusal) = set_cold_minimum(&app, 200_000).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+    assert_eq!(refusal["setting"], "cold_min_tokens");
+    assert!(
+        refusal["error"].as_str().unwrap().contains("128000"),
+        "{refusal}"
+    );
+    // The stored value, and the running one, are as they were.
+    assert_eq!(
+        store.load_configuration().unwrap().settings.cold_min_tokens,
+        None
+    );
+    assert_eq!(
+        server.config().gates.cold_min_tokens,
+        toker::config::GatesConfig::default().cold_min_tokens
+    );
+
+    // The largest window itself can be reached, so it is accepted.
+    let (status, accepted) = set_cold_minimum(&app, 128_000).await;
+    assert_eq!(status, StatusCode::OK, "{accepted}");
+    assert_eq!(
+        store.load_configuration().unwrap().settings.cold_min_tokens,
+        Some(128_000)
+    );
+    assert_eq!(server.config().gates.cold_min_tokens, 128_000);
+}
+
+#[tokio::test]
+async fn a_cold_minimum_is_accepted_where_no_window_resolves() {
+    // A listing that names no window, for a model the hand-verified
+    // catalogue does not know.
+    let (server, store) = server_listing(None, true);
+    let app = server.router();
+    assert_eq!(snapshot(&app).await["largest_context_window"], Value::Null);
+    let (status, accepted) = set_cold_minimum(&app, 5_000_000).await;
+    assert_eq!(status, StatusCode::OK, "{accepted}");
+    assert_eq!(
+        store.load_configuration().unwrap().settings.cold_min_tokens,
+        Some(5_000_000)
+    );
+
+    // A provider that is off offers nothing, whatever its listing says.
+    let (server, _) = server_listing(Some(128_000), false);
+    let (status, accepted) = set_cold_minimum(&server.router(), 5_000_000).await;
+    assert_eq!(status, StatusCode::OK, "{accepted}");
+}
+
+#[tokio::test]
+async fn an_edit_that_leaves_the_cold_minimum_alone_is_not_refused_for_it() {
+    let (server, store) = server_listing(Some(128_000), true);
+    let app = server.router();
+    // A minimum that was fine when it was stored and is not now.
+    let mut row = store.load_configuration().unwrap().settings;
+    row.cold_min_tokens = Some(900_000);
+    store.put_config_settings(&row).unwrap();
+
+    let status = put_back(
+        &app,
+        "/_toker/config/settings",
+        snapshot(&app).await["settings"].clone(),
+        json!({"quota_enabled": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        store.load_configuration().unwrap().settings.cold_min_tokens,
+        Some(900_000)
+    );
+    // The edit is not refused for it, but the condition is not silent: the
+    // snapshot says the minimum in force is out of every window's reach.
+    assert_eq!(snapshot(&app).await["cold_min_unreachable"], true);
+}
+
+/// A minimum is only refused as it is typed, so one that was reachable when
+/// it was stored is stranded by turning off the provider that supplied the
+/// largest window, and an unset one defaults to a figure never checked at
+/// all. Both are said on the snapshot the settings page reads.
+#[tokio::test]
+async fn a_stranded_cold_minimum_is_said_on_the_snapshot_without_refusing_anything() {
+    // The built-in default is larger than this listing's only window, and
+    // nothing ever typed it.
+    let (server, store) = server_listing(Some(128_000), true);
+    let app = server.router();
+    assert_eq!(
+        store.load_configuration().unwrap().settings.cold_min_tokens,
+        None
+    );
+    assert_eq!(snapshot(&app).await["cold_min_unreachable"], true);
+
+    // A minimum the largest window reaches is not out of reach.
+    let (status, accepted) = set_cold_minimum(&app, 128_000).await;
+    assert_eq!(status, StatusCode::OK, "{accepted}");
+    assert_eq!(snapshot(&app).await["cold_min_unreachable"], false);
+
+    // With no window resolving there is nothing to be out of reach of.
+    let (server, _) = server_listing(None, true);
+    let snapshot = snapshot(&server.router()).await;
+    assert_eq!(snapshot["largest_context_window"], Value::Null);
+    assert_eq!(snapshot["cold_min_unreachable"], false);
 }

@@ -395,6 +395,10 @@ pub struct CompiledPresentation {
     shadow_native: bool,
     route: PresentationRoute,
     metadata: Option<AdapterMetadata>,
+    /// Where a selector put this offer in its own ordering, from the first,
+    /// which the routing page reads as the newest it lists. Zero for a
+    /// presentation that is not one of several a selector expanded to.
+    rank: usize,
 }
 
 impl CompiledPresentation {
@@ -421,6 +425,9 @@ impl CompiledPresentation {
     }
     pub fn metadata(&self) -> Option<&AdapterMetadata> {
         self.metadata.as_ref()
+    }
+    pub fn rank(&self) -> usize {
+        self.rank
     }
 }
 
@@ -1285,6 +1292,7 @@ impl<'a> Compiler<'a> {
                             shadow_native: item.shadow_native,
                             route: PresentationRoute::Reference(target),
                             metadata: item.metadata.clone(),
+                            rank: 0,
                         },
                         &base,
                         item.id.as_stable_id(),
@@ -1360,7 +1368,7 @@ impl<'a> Compiler<'a> {
                     if selected.is_empty() {
                         self.info("selector-unresolved", selector_path, item.id.as_stable_id());
                     }
-                    for offer in selected {
+                    for (rank, offer) in selected.into_iter().enumerate() {
                         if !self.route_exists(protocol(&item.scope), &offer.binding) {
                             continue;
                         }
@@ -1434,7 +1442,7 @@ impl<'a> Compiler<'a> {
                         } else {
                             item.label.clone()
                         };
-                        if let Some(presentation) = self.exact_presentation(
+                        if let Some(mut presentation) = self.exact_presentation(
                             item,
                             slug.clone(),
                             label,
@@ -1442,6 +1450,7 @@ impl<'a> Compiler<'a> {
                             offer.backend_model_id.clone(),
                             &base,
                         ) {
+                            presentation.rank = rank;
                             self.insert_presentation(
                                 &mut out,
                                 scope.clone(),
@@ -1527,6 +1536,7 @@ impl<'a> Compiler<'a> {
                 model_id,
             },
             metadata: item.metadata.clone(),
+            rank: 0,
         })
     }
 

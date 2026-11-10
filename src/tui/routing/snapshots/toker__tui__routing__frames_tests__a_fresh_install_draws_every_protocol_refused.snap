@@ -1,0 +1,15 @@
+---
+source: src/tui/routing/frames_tests.rs
+expression: "frame(&state, 120, 40, false)"
+---
+ ?   dashboard   routing   config   accounts   1 presentations → 2 rewrites 0 → 3 defaults → 4 routes ›    no policy yet
+┌REWRITES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│       match                                      route                                                reach hits 24h │
+│ ┌─ anthropic_messages  0 rules ───────────────────────────────────────────────────────────────────────────────────── │
+│ └─ else  no default                            → refused · no route                                                - │
+│ ┌─ openai_chat  0 rules ──────────────────────────────────────────────────────────────────────────────────────────── │
+│ └─ else  no default                            → refused · no route                                                - │
+│ ┌─ openai_responses  0 rules ─────────────────────────────────────────────────────────────────────────────────────── │
+│ └─ else  no default                            → refused · no route                                                - │
+│ [n] needs a route first   [4] go to routes                                                                           │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

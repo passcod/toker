@@ -1,0 +1,22 @@
+---
+source: src/tui/routing/view.rs
+expression: "frame(&state, 120, 40)"
+---
+ ?   dashboard   routing   config   accounts   ‹ 2 rewrites → 3 defaults → 4 routes 7 · 5 models · 6 history  rev 9 live
+┌ROUTES────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ route                 sent to                     matched by            lanes            reach                       │
+│ claude-sub            anthropic_sub → openrouter  4 rules · 2 defaults  2 warm · 5 cold  no cred · billed fallback   │
+│ claude-api            anthropic_api               3 rules               none             off                         │
+│ openrouter-messages   openrouter                  1 rule                none             ok                          │
+│ openrouter-chat       openrouter                  1 rule · 2 defaults   3 cold           ok                          │
+│ openrouter-responses  openrouter                  1 rule                none             ok                          │
+│ openai-chat           openai_api                  1 rule                none             off                         │
+│ codex                 codex_sub → openrouter      3 rules               none             off · billed fallback       │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ROUTE─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ claude-sub                                                                                                           │
+│ 1  anthropic_sub.anthropic_messages  subscription    as asked                                no cred                 │
+│    ↓ when unavailable before send · overloaded · 5xx   billed: allow   ambiguous retry: deny   cache: preserve warm  │
+│ 2  openrouter.openrouter_messages    billed          alias claude-* → anthropic/claude-*     ok                      │
+│ [e] edit   [n] new   [d] delete   [t] trace   [enter] open route                                                     │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

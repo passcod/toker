@@ -649,6 +649,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                         model.as_deref(),
                         None,
                         &error,
+                        &facts,
                     );
                     return super::codex::anthropic_error_response(
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -667,6 +668,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                         model.as_deref(),
                         None,
                         &error,
+                        &facts,
                     );
                     tracing::error!(%error, "active Messages policy resolution failed");
                     let response = super::codex::anthropic_error_response(

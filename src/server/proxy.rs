@@ -262,6 +262,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                 Some(model.as_str()),
                 None,
                 &error,
+                &facts,
             );
             return error_response(
                 ErrorWire::Openai,
@@ -284,6 +285,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                 Some(model.as_str()),
                 None,
                 &error,
+                &facts,
             );
             tracing::error!(%error, "active Chat policy resolution failed");
             let response = upstream_failure(

@@ -1,0 +1,40 @@
+---
+source: src/tui/routing/view.rs
+expression: "frame(&state, 120, 40)"
+---
+ ?   dashboard   routing   config   accounts   ‹ 2 rewrites 15 ›         rev 10 live · 2 lanes on rev 9 · claude pending
+┌REWRITES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│       kind   match                       route                   sends             reach                    hits 24h │
+│ ┌─ anthropic_messages  6 rules ───────────────────────────────────────────────────────────────────────────────────── │
+│ │  1  prefix anthropic/${model}        → claude-sub              ${model}          no cred · billed fallback       - │
+│ │  2  prefix anthropic_sub/${model}    → claude-sub              ${model}          no cred · billed fallback      ≥1 │
+│ │  3  prefix anthropic_api/${model}    → claude-api              ${model}          off                             - │
+│ │  4  prefix openrouter/${model}       → openrouter-messages     ${model}          ok                             41 │
+│ │  5  prefix codex_sub/${model}        → codex                   ${model}          off · billed fallback           - │
+│ │  6  glob   claude-*                  → openrouter-messages     as asked          ok                              - │
+│ └─ else  default                       → claude-sub                                no cred · billed fallback      ≥3 │
+│ ┌─ openai_chat  5 rules ──────────────────────────────────────────────────────────────────────────────────────────── │
+│ │  1  prefix openrouter/${model}       → openrouter-chat         ${model}          ok                              9 │
+│ │  2  prefix openai_api/${model}       → openai-chat             ${model}          off                             - │
+│ │  3  prefix codex_sub/${model}        → codex                   ${model}          off · billed fallback           - │
+│ │  4  prefix anthropic_api/${model}    → claude-api              ${model}          off                             - │
+│ │  5  prefix anthropic_sub/${model}    → claude-sub              ${model}          no cred · billed fallback       - │
+│ └─ else  default                       → openrouter-chat                           ok                              - │
+│ ┌─ openai_responses  4 rules ─────────────────────────────────────────────────────────────────────────────────────── │
+│ │  1  prefix codex_sub/${model}        → codex                   ${model}          off · billed fallback          ≥2 │
+│ │  2  prefix anthropic_api/${model}    → claude-api              ${model}          off                             - │
+│ │  3  prefix anthropic_sub/${model}    → claude-sub              ${model}          no cred · billed fallback       - │
+│ │  4  prefix openrouter/${model}       → openrouter-responses    ${model}          ok                              - │
+│ └─ else  no default                    → refused · no route                                                        - │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌RULE──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ claude-* → openrouter-messages                                                                                       │
+│ match     glob  claude-*                                                                                             │
+│ sends     as asked                                                                                                   │
+│ example   claude-haiku-4-5 → claude-haiku-4-5                                                                        │
+│ sends to  openrouter-messages  1 candidate · openrouter · billed                                                     │
+│ reach     ok                                                                                                         │
+│ overlaps  none                                                                                                       │
+│ recent    -                                                                                                          │
+│ [e] edit   [n] new   [m] move   [d] delete   [t] trace   [enter] open route                                          │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

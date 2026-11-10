@@ -23,7 +23,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A named control operation, kept with its reply so state can distinguish an
-/// old snapshot from a draft edit or confirmation action.
+/// old snapshot from a save or confirmation action.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Command {
     pub(crate) name: &'static str,
@@ -31,6 +31,8 @@ pub(crate) struct Command {
     pub(crate) path: &'static str,
     pub(crate) control: &'static str,
     pub(crate) body: Option<Value>,
+    /// The query string, without the `?`, for an operation that takes one.
+    pub(crate) query: Option<String>,
 }
 
 impl Command {
@@ -43,6 +45,7 @@ impl Command {
             path: "snapshot",
             control,
             body: None,
+            query: None,
         }
     }
 }
@@ -174,8 +177,13 @@ async fn request(
     base: &str,
     command: &Command,
 ) -> Result<Response, String> {
+    let mut url = endpoint(base, command.path);
+    if let Some(query) = &command.query {
+        url.push('?');
+        url.push_str(query);
+    }
     let mut request = client
-        .request(command.method.clone(), endpoint(base, command.path))
+        .request(command.method.clone(), url)
         .header("x-toker-control", command.control)
         .timeout(if command.method == Method::GET {
             REQUEST_TIMEOUT

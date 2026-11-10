@@ -1,4 +1,5 @@
-//! Routing page rendering, including content-free typed modal forms.
+//! Routing page rendering: the tabs, the routes, and the form that opens
+//! under a row to edit it.
 
 use ratatui::{
     Frame,
@@ -8,11 +9,17 @@ use ratatui::{
     widgets::{Block, Clear, Paragraph, Wrap},
 };
 use serde_json::Value;
+use unicode_width::UnicodeWidthStr;
 
+use super::data::array;
+use super::edit_view;
+use super::editing::{Editing, What};
 use super::form::Form;
-use super::model::{Entry, Modal, State, View};
-use super::template::singular;
-use crate::tui::chrome::{self, Chrome, Noun, RowHit};
+use super::model::{Modal, Mode, State, Tab};
+use super::rules::{self, Entry};
+use super::{history, keys, models_tab, routes, status};
+use crate::tui::chrome::{self, Chrome, RowHit};
+use crate::tui::table::{self, BodyLine, Detail, Table};
 
 /// The page areas that the loop needs for click handling.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -27,278 +34,478 @@ pub(crate) struct Drawn {
     pub(super) form: Option<FormHit>,
 }
 
-/// An open form's visible lines: the field each focuses, if any.
+/// An open form's visible fields: where each is, and the form's row it
+/// focuses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct FormHit {
-    pub(super) body: Rect,
-    pub(super) rows: Vec<Option<usize>>,
+    pub(super) fields: Vec<(Rect, usize)>,
 }
-
-/// Below this width the list and the detail pane stack rather than sit
-/// side by side, where each would be too narrow to read.
-const SIDE_BY_SIDE_MIN_WIDTH: u16 = 100;
-
-/// What the list's counts call the entries they leave out.
-const NOUN: Noun = Noun {
-    one: "record",
-    many: "records",
-};
 
 pub(super) fn render(frame: &mut Frame, state: &State, overlay: bool) -> Drawn {
+    let labels: Vec<chrome::Tab> = Tab::ALL
+        .iter()
+        .map(|tab| {
+            let strip = chrome::Tab::new(tab.label()).after(tab.joiner());
+            match state.tab_count(*tab) {
+                Some(count) => strip.count(count),
+                None => strip,
+            }
+        })
+        .collect();
+    let status = status::text_of(
+        state.snapshot(),
+        state.active_revision_id(),
+        state.in_flight(),
+        state.lead(),
+        state.settings_note().or(state.notice()),
+    );
     // A refusal or a failed read is said over the page, which stays
     // usable read-only on the snapshot it last loaded.
-    let (header, body) = chrome::page(frame, state.error());
-    let labels = View::ALL.map(View::tab);
-    let current = View::ALL
-        .iter()
-        .position(|view| *view == state.view())
-        .unwrap_or(0);
-    let tabs_min = chrome::tabs_min_width(&labels, current);
-    let tabs_area = chrome::status(frame, header.rest, tabs_min, &status_text(state));
-    let tabs = chrome::tabs(frame, tabs_area, &labels, current);
-
-    let entries = state.entries();
-    let list: Vec<Vec<Line<'static>>> = if entries.is_empty() {
-        vec![vec![Line::raw("no routing data yet")]]
-    } else {
-        entries
-            .iter()
-            .map(|entry| vec![Line::raw(entry_summary(entry))])
-            .collect()
-    };
-    let lines = detail_lines(state, entries.get(state.selected()));
-
-    let stacked = body.width < SIDE_BY_SIDE_MIN_WIDTH;
-    let (master, detail) = if stacked {
-        // The list takes what it needs, up to a third of the body; the
-        // detail pane the rest.
-        let list_rows = (list.len() as u16 + Chrome::Boxed.cost())
-            .min(body.height / 3)
-            .max(Chrome::Boxed.cost() + 1)
-            .min(body.height);
-        let [master, detail] =
-            Layout::vertical([Constraint::Length(list_rows), Constraint::Fill(1)]).areas(body);
-        (master, detail)
-    } else {
-        let [master, detail] =
-            Layout::horizontal([Constraint::Percentage(42), Constraint::Fill(1)]).areas(body);
-        (master, detail)
-    };
-    // One framing for both panes, boxed only while neither loses content
-    // to its border (spec: UTUI#what-is-shed-first).
-    let detail_need = wrapped_rows(&lines, detail.width.saturating_sub(2));
-    let chrome = if Chrome::fitting(list.len(), master.height) == Chrome::Boxed
-        && Chrome::fitting(detail_need, detail.height) == Chrome::Boxed
-    {
-        Chrome::Boxed
-    } else {
-        Chrome::Ruled
-    };
-
-    let inner = chrome::panel(frame, master, state.view().title(), chrome);
-    let selected = (!entries.is_empty()).then_some(state.selected());
-    let rows = chrome::list(frame, inner, list, selected, NOUN);
-    let rows = if selected.is_some() { rows } else { Vec::new() };
-
-    let inner = chrome::panel(frame, detail, "DETAIL", chrome);
-    // Re-measured at the width the pane really has, which the ruled form
-    // shares with the boxed one.
-    let wrapped = wrapped_rows(&lines, inner.width);
-    let furthest = u16::try_from(wrapped)
-        .unwrap_or(u16::MAX)
-        .saturating_sub(inner.height);
-    state.set_detail_furthest(furthest);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((state.detail_scroll().min(furthest), 0)),
-        inner,
+    let chrome::Laid { header, tabs, body } = chrome::page(
+        frame,
+        crate::tui::Page::Routing,
+        state.error(),
+        &chrome::Strip {
+            tabs: &labels,
+            current: state.tab().index(),
+            status: &status,
+        },
     );
 
-    chrome::chips(frame, &header);
-    if overlay {
-        chrome::overlay(
-            frame,
-            "KEYS",
-            &[
-                chrome::Section {
-                    heading: None,
-                    rows: &KEYS,
-                },
-                chrome::Section {
-                    heading: Some("IN A FORM"),
-                    rows: &FORM_KEYS,
-                },
-            ],
-        );
-    }
-    let form = if state.modal().active() {
-        render_modal(frame, state)
-    } else {
-        None
-    };
-    Drawn {
+    let mut drawn = Drawn {
         header,
         tabs,
-        rows,
-        entries: master,
-        detail,
-        form,
-    }
-}
-
-/// How many rows `lines` take wrapped to `width`. `Paragraph` does not
-/// report its wrapped height, so this estimates it: a line wider than the
-/// pane takes its ceiling in rows, plus one for the word wrap that can
-/// push a word onto the next row. Over-counting only lets the pane scroll
-/// a row past the end.
-fn wrapped_rows(lines: &[Line], width: u16) -> usize {
-    let width = usize::from(width.max(1));
-    lines
-        .iter()
-        .map(|line| match line.width() {
-            columns if columns <= width => 1,
-            columns => columns.div_ceil(width) + 1,
-        })
-        .sum()
-}
-
-/// What the page is in the middle of, at the right of its header.
-fn status_text(state: &State) -> String {
-    let mut parts = Vec::new();
-    if let Some(generation) = state.generation() {
-        parts.push(format!("draft {generation}"));
-    }
-    if state.in_flight() {
-        parts.push("working".to_owned());
-    }
-    if let Some(note) = state.settings_note() {
-        parts.push(note.to_owned());
-    }
-    parts.join(" · ")
-}
-
-/// The page's keys, in its `?` overlay.
-const KEYS: [(&str, &str); 18] = [
-    ("↑/↓ j/k", "select a record"),
-    ("←/→ h/l 1–4", "switch view"),
-    ("pgup/pgdn", "scroll the detail"),
-    (
-        "n",
-        "add a record, asking which kind where a view lists several",
-    ),
-    ("e", "edit the selected record in a form"),
-    ("d", "remove the selected record"),
-    ("v", "preview a request"),
-    ("V", "validate the draft"),
-    ("a", "activate the draft"),
-    ("x", "reactivate the selected revision"),
-    ("p", "promote"),
-    (
-        "i",
-        "import toker.toml's routing into the draft, from the status view",
-    ),
-    ("r", "refresh"),
-    ("click", "select a record, or focus a form field"),
-    ("wheel", "scroll what is under the pointer"),
-    ("esc", "back to the dashboard"),
-    ("tab or ⇄", "next page"),
-    ("q", "quit"),
-];
-
-/// A form's keys. A form takes every key, `?` included, so it also says
-/// the common ones on its own last line.
-const FORM_KEYS: [(&str, &str); 8] = [
-    ("↑/↓", "move between fields"),
-    ("←/→", "change the value"),
-    ("tab", "complete"),
-    ("space", "toggle"),
-    ("alt+↑/↓", "move a list item or candidate"),
-    ("ctrl+d", "remove a list item"),
-    ("ctrl+s", "save"),
-    ("esc", "cancel"),
-];
-
-fn entry_summary(entry: &Entry<'_>) -> String {
-    let value = entry.value;
-    if entry.key == "defaults" {
-        return format!(
-            "default {}  {}",
-            super::model::scope_label(value),
-            short(value)
-        );
-    }
-    let name = [
-        "slug",
-        "id",
-        "name",
-        "revision",
-        "adapter",
-        "binding_id",
-        "provider",
-    ]
-    .into_iter()
-    .find_map(|key| value.get(key).and_then(Value::as_str).map(str::to_owned))
-    .or_else(|| {
-        ["id", "revision", "revision_id"]
-            .into_iter()
-            .find_map(|key| {
-                value
-                    .get(key)
-                    .and_then(Value::as_i64)
-                    .map(|number| number.to_string())
-            })
-    })
-    .unwrap_or_else(|| entry.key.to_owned());
-    format!("{name}  {}", short(value))
-}
-
-fn detail_lines(state: &State, selected: Option<&Entry<'_>>) -> Vec<Line<'static>> {
-    let mut lines = match selected {
-        Some(entry) => match state.snapshot() {
-            Some(snapshot) => super::detail::lines(snapshot, entry),
-            None => pretty(entry.value).lines().map(str::to_owned).collect(),
-        }
-        .into_iter()
-        .map(Line::raw)
-        .collect(),
-        None if state.loading() => vec![Line::raw("loading routing snapshot…")],
-        None => vec![Line::raw("routing snapshot has no entries for this view")],
+        ..Drawn::default()
     };
-    if let Some(generation) = state.generation() {
-        lines.insert(
-            0,
-            Line::styled(
-                format!("draft generation {generation}"),
-                Style::new().bold(),
-            ),
+    match (state.snapshot(), state.active()) {
+        (Some(snapshot), Some(active)) => match (state.tab(), state.mode()) {
+            (Tab::Routes, Mode::Route) => {
+                route_page(frame, body, snapshot, active, state, &mut drawn);
+            }
+            (Tab::Models, _) if state.editing().is_some() => {
+                edit_page(frame, body, state, active, &mut drawn);
+            }
+            (Tab::Models, _) => {
+                // A trace sits under the stack of panels, which gives up the
+                // room it takes.
+                let trace = state.trace().map(|trace| {
+                    trace.lines(snapshot, state.active_revision_id(), content_width(body))
+                });
+                match trace {
+                    Some(trace) => {
+                        let split =
+                            table::split(body, body.height.saturating_sub(2).into(), trace.len());
+                        models_tab::render(frame, split.table, state, active);
+                        if split.detail.height > 0 {
+                            table::draw_detail(frame, split.detail, "TRACE", split.chrome, trace);
+                        }
+                    }
+                    None => models_tab::render(frame, body, state, active),
+                }
+            }
+            (Tab::History, _) => history_tab(frame, body, snapshot, state, &mut drawn),
+            _ => lookup_tab(frame, body, snapshot, active, state, &mut drawn),
+        },
+        (Some(snapshot), None) => {
+            let note = if state.tab() == Tab::History {
+                history_tab(frame, body, snapshot, state, &mut drawn);
+                None
+            } else {
+                Some("the live revision has no derived facts: it did not compile")
+            };
+            if let Some(note) = note {
+                message(frame, body, state.tab().title(), note);
+            }
+        }
+        (None, _) => {
+            let note = if state.loading() {
+                "loading routing snapshot…"
+            } else {
+                "no routing snapshot: the service is not answering"
+            };
+            message(frame, body, state.tab().title(), note);
+        }
+    }
+
+    chrome::chips(frame, &drawn.header);
+    if overlay {
+        // Under the header, so the buttons stay in view.
+        let area = frame.area();
+        let used = drawn.header.keys.height;
+        keys::render(
+            frame,
+            Rect {
+                y: area.y + used,
+                height: area.height - used,
+                ..area
+            },
         );
     }
-    lines
+    if state.modal().active() {
+        drawn.form = render_modal(frame, state);
+    }
+    drawn
 }
 
-fn short(value: &Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "<unrenderable>".to_owned())
+/// A panel with one dim line in it, where there is nothing to draw.
+fn message(frame: &mut Frame, body: Rect, title: &str, note: &str) {
+    let framing = Chrome::fitting(1, body.height);
+    let area = Rect {
+        height: (1 + framing.cost()).min(body.height),
+        ..body
+    };
+    table::draw_detail(
+        frame,
+        area,
+        title,
+        framing,
+        vec![Line::styled(note.to_owned(), Style::new().dim())],
+    );
 }
 
-fn pretty(value: &Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| "<unrenderable>".to_owned())
+/// The inner width a table's lines are laid to: the panel's, less a cell of
+/// air either side.
+fn content_width(body: Rect) -> usize {
+    usize::from(body.width.saturating_sub(4))
 }
 
+/// The editing that belongs to the table the tab shows, when there is one.
+fn editing_here(state: &State) -> Option<&Editing> {
+    state.editing()
+}
+
+/// A lookup tab: its table, and the selected record's detail under it, or,
+/// while the record is edited, its form under the row and the preview of
+/// what the edit would do.
+fn lookup_tab(
+    frame: &mut Frame,
+    body: Rect,
+    snapshot: &Value,
+    active: &Value,
+    state: &State,
+    drawn: &mut Drawn,
+) {
+    let width = content_width(body);
+    let tab = state.tab();
+    let editing = editing_here(state);
+    // A rewrite being moved is shown where it would land.
+    let moved;
+    let active = match editing.map(|editing| &editing.what) {
+        Some(What::MoveRule {
+            scope_label,
+            from,
+            to,
+            ..
+        }) if tab == Tab::Rewrites => {
+            moved = rules::with_move(active, scope_label, *from, *to);
+            &moved
+        }
+        _ => active,
+    };
+    let entries = rules::entries(active, tab);
+    let selected = state.selected_in(tab);
+    let entry = entries.get(selected).copied();
+    let (mut table, mut detail, title): (Table, Detail, &str) = match tab {
+        Tab::Presentations => (
+            rules::presentations_table(active, width),
+            Detail::whole(match entry {
+                Some(Entry::Presentation(record)) => rules::presentation_detail(active, record),
+                _ => Vec::new(),
+            }),
+            "PRESENTATION",
+        ),
+        Tab::Rewrites => (
+            rules::rewrites_table(active, width),
+            match entry {
+                Some(Entry::Rewrite(rule)) => rules::with_reading(
+                    rules::rule_detail(active, rule),
+                    rule.get("reach").unwrap_or(&Value::Null),
+                    "[enter] open route",
+                ),
+                Some(Entry::Default(default)) => default_reading(active, default),
+                _ => Detail::whole(Vec::new()),
+            },
+            if matches!(entry, Some(Entry::Default(_))) {
+                "DEFAULT"
+            } else {
+                "RULE"
+            },
+        ),
+        Tab::Defaults => (
+            rules::defaults_table(active, width),
+            match entry {
+                Some(Entry::Default(default)) => default_reading(active, default),
+                _ => Detail::whole(Vec::new()),
+            },
+            "DEFAULT",
+        ),
+        Tab::Routes => (
+            // A trace marks the route it walked, which takes a gutter.
+            routes::routes_table(active, width - 2 * usize::from(state.trace().is_some())),
+            Detail::whole(
+                array(active, "routes")
+                    .get(selected)
+                    .map(|route| routes::route_detail(snapshot, route, width))
+                    .unwrap_or_default(),
+            ),
+            "ROUTE",
+        ),
+        Tab::Models | Tab::History => unreachable!("drawn by their own tabs"),
+    };
+    let mut title = title;
+    let live = state.active_revision_id();
+    if let Some(trace) = state.trace() {
+        let marks = trace.marks(active, tab, live);
+        table::mark_rows(&mut table, &marks, tab == Tab::Routes);
+        if editing.is_none() {
+            detail = Detail::whole(trace.lines(snapshot, live, width));
+            title = "TRACE";
+        }
+    }
+    if let Some(editing) = editing {
+        // The form opens under the row it belongs to, and the preview takes
+        // the detail's place.
+        let at = table
+            .body
+            .iter()
+            .position(|line| line.entry == Some(selected))
+            .map_or(table.body.len(), |at| at + 1);
+        let form = edit_view::block(editing, width);
+        table.body.splice(at..at, form);
+        detail = Detail::whole(edit_view::preview(editing, active, width));
+        title = "PREVIEW";
+    }
+    // A rule or a default sends to a route, so with none there is nothing to
+    // add and nothing to read about what exists: the table says where to go.
+    if editing.is_none()
+        && matches!(tab, Tab::Rewrites | Tab::Defaults)
+        && array(active, "routes").is_empty()
+    {
+        table.body.push(rules::needs_a_route());
+        detail = Detail::whole(Vec::new());
+    }
+    if table.body.is_empty() {
+        detail = Detail::whole(Vec::new());
+    }
+    let need = 1 + table.body.len().max(1);
+    // A detail with a reading gives up its lines to keep the table whole.
+    let split = if detail.has_reading() && editing.is_none() && state.trace().is_none() {
+        table::split_reading(body, need, detail.len())
+    } else {
+        table::split(body, need, detail.len())
+    };
+    drawn.entries = split.table;
+    drawn.detail = split.detail;
+    if table.body.is_empty() {
+        table::draw_detail(
+            frame,
+            split.table,
+            tab.title(),
+            split.chrome,
+            vec![Line::styled(
+                format!("no {} in the live revision", tab.label()),
+                Style::new().dim(),
+            )],
+        );
+        return;
+    }
+    let hits = table::draw_table(
+        frame,
+        split.table,
+        tab.title(),
+        split.chrome,
+        table,
+        Some(selected),
+    );
+    drawn.rows = hits.rows;
+    if editing.is_some() {
+        drawn.form = Some(FormHit {
+            fields: hits.fields,
+        });
+    }
+    if split.detail.height > 0 {
+        let lines = detail.shed(split.detail_rows, content_width(split.detail));
+        if split.bare {
+            table::draw_bare(frame, split.detail, lines);
+        } else {
+            table::draw_detail(frame, split.detail, title, split.chrome, lines);
+        }
+    }
+}
+
+/// A default's detail, its reach the reading: a default that is not there
+/// is added from the same place.
+fn default_reading(active: &Value, default: &Value) -> Detail {
+    let hint = if default.get("exists") == Some(&Value::Bool(true)) {
+        "[enter] open route"
+    } else {
+        "[n] new"
+    };
+    rules::with_reading(
+        rules::default_detail(active, default),
+        default.get("reach").unwrap_or(&Value::Null),
+        hint,
+    )
+}
+
+/// One route, whole; with a candidate being edited, the candidates and the
+/// form, and the preview under them.
+fn route_page(
+    frame: &mut Frame,
+    body: Rect,
+    snapshot: &Value,
+    active: &Value,
+    state: &State,
+    drawn: &mut Drawn,
+) {
+    let routes = array(active, "routes");
+    let at = state.selected_in(Tab::Routes);
+    let Some(route) = routes.get(at) else {
+        return;
+    };
+    let width = content_width(body);
+    let editing = editing_here(state);
+    let moved;
+    let route = match editing.map(|editing| &editing.what) {
+        Some(What::MoveCandidate { from, to, .. }) => {
+            moved = routes::with_move(route, *from, *to);
+            &moved
+        }
+        _ => route,
+    };
+    let top = routes::route_top(snapshot, route, at, routes.len(), width);
+    // The selected candidate is the one the edit keys act on.
+    let selected_line = routes::CANDIDATES_AT
+        + routes::candidate_rows(route, width)
+            .get(state.candidate())
+            .copied()
+            .unwrap_or(0);
+    let mut lines: Vec<BodyLine> = top
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            if index == selected_line && editing.is_none() {
+                BodyLine::form(table::reversed(line, width), None, false)
+            } else {
+                BodyLine::plain(line)
+            }
+        })
+        .collect();
+    let Some(editing) = editing else {
+        lines.extend(
+            routes::route_rest(active, route, width)
+                .into_iter()
+                .map(BodyLine::plain),
+        );
+        if let Some(trace) = state.trace() {
+            let trace = trace.lines(snapshot, state.active_revision_id(), width);
+            let split = table::split(body, lines.len(), trace.len());
+            drawn.entries = split.table;
+            drawn.detail = split.detail;
+            table::draw_page(frame, split.table, "ROUTE", split.chrome, lines);
+            if split.detail.height > 0 {
+                table::draw_detail(frame, split.detail, "TRACE", split.chrome, trace);
+            }
+            return;
+        }
+        let framing = Chrome::fitting(lines.len(), body.height);
+        let area = Rect {
+            height: (lines.len() as u16 + framing.cost()).min(body.height),
+            ..body
+        };
+        table::draw_page(frame, area, "ROUTE", framing, lines);
+        return;
+    };
+    lines.extend(edit_view::block(editing, width));
+    let preview = edit_view::preview(editing, active, width);
+    let split = table::split(body, lines.len(), preview.len());
+    drawn.entries = split.table;
+    drawn.detail = split.detail;
+    let fields = table::draw_page(frame, split.table, "ROUTE", split.chrome, lines);
+    drawn.form = Some(FormHit { fields });
+    if split.detail.height > 0 {
+        table::draw_detail(frame, split.detail, "PREVIEW", split.chrome, preview);
+    }
+}
+
+/// An edit on the models tab, whose records are not rows of a table: the
+/// form takes the page, with the preview under it.
+fn edit_page(frame: &mut Frame, body: Rect, state: &State, active: &Value, drawn: &mut Drawn) {
+    let Some(editing) = editing_here(state) else {
+        return;
+    };
+    let width = content_width(body);
+    let lines = edit_view::block(editing, width);
+    let preview = edit_view::preview(editing, active, width);
+    let split = table::split(body, lines.len(), preview.len());
+    drawn.entries = split.table;
+    drawn.detail = split.detail;
+    let fields = table::draw_page(frame, split.table, "MODELS", split.chrome, lines);
+    drawn.form = Some(FormHit { fields });
+    if split.detail.height > 0 {
+        table::draw_detail(frame, split.detail, "PREVIEW", split.chrome, preview);
+    }
+}
+
+/// The history tab: the revisions, and the selected one's detail.
+fn history_tab(frame: &mut Frame, body: Rect, snapshot: &Value, state: &State, drawn: &mut Drawn) {
+    let revisions = state.revisions();
+    let live = state.active_revision_id();
+    if revisions.is_empty() {
+        message(frame, body, Tab::History.title(), "no revisions read yet");
+        return;
+    }
+    let selected = state.selected_in(Tab::History);
+    let table = history::table(
+        snapshot,
+        revisions,
+        live,
+        state.more_revisions(),
+        content_width(body),
+    );
+    let mut detail = history::detail(
+        snapshot,
+        &revisions[selected.min(revisions.len() - 1)],
+        live,
+        state.armed(),
+    );
+    let mut detail_title = "REVISION";
+    if let Some(trace) = state.trace() {
+        detail = trace.lines(snapshot, live, content_width(body));
+        detail_title = "TRACE";
+    }
+    let split = table::split(body, 1 + table.body.len(), detail.len());
+    drawn.entries = split.table;
+    drawn.detail = split.detail;
+    drawn.rows = table::draw_table(
+        frame,
+        split.table,
+        Tab::History.title(),
+        split.chrome,
+        table,
+        Some(selected),
+    )
+    .rows;
+    if split.detail.height > 0 {
+        table::draw_detail(frame, split.detail, detail_title, split.chrome, detail);
+    }
+}
+
+/// A small question over the page: a promotion's or a description's form,
+/// or the confirmation of a reactivation.
 fn render_modal(frame: &mut Frame, state: &State) -> Option<FormHit> {
     let modal = state.modal();
     if let Modal::Form(form) = modal {
         return Some(render_form(frame, state, form));
     }
-    // A pretty-printed result is one string of many lines, and the popup is
-    // sized in lines drawn, not in strings.
+    // The popup is sized in lines drawn, not in strings.
     let lines: Vec<String> = modal_text(state)
         .iter()
         .flat_map(|text| text.split('\n').map(str::to_owned))
         .collect();
     let width = lines
         .iter()
-        .map(|line| line.chars().count())
+        .map(|line| line.width())
         .max()
         .unwrap_or(20)
         .min(100) as u16
@@ -321,12 +528,12 @@ fn render_modal(frame: &mut Frame, state: &State) -> Option<FormHit> {
     None
 }
 
-/// A form fills most of the screen: its fields in a window that follows the
+/// A one-line form is a popup: its fields in a window that follows the
 /// focus, then its key help and the last refusal.
 fn render_form(frame: &mut Frame, state: &State, form: &Form) -> FormHit {
     let area = frame.area();
     let width = area.width.saturating_sub(4).clamp(1, 110).min(area.width);
-    let height = area.height.saturating_sub(2).max(1).min(area.height);
+    let height = area.height.saturating_sub(2).clamp(1, 14).min(area.height);
     let popup = Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
         area.y + area.height.saturating_sub(height) / 2,
@@ -334,7 +541,7 @@ fn render_form(frame: &mut Frame, state: &State, form: &Form) -> FormHit {
         height,
     );
     frame.render_widget(Clear, popup);
-    let block = Block::bordered().title(form.title());
+    let block = Block::bordered().title(Modal::Form(Box::new(form.clone())).title());
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(inner);
@@ -354,7 +561,8 @@ fn render_form(frame: &mut Frame, state: &State, form: &Form) -> FormHit {
             } else {
                 Style::new()
             };
-            Line::styled(line.text.clone(), style)
+            let said: Vec<&str> = line.notes.iter().map(|(_, text)| text.as_str()).collect();
+            Line::styled(format!("{}  {}", line.text, said.join(" · ")), style)
         })
         .collect();
     frame.render_widget(Paragraph::new(rendered), body);
@@ -365,8 +573,16 @@ fn render_form(frame: &mut Frame, state: &State, form: &Form) -> FormHit {
     }
     frame.render_widget(Paragraph::new(notes), footer);
     FormHit {
-        body,
-        rows: shown.iter().map(|line| line.row).collect(),
+        fields: shown
+            .iter()
+            .enumerate()
+            .filter_map(|(at, line)| {
+                Some((
+                    Rect::new(body.x, body.y + at as u16, body.width, 1),
+                    line.row?,
+                ))
+            })
+            .collect(),
     }
 }
 
@@ -375,19 +591,6 @@ fn render_form(frame: &mut Frame, state: &State, form: &Form) -> FormHit {
 fn modal_text(state: &State) -> Vec<String> {
     let modal = state.modal();
     let mut lines = modal_lines(modal);
-    if let Modal::PreviewResult(result) = modal
-        && state.preview_asked()
-    {
-        // Under the close hint, over the raw result it summarises.
-        let summary = super::detail::preview_safeguards(result);
-        lines.splice(1..1, summary);
-    }
-    if matches!(modal, Modal::Activate { .. } | Modal::Reactivate { .. }) {
-        // Before the closing "confirms" line, so the prompt stays last.
-        let confirm = lines.pop();
-        lines.extend(state.activation_summary());
-        lines.extend(confirm);
-    }
     if let Some(error) = state.error() {
         lines.push(format!("! {error}"));
     }
@@ -399,406 +602,44 @@ fn modal_lines(modal: &Modal) -> Vec<String> {
         Modal::None => Vec::new(),
         // A form draws itself.
         Modal::Form(_) => Vec::new(),
-        Modal::NewKind { kinds, preselected } => {
-            let mut lines = vec!["Add which kind of record?".to_owned()];
-            lines.extend(kinds.iter().enumerate().map(|(index, kind)| {
-                let mark = if index == *preselected { ">" } else { " " };
-                format!("{mark} {} {}", index + 1, singular(kind))
-            }));
-            let pick = format!("1–{} or enter", kinds.len());
-            lines.push(chrome::hints(&[(&pick, "pick"), ("esc", "cancel")]));
+        Modal::Trace(picking) => {
+            let mut lines = picking.text();
+            lines.push(chrome::hints(&[
+                ("↑/↓", "choose"),
+                ("enter", "trace"),
+                ("esc", "cancel"),
+            ]));
             lines
         }
-        Modal::Remove { key, value } => vec![
-            format!("Remove this {key} record? This changes only the draft."),
-            short(value),
-            confirm_hint(),
-        ],
-        Modal::PreviewResult(result) => {
-            vec![chrome::hints(&[("any key", "close")]), pretty(result)]
-        }
-        Modal::Activate {
-            scope,
-            force_cache_transition,
-        } => activation_lines("Activate this draft?", *scope, *force_cache_transition),
-        Modal::Reactivate {
-            revision_id,
-            scope,
-            force_cache_transition,
-        } => {
-            let mut lines = activation_lines(
-                &format!("Create a forward revision from revision {revision_id}?"),
-                *scope,
-                *force_cache_transition,
-            );
-            lines.insert(1, "The active pointer never moves backwards.".to_owned());
-            lines
-        }
-        Modal::Import => vec![
-            "Replace the current draft with the routing in toker.toml?".to_owned(),
-            "The active revision does not change until the draft is activated.".to_owned(),
-            confirm_hint(),
-        ],
-        Modal::Conflict {
-            daemon_generation,
-            daemon_draft,
-        } => vec![
-            "The daemon draft changed while this terminal was editing.".to_owned(),
-            format!(
-                "daemon generation: {}",
-                daemon_generation.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
-            ),
-            chrome::hints(&[
-                ("r", "reload, discarding local typed edits"),
-                ("a", "reapply them to this daemon copy"),
-                ("esc", "close"),
-            ]),
-            pretty(daemon_draft),
-        ],
     }
-}
-
-/// The prompt every confirmation closes on.
-fn confirm_hint() -> String {
-    chrome::hints(&[("y/enter", "confirm"), ("n/esc", "cancel")])
-}
-
-fn activation_lines(prompt: &str, scope: usize, force_cache_transition: bool) -> Vec<String> {
-    let scope = ["new lanes", "new and cold lanes", "immediate"][scope.min(2)];
-    vec![
-        prompt.to_owned(),
-        format!("scope: {scope} · {}", chrome::hints(&[("h/l", "change")])),
-        format!(
-            "forced warm-cache transition: {} · {}",
-            if force_cache_transition { "YES" } else { "no" },
-            chrome::hints(&[("f", "toggle")])
-        ),
-        confirm_hint(),
-    ]
 }
 
 #[cfg(test)]
 mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
-    use super::{State, modal_text, render};
+    use super::{Drawn, State, Tab, render};
     use crate::tui::control::{Command, Reply, Response};
+    use crate::tui::routing::testing::{self, World};
 
-    #[test]
-    fn page_names_edit_and_activation_controls() {
+    /// A page that has read the snapshot and revisions of `world`, on `tab`.
+    fn page(world: World, tab: Tab) -> State {
         let mut state = State::default();
-        state.receive(Reply::Command(
-            Command::snapshot("routing-snapshot"),
-            Ok(Response {
-                status: 200,
-                body: serde_json::json!({
-                    "draft_generation": 2,
-                    "draft": {"policy": {"presentations": [{"slug": "friendly"}]}},
-                    "active_revision": {"policy": {"presentations": []}}
-                }),
-            }),
-        ));
-        let backend = TestBackend::new(140, 30);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|frame| {
-                render(frame, &state, false);
-            })
-            .expect("draw");
-        let text = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(!text.contains("n new"), "no page carries a footer: {text}");
-        let mut terminal = Terminal::new(TestBackend::new(140, 30)).expect("terminal");
-        terminal
-            .draw(|frame| {
-                render(frame, &state, true);
-            })
-            .expect("draw");
-        let text = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(text.contains("edit the selected record"), "{text}");
-        assert!(text.contains("activate the draft"), "{text}");
-    }
-
-    #[test]
-    fn the_activation_form_shows_its_impact_and_the_last_refusal() {
-        let mut state = State::default();
-        state.receive(Reply::Command(
-            Command::snapshot("routing-snapshot"),
-            Ok(Response {
-                status: 200,
-                body: serde_json::json!({
-                    "draft_generation": 2,
-                    "draft": {"policy": {"routes": [{"id": "new-route"}]}},
-                    "active_revision": {"policy": {"routes": []}},
-                    "lane_impacts": {"total": 4, "unpinned": 1, "warm": 2, "cold": 1, "unknown": 0},
-                    "publications": [{"adapter": "claude", "state": "failed"}],
-                    "derived": {
-                        "active": {"routes": [
-                            {"id": "kept", "edges": [{"from": "a", "to": "b", "crosses_cost_boundary": true, "billed_boundary": "deny", "from_cost": "subscription", "to_cost": "billed"}]},
-                            {"id": "gone", "edges": [{"from": "a", "to": "b", "crosses_cost_boundary": true, "billed_boundary": "allow"}]},
-                        ]},
-                        "draft": {"routes": [
-                            {"id": "kept", "edges": [{"from": "a", "to": "b", "crosses_cost_boundary": true, "billed_boundary": "allow", "from_cost": "subscription", "to_cost": "billed"}]},
-                            {"id": "new-route", "edges": [{"from": "a", "to": "b", "crosses_cost_boundary": true, "billed_boundary": "allow", "from_cost": "subscription", "to_cost": "unknown"}]},
-                        ]},
-                    },
-                }),
-            }),
-        ));
-        state.key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        let mut command = Command::snapshot("routing-snapshot");
-        command.name = "activate";
-        state.receive(Reply::Command(
-            command,
-            Ok(Response {
-                status: 409,
-                body: serde_json::json!({"error": "forced_cache_transition_required"}),
-            }),
-        ));
-        let text = modal_text(&state).join("\n");
-        assert!(text.contains("+route new-route"), "{text}");
-        assert!(text.contains("2 warm"), "{text}");
-        assert!(
-            text.contains("cost boundary: kept: a -> b consent allow (was deny)"),
-            "{text}"
-        );
-        assert!(
-            text.contains(
-                "cost boundary: new-route: a -> b now crosses subscription to unknown (consent allow)"
-            ),
-            "{text}"
-        );
-        assert!(
-            text.contains("cost boundary: gone: a -> b removed"),
-            "{text}"
-        );
-        assert!(text.contains("publication claude: failed"), "{text}");
-        assert!(text.contains("forced_cache_transition_required"), "{text}");
-        assert!(
-            text.lines()
-                .rev()
-                .nth(1)
-                .is_some_and(|line| line.contains("y/enter confirm · n/esc cancel")),
-            "the confirmation prompt stays above the refusal: {text}"
-        );
-    }
-
-    /// Every key the page acts on is named in its overlay, so a key that
-    /// was added cannot stay undocumented (spec: UTUI#finding-the-keys).
-    #[test]
-    fn the_overlay_names_every_key_the_page_takes() {
-        use crossterm::event::KeyCode;
-        let named = |key: &str| {
-            super::KEYS
-                .iter()
-                .any(|(keys, _)| keys.split([' ', '/']).any(|token| token == key))
+        let mut reply = |name: &'static str, body| {
+            let mut command = Command::snapshot("routing-snapshot");
+            command.name = name;
+            state.receive(Reply::Command(command, Ok(Response { status: 200, body })));
         };
-        for key in [
-            'e', 'n', 'd', 'v', 'V', 'a', 'x', 'p', 'i', 'r', 'h', 'j', 'k', 'l',
-        ] {
-            assert!(
-                !super::super::owns_key(KeyCode::Char(key)) || named(&key.to_string()),
-                "{key} is taken but not named"
-            );
-        }
-        assert!(named("pgup") && named("pgdn"));
-        for key in ["tab", "alt+↑", "ctrl+d", "ctrl+s", "space"] {
-            assert!(
-                super::FORM_KEYS
-                    .iter()
-                    .any(|(keys, _)| keys.split([' ', '/']).any(|token| token == key)),
-                "{key} in a form"
-            );
-        }
-
-        let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("terminal");
-        terminal
-            .draw(|frame| {
-                render(frame, &State::default(), true);
-            })
-            .expect("draw");
-        let text = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        for heading in ["KEYS", "IN A FORM", "? or esc close"] {
-            assert!(text.contains(heading), "{heading}: {text}");
-        }
-    }
-
-    #[test]
-    fn the_add_forms_say_what_they_do() {
-        let mut state = State::default();
-        state.receive(Reply::Command(
-            Command::snapshot("routing-snapshot"),
-            Ok(Response {
-                status: 200,
-                body: serde_json::json!({
-                    "draft_generation": 2,
-                    "draft": {"policy": {"routes": []}},
-                }),
-            }),
-        ));
-        state.set_view(super::View::Routes);
-        state.key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('n'),
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        let text = modal_text(&state).join("\n");
-        assert!(text.contains("1 route"), "{text}");
-        assert!(text.contains("2 default"), "{text}");
-    }
-
-    /// A snapshot with every kind of record and the derived facts for them,
-    /// so each view's frame shows the page as it reads with a real policy.
-    fn page_snapshot() -> serde_json::Value {
-        let route = serde_json::json!({
-            "id": "mixed", "display_name": "Subscription then billed",
-            "lane_transition": "move_when_cold",
-            "chain": {
-                "first": {"id": "sub", "binding_id": "codex_sub.codex_responses",
-                          "model": {"kind": "exact", "model_id": "gpt-example"}, "enabled": true},
-                "steps": [{
-                    "edge": {"preflight": "enabled", "post_send": ["rate_limit"],
-                             "billed_boundary": "allow", "ambiguous_transport": "deny",
-                             "cache_transition": "allow_cache_loss"},
-                    "candidate": {"id": "billed", "binding_id": "openrouter.openrouter_responses",
-                                  "model": {"kind": "requested_model"}, "enabled": true},
-                }],
-            },
-        });
-        let policy = serde_json::json!({
-            "description": "example draft",
-            "presentations": [
-                {"id": "p-mixed", "slug": "mixed", "label": "Mixed",
-                 "scope": {"kind": "protocol", "protocol": "openai_responses"},
-                 "source": {"kind": "virtual", "target": {"route_id": "mixed"}}, "enabled": true},
-            ],
-            "routes": [route],
-            "defaults": [{"scope": {"kind": "protocol", "protocol": "openai_responses"},
-                          "target": {"route_id": "mixed"}}],
-            "rewrites": [{"id": "r-sonnet", "scope": {"kind": "protocol", "protocol": "openai_responses"},
-                          "priority": 5, "model_matcher": {"kind": "glob", "value": "gpt-*"},
-                          "target": {"route_id": "mixed"}}],
-            "classifiers": [{"id": "gpt-family", "binding_id": "codex_sub.codex_responses",
-                             "model_matcher": {"kind": "regex", "value": "^gpt-(?P<family>[a-z]+)-(?P<version>[0-9.]+)$"},
-                             "family_template": "${family}", "version_template": "${version}",
-                             "version_parser": {"kind": "numeric_tuple", "components": 2, "separator": "."}}],
-            "upgrades": [{"id": "newest", "classifier_id": "gpt-family", "enabled": true,
-                          "lane_transition": "move_when_cold"}],
-        });
-        let derived_policy = serde_json::json!({
-            "routes": [{
-                "id": "mixed",
-                "pinned_lanes": {"warm": 2, "cold": 1, "unknown": 0},
-                "candidates": [
-                    {"id": "sub", "binding_id": "codex_sub.codex_responses", "cost_class": "subscription",
-                     "upgrade_policy_id": "newest",
-                     "upgrade": {"baseline": "gpt-example-1.0", "winner": "gpt-example-1.2",
-                                 "rejected": [{"model": "gpt-example-1.1", "reason": "not_newer"},
-                                              {"model": "gpt-other-2.0", "reason": "family_mismatch"}]}},
-                    {"id": "billed", "binding_id": "openrouter.openrouter_responses", "cost_class": "billed",
-                     "upgrade_policy_id": null, "upgrade": null},
-                ],
-                "edges": [{"from": "sub", "to": "billed", "from_cost": "subscription", "to_cost": "billed",
-                           "crosses_cost_boundary": true, "billed_boundary": "allow"}],
-            }],
-            "classifiers": [{"id": "gpt-family", "binding_id": "codex_sub.codex_responses",
-                             "parsed": [{"model": "gpt-example-1.0", "family": "example", "version": "1.0"}],
-                             "unparsed": [{"model": "gpt-example-latest"}]}],
-            "presentations": [{"scope": "openai_responses", "slug": "mixed",
-                               "adapter": "dynamic_responses_models",
-                               "desired": "left_out", "reason": "no_codex_record", "applied": null}],
-        });
-        serde_json::json!({
-            "draft_generation": 4,
-            "draft": {"policy": policy},
-            "active_revision": {"revision_id": 3, "policy": {}},
-            "draft_diagnostics": [
-                {"code": "virtual-presentation-unlisted-in-responses", "severity": "info",
-                 "record_id": "p-mixed", "path": "/presentations/0/metadata"},
-            ],
-            "lane_impacts": {"total": 4, "unpinned": 1, "warm": 2, "cold": 1, "unknown": 0},
-            "publications": [{"adapter": "dynamic_responses_models", "state": "applied",
-                              "scope": {"kind": "protocol", "protocol": "openai_responses"},
-                              "applied_revision_id": 3, "desired_revision_id": 3,
-                              "applied_inventory_generation": 7, "desired_inventory_generation": 7}],
-            "derived": {
-                "availability": [{
-                    "binding_id": "codex_sub.codex_responses", "provider": "codex_sub",
-                    "configured": {"state": "yes", "reason": "configured"},
-                    "enabled": {"state": "yes", "reason": "enabled"},
-                    "credential": {"state": "unknown"}, "catalogue": {"state": "fresh"},
-                    "capabilities": {"sampling": "supported", "tools": "supported", "images": "unknown"},
-                    "cost_class": "subscription",
-                }, {
-                    "binding_id": "openrouter.openrouter_responses", "provider": "openrouter",
-                    "configured": {"state": "no", "reason": "unconfigured"},
-                    "enabled": {"state": "no", "reason": "disabled"},
-                    "credential": {"state": "no", "reason": "provider-unconfigured"},
-                    "catalogue": {"state": "absent"}, "capabilities": {}, "cost_class": "billed",
-                }],
-                "circuits": [],
-                "draft": derived_policy,
-                "active": null,
-            },
-        })
-    }
-
-    fn frame(state: &State) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(120, 32)).expect("terminal");
-        terminal
-            .draw(|frame| {
-                render(frame, state, false);
-            })
-            .expect("draw");
-        let buffer = terminal.backend().buffer();
-        (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-                    .trim_end()
-                    .to_owned()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    fn page_in(view: super::View) -> State {
-        let mut state = State::default();
-        state.receive(Reply::Command(
-            Command::snapshot("routing-snapshot"),
-            Ok(Response {
-                status: 200,
-                body: page_snapshot(),
-            }),
-        ));
-        state.set_view(view);
+        reply("snapshot", testing::snapshot(world));
+        reply("revisions", testing::revisions(world));
+        state.set_tab(tab);
         state
     }
 
-    /// The page at `width`×`height`, and where it put things.
-    fn drawn_at(state: &State, width: u16, height: u16) -> (String, super::Drawn) {
+    /// The page at `width`×`height` as text, and where it put things.
+    fn drawn_at(state: &State, width: u16, height: u16) -> (String, Drawn) {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
-        let mut drawn = super::Drawn::default();
+        let mut drawn = Drawn::default();
         terminal
             .draw(|frame| drawn = render(frame, state, false))
             .expect("draw");
@@ -816,334 +657,664 @@ mod tests {
         (text, drawn)
     }
 
-    /// Below 100 columns the list sits over the detail pane rather than
-    /// beside it, where both would be too narrow to read.
-    #[test]
-    fn a_narrow_page_stacks_the_list_over_the_detail() {
-        let state = page_in(super::View::Routes);
-        let (_, wide) = drawn_at(&state, 100, 32);
-        assert_eq!(wide.entries.y, wide.detail.y, "side by side from 100");
-        assert!(wide.entries.right() <= wide.detail.x);
-        let (text, narrow) = drawn_at(&state, 99, 32);
-        assert_eq!(narrow.entries.x, narrow.detail.x, "stacked below:\n{text}");
-        assert!(narrow.entries.bottom() <= narrow.detail.y, "{text}");
-        assert!(narrow.entries.height <= 32 / 3, "{text}");
+    fn frame(state: &State, width: u16, height: u16) -> String {
+        drawn_at(state, width, height).0
     }
 
-    /// The other tabs collapse to their number before the current label
-    /// clips, and every tab stays clickable.
+    /// Rewrites at rest, as drawn for a 120×40 terminal, the second rule
+    /// selected.
     #[test]
-    fn a_narrow_header_collapses_the_other_tabs() {
-        let state = page_in(super::View::Routes);
-        let (text, drawn) = drawn_at(&state, 90, 32);
-        let header = text.lines().next().unwrap_or_default();
-        assert!(
-            header.contains("1  2 routes, candidates & defaults  3  4"),
-            "{header}"
-        );
-        assert_eq!(drawn.tabs.len(), 4);
-    }
-
-    /// Too short for the detail boxed, both panes give up their borders
-    /// before any line of content (spec: UTUI#what-is-shed-first).
-    #[test]
-    fn a_short_page_goes_ruled() {
-        let state = page_in(super::View::Routes);
-        let (tall, _) = drawn_at(&state, 120, 40);
-        assert!(
-            tall.contains("\u{250c}DETAIL"),
-            "boxed while it fits:\n{tall}"
-        );
-        let (short, _) = drawn_at(&state, 120, 12);
-        assert!(short.contains("DETAIL \u{2500}"), "ruled:\n{short}");
-        assert!(!short.contains('\u{250c}'), "{short}");
-    }
-
-    #[test]
-    fn the_presentations_page() {
-        insta::assert_snapshot!(frame(&page_in(super::View::Presentations)));
-    }
-
-    #[test]
-    fn the_routes_page() {
-        insta::assert_snapshot!(frame(&page_in(super::View::Routes)));
-    }
-
-    #[test]
-    fn the_rewrites_page_on_a_classifier() {
-        let mut state = page_in(super::View::Rewrites);
+    fn rewrites_at_rest_120x40() {
+        let mut state = page(World::AT_REST, Tab::Rewrites);
         state.move_selection(1);
-        insta::assert_snapshot!(frame(&state));
+        insta::assert_snapshot!(frame(&state, 120, 40));
     }
 
     #[test]
-    fn the_rewrites_page_on_an_upgrade() {
-        let mut state = page_in(super::View::Rewrites);
-        state.move_selection(2);
-        insta::assert_snapshot!(frame(&state));
-    }
-
-    #[test]
-    fn the_status_page_on_a_binding() {
-        let mut state = page_in(super::View::Status);
-        // active revision, draft, publication, then the bindings
-        state.move_selection(3);
-        insta::assert_snapshot!(frame(&state));
-    }
-
-    #[test]
-    fn the_activation_form() {
-        let mut state = page_in(super::View::Routes);
-        state.key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        insta::assert_snapshot!(frame(&state));
-    }
-
-    #[test]
-    fn the_detail_pane_scrolls_to_its_last_line_and_no_further() {
-        let mut state = page_in(super::View::Routes);
-        // A short terminal so the route's detail does not fit.
-        let mut terminal = Terminal::new(TestBackend::new(120, 14)).expect("terminal");
-        let draw = |terminal: &mut Terminal<TestBackend>, state: &State| {
-            terminal
-                .draw(|frame| {
-                    render(frame, state, false);
-                })
-                .expect("draw");
-            terminal
-                .backend()
-                .buffer()
-                .content
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>()
-        };
-        assert!(!draw(&mut terminal, &state).contains("model: the requested model"));
-        for _ in 0..5 {
-            state.key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::PageDown,
-                crossterm::event::KeyModifiers::NONE,
-            ));
-            draw(&mut terminal, &state);
-        }
-        let scrolled = state.detail_scroll();
-        assert!(draw(&mut terminal, &state).contains("model: the requested model"));
-        assert!(
-            scrolled > 0 && scrolled < 50,
-            "stops at the end: {scrolled}"
-        );
-        state.key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::PageUp,
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        assert!(state.detail_scroll() < scrolled);
-        // Moving to another item starts it at the top.
+    fn rewrites_at_rest_135x50() {
+        let mut state = page(World::AT_REST, Tab::Rewrites);
         state.move_selection(1);
-        assert_eq!(state.detail_scroll(), 0);
+        insta::assert_snapshot!(frame(&state, 135, 50));
     }
 
-    fn press_in(state: &mut State, code: crossterm::event::KeyCode) {
+    #[test]
+    fn rewrites_after_a_save_120x40() {
+        let mut state = page(World::SAVED, Tab::Rewrites);
+        state.move_selection(5);
+        insta::assert_snapshot!(frame(&state, 120, 40));
+    }
+
+    #[test]
+    fn presentations_120x40() {
+        let mut state = page(World::AT_REST, Tab::Presentations);
+        state.move_selection(4);
+        insta::assert_snapshot!(frame(&state, 120, 40));
+    }
+
+    #[test]
+    fn defaults_120x40() {
+        let state = page(World::FULL, Tab::Defaults);
+        insta::assert_snapshot!(frame(&state, 120, 40));
+    }
+
+    #[test]
+    fn routes_120x40() {
+        let state = page(World::FULL, Tab::Routes);
+        insta::assert_snapshot!(frame(&state, 120, 40));
+    }
+
+    #[test]
+    fn the_route_page_120x40() {
+        let mut state = page(World::FULL, Tab::Routes);
+        state.open();
+        insta::assert_snapshot!(frame(&state, 120, 40));
+    }
+
+    #[test]
+    fn models_with_the_focus_in_upgrades_120x40() {
+        let mut state = page(World::AT_REST, Tab::Models);
+        state.show_offers(testing::OR_CHAT, 180);
+        insta::assert_snapshot!(frame(&state, 120, 40));
+    }
+
+    #[test]
+    fn models_with_the_focus_in_families_120x40() {
+        let mut state = page(World::AT_REST, Tab::Models);
+        state.show_offers(testing::OR_CHAT, 180);
+        state.move_selection(-1);
+        insta::assert_snapshot!(frame(&state, 120, 40));
+    }
+
+    #[test]
+    fn models_with_the_focus_in_the_compaction_line_120x40() {
+        let mut state = page(World::AT_REST, Tab::Models);
+        state.show_offers(testing::OR_CHAT, 180);
+        state.move_selection(5);
+        insta::assert_snapshot!(frame(&state, 120, 40));
+    }
+
+    #[test]
+    fn models_with_the_focus_in_the_offers_120x40() {
+        let mut state = page(World::AT_REST, Tab::Models);
+        state.move_selection(7);
+        state.show_offers(testing::OR_CHAT, 180);
+        insta::assert_snapshot!(frame(&state, 120, 40));
+    }
+
+    fn press(state: &mut State, code: crossterm::event::KeyCode) {
         state.key(crossterm::event::KeyEvent::new(
             code,
             crossterm::event::KeyModifiers::NONE,
         ));
     }
 
-    /// Open the add form for the `digit`th kind of `view`.
-    fn adding(view: super::View, digit: char) -> State {
-        let mut state = page_in(view);
-        press_in(&mut state, crossterm::event::KeyCode::Char('n'));
-        if state.modal().title() == "ADD POLICY RECORD" {
-            press_in(&mut state, crossterm::event::KeyCode::Char(digit));
+    /// The tabs scroll around the current one before the strip clips, and
+    /// every tab stays indexed for the mouse.
+    #[test]
+    fn a_narrow_header_scrolls_the_tabs() {
+        let state = page(World::AT_REST, Tab::Routes);
+        let (text, drawn) = drawn_at(&state, 90, 32);
+        let header = text.lines().next().unwrap_or_default();
+        // The other tabs give way to their numbers, the current one keeps
+        // its name and count, and the arrows between them stay.
+        assert!(
+            header.contains("1 → 2 → 3 → 4 routes 7 · 5 · 6"),
+            "{header}"
+        );
+        assert_eq!(drawn.tabs.len(), 6);
+        assert!(drawn.tabs.iter().all(|tab| !tab.is_empty()));
+        let (text, drawn) = drawn_at(&state, 70, 32);
+        let header = text.lines().next().unwrap_or_default();
+        assert!(header.contains("4 routes 7"), "{header}");
+        assert!(drawn.tabs[0].is_empty(), "scrolled out of the strip");
+        assert!(!drawn.tabs[3].is_empty());
+    }
+
+    /// Too short for the detail boxed, both panels give up their borders
+    /// before any line of content (spec: UTUI#what-is-shed-first).
+    #[test]
+    fn a_short_page_goes_ruled() {
+        let state = page(World::AT_REST, Tab::Routes);
+        let (tall, _) = drawn_at(&state, 120, 40);
+        assert!(
+            tall.contains("\u{250c}ROUTE"),
+            "boxed while it fits:\n{tall}"
+        );
+        let (short, _) = drawn_at(&state, 120, 14);
+        assert!(short.contains("ROUTE \u{2500}"), "ruled:\n{short}");
+        assert!(!short.contains('\u{250c}'), "{short}");
+    }
+
+    /// A panel is no taller than its content, so the rows left over stay
+    /// bare rather than being boxed (spec: UTUI#the-routing-page).
+    #[test]
+    fn a_panel_is_no_taller_than_its_content() {
+        let state = page(World::AT_REST, Tab::Routes);
+        let (_, drawn) = drawn_at(&state, 120, 50);
+        assert_eq!(
+            drawn.entries.height,
+            1 + 7 + 2,
+            "heading, seven routes, borders"
+        );
+        assert_eq!(drawn.entries.bottom(), drawn.detail.y);
+        assert!(
+            drawn.detail.bottom() < 50,
+            "the page does not fill the terminal"
+        );
+    }
+
+    /// A table cut short counts what it left out, and the selection stays in
+    /// view.
+    #[test]
+    fn a_table_too_tall_for_its_room_windows_around_the_selection() {
+        let mut state = page(World::AT_REST, Tab::Rewrites);
+        state.move_selection(12);
+        let (text, drawn) = drawn_at(&state, 120, 16);
+        // The counts are of records, not of the lines groups take: eight
+        // records fill the room between the two counts, in eleven lines.
+        assert!(text.contains("… 5 records above"), "{text}");
+        assert!(text.contains("… 4 more records"), "{text}");
+        assert!(text.contains("codex_sub/${model}"), "{text}");
+        let selected = state.selected_in(Tab::Rewrites);
+        assert!(
+            drawn.rows.iter().any(|hit| hit.entry == selected),
+            "the selected row is drawn: {text}"
+        );
+    }
+
+    #[test]
+    fn clicking_an_entry_selects_it_and_a_click_on_a_row_names_the_entry_drawn_there() {
+        let mut state = page(World::AT_REST, Tab::Rewrites);
+        state.select(9);
+        assert_eq!(state.selected_in(Tab::Rewrites), 9);
+        // Out of range is ignored rather than clamped to a different entry.
+        state.select(99);
+        assert_eq!(state.selected_in(Tab::Rewrites), 9);
+        let (_, drawn) = drawn_at(&state, 120, 14);
+        let selected = drawn
+            .rows
+            .iter()
+            .find(|hit| hit.entry == 9)
+            .expect("row 9 is drawn in a 14-line terminal");
+        assert!(
+            drawn.rows[0].entry > 0,
+            "the table scrolled to reach row 9: {:?}",
+            drawn.rows
+        );
+        state.select(0);
+        assert_eq!(
+            crate::tui::chrome::entry_at(&drawn.rows, selected.area.as_position()),
+            Some(9)
+        );
+    }
+
+    /// Every tab draws, and its route page and its focus in each models
+    /// panel, in any room a terminal can be: a frame too small for a table
+    /// is cut, never a panic.
+    #[test]
+    fn every_tab_draws_in_any_size() {
+        for world in [World::AT_REST, World::FULL, World::SAVED] {
+            for tab in Tab::ALL {
+                let mut state = page(world, tab);
+                for width in [1, 2, 8, 20, 50, 80, 100, 135, 200] {
+                    for height in [1, 2, 3, 5, 8, 12, 24, 50] {
+                        drawn_at(&state, width, height);
+                    }
+                }
+                if tab == Tab::Routes {
+                    state.open();
+                    drawn_at(&state, 80, 24);
+                    drawn_at(&state, 30, 5);
+                }
+                if tab == Tab::Models {
+                    for _ in 0..6 {
+                        state.move_selection(7);
+                        drawn_at(&state, 100, 24);
+                        drawn_at(&state, 60, 10);
+                    }
+                }
+            }
         }
+    }
+
+    // --- states of the page ----------------------------------------------
+
+    #[test]
+    fn a_page_that_has_read_nothing_says_so() {
+        let state = State::default();
+        let text = frame(&state, 100, 12);
+        assert!(text.contains("no routing snapshot"), "{text}");
+        let mut state = State::default();
+        assert!(state.begin_refresh());
+        assert!(frame(&state, 100, 12).contains("loading routing snapshot"));
+    }
+
+    #[test]
+    fn a_revision_that_did_not_compile_has_no_facts_to_draw() {
+        let mut state = page(World::AT_REST, Tab::Rewrites);
+        let mut snapshot = testing::snapshot(World::AT_REST);
+        snapshot["derived"]["active"] = serde_json::Value::Null;
+        let mut command = Command::snapshot("routing-snapshot");
+        command.name = "snapshot";
+        state.receive(Reply::Command(
+            command,
+            Ok(Response {
+                status: 200,
+                body: snapshot,
+            }),
+        ));
+        let text = frame(&state, 100, 12);
+        assert!(text.contains("did not compile"), "{text}");
+    }
+
+    /// The header says where each client's settings stand, with the detail
+    /// the row records, whether pending, failed or unsupported.
+    #[test]
+    fn the_header_names_a_publication_that_is_not_applied_with_its_detail() {
+        let mut snapshot = testing::snapshot(World::AT_REST);
+        snapshot["publications"][0]["state"] = serde_json::json!("failed");
+        snapshot["publications"][0]["detail_code"] = serde_json::json!("settings_not_writable");
+        snapshot["publications"][1]["state"] = serde_json::json!("unsupported");
+        let mut state = State::default();
+        let mut command = Command::snapshot("routing-snapshot");
+        command.name = "snapshot";
+        state.receive(Reply::Command(
+            command,
+            Ok(Response {
+                status: 200,
+                body: snapshot,
+            }),
+        ));
+        let (text, _) = drawn_at(&state, 200, 12);
+        let header = text.lines().next().unwrap_or_default();
+        assert!(
+            header.contains("rev 9 live · claude failed: settings not writable · chat unsupported"),
+            "{header}"
+        );
+        // A page that has applied everything says only which revision is live.
+        let applied = frame(&page(World::AT_REST, Tab::Rewrites), 200, 12);
+        let header = applied.lines().next().unwrap_or_default();
+        assert!(header.trim_end().ends_with("rev 9 live"), "{header}");
+    }
+
+    #[test]
+    fn lanes_left_on_earlier_revisions_are_counted_in_the_header() {
+        let state = page(World::SAVED, Tab::Rewrites);
+        let (text, _) = drawn_at(&state, 200, 12);
+        let header = text.lines().next().unwrap_or_default();
+        assert!(
+            header.contains("rev 10 live · 2 lanes on rev 9 · claude pending"),
+            "{header}"
+        );
+    }
+
+    /// A rule that is shadowed says by what, in words.
+    #[test]
+    fn a_shadowed_rule_says_what_catches_it_first() {
+        let mut snapshot = testing::snapshot(World::AT_REST);
+        snapshot["derived"]["active"]["rewrites"][1]["shadowed_by"] = serde_json::json!([{
+            "scope_label": "anthropic_messages", "by": "earlier_rule", "id": "anthropic-messages-1",
+            "position": 1, "matcher": {"kind": "glob", "text": "anthropic*", "value": "anthropic*"},
+            "catches": "part", "basis": "names", "compared": 3,
+            "examples": ["anthropic_sub/claude-sonnet-5"], "scope_limited": false,
+        }]);
+        let mut state = State::default();
+        let mut command = Command::snapshot("routing-snapshot");
+        command.name = "snapshot";
+        state.receive(Reply::Command(
+            command,
+            Ok(Response {
+                status: 200,
+                body: snapshot,
+            }),
+        ));
+        state.set_tab(Tab::Rewrites);
+        state.move_selection(1);
+        let text = frame(&state, 140, 40);
+        assert!(
+            text.contains(
+                "part of it is caught first by rule 1 anthropic* (anthropic_sub/claude-sonnet-5)"
+            ),
+            "{text}"
+        );
+    }
+
+    /// A profile's default sits ahead of its protocol's at the end of the
+    /// protocol's group, and a profile's own group passes on to it.
+    #[test]
+    fn profile_defaults_come_ahead_of_the_protocols_at_the_end_of_its_group() {
+        let state = page(World::FULL, Tab::Rewrites);
+        insta::assert_snapshot!(frame(&state, 120, 40));
+    }
+
+    // --- forms ------------------------------------------------------------
+
+    #[test]
+    fn the_promotion_form() {
+        let mut state = page(World::AT_REST, Tab::Models);
+        press(&mut state, crossterm::event::KeyCode::Char('p'));
+        insta::assert_snapshot!("the_promotion_form", frame(&state, 120, 32));
+    }
+
+    // --- editing in place -------------------------------------------------
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn send(state: &mut State, code: KeyCode) {
+        state.key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    /// Answer `command` as the daemon would.
+    fn answer(state: &mut State, command: Command, status: u16, body: serde_json::Value) {
+        state.receive(Reply::Command(command, Ok(Response { status, body })));
+    }
+
+    /// Answer the check the open edit is due with `body`.
+    fn checked(state: &mut State, body: serde_json::Value) {
+        let check = state.next_check().expect("a check is due");
+        answer(state, check, 200, body);
+    }
+
+    fn fine() -> serde_json::Value {
+        serde_json::json!({"valid": true, "diagnostics": []})
+    }
+
+    /// What replaying the last 24 hours under the edit came to.
+    fn replayed(state: &mut State) {
+        let replay = state.next_check().expect("the replay");
+        assert_eq!(replay.name, "preview");
+        let request = |model: &str, ts: i64| {
+            serde_json::json!({
+                "request_id": ts, "ts_ms": ts, "request": {"model": model},
+                "under_active": {"outcome": "selected", "route_id": "claude-sub",
+                    "matched": {"kind": "default", "scope": "protocol", "id": null}},
+                "under_edit": {"outcome": "selected", "route_id": "openrouter-messages",
+                    "matched": {"kind": "rewrite", "scope": "protocol", "id": "new-rewrite"}},
+            })
+        };
+        answer(
+            state,
+            replay,
+            200,
+            serde_json::json!({
+                "replayed": 5, "unreplayable": 2, "truncated": false, "changed_total": 3,
+                "window": {"since_ms": 0, "until_ms": 86_400_000},
+                "changed": [
+                    request("claude-sonnet-5", 86_340_000),
+                    request("claude-opus-5", 85_800_000),
+                    request("claude-haiku-4-5", 82_000_000),
+                ],
+            }),
+        );
+    }
+
+    /// A new rewrite under the second rule of the messages protocol, with
+    /// the daemon's answer on it.
+    fn adding_a_rewrite(answer_with: serde_json::Value) -> State {
+        let mut state = page(World::AT_REST, Tab::Rewrites);
+        state.move_selection(1);
+        send(&mut state, KeyCode::Char('n'));
+        checked(&mut state, answer_with);
         state
     }
 
     #[test]
-    fn the_route_form() {
-        let mut state = page_in(super::View::Routes);
-        press_in(&mut state, crossterm::event::KeyCode::Char('e'));
-        insta::assert_snapshot!(frame(&state));
+    fn a_rewrite_being_added_opens_under_its_row_with_the_recent_traffic_under_it() {
+        let mut state = adding_a_rewrite(fine());
+        replayed(&mut state);
+        let text = frame(&state, 120, 50);
+        insta::assert_snapshot!(text);
+        assert!(text.contains("editing · rev 9 live"), "{text}");
+        assert!(text.contains("[ctrl+s] save   [esc] cancel"), "{text}");
+        assert!(
+            text.contains("3 of 5 recent requests would change route"),
+            "{text}"
+        );
+        assert!(text.contains("2 requests could not be replayed"), "{text}");
     }
 
     #[test]
-    fn the_route_form_scrolled_to_a_later_field() {
-        let mut state = page_in(super::View::Routes);
-        press_in(&mut state, crossterm::event::KeyCode::Char('e'));
-        for _ in 0..24 {
-            press_in(&mut state, crossterm::event::KeyCode::Down);
-        }
-        insta::assert_snapshot!(frame(&state));
+    fn a_refusal_is_said_in_red_beside_the_field_with_its_fix() {
+        let index = 14;
+        let mut state = adding_a_rewrite(serde_json::json!({
+            "valid": false,
+            "diagnostics": [{
+                "code": "capture-binding-not-regex", "severity": "error",
+                "record_id": "new-rewrite", "path": format!("/rewrites/{index}/target"),
+                "sentence": "The route takes a capture from the match, and this match is not a regular expression.",
+                "fix": "Match with a regular expression, or give the route the requested model instead.",
+            }],
+        }));
+        let text = frame(&state, 120, 50);
+        insta::assert_snapshot!(text);
+        assert!(text.contains("[ctrl+s] fix route to save"), "{text}");
+        // The refusal is red: it is the one thing on the page that is.
+        let mut terminal = Terminal::new(TestBackend::new(120, 50)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &state, false);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let red = buffer
+            .content
+            .iter()
+            .filter(|cell| cell.fg == ratatui::style::Color::Red)
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(red.contains("The route takes a capture"), "{red}");
+        assert!(red.contains("Match with a regular expression"), "{red}");
+        // And nothing about it blocks reading the rest.
+        send(&mut state, KeyCode::Esc);
     }
 
     #[test]
-    fn the_presentation_form() {
-        insta::assert_snapshot!(frame(&adding(super::View::Presentations, '1')));
+    fn a_warning_is_beside_the_field_and_the_save_stays_open() {
+        let mut state = page(World::AT_REST, Tab::Routes);
+        send(&mut state, KeyCode::Enter);
+        send(&mut state, KeyCode::Char('n'));
+        let (index, steps) = {
+            let route = state.document_route_for_tests();
+            (route.0, route.1)
+        };
+        checked(
+            &mut state,
+            serde_json::json!({"valid": true, "diagnostics": [{
+                "code": "binding-unconfigured", "severity": "warning", "record_id": "claude-sub",
+                "path": format!("/routes/{index}/chain/steps/{steps}/candidate/binding_id"),
+                "sentence": "The provider is off: the candidate is skipped until it is on.",
+                "fix": "Turn the provider on, or leave it.",
+            }]}),
+        );
+        replayed(&mut state);
+        let text = frame(&state, 120, 50);
+        insta::assert_snapshot!(text);
+        assert!(text.contains("[ctrl+s] save"), "{text}");
     }
 
     #[test]
-    fn the_default_form() {
-        insta::assert_snapshot!(frame(&adding(super::View::Routes, '2')));
+    fn a_save_moved_past_names_the_live_revision_in_the_form() {
+        let mut state = adding_a_rewrite(fine());
+        state.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let mut save = Command::snapshot("routing-snapshot");
+        save.name = "save";
+        answer(
+            &mut state,
+            save,
+            409,
+            serde_json::json!({"error": "stale_revision", "live_revision_id": 12}),
+        );
+        let text = frame(&state, 120, 50);
+        insta::assert_snapshot!(text);
+        assert!(
+            text.contains("revision 12 is now live; your edit is kept as you entered it"),
+            "{text}"
+        );
+        assert!(text.contains("[ctrl+s] save onto rev 12"), "{text}");
     }
 
     #[test]
-    fn the_rewrite_form() {
-        insta::assert_snapshot!(frame(&adding(super::View::Rewrites, '1')));
-    }
-
-    #[test]
-    fn the_classifier_form() {
-        insta::assert_snapshot!(frame(&adding(super::View::Rewrites, '2')));
-    }
-
-    #[test]
-    fn the_upgrade_form() {
-        insta::assert_snapshot!(frame(&adding(super::View::Rewrites, '3')));
-    }
-
-    #[test]
-    fn the_compaction_form() {
-        insta::assert_snapshot!(frame(&adding(super::View::Rewrites, '4')));
-    }
-
-    /// A preview that asked for server safeguards puts each candidate's
-    /// support above the raw result; one that did not leaves it as it was.
-    #[test]
-    fn a_preview_that_asked_summarises_server_safeguards() {
-        let body = serde_json::json!({"toker": "routing-preview", "ok": true, "result": {
-            "outcome": "selected",
-            "route_id": "mixed",
-            "server_safeguards": {"asked": true, "effective": "supported", "marked": true,
-                                  "skipped_candidate": true, "walked_again": false},
-            "trace": [
-                {"kind": "candidate", "candidate_id": "sub", "binding_id": "codex_sub.codex_responses",
-                 "server_safeguards": "unsupported", "result": {"Err": "LacksServerSafeguards"}},
-                {"kind": "candidate", "candidate_id": "api", "binding_id": "anthropic_api.anthropic_messages",
-                 "server_safeguards": "supported", "result": {"Ok": null}},
-            ],
-        }});
-        let mut asked = page_in(super::View::Status);
-        let mut command = Command::snapshot("routing-snapshot");
-        command.name = "preview";
-        command.body = Some(serde_json::json!({"asks_server_safeguards": true}));
-        asked.receive(Reply::Command(
-            command,
-            Ok(Response {
-                status: 200,
-                body: body.clone(),
+    fn a_removal_the_rest_of_the_policy_refuses_names_the_records() {
+        let mut state = page(World::AT_REST, Tab::Routes);
+        send(&mut state, KeyCode::Char('d'));
+        checked(
+            &mut state,
+            serde_json::json!({
+                "valid": false,
+                "diagnostics": [
+                    {"code": "missing-route", "severity": "error", "record_id": "anthropic-messages-1",
+                     "path": "/rewrites/0/target/route_id",
+                     "sentence": "The route it sends to is not in the policy.",
+                     "fix": "Send it to another route, or remove it too."},
+                    {"code": "missing-route", "severity": "error", "record_id": "anthropic-messages-2",
+                     "path": "/rewrites/1/target/route_id",
+                     "sentence": "The route it sends to is not in the policy.",
+                     "fix": "Send it to another route, or remove it too."},
+                ],
             }),
-        ));
-        insta::assert_snapshot!("a_preview_that_asked", frame(&asked));
-
-        let mut plain = page_in(super::View::Status);
-        let mut command = Command::snapshot("routing-snapshot");
-        command.name = "preview";
-        command.body = Some(serde_json::json!({}));
-        plain.receive(Reply::Command(command, Ok(Response { status: 200, body })));
-        assert!(!frame(&plain).contains("SERVER SAFEGUARDS"));
+        );
+        let text = frame(&state, 120, 40);
+        insta::assert_snapshot!(text);
+        assert!(text.contains("rewrite anthropic-messages-1"), "{text}");
+        assert!(text.contains("rewrite anthropic-messages-2"), "{text}");
+        assert!(text.contains("[ctrl+s] fix 2 records to save"), "{text}");
     }
 
     #[test]
-    fn the_promotion_and_preview_forms() {
-        let mut state = page_in(super::View::Status);
-        press_in(&mut state, crossterm::event::KeyCode::Char('p'));
-        insta::assert_snapshot!("the_promotion_form", frame(&state));
-        press_in(&mut state, crossterm::event::KeyCode::Esc);
-        press_in(&mut state, crossterm::event::KeyCode::Char('v'));
-        insta::assert_snapshot!("the_preview_form", frame(&state));
+    fn a_rewrite_being_moved_is_shown_where_it_would_land() {
+        let mut state = page(World::AT_REST, Tab::Rewrites);
+        state.move_selection(1);
+        send(&mut state, KeyCode::Char('m'));
+        send(&mut state, KeyCode::Down);
+        checked(&mut state, fine());
+        let text = frame(&state, 120, 40);
+        insta::assert_snapshot!(text);
+        assert!(text.contains("rule 2 → 3 of 5"), "{text}");
     }
 
     #[test]
-    fn a_form_with_completions_and_a_refusal() {
-        let mut state = page_in(super::View::Rewrites);
-        press_in(&mut state, crossterm::event::KeyCode::Char('n'));
-        press_in(&mut state, crossterm::event::KeyCode::Char('2'));
-        // The classifier's binding, searched for.
-        press_in(&mut state, crossterm::event::KeyCode::Down);
-        for _ in 0..40 {
-            press_in(&mut state, crossterm::event::KeyCode::Backspace);
-        }
-        for character in "codex".chars() {
-            press_in(&mut state, crossterm::event::KeyCode::Char(character));
-        }
+    fn a_fallback_added_to_a_route_is_a_form_among_its_candidates() {
+        let mut state = page(World::AT_REST, Tab::Routes);
+        send(&mut state, KeyCode::Enter);
+        send(&mut state, KeyCode::Char('n'));
+        checked(&mut state, fine());
+        replayed(&mut state);
+        let text = frame(&state, 120, 50);
+        insta::assert_snapshot!(text);
+        assert!(text.contains("add a fallback to claude-sub"), "{text}");
+    }
+
+    #[test]
+    fn a_candidate_being_reordered_is_shown_in_its_new_place() {
+        let mut state = page(World::AT_REST, Tab::Routes);
+        send(&mut state, KeyCode::Enter);
+        send(&mut state, KeyCode::Char('m'));
+        send(&mut state, KeyCode::Down);
+        checked(&mut state, fine());
+        let text = frame(&state, 120, 50);
+        insta::assert_snapshot!(text);
+        assert!(text.contains("candidate 1 → 2 of 2"), "{text}");
+    }
+
+    /// A refresh can leave the route with fewer candidates than the one the
+    /// page had selected; the selection follows it in rather than editing an
+    /// edge that is no longer there.
+    #[test]
+    fn a_refresh_that_shortens_the_open_route_keeps_the_selected_candidate_in_it() {
+        let mut state = page(World::AT_REST, Tab::Routes);
+        send(&mut state, KeyCode::Enter);
+        state.move_selection(1);
+        assert_eq!(state.candidate(), 1);
+        let mut snapshot = testing::snapshot(World::AT_REST);
+        snapshot["derived"]["active"]["routes"][0]["candidates"]
+            .as_array_mut()
+            .expect("the route's candidates")
+            .truncate(1);
         let mut command = Command::snapshot("routing-snapshot");
-        command.name = "draft-edit";
+        command.name = "snapshot";
         state.receive(Reply::Command(
             command,
             Ok(Response {
-                status: 422,
-                body: serde_json::json!({"error": "invalid_policy_edit", "detail": "id already exists"}),
+                status: 200,
+                body: snapshot,
             }),
         ));
-        insta::assert_snapshot!(frame(&state));
+        assert_eq!(state.candidate(), 0);
     }
 
     /// A click on a form line focuses that field, and a click on a line that
     /// is only a heading or a completion focuses nothing.
     #[test]
     fn a_click_focuses_the_field_on_its_line() {
-        let mut state = adding(super::View::Presentations, '1');
-        let mut terminal = Terminal::new(TestBackend::new(120, 32)).expect("terminal");
-        let mut hit = None;
-        terminal
-            .draw(|frame| hit = render(frame, &state, false).form)
-            .expect("draw");
-        let hit = hit.expect("a form is open");
-        let lines = frame(&state);
-        let rows: Vec<&str> = lines.lines().skip(usize::from(hit.body.y)).collect();
+        let mut state = page(World::AT_REST, Tab::Presentations);
+        send(&mut state, KeyCode::Char('n'));
+        let (text, drawn) = drawn_at(&state, 120, 50);
+        let hit = drawn.form.expect("a form is open");
+        let lines: Vec<&str> = text.lines().collect();
         let on = |needle: &str| {
-            rows.iter()
+            lines
+                .iter()
                 .position(|line| line.contains(needle))
-                .unwrap_or_else(|| panic!("no line with {needle:?}"))
+                .unwrap_or_else(|| panic!("no line with {needle:?}: {text}"))
         };
-        let slug = hit.rows[on("slug:")].expect("the slug line is a field");
-        assert!(hit.rows[on("SCOPE")].is_none(), "a heading is not a field");
+        let at = |y: usize| {
+            hit.fields
+                .iter()
+                .find(|(area, _)| usize::from(area.y) == y)
+                .map(|(_, row)| *row)
+        };
+        let slug = at(on("slug:")).expect("the slug line is a field");
+        assert!(at(on("SCOPE")).is_none(), "a heading is not a field");
         state.focus_form_row(slug);
-        let focused: Vec<String> = match state.modal() {
-            super::Modal::Form(form) => form
-                .lines()
-                .into_iter()
-                .filter(|line| line.focused)
-                .map(|line| line.text)
-                .collect(),
-            _ => panic!("a form is open"),
-        };
+        let focused: Vec<String> = state
+            .editing()
+            .expect("editing")
+            .form
+            .lines()
+            .into_iter()
+            .filter(|line| line.focused)
+            .map(|line| line.text)
+            .collect();
         assert_eq!(focused.len(), 1);
         assert!(focused[0].contains("slug"), "{focused:?}");
     }
 
+    /// An edit draws in any room a terminal can be.
     #[test]
-    fn clicking_an_entry_selects_it_and_the_list_scrolls_to_the_selection() {
-        let mut state = page_in(super::View::Status);
-        state.select(2);
-        assert_eq!(state.selected(), 2);
-        // Out of range is ignored rather than clamped to a different entry.
-        state.select(99);
-        assert_eq!(state.selected(), 2);
-        // A short list keeps the selection in view, and a click on a row
-        // names the entry drawn there rather than one counted from the top.
-        let mut terminal = Terminal::new(TestBackend::new(120, 8)).expect("terminal");
-        let mut drawn = super::Drawn::default();
-        state.select(5);
-        terminal
-            .draw(|frame| drawn = render(frame, &state, false))
-            .expect("draw");
-        let selected = drawn
-            .rows
-            .iter()
-            .find(|hit| hit.entry == 5)
-            .expect("row 5 is drawn in an 8-line terminal");
-        assert!(
-            drawn.rows[0].entry > 0,
-            "the list scrolled to reach row 5: {:?}",
-            drawn.rows
-        );
-        state.select(0);
-        assert_eq!(
-            crate::tui::chrome::entry_at(&drawn.rows, selected.area.as_position()),
-            Some(5)
-        );
+    fn every_edit_draws_in_any_size() {
+        let edits: [(Tab, &[char]); 6] = [
+            (Tab::Rewrites, &['n']),
+            (Tab::Rewrites, &['e']),
+            (Tab::Rewrites, &['m']),
+            (Tab::Presentations, &['d']),
+            (Tab::Models, &['e']),
+            (Tab::Defaults, &['n']),
+        ];
+        for (tab, keys) in edits {
+            let mut state = page(World::FULL, tab);
+            for key in keys {
+                send(&mut state, KeyCode::Char(*key));
+            }
+            // A move that has not moved has nothing to check.
+            if let Some(check) = state.next_check() {
+                answer(&mut state, check, 200, fine());
+            }
+            for width in [1, 2, 8, 20, 50, 80, 135] {
+                for height in [1, 2, 3, 5, 8, 12, 24, 50] {
+                    drawn_at(&state, width, height);
+                }
+            }
+        }
+        let mut state = page(World::FULL, Tab::Routes);
+        send(&mut state, KeyCode::Enter);
+        for key in ['n', 'e', 'd', 'm'] {
+            send(&mut state, KeyCode::Char(key));
+            for width in [1, 20, 80, 135] {
+                for height in [1, 3, 12, 24, 50] {
+                    drawn_at(&state, width, height);
+                }
+            }
+            send(&mut state, KeyCode::Esc);
+        }
     }
 }

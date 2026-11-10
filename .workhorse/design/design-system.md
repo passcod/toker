@@ -65,9 +65,9 @@ A meter over 95%, or one whose verdict is `spent` or `out ~T`. A hit rate under 
 **Cyan — identity rather than judgement.**
 A session's working directory in its label, and the context occupancy bar at a share that is not yet a concern. Cyan never means good or bad; it distinguishes.
 
-**Blue — one use only.** The `⇄` page-switch chip in the header.
+**Blue — one use only.** The current page's button in the header.
 
-**DarkGray — chrome that is not content.** The `?` chip that opens a page's overlay.
+**DarkGray — chrome that is not content.** The `?` chip that opens a page's overlay, and the buttons for the other pages.
 
 **Plain (`Reset`) — everything else**, which is most of the screen: labels, counts, names, the fields in a detail popup.
 
@@ -186,7 +186,7 @@ A page with one framing for several panels picks it once: boxed only while no pa
 **A page with views carries a numbered tab strip** in its header, after the chips: ` 1 providers  2 settings`.
 Tabs are lower case and two spaces apart, the current one bold and reversed, the others dim, and every tab is clickable.
 When the strip does not fit, the other tabs collapse to their number first, then the current label clips with `…`.
-A page status on the right of the header, such as routing's `draft 4 · working`, clips only once the tabs have collapsed.
+A page status on the right of the header, such as routing's `rev 10 live · 2 lanes on rev 9`, clips only once the tabs have collapsed.
 
 **A page's message sits under the header**, in red, wrapped across as many rows as it takes, and the page stays standing beneath it.
 It says what went wrong with the last thing the page tried: a refused value, a failed read.
@@ -195,9 +195,10 @@ It says what went wrong with the last thing the page tried: a refused value, a f
 It is as wide as its widest line within a floor and a ceiling, never wider than the frame.
 Overlays are exclusive: opening one closes the other.
 
-**The header carries its chips at the far left**, reversed: a `?` for the legend, then a `⇄` for the page switch.
-Every page draws the same chips: the `?` is three cells and `DarkGray`, the `⇄` is a single `Blue` cell in the gutter beside it, and the `⇄` disappears below 80 columns where the header needs every cell and `Tab` is the way across.
-`⇄` and `Tab` both go to the next page, on every page.
+**The header carries its chips at the far left**, reversed: a `?` for the legend, then a button for each page, `dashboard`, `routing`, `config` and `accounts`, in the order `Tab` cycles them.
+Every chip is its label padded a cell each side and set a cell apart from the next: the `?` and the other pages' buttons in `DarkGray`, the current page's in bold `Blue`.
+The buttons keep their full labels at every width; a page's own tabs give way before them, first dropping their counts, then scrolling to keep the current tab with as many neighbours as fit, marked `‹` and `›` where tabs are hidden.
+Clicking a button goes to that page, and `Tab` goes to the next one, on every page.
 On a one-row terminal the `?` survives even when the header has given its row away, because it is the way out to the legend at any size.
 
 ## Layout and shedding

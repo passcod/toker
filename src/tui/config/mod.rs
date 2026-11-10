@@ -4,7 +4,15 @@
 //! this page is a view of what the service says plus the requests that
 //! change it (spec: UTUI#the-configuration-pages).
 
+mod check;
+mod form;
 mod model;
+mod providers;
+mod settings;
+#[cfg(test)]
+mod testing;
+#[cfg(test)]
+mod tests;
 mod view;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -18,7 +26,7 @@ use model::State;
 pub(super) fn owns_key(code: KeyCode) -> bool {
     matches!(
         code,
-        KeyCode::Char('e' | 'c' | ' ' | '1' | '2' | 'h' | 'j' | 'k' | 'l')
+        KeyCode::Char('e' | 'c' | 'u' | 'f' | 'v' | 'p' | ' ' | '1' | '2' | 'h' | 'j' | 'k' | 'l')
             | KeyCode::Up
             | KeyCode::Down
             | KeyCode::Left
@@ -30,6 +38,9 @@ pub(super) fn owns_key(code: KeyCode) -> bool {
 
 pub(super) struct Page {
     client: Client,
+    /// The routing snapshot's reader, for what in routing depends on each
+    /// provider (spec: UTUI#providers).
+    routing: Client,
     state: State,
     drawn: std::cell::RefCell<view::Drawn>,
 }
@@ -38,6 +49,7 @@ impl Page {
     pub(super) fn new(port: u16) -> Page {
         let mut page = Page {
             client: Client::new(port, "config", "config-snapshot"),
+            routing: Client::new(port, "routing", "routing-snapshot"),
             state: State::default(),
             drawn: Default::default(),
         };
@@ -49,6 +61,16 @@ impl Page {
         if !self.client.refresh() {
             self.state.command_refused("snapshot");
         }
+        // A read that cannot be queued leaves what is known as it was: the
+        // dependents are marked unread by the reply, not by a full queue.
+        let _ = self.routing.refresh();
+    }
+
+    /// Arrive at the page: read it again, and open on the provider that
+    /// needs attention (spec: UTUI#providers).
+    pub(super) fn arrive(&mut self) {
+        self.state.reopen();
+        self.refresh();
     }
 
     pub(super) fn poll(&mut self) {
@@ -57,6 +79,14 @@ impl Page {
                 self.send(next);
             }
         }
+        while let Some(reply) = self.routing.poll() {
+            self.state.receive_routing(reply);
+        }
+    }
+
+    /// The route the operator asked to be taken to on the routing page.
+    pub(super) fn take_goto(&mut self) -> Option<String> {
+        self.state.take_goto()
     }
 
     /// Handle a key owned by this page. Returns whether a text entry was

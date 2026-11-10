@@ -2,7 +2,7 @@
 source: src/tui/view.rs
 expression: "rows.join(\"\\n\")"
 ---
- ? ⇄last 30m · 1 session · 1 idle · 8 requests                                                                                                                               last req no data · 12:34:56
+ ?   dashboard   routing   config   accounts  last 30m · 1 session · 1 idle · 8 requests                                                                                     last req no data · 12:34:56
 ┌SESSIONS──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │session                                                                                                                                                 ctx model reqs prompt now peak msgs ↺ out idle│
 │-                                                                                                                                                         ? ?        8          ?    ?    - -   ?   5m│

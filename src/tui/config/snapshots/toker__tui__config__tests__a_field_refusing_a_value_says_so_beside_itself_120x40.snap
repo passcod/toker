@@ -1,0 +1,30 @@
+---
+source: src/tui/config/tests.rs
+expression: "frame(&state, 120, 40, false)"
+---
+ ?   dashboard   routing   config   accounts   1 providers 5 · 2 settings                       editing · 2 providers on
+┌SETTINGS──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│   setting               value                                                                                        │
+│ ┌─ gates  5 ──────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│ │ quota gate            on                                                                                           │
+│ │ cold gate             on                                                                                           │
+│ │ cold outlook          on                                                                                           │
+│ │ cold min tokens       175k                                                                                         │
+│ │     ┌ tokens          2M▏           more than any configured model's context, 1M: use 1M or less                   │
+│ │     └ [ctrl+s] fix value to save   [esc] cancel                                                                    │
+│ │ cold idle minutes     follows lane TTL                                                                             │
+│ ┌─ session  4 ────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│ │ session headers       x-toker-session · x-claude-code-session-id · x-session-id                                    │
+│ │ ping header           x-toker-ping                                                                                 │
+│ │ idle-sleep lock       on                                                                                           │
+│ │ transcript roots      none                                                                                         │
+│ ┌─ notices  5 ────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│ │ default notice style  gfm  built-in                                                                                │
+│ │ claude                block  built-in                                                                              │
+│ │ opencode              gfm  follows default                                                                         │
+│ │ codex                 gfm  follows default                                                                         │
+│ │ workhorse             toker  built-in                                                                              │
+│ ┌─ fixed here  2 ─────────────────────────────────────────────────────────────────────────────────────────────────── │
+│ │ listener port         18123                                       set by toker setup                               │
+│ │ store                 /home/example/.local/share/toker/toker.db   set in toker.toml                                │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

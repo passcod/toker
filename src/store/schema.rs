@@ -1044,6 +1044,352 @@ pub(super) const MIGRATIONS: &[&str] = &[
         SELECT RAISE(ABORT, 'invalid request attempt reason');
     END;
     "#,
+    // v22 — a revision may be recorded as a `save` (spec: RREV#saving-an-edit).
+    // The source CHECK cannot be widened in place, so this rebuilds the parent
+    // and the two tables that reference it, as v9 did, with the triggers that
+    // name it dropped first and recreated after. Existing revisions keep their
+    // source: those written as `draft` stay `draft`. The draft columns of the
+    // state row stay in the schema, since migrations are append-only, but
+    // nothing reads or writes them any more.
+    r#"
+    PRAGMA defer_foreign_keys = ON;
+
+    DROP TRIGGER lanes_pin_insert_check;
+    DROP TRIGGER lanes_pin_update_check;
+    DROP TRIGGER requests_policy_revision_check;
+
+    CREATE TABLE routing_policy_revisions_new (
+        revision_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_ms               INTEGER NOT NULL,
+        activated_ms             INTEGER NOT NULL,
+        description              TEXT,
+        activation_scope         TEXT NOT NULL CHECK (
+            activation_scope IN ('new_lanes', 'new_and_cold_lanes', 'immediate')
+        ),
+        forced_cache_transition  INTEGER NOT NULL CHECK (
+            forced_cache_transition IN (0, 1)
+        ),
+        source                   TEXT NOT NULL CHECK (
+            source IN ('legacy', 'draft', 'reactivation', 'save')
+        ),
+        parent_revision_id       INTEGER REFERENCES routing_policy_revisions_new(revision_id),
+        document_json            TEXT NOT NULL CHECK (json_valid(document_json)),
+        fingerprint              TEXT NOT NULL CHECK (
+            length(fingerprint) = 64
+            AND fingerprint NOT GLOB '*[^0-9a-f]*'
+        ),
+        compiler_origin          TEXT NOT NULL DEFAULT 'authored' CHECK (
+            compiler_origin IN ('authored', 'generated_revision_one')
+        )
+    );
+    INSERT INTO routing_policy_revisions_new
+        (revision_id, created_ms, activated_ms, description, activation_scope,
+         forced_cache_transition, source, parent_revision_id, document_json,
+         fingerprint, compiler_origin)
+    SELECT revision_id, created_ms, activated_ms, description, activation_scope,
+           forced_cache_transition, source, parent_revision_id, document_json,
+           fingerprint, compiler_origin
+    FROM routing_policy_revisions;
+
+    CREATE TABLE routing_policy_state_new (
+        id                       INTEGER PRIMARY KEY CHECK (id = 1),
+        active_revision_id       INTEGER REFERENCES routing_policy_revisions_new(revision_id),
+        draft_generation         INTEGER NOT NULL DEFAULT 0 CHECK (draft_generation >= 0),
+        draft_base_revision_id   INTEGER REFERENCES routing_policy_revisions_new(revision_id),
+        draft_document_json      TEXT CHECK (
+            draft_document_json IS NULL OR json_valid(draft_document_json)
+        ),
+        draft_fingerprint        TEXT CHECK (
+            draft_fingerprint IS NULL OR (
+                length(draft_fingerprint) = 64
+                AND draft_fingerprint NOT GLOB '*[^0-9a-f]*'
+            )
+        ),
+        draft_updated_ms         INTEGER,
+        legacy_imported_ms       INTEGER,
+        CHECK (
+            (draft_base_revision_id IS NULL
+             AND draft_document_json IS NULL
+             AND draft_fingerprint IS NULL
+             AND draft_updated_ms IS NULL)
+            OR
+            (draft_base_revision_id IS NOT NULL
+             AND draft_document_json IS NOT NULL
+             AND draft_fingerprint IS NOT NULL
+             AND draft_updated_ms IS NOT NULL)
+        )
+    );
+    INSERT INTO routing_policy_state_new
+        (id, active_revision_id, draft_generation, draft_base_revision_id,
+         draft_document_json, draft_fingerprint, draft_updated_ms, legacy_imported_ms)
+    SELECT id, active_revision_id, draft_generation, draft_base_revision_id,
+           draft_document_json, draft_fingerprint, draft_updated_ms, legacy_imported_ms
+    FROM routing_policy_state;
+
+    CREATE TABLE routing_publications_new (
+        scope_key                    TEXT NOT NULL,
+        adapter                      TEXT NOT NULL,
+        desired_revision_id          INTEGER NOT NULL
+            REFERENCES routing_policy_revisions_new(revision_id),
+        applied_revision_id          INTEGER
+            REFERENCES routing_policy_revisions_new(revision_id),
+        desired_inventory_generation INTEGER NOT NULL CHECK (
+            desired_inventory_generation >= 0
+        ),
+        applied_inventory_generation INTEGER CHECK (
+            applied_inventory_generation >= 0
+        ),
+        state                        TEXT NOT NULL CHECK (
+            state IN ('pending', 'applied', 'failed', 'unsupported')
+        ),
+        detail_code                  TEXT,
+        updated_ms                   INTEGER NOT NULL,
+        applied_identities_json      TEXT CHECK (
+            applied_identities_json IS NULL OR (
+                applied_revision_id IS NOT NULL
+                AND json_valid(applied_identities_json)
+                AND json_type(applied_identities_json) = 'array'
+                AND json_array_length(applied_identities_json) <= 1024
+            )
+        ),
+        PRIMARY KEY (scope_key, adapter),
+        CHECK (
+            (applied_revision_id IS NULL
+             AND applied_inventory_generation IS NULL)
+            OR
+            (applied_revision_id IS NOT NULL
+             AND applied_inventory_generation IS NOT NULL)
+        ),
+        CHECK (
+            state != 'applied'
+            OR (applied_revision_id = desired_revision_id
+                AND applied_inventory_generation = desired_inventory_generation)
+        )
+    );
+    INSERT INTO routing_publications_new
+        (scope_key, adapter, desired_revision_id, applied_revision_id,
+         desired_inventory_generation, applied_inventory_generation, state,
+         detail_code, updated_ms, applied_identities_json)
+    SELECT scope_key, adapter, desired_revision_id, applied_revision_id,
+           desired_inventory_generation, applied_inventory_generation, state,
+           detail_code, updated_ms, applied_identities_json
+    FROM routing_publications;
+
+    DROP TABLE routing_policy_state;
+    DROP TABLE routing_publications;
+    DROP TABLE routing_policy_revisions;
+    ALTER TABLE routing_policy_revisions_new RENAME TO routing_policy_revisions;
+    ALTER TABLE routing_policy_state_new RENAME TO routing_policy_state;
+    ALTER TABLE routing_publications_new RENAME TO routing_publications;
+
+    CREATE INDEX routing_policy_revisions_activated_idx
+        ON routing_policy_revisions (activated_ms);
+    CREATE INDEX routing_policy_revisions_parent_idx
+        ON routing_policy_revisions (parent_revision_id);
+    CREATE INDEX routing_policy_revisions_fingerprint_idx
+        ON routing_policy_revisions (fingerprint);
+    CREATE INDEX routing_publications_desired_revision_idx
+        ON routing_publications (desired_revision_id);
+    CREATE INDEX routing_publications_state_idx
+        ON routing_publications (state);
+
+    CREATE TRIGGER lanes_pin_insert_check
+    BEFORE INSERT ON lanes
+    WHEN NOT (
+        (NEW.policy_revision_id IS NULL
+         AND NEW.policy_route_id IS NULL
+         AND NEW.route_fingerprint IS NULL
+         AND NEW.candidate_id IS NULL
+         AND NEW.binding_id IS NULL
+         AND NEW.baseline_model IS NULL
+         AND NEW.effective_model IS NULL)
+        OR
+        (NEW.policy_revision_id IS NOT NULL
+         AND NEW.policy_route_id IS NOT NULL
+         AND NEW.route_fingerprint IS NOT NULL
+         AND NEW.candidate_id IS NOT NULL
+         AND NEW.binding_id IS NOT NULL
+         AND NEW.baseline_model IS NOT NULL
+         AND NEW.effective_model IS NOT NULL
+         AND EXISTS (
+             SELECT 1 FROM routing_policy_revisions
+             WHERE revision_id = NEW.policy_revision_id
+         ))
+    ) BEGIN
+        SELECT RAISE(ABORT, 'invalid lane pin');
+    END;
+    CREATE TRIGGER lanes_pin_update_check
+    BEFORE UPDATE OF policy_revision_id, policy_route_id, route_fingerprint,
+                     candidate_id, binding_id, baseline_model, effective_model
+    ON lanes
+    WHEN NOT (
+        (NEW.policy_revision_id IS NULL
+         AND NEW.policy_route_id IS NULL
+         AND NEW.route_fingerprint IS NULL
+         AND NEW.candidate_id IS NULL
+         AND NEW.binding_id IS NULL
+         AND NEW.baseline_model IS NULL
+         AND NEW.effective_model IS NULL)
+        OR
+        (NEW.policy_revision_id IS NOT NULL
+         AND NEW.policy_route_id IS NOT NULL
+         AND NEW.route_fingerprint IS NOT NULL
+         AND NEW.candidate_id IS NOT NULL
+         AND NEW.binding_id IS NOT NULL
+         AND NEW.baseline_model IS NOT NULL
+         AND NEW.effective_model IS NOT NULL
+         AND EXISTS (
+             SELECT 1 FROM routing_policy_revisions
+             WHERE revision_id = NEW.policy_revision_id
+         ))
+    ) BEGIN
+        SELECT RAISE(ABORT, 'invalid lane pin');
+    END;
+
+    CREATE TRIGGER requests_policy_revision_check
+    BEFORE INSERT ON requests
+    WHEN NEW.policy_revision_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM routing_policy_revisions
+        WHERE revision_id = NEW.policy_revision_id
+    ) BEGIN
+        SELECT RAISE(ABORT, 'invalid request policy revision');
+    END;
+    "#,
+    // v23 — widening an activation's scope after the fact (spec:
+    // RREV#widening-an-activation). A revision is never edited, so the
+    // widened scope, the consent given with it and when lie on the state row,
+    // and the next activation clears them. NULL means the revision's own
+    // scope stands.
+    r#"
+    ALTER TABLE routing_policy_state ADD COLUMN widened_scope TEXT
+        CHECK (widened_scope IN ('new_and_cold_lanes', 'immediate'));
+    ALTER TABLE routing_policy_state ADD COLUMN widened_forced_cache_transition INTEGER
+        CHECK (widened_forced_cache_transition IN (0, 1));
+    ALTER TABLE routing_policy_state ADD COLUMN widened_ms INTEGER;
+    "#,
+    // v24 — the resolver's facts and the lookup that matched, on every
+    // policy-routed row (spec: RPROV). `facts_recorded` is the marker: it is
+    // 1 on a row that carries the facts and NULL on every row written before,
+    // which therefore read as lacking them (not replayable; a hit count over
+    // them is a floor) rather than as rows whose facts were all absent. A
+    // fact that is itself absent, such as no requested model, is NULL beside
+    // the marker. Nothing here holds a prompt, a body or a header value; the
+    // capabilities are a JSON object of booleans.
+    //
+    // The protocol, requested model and the safeguards ask are repeated here
+    // although other columns say something like them: those are written per
+    // row kind with their own rules (a route-unavailable row records no ask,
+    // `frontend` is a wire label, not the resolver's protocol), and a replay
+    // must read exactly what the resolver was given.
+    //
+    // `requests_ts_ms_idx` (v1) already serves a 24-hour window.
+    r#"
+    ALTER TABLE requests ADD COLUMN facts_recorded INTEGER
+        CHECK (facts_recorded IN (1));
+    ALTER TABLE requests ADD COLUMN facts_profile TEXT;
+    ALTER TABLE requests ADD COLUMN facts_protocol TEXT
+        CHECK (facts_protocol IN ('anthropic_messages', 'openai_chat', 'openai_responses'));
+    ALTER TABLE requests ADD COLUMN facts_requested_model TEXT;
+    ALTER TABLE requests ADD COLUMN facts_prompt_bound INTEGER
+        CHECK (facts_prompt_bound >= 0);
+    ALTER TABLE requests ADD COLUMN facts_message_count INTEGER
+        CHECK (facts_message_count >= 0);
+    ALTER TABLE requests ADD COLUMN facts_tool_count INTEGER
+        CHECK (facts_tool_count >= 0);
+    ALTER TABLE requests ADD COLUMN facts_capabilities TEXT
+        CHECK (facts_capabilities IS NULL OR json_valid(facts_capabilities));
+    ALTER TABLE requests ADD COLUMN facts_asks_safeguards INTEGER
+        CHECK (facts_asks_safeguards IN (0, 1));
+    ALTER TABLE requests ADD COLUMN facts_binding_affinity TEXT;
+    ALTER TABLE requests ADD COLUMN facts_class TEXT
+        CHECK (facts_class IN ('inference', 'compaction'));
+    ALTER TABLE requests ADD COLUMN lookup_kind TEXT
+        CHECK (lookup_kind IN ('presentation', 'rewrite', 'default', 'compaction'));
+    ALTER TABLE requests ADD COLUMN lookup_scope TEXT
+        CHECK (lookup_scope IN ('profile', 'protocol'));
+
+    CREATE TRIGGER requests_facts_shape_check
+    BEFORE INSERT ON requests
+    WHEN (NEW.facts_recorded IS NULL AND (
+              NEW.facts_profile IS NOT NULL OR NEW.facts_protocol IS NOT NULL
+              OR NEW.facts_requested_model IS NOT NULL
+              OR NEW.facts_prompt_bound IS NOT NULL
+              OR NEW.facts_message_count IS NOT NULL
+              OR NEW.facts_tool_count IS NOT NULL
+              OR NEW.facts_capabilities IS NOT NULL
+              OR NEW.facts_asks_safeguards IS NOT NULL
+              OR NEW.facts_binding_affinity IS NOT NULL
+              OR NEW.facts_class IS NOT NULL
+              OR NEW.lookup_kind IS NOT NULL OR NEW.lookup_scope IS NOT NULL
+          ))
+       OR (NEW.facts_recorded IS NOT NULL AND (
+              NEW.policy_revision_id IS NULL
+              OR NEW.facts_protocol IS NULL OR NEW.facts_prompt_bound IS NULL
+              OR NEW.facts_tool_count IS NULL OR NEW.facts_capabilities IS NULL
+              OR NEW.facts_asks_safeguards IS NULL OR NEW.facts_class IS NULL
+          ))
+       OR (NEW.lookup_kind IS NULL AND NEW.lookup_scope IS NOT NULL)
+       OR (NEW.lookup_kind IN ('compaction') AND NEW.lookup_scope IS NOT NULL)
+       OR (NEW.lookup_kind IN ('presentation', 'rewrite', 'default')
+           AND NEW.lookup_scope IS NULL)
+       OR (NEW.lookup_scope = 'profile' AND NEW.facts_profile IS NULL)
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid request resolver facts');
+    END;
+    "#,
+    // v25 — the lane the resolver was given, beside the rest of its facts
+    // (spec: RSOLV#facts-in). The resolver reads the lane's temperature, its
+    // pin and the upgrade the lane holds, and starts its walk at the pinned
+    // candidate: a replay that resolved a pinned lane as a new one would
+    // reach a candidate the request never could.
+    //
+    // `facts_lane` is the marker as well as the value: NULL on a row written
+    // before the lane was recorded, which therefore reads as lacking it
+    // rather than as having been given no lane, 'new' where the resolver was
+    // given none, and the lane's cache temperature where it was. The pin
+    // columns are the identities the resolver reads of a pin, and are absent
+    // together on an unpinned lane. The pin's revision and baseline model are
+    // not here: the resolver reads neither.
+    //
+    // The forced pair is repeated from `forced_from`/`forced_to`, which the
+    // row writes with their own per-kind rules; a replay must read what the
+    // resolver was given.
+    r#"
+    ALTER TABLE requests ADD COLUMN facts_lane TEXT
+        CHECK (facts_lane IN ('new', 'warm', 'cold', 'unknown'));
+    ALTER TABLE requests ADD COLUMN facts_lane_route_fingerprint TEXT;
+    ALTER TABLE requests ADD COLUMN facts_lane_candidate_id TEXT;
+    ALTER TABLE requests ADD COLUMN facts_lane_binding_id TEXT;
+    ALTER TABLE requests ADD COLUMN facts_lane_effective_model TEXT;
+    ALTER TABLE requests ADD COLUMN facts_lane_forced_from TEXT;
+    ALTER TABLE requests ADD COLUMN facts_lane_forced_to TEXT;
+
+    CREATE TRIGGER requests_facts_lane_shape_check
+    BEFORE INSERT ON requests
+    WHEN (NEW.facts_lane IS NULL AND (
+              NEW.facts_lane_route_fingerprint IS NOT NULL
+              OR NEW.facts_lane_candidate_id IS NOT NULL
+              OR NEW.facts_lane_binding_id IS NOT NULL
+              OR NEW.facts_lane_effective_model IS NOT NULL
+              OR NEW.facts_lane_forced_from IS NOT NULL
+              OR NEW.facts_lane_forced_to IS NOT NULL
+          ))
+       OR (NEW.facts_lane IS NOT NULL AND NEW.facts_recorded IS NULL)
+       OR (NEW.facts_lane = 'new' AND (
+              NEW.facts_lane_route_fingerprint IS NOT NULL
+              OR NEW.facts_lane_candidate_id IS NOT NULL
+              OR NEW.facts_lane_binding_id IS NOT NULL
+              OR NEW.facts_lane_effective_model IS NOT NULL
+              OR NEW.facts_lane_forced_from IS NOT NULL
+              OR NEW.facts_lane_forced_to IS NOT NULL
+          ))
+       OR ((NEW.facts_lane_route_fingerprint IS NULL) != (NEW.facts_lane_candidate_id IS NULL))
+       OR ((NEW.facts_lane_route_fingerprint IS NULL) != (NEW.facts_lane_binding_id IS NULL))
+       OR ((NEW.facts_lane_route_fingerprint IS NULL) != (NEW.facts_lane_effective_model IS NULL))
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid request resolver lane facts');
+    END;
+    "#,
 ];
 
 fn validate_v10_history(conn: &Connection) -> Result<()> {

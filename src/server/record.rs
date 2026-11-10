@@ -311,8 +311,9 @@ pub(crate) fn record_unroutable(
     requested_model: Option<&str>,
     lineage: Option<SessionLineage>,
     error: &super::PolicyAttemptError,
+    facts: &crate::policy::RequestFacts,
 ) {
-    match error.unroutable_provenance() {
+    match error.unroutable_provenance(facts) {
         Some(Ok(policy_routing)) => record_route_unavailable(
             server,
             started,

@@ -9,14 +9,17 @@ pub mod compile;
 pub mod diagnostic;
 pub mod document;
 pub mod edit;
+pub mod facts;
 pub mod force_newest;
 pub mod learning;
 pub mod legacy;
 pub mod matcher;
 pub mod pinning;
+pub mod reach;
 pub mod resolve;
 pub mod runtime;
 mod selector;
+pub mod shadow;
 pub mod transition;
 pub mod version;
 
@@ -31,13 +34,15 @@ pub use compile::{
     CompiledUpgradePolicy, PresentationRoute, compile,
 };
 pub use diagnostic::{
-    Diagnostic, DiagnosticCode, DiagnosticField, DiagnosticPath, DiagnosticPathError, Severity,
+    Diagnostic, DiagnosticCode, DiagnosticField, DiagnosticPath, DiagnosticPathError, Explanation,
+    Severity, explain,
 };
 pub use document::*;
 pub use edit::{
     CandidateMoveDestination, MAX_POLICY_EDIT_OPERATIONS, PolicyEdit, PolicyEditError,
     PolicyEditOperation,
 };
+pub use facts::RecordedFacts;
 pub use learning::{
     BindingLearningView, LearnedEvidence, LearningSnapshot, LearningView, RecencyEvidence,
 };
@@ -46,6 +51,9 @@ pub use matcher::{
     MatcherCaptures, MatcherError, MatcherSpec, Template, TemplateError,
 };
 pub use pinning::{PinPersistence, persist_transition};
+pub use reach::{
+    EdgeSetting, EdgeStop, NoRoute, Reach, Serving, Skipped, offer_reach, route_reach,
+};
 pub use resolve::{
     AttemptPlan, AvailabilitySnapshot, BindingAvailability, CandidateEvidence,
     CatalogueAvailability, CircuitSnapshot, CompactionEvidence, CredentialSnapshot, Evidence,

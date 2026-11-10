@@ -5,7 +5,7 @@ id: RMIG
 # Migrating routing into the store
 
 Routing was once configuration interpreted per request, and is now a series of revisions in the store.
-This spec covers the seam between the two: how a machine whose routing was in its file gets a revision, what survives an interrupted migration, how a file may be read deliberately afterwards, and how revisions an earlier version generated are retired.
+This spec covers the seam between the two: how a machine whose routing was in its file gets a revision, what survives an interrupted migration, and how revisions an earlier version generated are retired.
 
 ## The routing fields
 
@@ -17,10 +17,10 @@ Enabling a provider is configuration, held in the store as [DCONF](../service/co
 A file carrying the routing fields of an earlier version MUST still parse.
 
 > [!NOTE]
-> Setup reads such a file to move a machine off it, and an import reads one deliberately, so those fields must still be understood long after nothing writes them.
+> Setup reads such a file to move a machine off it, so those fields must still be understood long after nothing writes them.
 
 Nothing at request time MUST read those fields.
-They MUST be read only when the first revision is created, and when a file is imported deliberately.
+They MUST be read only when the first revision is created.
 
 Toker MUST NOT write a configuration file.
 
@@ -31,8 +31,6 @@ That pointer MUST be the whole ownership marker, and the file MUST carry no flag
 
 There MUST be no state in which both the file and the store decide.
 Where a revision is active, the file's routing fields MUST be ignored whether or not they were edited.
-
-The only way the file may affect routing again is a deliberate import.
 
 A service that cannot establish or load an active revision MUST refuse to start.
 A pointer to a revision that is missing, or that no longer compiles, MUST be a startup error.
@@ -61,7 +59,7 @@ It MUST generate each of these.
 Every known provider MUST own its prefix even while disabled.
 
 > [!NOTE]
-> A prefix naming an unconfigured provider then lands on a disabled candidate and gets a local answer, instead of falling through to a default that would send it somewhere the operator did not name.
+> A prefix naming an unconfigured provider then lands on its own route, whose candidate is disabled, and gets a local answer unless the operator gives that route a fallback, instead of falling through to a default that would send it somewhere the operator did not name.
 
 Where no default exists for the Messages protocol but a configured binding has a model map, it MUST generate a lowest-precedence rewrite over the client's own model names, so that a client's side calls still reach a configured provider through that binding's alias policy.
 
@@ -99,7 +97,7 @@ The generated compaction substitution MUST name the configured compaction model,
 Creation MUST happen in one immediate transaction.
 
 Where a pointer already exists, that transaction MUST return the active revision unchanged.
-Otherwise it MUST insert the revision, set the pointer, copy the document into the draft at its first generation, stamp the import marker, and set the desired publication handoff for every adapter.
+Otherwise it MUST insert the revision, set the pointer, stamp the import marker, and set the desired publication handoff for every adapter.
 
 A marker present without a pointer MUST refuse the transaction.
 
@@ -148,21 +146,6 @@ Setup MUST NOT replace or edit an active revision.
 It MUST report that routing is owned by the store and name the active revision.
 It MUST NOT ask which binding is a protocol's default, that question having no effect.
 
-## Importing a file deliberately
-
-An import MUST name the file it reads, there being no configuration file to take by default.
-
-An import MUST load that file, read its routing fields as input, generate a document of the same shape as the first revision, and replace the draft at the generation the caller holds.
-
-An import MUST leave the active revision untouched.
-An import MUST leave the draft as it was where the file fails to load or compile.
-
-The result MUST be an ordinary draft, validated, previewed, edited and activated like any other.
-
-> [!NOTE]
-> Import is for a file that carries routing.
-> One that carries none yields a document built from the enabled providers alone, which is the first revision for a fresh machine rather than the operator's edited policy.
-
 ## Retiring generated revisions
 
 An earlier version stored revisions whose documents carried semantics only its generated first revision could use, and recorded them with a generated compiler origin.
@@ -175,12 +158,7 @@ That transaction MUST clear the pin of every lane pinned to a generated revision
 > A lane warm at that moment loses its cache once, as an activation forced past warm lanes would.
 > Refusing instead would hold the service down until every such lane went idle and was pruned, and on the machines that exist those lanes were long cold anyway.
 
-Where the active pointer named one, the same transaction MUST clear the pointer, the draft and the import marker, and MUST then establish the first revision as a machine with no file to read does, as [creating it](#creating-it) specifies.
-Where the draft was based on a generated revision, or no longer decodes, the same transaction MUST replace the draft with the active revision's document at the next generation.
-
-> [!NOTE]
-> An imported draft carries the generated semantics whichever revision it was based on.
-
+Where the active pointer named one, the same transaction MUST clear the pointer and the import marker, and MUST then establish the first revision as a machine with no file to read does, as [creating it](#creating-it) specifies.
 > [!NOTE]
 > Deleting these rows is the one exception to keeping the store's history, because a revision that cannot be decoded keeps nothing a reader could use.
 

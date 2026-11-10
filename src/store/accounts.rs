@@ -434,20 +434,3 @@ pub(super) fn rows_for_digest(conn: &Connection, provider: &str, digest: &str) -
         |row| row.get(0),
     )?)
 }
-
-/// A credential that reaches `account`, newest first. An account is only
-/// ever named by way of a credential it served, so naming one by hand
-/// needs the digest to hang the identity off.
-pub(super) fn credential_of(conn: &Connection, account: i64) -> Result<Option<CredentialDigest>> {
-    let digest: Option<String> = conn
-        .query_row(
-            "SELECT digest FROM credential_accounts
-             WHERE account_number = ?1 ORDER BY last_seen_ms DESC, digest LIMIT 1",
-            [account],
-            |row| row.get(0),
-        )
-        .optional()?;
-    digest
-        .map(|digest| CredentialDigest::new(digest).map_err(Error::InvalidAccountState))
-        .transpose()
-}

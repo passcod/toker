@@ -1,37 +1,36 @@
 ---
 source: src/tui/routing/view.rs
-assertion_line: 972
-expression: frame(&state)
+expression: "frame(&state, 120, 32)"
 ---
- ? ⇄ 1  2  3  4 preview, revisions & activation                                                                  draft 4
-┌PREV┌PROMOTE LEARNED MODEL───────────────────────────────────────────────────────────────────────────────────────┐────┐
-│3  {│> binding: ▏                                                                                                │    │
-│draf│    Tab: anthropic_sub.anthropic_messages | anthropic_api.anthropic_messages | openai_api.openai_chat_comple│    │
-│dyna│  model:                                                                                                    │    │
-│code│                                                                                                            │    │
-│open│                                                                                                            │    │
-│lane│                                                                                                            │    │
-│diag│                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │tab complete from a daemon offer · enter record · esc cancel                                                │    │
-│    │                                                                                                            │    │
-│    └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
-└────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘
+ ?   dashboard   routing   config   accounts   ‹ 2 rewrites → 3 defaults → 4 routes · 5 models 11 · 6 history rev 9 live
+┌FAMILIES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ family           matches                         example                       reads as                              │
+│ claude-opus      claude-opus-*                   claude-opus-4-7               opus · 4.7                            │
+│ claude-sonnet    claude-sonnet-*                 claude-sonnet-4-5             sonnet · 4.5                          │
+│ claude-haiku     claude-haiku-*                  claude-haiku-4-5              haiku · 4.5                           │
+│ gpt              gpt-*                           openai/gpt-5.6-sol            sol · 5.6                             │
+│ qwen             qwen/qwen*                      qwen/qwen3.5-max              max · 3.5                             │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌UPGR┌PROMOTE LEARNED MODEL───────────────────────────────────────────────────────────────────────────────────────┐────┐
+│ new│> binding: ▏                                                                                                │    │
+│ cla│    Tab: anthropic_sub.anthropic_messages | anthropic_api.anthropic_messages | openai_api.openai_chat_comple│    │
+│ cla│  model:                                                                                                    │    │
+│ ope│                                                                                                            │    │
+│ ope│                                                                                                            │    │
+│ cod│                                                                                                            │    │
+│ [e]│                                                                                                            │    │
+└────│                                                                                                            │────┘
+┌COMP│                                                                                                            │────┐
+│ col│                                                                                                            │    │
+└────│tab complete from a daemon offer · enter record · esc cancel                                                │────┘
+┌OFFE│                                                                                                            │────┐
+│ ant└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
+│ claude-sonnet-5                              200k   2025-08                                                          │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

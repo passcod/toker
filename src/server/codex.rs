@@ -261,6 +261,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
                     Some(requested_model.as_str()),
                     lineage.clone(),
                     &error,
+                    &facts,
                 );
                 return frontend_error_response(
                     CodexFrontendWire::OpenAiResponses,
@@ -280,6 +281,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
                     Some(requested_model.as_str()),
                     lineage.clone(),
                     &error,
+                    &facts,
                 );
                 tracing::error!(%error, "active Responses policy resolution failed");
                 let response = frontend_error_response(

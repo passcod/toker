@@ -1,0 +1,34 @@
+---
+source: src/tui/routing/view.rs
+expression: text
+---
+ ?   dashboard   routing   config   accounts   1 presentations → 2 rewrites 14 → 3 defaults ›       editing · rev 9 live
+┌REWRITES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│       match                              route                                     reach                    hits 24h │
+│ ┌─ anthropic_messages  5 rules · prefix · sends ${model} ─────────────────────────────────────────────────────────── │
+│ │  1  anthropic/${model}               → claude-sub                                no cred · billed fallback       - │
+│ │  2  anthropic_api/${model}           → claude-api                                off                             - │
+│ │  3  anthropic_sub/${model}           → claude-sub                                no cred · billed fallback      ≥1 │
+│     ┌ move a rewrite of anthropic_messages                                                                           │
+│     │ rule 2 → 3 of 5  [↑/↓] to put it where it goes                                                                 │
+│     └ [↑/↓] move   [ctrl+s] save   [esc] cancel                                                                      │
+│ │  4  openrouter/${model}              → openrouter-messages                       ok                             41 │
+│ │  5  codex_sub/${model}               → codex                                     off · billed fallback           - │
+│ └─ else  default                       → claude-sub                                no cred · billed fallback      ≥3 │
+│ ┌─ openai_chat  5 rules · prefix · sends ${model} ────────────────────────────────────────────────────────────────── │
+│ │  1  openrouter/${model}              → openrouter-chat                           ok                              9 │
+│ │  2  openai_api/${model}              → openai-chat                               off                             - │
+│ │  3  codex_sub/${model}               → codex                                     off · billed fallback           - │
+│ │  4  anthropic_api/${model}           → claude-api                                off                             - │
+│ │  5  anthropic_sub/${model}           → claude-sub                                no cred · billed fallback       - │
+│ └─ else  default                       → openrouter-chat                           ok                              - │
+│ ┌─ openai_responses  4 rules · prefix · sends ${model} ───────────────────────────────────────────────────────────── │
+│ │  1  codex_sub/${model}               → codex                                     off · billed fallback          ≥2 │
+│ │  2  anthropic_api/${model}           → claude-api                                off                             - │
+│ │  3  anthropic_sub/${model}           → claude-sub                                no cred · billed fallback       - │
+│ │  4  openrouter/${model}              → openrouter-responses                      ok                              - │
+│ └─ else  no default                    → refused · no route                                                        - │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌PREVIEW───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ replaying the last 24 hours of requests under the edit                                                               │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

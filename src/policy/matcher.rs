@@ -137,8 +137,19 @@ impl CompiledMatcher {
         }
     }
 
+    /// Whether the matcher matches, without collecting the captures. Shadow
+    /// comparison runs every catalogue name through two matchers per pair of
+    /// rules, and going through [`Self::captures`] allocated two `BTreeMap`s
+    /// per regex hit only to drop them.
     pub fn is_match(&self, input: &str) -> Result<bool, MatcherError> {
-        Ok(self.captures(input)?.is_some())
+        if input.len() > MAX_MATCH_INPUT_BYTES {
+            return Err(MatcherError::InputTooLong);
+        }
+        Ok(match self {
+            Self::Exact(value) => value == input,
+            Self::Glob(glob) => glob.is_match(input),
+            Self::Regex(regex) => regex.is_match(input),
+        })
     }
 }
 
@@ -344,6 +355,29 @@ mod tests {
         assert_eq!(
             template.render(&values, &captures).unwrap(),
             "alpha/12/original"
+        );
+    }
+
+    #[test]
+    fn regex_is_match_agrees_with_captures_and_still_bounds_its_input() {
+        let matcher = MatcherSpec::Regex(r"^model-(?P<family>[a-z]+)-(\d+)$".to_owned())
+            .compile()
+            .unwrap();
+        for input in ["model-alpha-12", "model-alpha-", "other"] {
+            assert_eq!(
+                matcher.is_match(input).unwrap(),
+                matcher.captures(input).unwrap().is_some(),
+                "{input}"
+            );
+        }
+        assert_eq!(
+            matcher.is_match(&"x".repeat(MAX_MATCH_INPUT_BYTES + 1)),
+            Err(MatcherError::InputTooLong)
+        );
+        let glob = MatcherSpec::Glob("model-*".to_owned()).compile().unwrap();
+        assert_eq!(
+            glob.is_match(&"x".repeat(MAX_MATCH_INPUT_BYTES + 1)),
+            Err(MatcherError::InputTooLong)
         );
     }
 

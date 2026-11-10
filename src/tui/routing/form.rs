@@ -28,7 +28,7 @@ pub(super) enum Node {
     Binding,
     /// A backend model id, completed from the offers of the nearest binding.
     Model,
-    /// The id of another record in the draft, completed from those ids.
+    /// The id of another record in the policy, completed from those ids.
     Ref {
         kind: &'static str,
         optional: bool,
@@ -450,59 +450,89 @@ const COMPACTION: &[Field] = &[
 
 const DESCRIPTION: &[Field] = &[field("description", "description", Node::OptText)];
 
+/// An invented request to trace: what the resolver reads of one, less the
+/// parts that only matter to a lane that already exists.
+const TRACE: &[Field] = &[
+    field("profile", "profile", Node::OptText),
+    field("protocol", "protocol", PROTOCOL),
+    field("model", "model", Node::OptText),
+    field("prompt_bound", "prompt tokens", Node::OptInt),
+    field(
+        "asks_server_safeguards",
+        "asks for safeguards",
+        Node::Bool(false),
+    ),
+];
+
 const PROMOTE: &[Field] = &[
     field("binding_id", "binding", Node::Binding),
     field("model_id", "model", Node::Model),
 ];
 
-const PREVIEW: &[Field] = &[
-    field("protocol", "protocol", PROTOCOL),
-    field("profile", "profile", Node::OptText),
-    field("model", "model", Node::OptText),
-    field("lane_key", "lane key", Node::OptText),
-    field("prompt_bound", "prompt bound", Node::Int),
-    field("message_count", "message count", Node::OptInt),
-    field("tool_count", "tool count", Node::Int),
-    field(
-        "asks_server_safeguards",
-        "asks for server safeguards",
-        Node::Bool(false),
-    ),
+/// A fallback candidate: the edge into it, then the candidate.
+const FALLBACK: &[Field] = &[
+    field("edge", "fallback when", Node::Object(EDGE)),
+    field("candidate", "candidate", Node::Object(CANDIDATE)),
 ];
+
+/// A route's first candidate, which no edge leads into.
+const PRIMARY: &[Field] = &[field("candidate", "candidate", Node::Object(CANDIDATE))];
+
+/// The edge a candidate moved to the front or after another needs, where it
+/// had none of its own to carry along.
+pub(super) fn default_edge() -> Value {
+    default_for(&Node::Object(EDGE), true)
+}
 
 /// What a form is for, which decides its schema and what saving it does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Purpose {
-    Record { kind: &'static str, adding: bool },
+    Record {
+        kind: &'static str,
+        adding: bool,
+    },
+    /// One of a route's candidates, with the edge into it unless it is the
+    /// first.
+    Candidate {
+        with_edge: bool,
+    },
     Description,
     Promote,
-    Preview,
+    /// An invented request, to be traced through the policy.
+    Trace,
+    /// Removing or moving something: a form with no fields, which only
+    /// carries the refusals a check finds.
+    Fieldless,
 }
 
 impl Purpose {
+    /// What the form is called, as a phrase.
     pub(super) fn title(self) -> &'static str {
         match self {
             Purpose::Record { kind, adding } => match (kind, adding) {
-                ("presentations", false) => "EDIT PRESENTATION",
-                ("presentations", true) => "ADD PRESENTATION",
-                ("routes", false) => "EDIT ROUTE",
-                ("routes", true) => "ADD ROUTE",
-                ("defaults", false) => "EDIT DEFAULT",
-                ("defaults", true) => "ADD DEFAULT",
-                ("rewrites", false) => "EDIT REWRITE",
-                ("rewrites", true) => "ADD REWRITE",
-                ("classifiers", false) => "EDIT CLASSIFIER",
-                ("classifiers", true) => "ADD CLASSIFIER",
-                ("upgrades", false) => "EDIT UPGRADE",
-                ("upgrades", true) => "ADD UPGRADE",
-                ("compaction", false) => "EDIT COMPACTION",
-                ("compaction", true) => "ADD COMPACTION",
-                (_, false) => "EDIT POLICY RECORD",
-                (_, true) => "ADD POLICY RECORD",
+                ("presentations", false) => "edit presentation",
+                ("presentations", true) => "new presentation",
+                ("routes", false) => "edit route",
+                ("routes", true) => "new route",
+                ("defaults", false) => "edit default",
+                ("defaults", true) => "new default",
+                ("rewrites", false) => "edit rewrite",
+                ("rewrites", true) => "new rewrite",
+                ("classifiers", false) => "edit classifier",
+                ("classifiers", true) => "new classifier",
+                ("upgrades", false) => "edit upgrade",
+                ("upgrades", true) => "new upgrade",
+                ("compaction", false) => "edit compaction",
+                ("compaction", true) => "new compaction",
+                (_, false) => "edit policy record",
+                (_, true) => "new policy record",
             },
-            Purpose::Description => "EDIT DRAFT DESCRIPTION",
-            Purpose::Promote => "PROMOTE LEARNED MODEL",
-            Purpose::Preview => "ROUTING PREVIEW",
+            Purpose::Candidate { with_edge: true } => "fallback candidate",
+            Purpose::Candidate { with_edge: false } => "first candidate",
+            Purpose::Description => "edit description",
+            Purpose::Promote => "promote learned model",
+            Purpose::Trace => "trace an invented request",
+            Purpose::Fieldless => "",
         }
     }
 
@@ -518,30 +548,58 @@ impl Purpose {
                 "compaction" => COMPACTION,
                 _ => &[],
             },
+            Purpose::Candidate { with_edge: true } => FALLBACK,
+            Purpose::Candidate { with_edge: false } => PRIMARY,
             Purpose::Description => DESCRIPTION,
             Purpose::Promote => PROMOTE,
-            Purpose::Preview => PREVIEW,
+            Purpose::Trace => TRACE,
+            Purpose::Fieldless => &[],
         }
     }
 
     /// Short forms answer one question and Enter submits them. A record form
     /// has many fields, so Enter there moves on.
     fn enter_submits(self) -> bool {
-        !matches!(self, Purpose::Record { .. })
+        matches!(
+            self,
+            Purpose::Description | Purpose::Promote | Purpose::Trace
+        )
     }
 
     fn help(self) -> &'static str {
         match self {
-            Purpose::Record { .. } => {
-                "↑/↓ field · ←/→ change · tab complete · ctrl+s save · esc cancel"
-            }
             Purpose::Description => "enter save · esc cancel",
             Purpose::Promote => "tab complete from a daemon offer · enter record · esc cancel",
-            Purpose::Preview => {
-                "content-free request facts only · space toggle · enter preview · esc cancel"
-            }
+            Purpose::Trace => "↑/↓ field · ←/→ change · enter trace · esc cancel",
+            _ => "↑/↓ field · ←/→ change · tab complete · ctrl+s save · esc cancel",
         }
     }
+}
+
+/// Whether a finding stops the form being saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Severity {
+    Refusal,
+    Warning,
+}
+
+/// What a check found out about the form: where it is, as the path inside the
+/// record, and what to say beside it (spec: UTUI#editing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Finding {
+    pub(super) path: Vec<String>,
+    pub(super) severity: Severity,
+    pub(super) sentence: String,
+    pub(super) fix: Option<String>,
+}
+
+/// How a note beside a field reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Note {
+    /// What an accepted field does.
+    Reading,
+    Warning,
+    Refusal,
 }
 
 /// What the daemon last said that completion draws on.
@@ -551,11 +609,11 @@ pub(super) struct Context {
     pub(super) bindings: Vec<String>,
     /// (binding, model) pairs the catalogues offer.
     pub(super) offers: Vec<(String, String)>,
-    /// Record ids in the draft, by collection.
+    /// Record ids in the policy, by collection.
     pub(super) ids: BTreeMap<&'static str, Vec<String>>,
-    /// Draft diagnostics against the record being edited, as (path inside
-    /// the record, code).
-    pub(super) diagnostics: Vec<(String, String)>,
+    /// What each route is, in a few words, by its id: what a field naming a
+    /// route says beside itself once it is accepted.
+    pub(super) routes: BTreeMap<String, String>,
 }
 
 /// One step into a value.
@@ -672,6 +730,9 @@ pub(super) struct FormLine {
     /// The field a click on this line focuses; a line that only informs
     /// (a heading, the completions) has none.
     pub(super) row: Option<usize>,
+    /// What the check says beside the field: a refusal with how to fix it, a
+    /// warning, or what the field does.
+    pub(super) notes: Vec<(Note, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -686,6 +747,8 @@ pub(super) struct Form {
     completing: Option<(String, usize)>,
     context: Context,
     note: Option<String>,
+    /// What the last check found, placed beside the fields it concerns.
+    findings: Vec<Finding>,
 }
 
 impl Form {
@@ -699,6 +762,7 @@ impl Form {
             completing: None,
             context,
             note: None,
+            findings: Vec::new(),
         };
         form.focus_first();
         form
@@ -810,26 +874,220 @@ impl Form {
     }
 
     /// The form's lines, one per row, with completions under the focused
-    /// input.
+    /// input and each field's notes with it.
     pub(super) fn lines(&self) -> Vec<FormLine> {
         let rows = self.rows();
+        let collapsed = self.collapsed(&rows);
         let mut lines = Vec::new();
         for (index, row) in rows.iter().enumerate() {
+            if let Some((_, _, summary)) = collapsed.iter().find(|(start, _, _)| *start == index) {
+                lines.push(FormLine {
+                    text: summary.clone(),
+                    focused: false,
+                    row: None,
+                    notes: Vec::new(),
+                });
+                continue;
+            }
+            if collapsed
+                .iter()
+                .any(|(start, end, _)| index > *start && index < *end)
+            {
+                continue;
+            }
             let focused = index == self.focus;
             lines.push(FormLine {
                 text: self.row_text(row, focused),
                 focused,
                 row: row.focusable().then_some(index),
+                notes: self.notes_for(&rows, index),
             });
             if focused && let Some(text) = self.suggestion_line() {
                 lines.push(FormLine {
                     text: format!("    {text}"),
                     focused: false,
                     row: None,
+                    notes: Vec::new(),
                 });
             }
         }
         lines
+    }
+
+    /// The groups of switches that are drawn as one line while the focus is
+    /// not among them and nothing in them is refused: a form of many fields
+    /// is mostly such groups left as they are. Each is its first row, the row
+    /// after its last, and what it says of itself.
+    fn collapsed(&self, rows: &[Row]) -> Vec<(usize, usize, String)> {
+        let (placed, _) = self.placed(rows);
+        let mut groups = Vec::new();
+        let mut index = 0;
+        while index < rows.len() {
+            let row = &rows[index];
+            let end = index
+                + 1
+                + rows[index + 1..]
+                    .iter()
+                    .take_while(|child| child.depth > row.depth)
+                    .count();
+            let children = &rows[index + 1..end];
+            let switches = !children.is_empty()
+                && children
+                    .iter()
+                    .all(|child| matches!(child.op, Op::Flag(_) | Op::Toggle));
+            let quiet = !(index..end).contains(&self.focus)
+                && !placed.iter().any(|(at, _)| (index..end).contains(at));
+            if matches!(row.op, Op::Heading) && row.depth >= 1 && switches && quiet {
+                let on: Vec<String> = children
+                    .iter()
+                    .filter(|child| self.is_on(child))
+                    .map(|child| match &child.op {
+                        Op::Flag(option) => option.replace('_', " "),
+                        _ => child.label.clone(),
+                    })
+                    .collect();
+                let said = if on.is_empty() {
+                    "none".to_owned()
+                } else {
+                    on.join(", ")
+                };
+                groups.push((
+                    index,
+                    end,
+                    format!(
+                        "  {}{}: {said}",
+                        "  ".repeat(row.depth),
+                        row.label.to_uppercase()
+                    ),
+                ));
+                index = end;
+                continue;
+            }
+            index += 1;
+        }
+        groups
+    }
+
+    /// Hand the form what a check found. A finding goes beside the field
+    /// its path names, or the nearest one that holds it.
+    pub(super) fn set_findings(&mut self, findings: Vec<Finding>) {
+        self.findings = findings;
+    }
+
+    /// The row a path inside the record lands on: the field it names, or
+    /// failing that the deepest one that contains it.
+    fn row_for(&self, rows: &[Row], path: &[String]) -> Option<usize> {
+        let at = |row: &Row| {
+            row.path
+                .iter()
+                .map(|seg| match seg {
+                    Seg::Key(name) => name.clone(),
+                    Seg::Index(index) => index.to_string(),
+                })
+                .collect::<Vec<_>>()
+        };
+        (0..=path.len()).rev().find_map(|len| {
+            rows.iter()
+                .position(|row| at(row) == path[..len] && !matches!(row.op, Op::Add { .. }))
+        })
+    }
+
+    /// What a form's own rules refuse, apart from the check: a blank id.
+    fn local_findings(&self) -> Vec<Finding> {
+        let mut found = Vec::new();
+        if let Purpose::Record { .. } = self.purpose {
+            for name in ["id", "slug"] {
+                if self.value.get(name).and_then(Value::as_str) == Some("") {
+                    found.push(Finding {
+                        path: vec![name.to_owned()],
+                        severity: Severity::Refusal,
+                        sentence: format!("{name} is empty"),
+                        fix: Some(format!("give the record a {name}")),
+                    });
+                }
+            }
+        }
+        found
+    }
+
+    /// Every finding that is placed, with the row it lands on, and those no
+    /// field holds.
+    fn placed(&self, rows: &[Row]) -> (Vec<(usize, Finding)>, Vec<Finding>) {
+        let mut on_rows = Vec::new();
+        let mut loose = Vec::new();
+        for finding in self
+            .local_findings()
+            .into_iter()
+            .chain(self.findings.clone())
+        {
+            match self.row_for(rows, &finding.path) {
+                Some(row) => on_rows.push((row, finding)),
+                None => loose.push(finding),
+            }
+        }
+        (on_rows, loose)
+    }
+
+    /// The notes beside row `index`.
+    fn notes_for(&self, rows: &[Row], index: usize) -> Vec<(Note, String)> {
+        let row = &rows[index];
+        let (placed, _) = self.placed(rows);
+        let mut notes: Vec<(Note, String)> = Vec::new();
+        for (at, finding) in placed {
+            if at != index {
+                continue;
+            }
+            let note = match finding.severity {
+                Severity::Refusal => Note::Refusal,
+                Severity::Warning => Note::Warning,
+            };
+            notes.push((note, finding.sentence));
+            notes.extend(finding.fix.map(|fix| (note, fix)));
+        }
+        if !notes.is_empty() {
+            return notes;
+        }
+        // An accepted field may say what it does.
+        if let Op::Input(input) = &row.op {
+            // A value still being typed is not judged until it is left.
+            if index != self.focus && self.unoffered(row, *input) {
+                notes.push((Note::Warning, "the catalogues do not offer this".to_owned()));
+            } else if let Input::Ref { kind: "routes", .. } = input
+                && let Some(text) = get(&self.value, &row.path).as_str()
+                && let Some(said) = self.context.routes.get(text)
+            {
+                notes.push((Note::Reading, said.clone()));
+            }
+        }
+        notes
+    }
+
+    /// The names of the fields that hold a refusal, for the save control to
+    /// say what is in the way, and whether a refusal belongs to no field.
+    pub(super) fn refused(&self) -> (Vec<String>, bool) {
+        let rows = self.rows();
+        let (placed, loose) = self.placed(&rows);
+        let mut names: Vec<String> = Vec::new();
+        for (at, finding) in placed {
+            if finding.severity == Severity::Refusal {
+                let name = rows[at].label.clone();
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        (
+            names,
+            loose
+                .iter()
+                .any(|finding| finding.severity == Severity::Refusal),
+        )
+    }
+
+    /// The findings that landed on no field of the form.
+    pub(super) fn loose(&self) -> Vec<Finding> {
+        let rows = self.rows();
+        self.placed(&rows).1
     }
 
     #[cfg(test)]
@@ -879,9 +1137,6 @@ impl Form {
     fn row_text(&self, row: &Row, focused: bool) -> String {
         let indent = "  ".repeat(row.depth);
         let mark = if focused { "> " } else { "  " };
-        let diagnostic = self
-            .diagnostic_for(row)
-            .map_or(String::new(), |code| format!("  ! {code}"));
         let body = match &row.op {
             Op::Heading => row.label.to_uppercase(),
             Op::ItemHeader => {
@@ -915,17 +1170,14 @@ impl Form {
                         _ => String::new(),
                     }
                 };
-                // A value still being typed is not judged until it is left.
-                let unoffered = !focused && self.unoffered(row, *input);
                 format!(
-                    "{}: {}{}",
+                    "{}: {}",
                     row.label,
                     if text.is_empty() && !focused && input.nullable() {
                         "(none)".to_owned()
                     } else {
                         text
                     },
-                    if unoffered { "  (not offered)" } else { "" }
                 )
             }
             Op::Toggle => format!(
@@ -980,16 +1232,7 @@ impl Form {
         } else {
             ""
         };
-        format!("{mark}{indent}{body}{fixed}{diagnostic}")
-    }
-
-    fn diagnostic_for(&self, row: &Row) -> Option<&str> {
-        let path = path_text(&row.path);
-        self.context
-            .diagnostics
-            .iter()
-            .find(|(at, _)| *at == path)
-            .map(|(_, code)| code.as_str())
+        format!("{mark}{indent}{body}{fixed}")
     }
 
     /// Whether a completed field holds a value the catalogues do not offer.
@@ -1051,16 +1294,10 @@ impl Form {
     /// Whether saving would make sense to try: not when a required id or
     /// name is blank, which the daemon would only refuse.
     pub(super) fn problem(&self) -> Option<String> {
-        if let Purpose::Record { .. } = self.purpose {
-            for name in ["id", "slug"] {
-                if let Some(text) = self.value.get(name).and_then(Value::as_str)
-                    && text.is_empty()
-                {
-                    return Some(format!("{name} is empty"));
-                }
-            }
-        }
-        None
+        self.local_findings()
+            .into_iter()
+            .next()
+            .map(|finding| finding.sentence)
     }
 
     pub(super) fn key(&mut self, event: KeyEvent) -> Outcome {
@@ -1069,10 +1306,12 @@ impl Form {
         let alt = event.modifiers.contains(KeyModifiers::ALT);
         let rows = self.rows();
         let Some(row) = rows.get(self.focus).cloned() else {
-            return if event.code == KeyCode::Esc {
-                Outcome::Cancel
-            } else {
-                Outcome::Keep
+            // A form with no fields still saves and abandons.
+            return match event.code {
+                KeyCode::Esc => Outcome::Cancel,
+                KeyCode::Enter if ctrl => self.submit(),
+                KeyCode::Char('s') if ctrl => self.submit(),
+                _ => Outcome::Keep,
             };
         };
         if self.locked(&row) && edits(&event, &row) {
@@ -1541,16 +1780,6 @@ fn tag_name(node: &Node) -> Option<&'static str> {
         Node::Union { tag, .. } => Some(tag),
         _ => None,
     }
-}
-
-fn path_text(path: &[Seg]) -> String {
-    path.iter()
-        .map(|seg| match seg {
-            Seg::Key(name) => name.clone(),
-            Seg::Index(index) => index.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 fn get<'a>(value: &'a Value, path: &[Seg]) -> &'a Value {
@@ -2053,14 +2282,10 @@ mod tests {
         press(&mut form, KeyCode::Backspace);
         assert_eq!(form.value()["priority"], 0);
 
-        let mut preview = Form::new(
-            Purpose::Preview,
-            json!({"protocol": "openai_chat", "message_count": 3}),
-            Context::default(),
-        );
-        focus_label(&mut preview, "message count");
-        press(&mut preview, KeyCode::Backspace);
-        assert_eq!(preview.value()["message_count"], Value::Null);
+        let mut upgrade = record("upgrades");
+        focus_label(&mut upgrade, "classifier");
+        press(&mut upgrade, KeyCode::Backspace);
+        assert_eq!(upgrade.value()["classifier_id"], "new-classifie");
     }
 
     #[test]
@@ -2327,11 +2552,14 @@ mod tests {
             .into_iter()
             .find(|line| line.text.contains("gpt-three"))
             .expect("the model row");
-        assert!(shown.text.contains("(not offered)"), "{}", shown.text);
+        assert_eq!(
+            shown.notes,
+            [(Note::Warning, "the catalogues do not offer this".to_owned())]
+        );
     }
 
     #[test]
-    fn a_record_id_completes_from_the_drafts_ids() {
+    fn a_record_id_completes_from_the_policys_ids() {
         let mut context = Context::default();
         context
             .ids
@@ -2462,30 +2690,77 @@ mod tests {
         assert_eq!(outcome, Outcome::Submit);
     }
 
+    /// What a check found is said beside the field its path names, or the
+    /// nearest field that holds it, with the fix, and the form says which
+    /// fields hold a refusal.
     #[test]
-    fn daemon_diagnostics_mark_the_field_they_name() {
-        let context = Context {
-            diagnostics: vec![(
-                "chain/first/binding_id".to_owned(),
-                "binding-unconfigured".to_owned(),
-            )],
-            ..Context::default()
-        };
-        let form = Form::new(
+    fn findings_are_placed_beside_the_field_they_name() {
+        let mut form = Form::new(
             Purpose::Record {
                 kind: "routes",
                 adding: false,
             },
             template("routes", None),
-            context,
+            Context::default(),
         );
-        let marked: Vec<_> = form
-            .lines()
-            .into_iter()
-            .filter(|line| line.text.contains("! binding-unconfigured"))
-            .collect();
-        assert_eq!(marked.len(), 1);
-        assert!(marked[0].text.contains("binding"));
+        form.set_findings(vec![
+            Finding {
+                path: vec!["chain".into(), "first".into(), "binding_id".into()],
+                severity: Severity::Refusal,
+                sentence: "the binding is not one toker implements".to_owned(),
+                fix: Some("choose one that is".to_owned()),
+            },
+            // A path the form has no field for lands on the one that holds it.
+            Finding {
+                path: vec![
+                    "chain".into(),
+                    "first".into(),
+                    "model".into(),
+                    "nope".into(),
+                ],
+                severity: Severity::Warning,
+                sentence: "the model may not be there".to_owned(),
+                fix: None,
+            },
+        ]);
+        let lines = form.lines();
+        let binding = lines
+            .iter()
+            .find(|line| line.text.contains("binding:"))
+            .expect("the binding field");
+        assert_eq!(
+            binding.notes,
+            [
+                (
+                    Note::Refusal,
+                    "the binding is not one toker implements".to_owned()
+                ),
+                (Note::Refusal, "choose one that is".to_owned()),
+            ]
+        );
+        assert!(
+            lines.iter().any(
+                |line| line.notes == [(Note::Warning, "the model may not be there".to_owned())]
+            ),
+            "{lines:?}"
+        );
+        assert_eq!(form.refused(), (vec!["binding".to_owned()], false));
+        assert!(form.loose().is_empty());
+    }
+
+    /// A finding about nothing the form holds belongs to no field, and still
+    /// blocks the save.
+    #[test]
+    fn a_finding_no_field_holds_is_loose() {
+        let mut form = record("rewrites");
+        form.set_findings(vec![Finding {
+            path: Vec::new(),
+            severity: Severity::Refusal,
+            sentence: "no".to_owned(),
+            fix: None,
+        }]);
+        assert_eq!(form.refused(), (Vec::new(), true));
+        assert_eq!(form.loose().len(), 1);
     }
 
     #[test]

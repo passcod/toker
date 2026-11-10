@@ -373,6 +373,34 @@ mod tests {
                     candidate_id: CandidateId::new("candidate").unwrap(),
                     baseline_model: "claude-opus-5".to_owned(),
                 },
+                facts: Some(crate::policy::RecordedFacts {
+                    profile: Some(crate::policy::ProfileId::new("work").unwrap()),
+                    protocol: crate::policy::FrontendProtocol::AnthropicMessages,
+                    requested_model: Some("claude-opus-4".to_owned()),
+                    prompt_bound: 1_000,
+                    message_count: Some(4),
+                    tool_count: 2,
+                    required_capabilities: crate::policy::CapabilityFlags::default(),
+                    asks_server_safeguards: false,
+                    binding_affinity: Some(
+                        BindingId::new("openrouter.openrouter_messages").unwrap(),
+                    ),
+                    class: crate::policy::RequestClass::Inference,
+                    lane: crate::policy::facts::RecordedLane::Read(Box::new(
+                        crate::policy::facts::RecordedLaneState {
+                            temperature: crate::policy::CacheTemperature::Warm,
+                            pin: Some(crate::policy::facts::RecordedPin {
+                                route_fingerprint: "44".repeat(32).parse().unwrap(),
+                                candidate_id: CandidateId::new("candidate").unwrap(),
+                                binding_id: BindingId::new("openrouter.openrouter_messages")
+                                    .unwrap(),
+                                effective_model: "claude-opus-5".to_owned(),
+                            }),
+                            forced_from: Some("claude-sonnet-4-5".to_owned()),
+                            forced_to: Some("claude-opus-5".to_owned()),
+                        },
+                    )),
+                }),
             }),
             lineage: Some(SessionLineage::codex_guardian("guardian:parent-session").unwrap()),
         }

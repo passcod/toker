@@ -9,34 +9,27 @@
 
 use serde_json::{Value, json};
 
-use super::model::View;
+use super::model::{Panel, Tab};
 
-/// The record kinds a view lists, in the order the add chooser offers them.
-pub(super) fn kinds(view: View) -> &'static [&'static str] {
-    match view {
-        View::Presentations => &["presentations"],
-        View::Routes => &["routes", "defaults"],
-        View::Rewrites => &["rewrites", "classifiers", "upgrades", "compaction"],
-        View::Status => &[],
-    }
-}
-
-/// What the chooser calls a kind.
-pub(super) fn singular(kind: &str) -> &'static str {
-    match kind {
-        "presentations" => "presentation",
-        "routes" => "route",
-        "defaults" => "default",
-        "rewrites" => "rewrite",
-        "classifiers" => "classifier (family)",
-        "upgrades" => "upgrade",
-        "compaction" => "compaction policy",
-        _ => "record",
+/// The kind of record a tab adds. The models tab holds several, by the
+/// panel the focus is in.
+pub(super) fn kind_for(tab: Tab, focus: Panel) -> Option<&'static str> {
+    match tab {
+        Tab::Presentations => Some("presentations"),
+        Tab::Rewrites => Some("rewrites"),
+        Tab::Defaults => Some("defaults"),
+        Tab::Routes => Some("routes"),
+        Tab::Models => Some(match focus {
+            Panel::Families => "classifiers",
+            Panel::Upgrades | Panel::Offers => "upgrades",
+            Panel::Compaction => "compaction",
+        }),
+        Tab::History => None,
     }
 }
 
 /// The template for a new record of `kind`. A new default points at
-/// `route_id`, which is the draft's first route when it has one.
+/// `route_id`, which is the first route of the live policy when it has one.
 pub(super) fn template(kind: &str, route_id: Option<&str>) -> Value {
     let route_id = route_id.unwrap_or("route-id");
     match kind {
@@ -110,9 +103,10 @@ pub(super) fn template(kind: &str, route_id: Option<&str>) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{kinds, template};
+    use super::{kind_for, template};
     use crate::policy::{PolicyDocument, PolicyEdit};
-    use crate::tui::routing::model::{View, add_edit};
+    use crate::tui::routing::editing::add_edit;
+    use crate::tui::routing::model::{Panel, Tab};
 
     fn empty() -> PolicyDocument {
         serde_json::from_value(serde_json::json!({ "format_version": 3 })).expect("document")
@@ -122,8 +116,16 @@ mod tests {
     /// it will add, so each one is pushed through it.
     #[test]
     fn every_template_is_an_addition_the_daemon_accepts() {
-        for view in [View::Presentations, View::Routes, View::Rewrites] {
-            for kind in kinds(view) {
+        for (tab, focus) in [
+            (Tab::Presentations, Panel::Upgrades),
+            (Tab::Rewrites, Panel::Upgrades),
+            (Tab::Defaults, Panel::Upgrades),
+            (Tab::Routes, Panel::Upgrades),
+            (Tab::Models, Panel::Families),
+            (Tab::Models, Panel::Upgrades),
+            (Tab::Models, Panel::Compaction),
+        ] {
+            if let Some(kind) = kind_for(tab, focus) {
                 let operation = add_edit(kind, template(kind, None));
                 let edit: PolicyEdit =
                     serde_json::from_value(serde_json::json!({ "operations": [operation] }))

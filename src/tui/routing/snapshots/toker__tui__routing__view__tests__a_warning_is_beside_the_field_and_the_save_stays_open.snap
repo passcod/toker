@@ -1,0 +1,42 @@
+---
+source: src/tui/routing/view.rs
+expression: text
+---
+ ?   dashboard   routing   config   accounts   ‹ 2 rewrites → 3 defaults → 4 routes 7 · 5 models ›  editing · rev 9 live
+┌ROUTE─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ claude-sub                                                                                                    1 of 7 │
+│                                                                                                                      │
+│ sent to  2 candidates                                                                                                │
+│ 1  anthropic_sub.anthropic_messages  subscription    as asked                                no cred                 │
+│    ↓ when unavailable before send · overloaded · 5xx   billed: allow   ambiguous retry: deny   cache: preserve warm  │
+│ 2  openrouter.openrouter_messages    billed          alias claude-* → anthropic/claude-*     ok                      │
+│     ┌ add a fallback to claude-sub                                                                                   │
+│     │   FALLBACK WHEN                                                                                                │
+│     │ >   fallback before send: < disabled >                                                                         │
+│     │     FALLBACK AFTER SEND ON: none                                                                               │
+│     │     may start billed spend: < deny >                                                                           │
+│     │     may retry an ambiguous send: < deny >                                                                      │
+│     │     cache transition: < preserve_warm >                                                                        │
+│     │   CANDIDATE                                                                                                    │
+│     │     id: fallback-1                                                                                             │
+│     │     binding: anthropic_sub.anthropic_messages  The provider is off: the candidate is skipped until it is on.   │
+│     │                                                Turn the provider on, or leave it.                              │
+│     │     MODEL                                                                                                      │
+│     │       kind: < exact >                                                                                          │
+│     │       model: model-id                          the catalogues do not offer this                                │
+│     │     upgrade policy: (none)                                                                                     │
+│     │     [ ] alias rules                                                                                            │
+│     │     REQUIRED CAPABILITIES: none                                                                                │
+│     │     [x] enabled                                                                                                │
+│     │     HEALTH CIRCUITS                                                                                            │
+│     │       + add health circuit                                                                                     │
+│     └ [ctrl+s] save   [esc] cancel                                                                                   │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌PREVIEW───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 3 of 5 recent requests would change route                                                                            │
+│ request                 when     now                             with this change                                    │
+│ claude-sonnet-5         1m ago   default → claude-sub            rewrite new-rewrite → openrouter-messages           │
+│ claude-opus-5           10m ago  default → claude-sub            rewrite new-rewrite → openrouter-messages           │
+│ claude-haiku-4-5        1h ago   default → claude-sub            rewrite new-rewrite → openrouter-messages           │
+│ 2 requests could not be replayed: the ledger did not record what routing was given                                   │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
