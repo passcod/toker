@@ -220,6 +220,93 @@ async fn a_refused_value_leaves_the_stored_one_as_it_was() {
     );
 }
 
+/// What a client does with a snapshot row: send it back with one field
+/// changed. The service writes the row it is given whole, so everything the
+/// snapshot carries has to survive the trip.
+async fn put_back(app: &axum::Router, path: &str, mut row: Value, change: Value) -> StatusCode {
+    for (name, value) in change.as_object().expect("an object") {
+        row[name] = value.clone();
+    }
+    let object = row.as_object_mut().expect("a row");
+    object.remove("credential");
+    app.clone()
+        .oneshot(request("PUT", path, Some("config-edit"), Some(row)))
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn an_edit_sent_back_from_the_snapshot_leaves_every_other_field_as_it_was() {
+    let (server, _store) = server();
+    let app = server.router();
+
+    // Fields the page does not show: the refresh endpoint, the session
+    // header names and the transcript roots.
+    let status = put_back(
+        &app,
+        "/_toker/config/provider",
+        provider(&snapshot(&app).await, "codex_sub").clone(),
+        json!({"enabled": true, "refresh_url": "http://login.invalid/token"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let status = put_back(
+        &app,
+        "/_toker/config/settings",
+        snapshot(&app).await["settings"].clone(),
+        json!({
+            "session_headers": ["x-session-id"],
+            "transcript_roots": ["/harness/repos/.claude"]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Toggle one thing on each, the way the page does.
+    let before = snapshot(&app).await;
+    assert_eq!(
+        put_back(
+            &app,
+            "/_toker/config/provider",
+            provider(&before, "codex_sub").clone(),
+            json!({"enabled": false}),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        put_back(
+            &app,
+            "/_toker/config/settings",
+            before["settings"].clone(),
+            json!({"quota_enabled": false}),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    let after = snapshot(&app).await;
+    let mut expected = provider(&before, "codex_sub").clone();
+    expected["enabled"] = json!(false);
+    assert_eq!(provider(&after, "codex_sub"), &expected);
+    assert_eq!(
+        provider(&after, "codex_sub")["refresh_url"],
+        json!("http://login.invalid/token")
+    );
+    let mut expected = before["settings"].clone();
+    expected["quota_enabled"] = json!(false);
+    assert_eq!(after["settings"], expected);
+    assert_eq!(
+        after["settings"]["session_headers"],
+        json!(["x-session-id"])
+    );
+    assert_eq!(
+        after["settings"]["transcript_roots"],
+        json!(["/harness/repos/.claude"])
+    );
+}
+
 #[tokio::test]
 async fn a_provider_toker_does_not_know_is_refused() {
     let (server, _store) = server();

@@ -31,6 +31,9 @@ pub(super) struct Provider {
     pub(super) env_set: bool,
     pub(super) keyring: bool,
     pub(super) literal_set: bool,
+    /// Not shown, but sent back with every edit: the service writes the row
+    /// it is given whole, so a field left out is a field cleared.
+    pub(super) refresh_url: Option<String>,
     pub(super) client_version: Option<String>,
     pub(super) version_probe: Option<bool>,
 }
@@ -60,6 +63,10 @@ pub(super) struct Settings {
     pub(super) awake: Option<bool>,
     pub(super) ping_header: Option<String>,
     pub(super) notice_default: Option<String>,
+    /// Not shown yet, but sent back with every edit for the same reason as
+    /// [`Provider::refresh_url`].
+    pub(super) session_headers: Option<Vec<String>>,
+    pub(super) transcript_roots: Option<Vec<String>>,
 }
 
 /// One Messages binding's standing with server safeguards: what it declares
@@ -554,6 +561,7 @@ fn provider_body(provider: &Provider) -> Value {
         "provider": provider.name,
         "enabled": provider.enabled,
         "upstream": provider.upstream,
+        "refresh_url": provider.refresh_url,
         "client_version": provider.client_version,
         "version_probe": provider.version_probe,
     })
@@ -569,6 +577,8 @@ fn settings_body(settings: &Settings) -> Value {
         "awake": settings.awake,
         "ping_header": settings.ping_header,
         "notice_default": settings.notice_default,
+        "session_headers": settings.session_headers,
+        "transcript_roots": settings.transcript_roots,
     })
 }
 
@@ -610,6 +620,8 @@ fn parse_snapshot(body: &Value) -> Snapshot {
             awake: flag("awake"),
             ping_header: text(&settings, "ping_header"),
             notice_default: text(&settings, "notice_default"),
+            session_headers: names(&settings, "session_headers"),
+            transcript_roots: names(&settings, "transcript_roots"),
         },
         db_path: body
             .get("db_path")
@@ -646,6 +658,7 @@ fn parse_provider(row: &Value) -> Provider {
             .get("literal_set")
             .and_then(Value::as_bool)
             .unwrap_or_default(),
+        refresh_url: text(row, "refresh_url"),
         client_version: text(row, "client_version"),
         version_probe: row.get("version_probe").and_then(Value::as_bool),
     }
@@ -670,6 +683,17 @@ fn parse_safeguards(row: &Value) -> Safeguards {
     }
 }
 
+/// A list setting, kept as it was: absent and empty are different answers.
+fn names(value: &Value, name: &str) -> Option<Vec<String>> {
+    value.get(name).and_then(Value::as_array).map(|items| {
+        items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    })
+}
+
 fn text(value: &Value, name: &str) -> Option<String> {
     value
         .get(name)
@@ -691,6 +715,7 @@ pub(super) mod testing {
                     "provider": "anthropic_sub",
                     "enabled": true,
                     "upstream": null,
+                    "refresh_url": "http://login.invalid/token",
                     "credential": {
                         "env": "TOKER_ANTHROPIC_SUB_TOKEN",
                         "env_set": false,
@@ -725,7 +750,9 @@ pub(super) mod testing {
                 "cold_min_tokens": 175000,
                 "awake": null,
                 "ping_header": null,
-                "notice_default": null
+                "notice_default": null,
+                "session_headers": ["x-session-id"],
+                "transcript_roots": ["/harness/repos/.claude"]
             },
             "db_path": "/home/example/.local/share/toker/toker.db",
             "port": 18123
@@ -808,6 +835,32 @@ mod tests {
         // path never carries one in either direction (spec: DCTRL).
         assert!(body.get("cred_literal").is_none());
         assert!(body.get("credential").is_none());
+    }
+
+    #[test]
+    fn an_edit_carries_the_fields_the_page_does_not_show() {
+        // The service writes the row it is given whole, so a field left out
+        // of the body is cleared in the store.
+        let mut state = loaded();
+        let provider = state
+            .key(key(KeyCode::Char(' ')))
+            .expect("a request")
+            .body
+            .expect("a body");
+        assert_eq!(provider["refresh_url"], json!("http://login.invalid/token"));
+
+        let mut state = loaded();
+        state.set_view(View::Settings);
+        let settings = state
+            .key(key(KeyCode::Char(' ')))
+            .expect("a request")
+            .body
+            .expect("a body");
+        assert_eq!(settings["session_headers"], json!(["x-session-id"]));
+        assert_eq!(
+            settings["transcript_roots"],
+            json!(["/harness/repos/.claude"])
+        );
     }
 
     #[test]
