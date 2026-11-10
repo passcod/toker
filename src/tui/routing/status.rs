@@ -21,25 +21,19 @@ fn adapter_name(adapter: &str) -> &str {
 }
 
 /// `2 lanes on rev 9`, for the lanes still pinned to a revision that is no
-/// longer live. Nothing where there are none.
-fn earlier_lanes(snapshot: &Value, live: Option<i64>) -> Option<String> {
-    let revisions = snapshot
-        .get("derived")
-        .map(|derived| array(derived, "revisions"))
-        .unwrap_or(&[]);
-    let mut total = 0;
-    let mut on = Vec::new();
-    for revision in revisions {
-        let id = revision.get("revision_id").and_then(Value::as_i64);
-        let lanes = count(revision, "total");
-        if id != live && lanes > 0 {
-            total += lanes;
-            on.extend(id);
-        }
-    }
+/// longer live, as the daemon worked them out against it. Nothing where
+/// there are none.
+fn earlier_lanes(snapshot: &Value) -> Option<String> {
+    let earlier = data::earlier_lanes(snapshot);
+    let total = count(earlier, "total");
     if total == 0 {
         return None;
     }
+    let mut on: Vec<i64> = array(earlier, "revisions")
+        .iter()
+        .filter(|revision| count(revision, "total") > 0)
+        .filter_map(|revision| revision.get("revision_id").and_then(Value::as_i64))
+        .collect();
     on.sort_unstable();
     let on: Vec<String> = on.iter().map(i64::to_string).collect();
     Some(format!(
@@ -91,7 +85,7 @@ pub(super) fn text_of(
         parts.push(format!("rev {revision} live"));
     }
     if let Some(snapshot) = snapshot {
-        parts.extend(earlier_lanes(snapshot, data::revision_id(snapshot)));
+        parts.extend(earlier_lanes(snapshot));
         parts.extend(unapplied(snapshot));
     }
     if working {

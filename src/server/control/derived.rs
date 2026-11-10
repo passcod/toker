@@ -54,6 +54,9 @@ pub(crate) struct Inputs<'a, L> {
     /// The active policy, where it compiles.
     pub active: Option<ActivePolicy<'a>>,
     pub hits: &'a HitCounts,
+    /// The revision the lanes are judged against: one on any other revision
+    /// is on an earlier one.
+    pub live_revision_id: i64,
     /// Lanes pinned to each revision, by revision.
     pub revision_lanes: &'a BTreeMap<i64, RoutingLaneImpacts>,
     /// Which lanes pinned to each revision hold a cache that moving them onto
@@ -164,6 +167,13 @@ pub(crate) fn build<L: LearningView>(inputs: &Inputs<'_, L>) -> Value {
             }))
             .collect::<Vec<_>>(),
         "active": inputs.active.map(|active| policy_body(active, inputs)),
+        // A live revision with no record in it is a fresh install, whatever
+        // number it carries. The page used to decide that by walking the
+        // document itself.
+        "holds_nothing": inputs
+            .active
+            .is_some_and(|active| holds_nothing(active.document)),
+        "earlier_lanes": earlier_lanes(inputs),
         "revisions": inputs
             .revision_lanes
             .iter()
@@ -428,6 +438,52 @@ fn cost_name(cost: CostClass) -> &'static str {
         CostClass::Billed => "billed",
         CostClass::Unknown => "unknown",
     }
+}
+
+/// The lanes still pinned to a revision that is no longer live: how many,
+/// how many of those moving would cost a cache, the names of some of those,
+/// and the earlier revisions holding them.
+///
+/// The consent a widening asks for turns on the at-risk count, and the page
+/// drew it four separate ways from the per-revision rows before this.
+fn earlier_lanes<L: LearningView>(inputs: &Inputs<'_, L>) -> Value {
+    let mut total = RoutingLaneImpacts::default();
+    let mut lanes: Vec<&String> = Vec::new();
+    let mut revisions = Vec::new();
+    for (revision_id, impacts) in inputs.revision_lanes {
+        if *revision_id == inputs.live_revision_id {
+            continue;
+        }
+        total.add(impacts);
+        let named = inputs
+            .revision_at_risk
+            .get(revision_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        lanes.extend(named);
+        revisions.push(json!({
+            "revision_id": revision_id,
+            "total": impacts.total,
+            "at_risk": impacts.at_risk(),
+        }));
+    }
+    json!({
+        "total": total.total,
+        "at_risk": total.at_risk(),
+        "lanes": lanes,
+        "revisions": revisions,
+    })
+}
+
+/// Whether a document holds no record at all, as a fresh install's does.
+fn holds_nothing(document: &PolicyDocument) -> bool {
+    document.presentations.is_empty()
+        && document.routes.is_empty()
+        && document.defaults.is_empty()
+        && document.rewrites.is_empty()
+        && document.classifiers.is_empty()
+        && document.upgrades.is_empty()
+        && document.compaction.is_none()
 }
 
 fn lanes_body(impacts: Option<&RoutingLaneImpacts>) -> Value {

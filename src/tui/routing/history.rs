@@ -9,7 +9,7 @@ use ratatui::{
 use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::data::{array, count, text};
+use super::data::{self, array, count, text};
 use super::words::{lanes_phrase, when};
 use crate::tui::table::{BodyLine, Cells, Table, heading, span, widest};
 use crate::tui::tone::{bold, dim};
@@ -198,38 +198,20 @@ fn short(name: &str) -> String {
     format!("{head}…{}", tail.into_iter().collect::<String>())
 }
 
-/// The lanes whose cache moving the running lanes onto revision `live` would
-/// lose, and how many of them there are: those on an earlier revision that
-/// are warm or not provably cold.
-pub(super) fn at_risk(snapshot: &Value, live: i64) -> (Vec<String>, u64) {
-    let earlier = || {
-        snapshot
-            .get("derived")
-            .map(|derived| array(derived, "revisions"))
-            .unwrap_or(&[])
-            .iter()
-            .filter(move |lanes| lanes.get("revision_id").and_then(Value::as_i64) != Some(live))
-    };
-    let names = earlier()
-        .flat_map(|lanes| array(lanes, "at_risk"))
+/// The lanes whose cache moving the running lanes onto the live revision
+/// would lose, and how many of them there are, as the daemon worked it out.
+pub(super) fn at_risk(snapshot: &Value) -> (Vec<String>, u64) {
+    let earlier = data::earlier_lanes(snapshot);
+    let names = array(earlier, "lanes")
+        .iter()
         .filter_map(|name| name.as_str().map(str::to_owned))
         .collect();
-    let total = earlier()
-        .map(|lanes| count(lanes, "warm") + count(lanes, "unknown"))
-        .sum();
-    (names, total)
+    (names, count(earlier, "at_risk"))
 }
 
-/// How many lanes are pinned to a revision other than `live`.
-pub(super) fn on_earlier(snapshot: &Value, live: i64) -> u64 {
-    snapshot
-        .get("derived")
-        .map(|derived| array(derived, "revisions"))
-        .unwrap_or(&[])
-        .iter()
-        .filter(|lanes| lanes.get("revision_id").and_then(Value::as_i64) != Some(live))
-        .map(|lanes| count(lanes, "total"))
-        .sum()
+/// How many lanes are pinned to a revision that is no longer live.
+pub(super) fn on_earlier(snapshot: &Value) -> u64 {
+    count(data::earlier_lanes(snapshot), "total")
 }
 
 /// Where the lanes stand: on this revision and, where it is the live one,

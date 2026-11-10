@@ -45,21 +45,23 @@ pub(super) fn policy(snapshot: &Value) -> Option<&Value> {
 }
 
 /// Whether the live revision holds no record at all, as a fresh install's
-/// does. A snapshot with no policy in it says nothing either way.
+/// does, as the daemon says. A snapshot with nothing derived in it says
+/// nothing either way.
 pub(super) fn holds_nothing(snapshot: &Value) -> bool {
-    policy(snapshot).is_some_and(|policy| {
-        [
-            "presentations",
-            "routes",
-            "defaults",
-            "rewrites",
-            "classifiers",
-            "upgrades",
-        ]
-        .iter()
-        .all(|table| array(policy, table).is_empty())
-            && policy.get("compaction").is_none_or(Value::is_null)
-    })
+    snapshot
+        .get("derived")
+        .and_then(|derived| derived.get("holds_nothing"))
+        == Some(&Value::Bool(true))
+}
+
+/// The lanes still pinned to a revision that is no longer live, as the
+/// daemon worked them out against it: how many, how many of those moving
+/// would cost a cache, some of their names, and the revisions holding them.
+pub(super) fn earlier_lanes(snapshot: &Value) -> &Value {
+    snapshot
+        .get("derived")
+        .and_then(|derived| derived.get("earlier_lanes"))
+        .unwrap_or(&Value::Null)
 }
 
 pub(super) fn revision_id(snapshot: &Value) -> Option<i64> {

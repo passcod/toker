@@ -64,6 +64,7 @@ fn key(state: &mut State, key: char) -> Option<Command> {
 /// The snapshot with its lanes as `revisions` says.
 fn with_lanes(revisions: Value) -> State {
     let mut snapshot = testing::snapshot(World::SAVED);
+    snapshot["derived"]["earlier_lanes"] = testing::earlier_lanes(&revisions, 10);
     snapshot["derived"]["revisions"] = revisions;
     let mut state = State::default();
     reply(&mut state, "snapshot", 200, snapshot);
@@ -262,10 +263,12 @@ fn a_confirmation_is_for_the_revision_it_named_not_one_that_went_live_since() {
 /// The prompt after `m`, with `lanes` at risk on the earlier revision.
 fn prompt_naming(lanes: Value) -> String {
     let mut snapshot = testing::snapshot(World::SAVED);
-    snapshot["derived"]["revisions"] = json!([
+    let revisions = json!([
         {"revision_id": 9, "warm": 2, "cold": 0, "unknown": 0, "total": 2, "at_risk": lanes},
         {"revision_id": 10, "warm": 0, "cold": 1, "unknown": 0, "total": 1, "at_risk": []},
     ]);
+    snapshot["derived"]["earlier_lanes"] = testing::earlier_lanes(&revisions, 10);
+    snapshot["derived"]["revisions"] = revisions;
     let mut state = State::default();
     reply(&mut state, "snapshot", 200, snapshot);
     reply(
@@ -379,7 +382,8 @@ fn the_daemon_asking_for_consent_the_page_did_not_foresee_arms_the_move() {
         Ok(Response {
             status: 409,
             body: json!({"error": "forced_cache_transition_required",
-                "lane_impacts": {"total": 5, "warm": 1, "cold": 3, "unknown": 1, "unpinned": 1}}),
+                "lane_impacts": {"total": 5, "warm": 1, "cold": 3, "unknown": 1,
+                    "unpinned": 1, "at_risk": 2}}),
         }),
     ));
     assert!(!state.in_flight());

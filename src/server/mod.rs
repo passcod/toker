@@ -910,6 +910,7 @@ impl Server {
                     document: revision.document.document(),
                 }),
             hits: &hit_counts,
+            live_revision_id: revision.revision_id,
             revision_lanes: &revision_lanes,
             revision_at_risk: &at_risk,
         });
@@ -2369,6 +2370,23 @@ pub(crate) struct RoutingLaneImpacts {
     pub(crate) unknown: u64,
 }
 
+impl RoutingLaneImpacts {
+    /// The lanes moving would cost a cache: warm, or not provably cold. The
+    /// one place that predicate is written, so a page cannot read consent
+    /// differently from the activation that asks for it.
+    pub(crate) fn at_risk(&self) -> u64 {
+        self.warm + self.unknown
+    }
+
+    pub(crate) fn add(&mut self, other: &Self) {
+        self.total += other.total;
+        self.unpinned += other.unpinned;
+        self.warm += other.warm;
+        self.cold += other.cold;
+        self.unknown += other.unknown;
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct RoutingActivation {
     pub(crate) activation: ActivatedPolicyRevision,
@@ -2414,7 +2432,7 @@ fn require_cache_consent(
     forced_cache_transition: bool,
 ) -> Result<(), RoutingControlError> {
     if scope == crate::policy::ActivationScope::Immediate
-        && impacts.warm + impacts.unknown > 0
+        && impacts.at_risk() > 0
         && !forced_cache_transition
     {
         return Err(RoutingControlError::ForcedTransitionRequired { impacts: *impacts });

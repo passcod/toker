@@ -268,6 +268,7 @@ fn derive(document: Value, availability: &AvailabilitySnapshot, hits: &HitCounts
             document: &document,
         }),
         hits,
+        live_revision_id: 1,
         revision_lanes: &revision_lanes,
         revision_at_risk: &Default::default(),
     })["active"]
@@ -706,6 +707,7 @@ fn a_route_carries_its_providers_reach_and_the_lanes_it_holds() {
             document: &document,
         }),
         hits: &hits(HitCoverage::Complete),
+        live_revision_id: 9,
         revision_lanes: &revision_lanes,
         revision_at_risk: &Default::default(),
     });
@@ -731,6 +733,51 @@ fn a_route_carries_its_providers_reach_and_the_lanes_it_holds() {
     assert_eq!(revisions[0]["warm"], 2);
     assert_eq!(revisions[1]["revision_id"], 9);
     assert_eq!(revisions[1]["total"], 1);
+
+    // Rev 9 is live, so only rev 7's lanes are on an earlier revision, and
+    // both of them are warm, so moving them would cost a cache.
+    assert_eq!(
+        derived["earlier_lanes"],
+        json!({
+            "total": 2,
+            "at_risk": 2,
+            "lanes": [],
+            "revisions": [{"revision_id": 7, "total": 2, "at_risk": 2}],
+        })
+    );
+    assert_eq!(derived["holds_nothing"], false);
+}
+
+/// A revision with no record in it is a fresh install, whatever number it
+/// carries; the page reads the flag rather than walking the document.
+#[test]
+fn an_empty_document_says_it_holds_nothing() {
+    let (policy, document) = compiled(json!({
+        "format_version": 5,
+        "presentations": [], "routes": [], "defaults": [],
+        "rewrites": [], "classifiers": [], "upgrades": [],
+    }));
+    let revision_lanes = BTreeMap::new();
+    let pinned = BTreeMap::new();
+    let derived = build(&Inputs {
+        availability: &healthy(),
+        inventory: &inventory(),
+        learning: &NoLearning,
+        circuits: &Default::default(),
+        pinned: &pinned,
+        publications: &[],
+        active: Some(ActivePolicy {
+            policy: &policy,
+            document: &document,
+        }),
+        hits: &hits(HitCoverage::Complete),
+        live_revision_id: 1,
+        revision_lanes: &revision_lanes,
+        revision_at_risk: &Default::default(),
+    });
+    assert_eq!(derived["holds_nothing"], true);
+    assert_eq!(derived["earlier_lanes"]["total"], 0);
+    assert_eq!(derived["earlier_lanes"]["at_risk"], 0);
 }
 
 #[test]

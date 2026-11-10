@@ -974,6 +974,9 @@ fn lane_impacts_body(impacts: &RoutingLaneImpacts) -> Value {
         "warm": impacts.warm,
         "cold": impacts.cold,
         "unknown": impacts.unknown,
+        // The consent the refusal asks for turns on this, so it is said
+        // rather than left to the terminal to add up again.
+        "at_risk": impacts.at_risk(),
     })
 }
 

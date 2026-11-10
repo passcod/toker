@@ -1215,7 +1215,7 @@ fn built(world: World) -> Value {
         },
         "activation": {"scope": "new_and_cold_lanes", "forced_cache_transition": false},
         "offers": offers(),
-        "lane_impacts": {"total": 10, "unpinned": 0, "warm": 2, "cold": 8, "unknown": 0},
+        "lane_impacts": {"total": 10, "unpinned": 0, "warm": 2, "cold": 8, "unknown": 0, "at_risk": 2},
         "publications": [
             publication(
                 "claude_settings",
@@ -1238,6 +1238,17 @@ fn built(world: World) -> Value {
                 json!([{"revision_id": 9, "warm": 2, "cold": 8, "unknown": 0, "total": 10,
                     "at_risk": ["ses-hot", "ses-crow"]}])
             },
+            "holds_nothing": world.empty,
+            // Worked out against the live revision: with rev 10 live, rev 9's
+            // two warm lanes are the ones moving would cost a cache.
+            "earlier_lanes": if world.saved {
+                json!({
+                    "total": 2, "at_risk": 2, "lanes": ["ses-hot", "ses-crow"],
+                    "revisions": [{"revision_id": 9, "total": 2, "at_risk": 2}],
+                })
+            } else {
+                json!({"total": 0, "at_risk": 0, "lanes": [], "revisions": []})
+            },
             "active": {
                 "routes": routes,
                 "classifiers": classifiers(),
@@ -1253,6 +1264,39 @@ fn built(world: World) -> Value {
             },
         },
     })
+}
+
+/// The `earlier_lanes` the daemon derives from the per-revision rows with
+/// `live` the live revision, for tests that set those rows by hand. It
+/// mirrors `server::control::derived::earlier_lanes`.
+pub(super) fn earlier_lanes(revisions: &Value, live: i64) -> Value {
+    let mut total = 0;
+    let mut at_risk = 0;
+    let mut lanes: Vec<Value> = Vec::new();
+    let mut rows: Vec<Value> = Vec::new();
+    for revision in revisions.as_array().into_iter().flatten() {
+        let number = |key: &str| revision.get(key).and_then(Value::as_u64).unwrap_or(0);
+        if revision.get("revision_id").and_then(Value::as_i64) == Some(live) {
+            continue;
+        }
+        let risk = number("warm") + number("unknown");
+        total += number("total");
+        at_risk += risk;
+        lanes.extend(
+            revision
+                .get("at_risk")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .cloned(),
+        );
+        rows.push(json!({
+            "revision_id": revision["revision_id"],
+            "total": number("total"),
+            "at_risk": risk,
+        }));
+    }
+    json!({"total": total, "at_risk": at_risk, "lanes": lanes, "revisions": rows})
 }
 
 /// The revision history the page reads beside the snapshot, newest first.

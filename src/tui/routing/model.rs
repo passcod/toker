@@ -877,7 +877,7 @@ impl State {
                 Some("forced_cache_transition_required") => {
                     let impacts = response.body.get("lane_impacts").unwrap_or(&Value::Null);
                     let live = self.active_revision_id.unwrap_or_default();
-                    let count = data::count(impacts, "warm") + data::count(impacts, "unknown");
+                    let count = data::count(impacts, "at_risk");
                     self.armed = Some(Armed::new(Vec::new(), count, live));
                     self.error = None;
                 }
@@ -1729,11 +1729,11 @@ impl State {
             ));
             return None;
         }
-        if history::on_earlier(snapshot, live) == 0 {
+        if history::on_earlier(snapshot) == 0 {
             self.notice = Some(format!("no lane is on an earlier revision than rev {live}"));
             return None;
         }
-        let (names, count) = history::at_risk(snapshot, live);
+        let (names, count) = history::at_risk(snapshot);
         if count == 0 {
             return self.widen(live, false);
         }

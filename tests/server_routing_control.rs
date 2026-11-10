@@ -1093,6 +1093,11 @@ async fn a_widening_goes_forward_only_and_a_save_starts_from_its_own_scope() {
     assert_eq!(denied["error"], "forced_cache_transition_required");
     assert_eq!(denied["lane_impacts"]["unknown"], 1);
     assert_eq!(
+        denied["lane_impacts"]["at_risk"], 1,
+        "the refusal says what consent it wants, rather than leaving the \
+         terminal to add warm and unknown up again"
+    );
+    assert_eq!(
         snapshot(&app).await["activation"]["scope"],
         "new_and_cold_lanes",
         "a refused widening changed nothing"
