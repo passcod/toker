@@ -74,4 +74,5 @@ For mapping Claude tiers onto another provider, the selector is the direct fit.
 - A codex-only Anthropic default passes `claude-*` names to codex, and nothing on the routing page flags it.
 - No way to duplicate a record, so each tier's rewrite is entered from the blank template.
 - Reference fields such as **route** complete only by prefix, start prefilled with another record's id, and never list the choices: clear back to `route-`, type the start of the id, then tab.
+- A route reference's arguments start empty, a new one is named `name-1`, and the form never offers the route's declared parameters, so `requested_model` has to be known and typed.
 - Codex has no generated classifier, and its listing has no release dates, so "newest codex model" needs a hand-written classifier regex first.
