@@ -590,7 +590,7 @@ const LABELS: usize = 10;
 /// matches with a worked example, what it sends on, the route and
 /// candidates, its reach with the reason for it, anything earlier that
 /// already catches it, and its recent catches (spec: UTUI#reading-a-table).
-pub(super) fn rule_detail(active: &Value, rule: &Value, earlier: &[&Value]) -> Vec<Line<'static>> {
+pub(super) fn rule_detail(active: &Value, rule: &Value) -> Vec<Line<'static>> {
     let matcher = rule.get("matcher").unwrap_or(&Value::Null);
     let route = text(rule, "route_id");
     let reach = rule.get("reach").unwrap_or(&Value::Null);
@@ -623,7 +623,7 @@ pub(super) fn rule_detail(active: &Value, rule: &Value, earlier: &[&Value]) -> V
     lines.push(field(
         "overlaps",
         LABELS,
-        vec![Span::raw(overlap_text(rule, earlier))],
+        vec![Span::raw(overlap_text(rule))],
     ));
     lines.push(field(
         "recent",
@@ -692,21 +692,13 @@ fn example_spans(example: Option<&Value>) -> Vec<Span<'static>> {
 }
 
 /// What already catches all or part of what a rule matches, in words, or
-/// that nothing does and why.
-fn overlap_text(rule: &Value, earlier: &[&Value]) -> String {
+/// that nothing does. Why nothing does is the daemon's to say: the page read
+/// the earlier rules' matcher kinds and wrote a reason of its own, which was
+/// the one place it judged policy rather than laying out what it was given.
+fn overlap_text(rule: &Value) -> String {
     let shadows = array(rule, "shadowed_by");
     if shadows.is_empty() {
-        let matcher = rule.get("matcher").unwrap_or(&Value::Null);
-        let prefixes = matcher_kind(matcher) == "prefix"
-            && !earlier.is_empty()
-            && earlier
-                .iter()
-                .all(|rule| rule.get("matcher").map(matcher_kind) == Some("prefix"));
-        return if prefixes {
-            "none: the prefixes differ".to_owned()
-        } else {
-            format!("none: no rule above catches {}", matcher_text(matcher))
-        };
+        return "none".to_owned();
     }
     shadows
         .iter()
@@ -778,20 +770,6 @@ pub(super) fn default_detail(active: &Value, default: &Value) -> Vec<Line<'stati
         lines.push(controls(&[("n", "new"), ("t", "trace")]));
     }
     lines
-}
-
-/// The rules that come before `rule` in its own group, for the detail's
-/// word on overlap.
-pub(super) fn rules_before<'a>(active: &'a Value, rule: &Value) -> Vec<&'a Value> {
-    let label = text(rule, "scope_label");
-    let position = rule.get("position").and_then(Value::as_u64).unwrap_or(0);
-    array(active, "rewrites")
-        .iter()
-        .filter(|other| {
-            text(other, "scope_label") == label
-                && other.get("position").and_then(Value::as_u64).unwrap_or(0) < position
-        })
-        .collect()
 }
 
 // --- defaults ---------------------------------------------------------------
@@ -1187,7 +1165,7 @@ pub(super) fn presentation_detail(active: &Value, record: &Value) -> Vec<Line<'s
     lines.push(field(
         "overlaps",
         LABELS,
-        vec![Span::raw(presentation_overlap(record))],
+        vec![Span::raw(overlap_text(record))],
     ));
     lines.push(field(
         "published",
@@ -1225,14 +1203,23 @@ fn lists_text(record: &Value) -> String {
     text
 }
 
-fn presentation_overlap(record: &Value) -> String {
-    let shadows = array(record, "shadowed_by");
-    if shadows.is_empty() {
-        return "none".to_owned();
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::overlap_text;
+
+    /// An empty `shadowed_by` is the daemon saying nothing catches the rule.
+    /// The page used to read the matcher kinds and write a reason of its own,
+    /// judging policy from less than the daemon had.
+    #[test]
+    fn a_rule_nothing_shadows_reads_as_none_whatever_its_matcher_is() {
+        for kind in ["exact", "prefix", "glob", "regex"] {
+            let rule = json!({
+                "shadowed_by": [],
+                "matcher": {"kind": kind, "text": "claude-*", "value": "claude-*"},
+            });
+            assert_eq!(overlap_text(&rule), "none", "{kind}");
+        }
     }
-    shadows
-        .iter()
-        .map(shadow_text)
-        .collect::<Vec<_>>()
-        .join("; ")
 }

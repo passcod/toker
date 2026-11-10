@@ -34,7 +34,7 @@ expression: "frame(&state, 120, 40)"
 │ example   claude-haiku-4-5 → claude-haiku-4-5                                                                        │
 │ sends to  openrouter-messages  1 candidate · openrouter · billed                                                     │
 │ reach     ok                                                                                                         │
-│ overlaps  none: no rule above catches claude-*                                                                       │
+│ overlaps  none                                                                                                       │
 │ recent    -                                                                                                          │
 │ [e] edit   [n] new   [m] move   [d] delete   [t] trace   [enter] open route                                          │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

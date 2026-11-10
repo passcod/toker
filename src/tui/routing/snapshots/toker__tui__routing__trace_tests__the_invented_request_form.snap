@@ -33,7 +33,7 @@ expression: "frame(&state, 120, 40)"
 │ example   anthropic_sub/claude-sonnet-5 → claude-sonnet-5                                                            │
 │ sends to  claude-sub  2 candidates · anthropic_sub → openrouter                                                      │
 │ reach     no cred · billed fallback  anthropic_sub has no credential, so openrouter serves it, billed                │
-│ overlaps  none: the prefixes differ                                                                                  │
+│ overlaps  none                                                                                                       │
 │ recent    ≥1 in 24h                                                                                                  │
 │ [e] edit   [n] new   [m] move   [d] delete   [t] trace   [enter] open route                                          │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

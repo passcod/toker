@@ -218,7 +218,7 @@ fn lookup_tab(
             rules::rewrites_table(active, width),
             match entry {
                 Some(Entry::Rewrite(rule)) => rules::with_reading(
-                    rules::rule_detail(active, rule, &rules::rules_before(active, rule)),
+                    rules::rule_detail(active, rule),
                     rule.get("reach").unwrap_or(&Value::Null),
                     "[enter] open route",
                 ),
