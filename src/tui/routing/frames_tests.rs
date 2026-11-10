@@ -54,12 +54,12 @@ fn a_fresh_install_draws_every_protocol_refused() {
     insta::assert_snapshot!(frame(&state, 120, 40, false));
 }
 
-/// The overlay at 120×40: the keys grouped by where they apply beside the
+/// The overlay at 120×44: the keys grouped by where they apply beside the
 /// marks, under a header whose buttons stay in view.
 #[test]
-fn the_keys_overlay_groups_the_keys_beside_the_marks_120x40() {
+fn the_keys_overlay_groups_the_keys_beside_the_marks_120x44() {
     let state = page(World::AT_REST, Tab::Rewrites);
-    insta::assert_snapshot!(frame(&state, 120, 40, true));
+    insta::assert_snapshot!(frame(&state, 120, 44, true));
 }
 
 /// A page that has drawn `state` with the overlay open: its first row.
@@ -163,7 +163,7 @@ fn the_overlay_explains_every_mark_the_page_draws_and_no_other() {
     let drawn = frames.join("\n");
 
     // What the overlay says it explains, and where on the page to see it.
-    let probes: [(&str, &[&str]); 30] = [
+    let probes: [(&str, &[&str]); 34] = [
         (">", &["> caught"]),
         ("↓", &["↓ fell past"]),
         ("┌─ │ └─", &["┌─ ", "└─ else"]),
@@ -174,10 +174,7 @@ fn the_overlay_explains_every_mark_the_page_draws_and_no_other() {
         ("ok", &["  ok  "]),
         ("no cred", &["no cred"]),
         ("off", &["  off  "]),
-        (
-            "billed (fallback)",
-            &["billed fallback", "no cred · billed "],
-        ),
+        ("billed fallback", &["billed fallback", "no cred · billed "]),
         ("refused", &["refused"]),
         ("refused · no route", &["refused · no route"]),
         ("- ≥N", &["  - ", "≥1"]),
@@ -200,7 +197,11 @@ fn the_overlay_explains_every_mark_the_page_draws_and_no_other() {
         ("→ ·", &["→ 2 rewrites", "· 5 models"]),
         ("‹ ›", &["‹"]),
         // The rest are read off the vocabulary rather than a frame.
-        ("unbilled (fallback)", &[]),
+        ("unbilled fallback", &[]),
+        ("fallback, cost unknown", &[]),
+        ("none available", &[]),
+        ("billed · unbilled", &[]),
+        ("cost unknown", &[]),
     ];
     let mut explained: Vec<&str> = [
         &keys::ROWS[..],
@@ -241,6 +242,45 @@ fn the_overlay_explains_every_mark_the_page_draws_and_no_other() {
             && !('\u{2500}'..='\u{257f}').contains(glyph)
     }) {
         assert!(said.contains(glyph), "{glyph:?} is drawn but not explained");
+    }
+}
+
+/// Each clause the vocabulary writes for a reach, in full or in its fewest
+/// words, is a mark the overlay explains, spelled as the page spells it.
+#[test]
+fn every_clause_a_reach_is_written_in_is_explained_as_written() {
+    use super::keys;
+    use super::words::reach_text_in;
+    use serde_json::json;
+    let marks: Vec<&str> = keys::READINGS.iter().map(|(mark, _)| *mark).collect();
+    let later = |billed: serde_json::Value| {
+        json!({"outcome": "served_later", "serving": {"billed": billed},
+            "skipped": [{"reason": "no_credential", "provider": "p"}]})
+    };
+    for reach in [
+        later(json!(true)),
+        later(json!(false)),
+        later(json!(null)),
+        json!({"outcome": "refused_unavailable", "skipped": []}),
+    ] {
+        let full = reach_text_in(&reach, false);
+        for clause in full.split(" · ") {
+            assert!(
+                marks.contains(&clause),
+                "{clause:?} of {full:?} is not explained as written"
+            );
+        }
+        // The brief forms are said together, in one entry.
+        let brief = reach_text_in(&reach, true);
+        for clause in brief.split(" · ") {
+            assert!(
+                marks.contains(&clause)
+                    || marks
+                        .iter()
+                        .any(|mark| mark.split(" · ").any(|word| word == clause)),
+                "{clause:?} of {brief:?} is not explained as written"
+            );
+        }
     }
 }
 

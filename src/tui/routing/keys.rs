@@ -27,7 +27,7 @@ pub(super) const ANYWHERE: [(&str, &str); 16] = [
 ];
 
 pub(super) const IN_HISTORY: [(&str, &str); 3] = [
-    ("a", "make the selected revision live"),
+    ("a", "reactivate now, for new and cold lanes"),
     ("m", "move running lanes; m again to confirm"),
     ("c", "trace a request under the revision"),
 ];
@@ -60,21 +60,25 @@ pub(super) const ROWS: [(&str, &str); 7] = [
 ];
 
 /// What a reach, a hit count and a cut list say.
-pub(super) const READINGS: [(&str, &str); 9] = [
+pub(super) const READINGS: [(&str, &str); 13] = [
     ("ok", "the first candidate serves it"),
     ("no cred", "provider on, with no credential"),
     ("off", "provider turned off"),
-    ("billed (fallback)", "a later one serves it, per token"),
-    ("unbilled (fallback)", "a later one serves it, not billed"),
+    ("billed fallback", "a later one serves it, per token"),
+    ("unbilled fallback", "a later one serves it, not billed"),
+    ("fallback, cost unknown", "a later one serves it; no price"),
+    ("billed · unbilled", "those two, where room is short"),
+    ("cost unknown", "that one, where room is short"),
+    ("none available", "every candidate is unavailable"),
     ("refused", "an edge's setting stops the walk"),
     ("refused · no route", "no rule or default catches it"),
-    ("- ≥N", "not recorded · a floor, some unknown"),
+    ("- ≥N", "unrecorded · a floor, some unknown"),
     ("… N more", "a list cut short; also … N above"),
 ];
 
 /// What a presentation's row and detail say.
 pub(super) const PRESENTATIONS: [(&str, &str); 5] = [
-    ("slug", "the name a client sees it listed under"),
+    ("slug", "the name a client lists it under"),
     ("${model_id}", "a listed model's provider id"),
     ("as", "the picker tier it is listed under"),
     ("published", "written to the client's settings"),
@@ -87,8 +91,8 @@ pub(super) const REVISIONS: [(&str, &str); 9] = [
     ("live", "the revision serving new lanes"),
     ("warm · cold", "a lane's prompt cache live · lapsed"),
     ("[m] reversed", "armed: press again to go ahead"),
-    ("N lanes on rev M", "warm lanes left on an older revision"),
-    ("claude pending", "settings lag: or failed, unsupported"),
+    ("N lanes on rev M", "warm lanes still on an older rev"),
+    ("claude pending", "settings lag, failed or unsupported"),
     ("no policy yet", "the live revision holds no record"),
     ("→ ·", "lookup order; models, history apart"),
     ("‹ ›", "tabs scrolled out of the strip"),
