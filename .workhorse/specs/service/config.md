@@ -84,6 +84,12 @@ The control surface MUST refuse a value it cannot use, naming the setting it ref
 > [!NOTE]
 > Refusing at the edit is refusing where there is someone to tell.
 
+Enabling a provider MUST, in the same operation, give each protocol that provider serves a default route to it where the active revision has none for that protocol, and MUST [save](../routing/revisions.md#saving-an-edit) that as a revision.
+A protocol that already has a default MUST keep it.
+
+> [!NOTE]
+> A machine set up before any provider was found then serves once one is turned on, without a trip to the routing page.
+
 ### Configuration never refuses a start
 
 A stored setting the service cannot use MUST disable only what that setting describes, and MUST NOT prevent the service from starting.
