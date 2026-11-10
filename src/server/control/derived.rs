@@ -51,16 +51,23 @@ pub(crate) struct Inputs<'a, L> {
     pub circuits: &'a CircuitSnapshot,
     pub pinned: &'a BTreeMap<RouteId, RoutingLaneImpacts>,
     pub publications: &'a [RoutingPublication],
-    pub active: Option<&'a CompiledPolicy>,
-    /// The document the active policy was compiled from, which holds what
-    /// compilation drops: the defaults, and a matcher's own spelling.
-    pub document: Option<&'a PolicyDocument>,
+    /// The active policy, where it compiles.
+    pub active: Option<ActivePolicy<'a>>,
     pub hits: &'a HitCounts,
     /// Lanes pinned to each revision, by revision.
     pub revision_lanes: &'a BTreeMap<i64, RoutingLaneImpacts>,
     /// Which lanes pinned to each revision hold a cache that moving them onto
     /// another revision would lose, by revision.
     pub revision_at_risk: &'a BTreeMap<i64, Vec<String>>,
+}
+
+/// A compiled policy with the document it was compiled from, which holds what
+/// compilation drops: the defaults, and a matcher's own spelling. They travel
+/// together so no caller can pair a policy with another revision's document.
+#[derive(Clone, Copy)]
+pub(crate) struct ActivePolicy<'a> {
+    pub policy: &'a CompiledPolicy,
+    pub document: &'a PolicyDocument,
 }
 
 /// What every fact about a record is worked out from: one policy, one
@@ -156,10 +163,7 @@ pub(crate) fn build<L: LearningView>(inputs: &Inputs<'_, L>) -> Value {
                 "failure": circuit.failure,
             }))
             .collect::<Vec<_>>(),
-        "active": inputs
-            .active
-            .zip(inputs.document)
-            .map(|(policy, document)| policy_body(policy, document, inputs)),
+        "active": inputs.active.map(|active| policy_body(active, inputs)),
         "revisions": inputs
             .revision_lanes
             .iter()
@@ -179,11 +183,8 @@ pub(crate) fn build<L: LearningView>(inputs: &Inputs<'_, L>) -> Value {
     })
 }
 
-fn policy_body<L: LearningView>(
-    policy: &CompiledPolicy,
-    document: &PolicyDocument,
-    inputs: &Inputs<'_, L>,
-) -> Value {
+fn policy_body<L: LearningView>(active: ActivePolicy<'_>, inputs: &Inputs<'_, L>) -> Value {
+    let ActivePolicy { policy, document } = active;
     let ctx = Context::new(
         policy,
         document,

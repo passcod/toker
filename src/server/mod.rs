@@ -903,8 +903,12 @@ impl Server {
             circuits: &circuits,
             pinned: &pinned,
             publications: &publications,
-            active: active_policy.as_ref(),
-            document: Some(revision.document.document()),
+            active: active_policy
+                .as_ref()
+                .map(|policy| control::derived::ActivePolicy {
+                    policy,
+                    document: revision.document.document(),
+                }),
             hits: &hit_counts,
             revision_lanes: &revision_lanes,
             revision_at_risk: &at_risk,

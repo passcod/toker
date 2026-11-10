@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
-use super::{Inputs, build};
+use super::{ActivePolicy, Inputs, build};
 use crate::catalog::offers::{BackendOffer, OfferInventory};
 use crate::policy::{
     AvailabilitySnapshot, BindingAvailability, CatalogueAvailability, CompiledPolicy, CostClass,
@@ -263,8 +263,10 @@ fn derive(document: Value, availability: &AvailabilitySnapshot, hits: &HitCounts
         circuits: &Default::default(),
         pinned: &pinned,
         publications: &[],
-        active: Some(&policy),
-        document: Some(&document),
+        active: Some(ActivePolicy {
+            policy: &policy,
+            document: &document,
+        }),
         hits,
         revision_lanes: &revision_lanes,
         revision_at_risk: &Default::default(),
@@ -699,8 +701,10 @@ fn a_route_carries_its_providers_reach_and_the_lanes_it_holds() {
         circuits: &Default::default(),
         pinned: &pinned,
         publications: &[],
-        active: Some(&policy),
-        document: Some(&document),
+        active: Some(ActivePolicy {
+            policy: &policy,
+            document: &document,
+        }),
         hits: &hits(HitCoverage::Complete),
         revision_lanes: &revision_lanes,
         revision_at_risk: &Default::default(),
