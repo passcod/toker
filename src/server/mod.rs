@@ -874,6 +874,13 @@ impl Server {
             inventory_generation,
         } = basis;
         let now = now_ms();
+        // The table's reach must read the availability preview reads, or a
+        // marked binding or an aged catalogue is one thing in the table and
+        // another in the trace of the same request (spec:
+        // UTUI#reading-a-table).
+        let availability = availability
+            .at(now, crate::catalog::fetched::CACHE_TTL_MS)
+            .with_safeguards_marks(&self.safeguards_marks());
         let lane_impacts = self.routing_lane_impacts_locked(&state, now)?;
         let publications = self.store.load_publications()?;
         let active_policy = compile_stored_policy(&revision, &self.registry, &inventory).ok();

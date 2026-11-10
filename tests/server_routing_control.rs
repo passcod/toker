@@ -1265,6 +1265,45 @@ async fn stale_publication_acknowledgement_conflicts_and_generic_call_cannot_cla
     );
 }
 
+/// The table's reach must be worked out from the availability preview uses,
+/// marks and catalogue age included (spec: UTUI#reading-a-table).
+#[tokio::test]
+async fn the_table_reads_the_same_availability_preview_does() {
+    let dir = common::tempdir("toker-routing-marks-");
+    let db = dir.join("toker.db");
+    let binding: toker::policy::BindingId = "openrouter.openrouter_messages".parse().unwrap();
+    {
+        let store = Store::open(&db).unwrap();
+        store
+            .set_safeguards_mark(&binding, jiff::Timestamp::now().as_millisecond())
+            .unwrap();
+    }
+    let mut config = config();
+    config.db_path = db.clone();
+    let store = Arc::new(Store::open(&db).unwrap());
+    let server = Server::with_seams(config, store, toker::server::Seams::isolated())
+        .expect("authoritative server");
+    let app = server.router();
+
+    let derived = snapshot(&app).await["derived"].clone();
+    let marked: Vec<&Value> = derived["active"]["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|route| {
+            route["handled_by"]["server_safeguards"]["candidates"]
+                .as_array()
+                .unwrap()
+        })
+        .filter(|candidate| candidate["binding_id"] == "openrouter.openrouter_messages")
+        .collect();
+    assert!(!marked.is_empty(), "{derived}");
+    for candidate in marked {
+        assert_eq!(candidate["marked"], true, "{candidate}");
+        assert_eq!(candidate["support"], "unsupported", "{candidate}");
+    }
+}
+
 #[tokio::test]
 async fn the_snapshot_carries_derived_content_for_the_active_revision() {
     let (server, store) = server();
