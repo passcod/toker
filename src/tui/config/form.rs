@@ -8,9 +8,8 @@ use ratatui::{
 };
 
 use super::model::{Editing, Snapshot, Verdict};
-use crate::tui::routing::edit_view::wrap;
-use crate::tui::routing::table::{BodyLine, span};
-use crate::tui::routing::words::{Tone, dim, toned};
+use crate::tui::table::{BodyLine, span, wrap};
+use crate::tui::tone::{Tone, dim, toned};
 
 /// The cells the field's name takes, so values line up across forms.
 const NAME: usize = 16;

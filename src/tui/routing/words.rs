@@ -2,53 +2,11 @@
 //! edge, a setting. One vocabulary for the tables, the details and the
 //! route page, so the same fact reads the same wherever it shows.
 
-use ratatui::{
-    style::{Color, Style},
-    text::Span,
-};
+use ratatui::text::Span;
 use serde_json::Value;
 
 use super::data::{array, text};
-
-/// How loudly a clause reads. Colour only ever draws the eye to a problem:
-/// healthy is plain, what is merely off is dim, and a refusal is red
-/// (spec: UTUI#distinguishing-a-reading; it never carries a reading alone).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::tui) enum Tone {
-    Plain,
-    Dim,
-    Warn,
-    Bad,
-}
-
-impl Tone {
-    pub(in crate::tui) fn style(self) -> Style {
-        match self {
-            Tone::Plain => Style::new(),
-            Tone::Dim => Style::new().dim(),
-            Tone::Warn => Style::new().fg(Color::Yellow),
-            Tone::Bad => Style::new().fg(Color::Red),
-        }
-    }
-}
-
-pub(in crate::tui) fn dim() -> Style {
-    Style::new().dim()
-}
-
-pub(in crate::tui) fn bold() -> Style {
-    Style::new().bold()
-}
-
-/// A span in a tone.
-pub(in crate::tui) fn toned(content: impl Into<String>, tone: Tone) -> Span<'static> {
-    Span::styled(content.into(), tone.style())
-}
-
-/// A dim label, for the left of a label and value row.
-pub(in crate::tui) fn label(content: impl Into<String>) -> Span<'static> {
-    Span::styled(content.into(), dim())
-}
+use crate::tui::tone::{Tone, toned};
 
 /// The reach of a record as the clauses it reads in, each with its tone.
 /// `ok` where the route's first candidate serves; otherwise why not, and

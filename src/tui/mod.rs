@@ -54,6 +54,8 @@ mod rebuilds;
 mod reexec;
 mod routing;
 pub use routing::SettingsSync;
+mod table;
+mod tone;
 mod view;
 
 use std::collections::HashMap;

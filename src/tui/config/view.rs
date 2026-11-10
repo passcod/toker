@@ -12,7 +12,7 @@ use ratatui::text::Line;
 use super::model::{State, View};
 use super::{providers, settings};
 use crate::tui::chrome::{self, Chrome, RowHit, Section};
-use crate::tui::routing::table;
+use crate::tui::table;
 
 /// Where the last frame put things, for the mouse.
 #[derive(Debug, Clone, Default)]

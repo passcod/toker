@@ -12,9 +12,9 @@ use unicode_width::UnicodeWidthStr;
 use super::data::{array, text};
 use super::editing::{Editing, What};
 use super::form::{FormLine, Note};
-use super::table::{BodyLine, Cells, span};
-use super::words::{Tone, dim, toned};
 use crate::tui::chrome;
+use crate::tui::table::{BodyLine, Cells, span, wrap};
+use crate::tui::tone::{Tone, dim, toned};
 
 /// Where a form's lines are indented to, under the row they belong to.
 const INDENT: usize = 4;
@@ -87,26 +87,6 @@ fn tone_of(note: Note) -> Tone {
         Note::Warning => Tone::Warn,
         Note::Refusal => Tone::Bad,
     }
-}
-
-/// `text` broken into lines of at most `width` cells, at spaces.
-pub(in crate::tui) fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        if !line.is_empty() && line.width() + 1 + word.width() > width {
-            lines.push(std::mem::take(&mut line));
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(word);
-    }
-    if !line.is_empty() || lines.is_empty() {
-        lines.push(line);
-    }
-    lines
 }
 
 fn guttered(spans: Vec<Span<'static>>, bar: &str) -> Vec<Span<'static>> {

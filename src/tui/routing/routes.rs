@@ -8,11 +8,14 @@ use ratatui::text::{Line, Span};
 use serde_json::Value;
 
 use super::data::{self, array, counted, flag, text};
-use super::table::{BodyLine, Cells, Table, controls, controls_in, field, heading, span, widest};
 use super::words::{
-    Tone, bold, cache_words, cost_word, dim, edge_parts, label, lane_words, lanes_phrase,
-    matched_by_phrase, matcher_text, reach_spans, reach_text_in, reason_word, toned,
+    cache_words, cost_word, edge_parts, lane_words, lanes_phrase, matched_by_phrase, matcher_text,
+    reach_spans, reach_text_in, reason_word,
 };
+use crate::tui::table::{
+    BodyLine, Cells, Table, controls, controls_in, field, heading, span, widest,
+};
+use crate::tui::tone::{Tone, bold, dim, label, toned};
 use unicode_width::UnicodeWidthStr;
 
 /// The route at `id`'s place in the routes tab.

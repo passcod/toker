@@ -12,13 +12,14 @@ use serde_json::Value;
 
 use super::data::{array, counted, text};
 use super::model::{Tab, Target};
-use super::table::{
+use super::words::{
+    hits_phrase, hits_span, matcher_kind, matcher_text, no_reach, reach_reason, reach_spans,
+    reach_spans_in, reach_text_in,
+};
+use crate::tui::table::{
     BodyLine, Cells, Detail, Table, controls, field, heading, span, widest, width_of,
 };
-use super::words::{
-    Tone, bold, dim, hits_phrase, hits_span, label, matcher_kind, matcher_text, no_reach,
-    reach_reason, reach_spans, reach_spans_in, reach_text_in, toned,
-};
+use crate::tui::tone::{Tone, bold, dim, label, toned};
 
 /// A record the selection can rest on in a lookup table.
 #[derive(Debug, Clone, Copy)]

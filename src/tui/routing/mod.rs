@@ -1,7 +1,7 @@
 //! Routing policy page.
 
 mod data;
-pub(in crate::tui) mod edit_view;
+mod edit_view;
 mod editing;
 mod form;
 #[cfg(test)]
@@ -16,7 +16,6 @@ mod reconcile;
 mod routes;
 mod rules;
 mod status;
-pub(in crate::tui) mod table;
 mod template;
 #[cfg(test)]
 mod testing;
@@ -24,7 +23,7 @@ mod trace;
 #[cfg(test)]
 mod trace_tests;
 mod view;
-pub(in crate::tui) mod words;
+mod words;
 
 use crate::tui::control::{Client, Command, Reply};
 use crossterm::event::KeyEvent;

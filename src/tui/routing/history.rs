@@ -10,8 +10,9 @@ use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::data::{array, count, text};
-use super::table::{BodyLine, Cells, Table, heading, span, widest};
-use super::words::{bold, dim, lanes_phrase, when};
+use super::words::{lanes_phrase, when};
+use crate::tui::table::{BodyLine, Cells, Table, heading, span, widest};
+use crate::tui::tone::{bold, dim};
 
 /// The most changes the detail lists before it counts the rest.
 const CHANGES_SHOWN: usize = 8;

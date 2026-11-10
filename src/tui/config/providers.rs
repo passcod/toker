@@ -15,10 +15,10 @@ use ratatui::{
 use super::form;
 use super::model::{Dependents, Provider, Row, Safeguards, Snapshot, State, Target};
 use crate::tui::chrome::RowHit;
-use crate::tui::routing::table::{
+use crate::tui::table::{
     self, BodyLine, Cells, Detail, Table, controls_in, field, heading, span, widest,
 };
-use crate::tui::routing::words::{Tone, toned};
+use crate::tui::tone::{Tone, toned};
 
 /// `1 route` or `4 routes`.
 pub(super) fn counted(count: usize, one: &str, many: &str) -> String {
@@ -331,7 +331,7 @@ fn detail(provider: &Provider, snapshot: &Snapshot, state: &State, width: usize)
     ) + 2;
     let mut lines: Vec<Line<'static>> = vec![Line::styled(
         provider.name.clone(),
-        crate::tui::routing::words::bold(),
+        crate::tui::tone::bold(),
     )];
 
     let mut state_value = vec![Span::raw(if provider.enabled { "on" } else { "off" })];

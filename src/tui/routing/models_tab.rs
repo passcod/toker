@@ -17,9 +17,10 @@ use serde_json::Value;
 use super::data::{array, count, counted, text};
 use super::model::{Panel, State};
 use super::routes::compaction_text;
-use super::table::{Cells, controls, fit, heading, span, widest};
-use super::words::{Tone, dim, matcher_text, toned};
+use super::words::matcher_text;
 use crate::tui::chrome::{self, Chrome};
+use crate::tui::table::{Cells, controls, fit, heading, span, widest};
+use crate::tui::tone::{Tone, dim, toned};
 
 /// How many records the tab holds, for the strip: families, upgrades and the
 /// compaction policy, if any.

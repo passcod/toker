@@ -16,9 +16,9 @@ use serde_json::{Value, json};
 use super::data::{array, count, text};
 use super::model::Tab;
 use super::rules::{self, Entry};
-use super::table::{controls, reversed, span};
-use super::words::{Tone, bold, dim, toned};
 use crate::tui::control::{Command, Response};
+use crate::tui::table::{controls, reversed, span};
+use crate::tui::tone::{Tone, bold, dim, toned};
 
 /// What is traced.
 #[derive(Debug, Clone, PartialEq)]

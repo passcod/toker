@@ -16,9 +16,9 @@ use super::editing::{Editing, What};
 use super::form::Form;
 use super::model::{Modal, Mode, State, Tab};
 use super::rules::{self, Entry};
-use super::table::{self, BodyLine, Detail, Table};
 use super::{history, keys, models_tab, routes, status};
 use crate::tui::chrome::{self, Chrome, RowHit};
+use crate::tui::table::{self, BodyLine, Detail, Table};
 
 /// The page areas that the loop needs for click handling.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

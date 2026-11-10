@@ -16,8 +16,8 @@ use super::check;
 use super::form;
 use super::model::{Row, Snapshot, State, Target};
 use crate::tui::chrome::RowHit;
-use crate::tui::routing::table::{self, BodyLine, Cells, Table, heading, span, widest};
-use crate::tui::routing::words::{Tone, dim, toned};
+use crate::tui::table::{self, BodyLine, Cells, Table, heading, span, widest};
+use crate::tui::tone::{Tone, dim, toned};
 
 fn label(row: Row, snapshot: &Snapshot) -> String {
     match row {
@@ -134,7 +134,7 @@ fn head(name: &str, count: usize, width: usize) -> Line<'static> {
     let used = lead.width() + name.width() + tail.width();
     Line::from(vec![
         span(lead, dim()),
-        span(name.to_owned(), crate::tui::routing::words::bold()),
+        span(name.to_owned(), crate::tui::tone::bold()),
         span(tail, dim()),
         span("─".repeat(width.saturating_sub(used)), dim()),
     ])
