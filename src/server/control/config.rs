@@ -139,7 +139,8 @@ pub(crate) async fn snapshot(State(server): State<Server>, request: Request) -> 
             // What a minimum for the cold gate is checked against: the
             // largest window the enabled providers' models resolve, absent
             // where none does, so a form can refuse as it is typed what a
-            // save would (spec: GCOLD#only-a-request-that-could-be-the-re-read).
+            // save would
+            // (spec: GCOLD#only-a-request-that-could-be-the-re-read).
             "largest_context_window": largest_window,
             // Shown but not editable: settled before the store is opened
             // (spec: DCONF#before-the-store).

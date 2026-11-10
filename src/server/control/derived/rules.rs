@@ -74,7 +74,8 @@ struct Published {
 
 /// Scopes in the order the tables are drawn: for each protocol in turn, each
 /// profile that has any record, then the protocol itself, since what a
-/// profile's rules miss is tried against its protocol's (spec: UTUI#reading-a-table).
+/// profile's rules miss is tried against its protocol's
+/// (spec: UTUI#reading-a-table).
 /// Every protocol is present, so one with no policy still has a place to say
 /// that it refuses.
 fn scope_order(document: &PolicyDocument) -> Vec<FrontendScope> {
