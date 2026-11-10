@@ -391,6 +391,7 @@ impl Paths {
         // for every other process, and a setup that wrote the XDG one
         // anyway would leave its rows where nothing reads them.
         let store = crate::config::store_path()?;
+        let codex_auth = crate::config::default_codex_auth_path();
         Ok(Paths {
             config_toml: crate::config::config_path()?,
             units_dir: config_home.join("systemd").join("user"),
@@ -399,8 +400,10 @@ impl Paths {
             opencode_config: config_home.join("opencode").join("opencode.json"),
             shell_rcs: vec![home.join(".bashrc"), home.join(".zshrc")],
             ctp_usage: data_home.join("claude-token-proxy").join("usage.jsonl"),
-            codex_auth: home.join(".codex").join("auth.json"),
-            codex_config: home.join(".codex").join("config.toml"),
+            // The service's own resolution, CODEX_HOME included, so the
+            // directory the unit lets it write is the one it refreshes in.
+            codex_config: codex_auth.with_file_name("config.toml"),
+            codex_auth,
             state_dir: store
                 .parent()
                 .map(Path::to_path_buf)
@@ -481,8 +484,8 @@ WantedBy=sockets.target
 /// of which `%h` can express).
 ///
 /// `extra_writable` are directories outside the state dir the service
-/// must write: the codex login's, when codex_sub is enabled, because a
-/// refresh persists the new tokens by renaming over `auth.json` there.
+/// must write: the codex login's, because a refresh persists the new
+/// tokens by renaming over `auth.json` there.
 /// Under `ProtectHome=read-only` that rename failed, so every refresh
 /// was lost and the next start refreshed again from the stale token.
 /// Each is `-`-prefixed: a missing one is skipped, where a missing state
@@ -552,13 +555,14 @@ MemoryDenyWriteExecute=true
     )
 }
 
-/// The directories outside the state dir that `config`'s backends write
-/// (see [`service_unit`]).
-pub fn extra_writable(config: &Config) -> Vec<PathBuf> {
-    config
-        .codex_sub
-        .as_ref()
-        .and_then(|codex| codex.auth_path.parent())
+/// The directories outside the state dir the service may write (see
+/// [`service_unit`]). The codex login's is there whether or not codex_sub
+/// is enabled, since it is turned on from the dashboard without setup
+/// running again (spec: DCONF#the-one-write-outside-it).
+pub fn extra_writable(paths: &Paths) -> Vec<PathBuf> {
+    paths
+        .codex_auth
+        .parent()
         .map(Path::to_path_buf)
         .into_iter()
         .collect()
@@ -1836,7 +1840,7 @@ impl<'a> Wizard<'a> {
             (SOCKET_UNIT, socket_unit(port)),
             (
                 SERVICE_UNIT,
-                service_unit(&exe, &self.paths.db_path(), &extra_writable(current)),
+                service_unit(&exe, &self.paths.db_path(), &extra_writable(self.paths)),
             ),
         ];
 
@@ -3788,35 +3792,23 @@ default_backend_anthropic = "codex_sub"
     // ── the tests ──────────────────────────────────────────────────
 
     #[test]
-    fn codex_s_login_dir_is_writable_only_when_codex_is_enabled() {
+    fn codex_s_login_dir_is_writable_whether_or_not_codex_is_enabled() {
         // A refresh renames over auth.json in its own directory; under
         // ProtectHome=read-only that failed and every refresh was lost.
-        let dir = crate::setup::test_dir("codex-writable");
-        let with = dir.join("with.toml");
-        std::fs::write(
-            &with,
-            "[providers.codex_sub]\nauth_path = \"/home/u/.codex/auth.json\"\n",
-        )
-        .expect("write config");
-        let config = Config::load_from(&with).expect("loads");
+        let paths = Paths::scratch(Path::new("/home/u"));
         assert_eq!(
-            extra_writable(&config),
+            extra_writable(&paths),
             vec![PathBuf::from("/home/u/.codex")]
         );
         let unit = service_unit(
             Path::new("/opt/toker/toker"),
             Path::new("/srv/state/toker/toker.db"),
-            &extra_writable(&config),
+            &[PathBuf::from("/home/u/.codex")],
         );
         assert!(unit.contains("ReadWritePaths=/srv/state/toker\n"));
         // Optional: a missing login dir must not fail the start the way a
         // missing state dir does.
         assert!(unit.contains("ReadWritePaths=-/home/u/.codex\n"));
-
-        let without = dir.join("without.toml");
-        std::fs::write(&without, "[providers.anthropic_sub]\n").expect("write config");
-        let config = Config::load_from(&without).expect("loads");
-        assert!(extra_writable(&config).is_empty());
     }
 
     #[test]
@@ -4067,7 +4059,7 @@ default_backend_anthropic = "codex_sub"
             (SOCKET_UNIT.to_owned(), socket_unit(port)),
             (
                 SERVICE_UNIT.to_owned(),
-                service_unit(&exe, &rig.paths().db_path(), &[]),
+                service_unit(&exe, &rig.paths().db_path(), &extra_writable(&rig.paths())),
             ),
         ];
         units.extend(picker_installed(&rig, &exe));
@@ -5329,7 +5321,7 @@ default_backend_anthropic = "codex_sub"
                 (SOCKET_UNIT.to_owned(), socket_unit(port)),
                 (
                     SERVICE_UNIT.to_owned(),
-                    service_unit(&exe, &rig.paths().db_path(), &[])
+                    service_unit(&exe, &rig.paths().db_path(), &extra_writable(&rig.paths()))
                 ),
                 (HOLD_TIMER_UNIT.to_owned(), hold_timer),
                 (HOLD_SERVICE_UNIT.to_owned(), hold_service),

@@ -2069,7 +2069,7 @@ fn expand_tilde(path: &str) -> PathBuf {
 /// installed rather than from what toker was told, and the two cannot be
 /// configured into disagreeing. The service does not share the operator's
 /// shell, so setup carries `CODEX_HOME` into the unit for them to agree.
-fn default_codex_auth_path() -> PathBuf {
+pub fn default_codex_auth_path() -> PathBuf {
     codex_auth_path_in(&ProcessEnvironment)
 }
 
