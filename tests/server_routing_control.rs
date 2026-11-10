@@ -1320,6 +1320,15 @@ async fn the_snapshot_carries_derived_content_for_the_active_revision() {
     assert_eq!(revisions.len(), 1, "{revisions:?}");
     assert_eq!(revisions[0]["revision_id"], 1);
     assert_eq!(revisions[0]["total"], 1);
+    // A lane that is not provably cold is named, so that moving it can say
+    // whose cache it would lose; one that is cold is not.
+    let at_risk = revisions[0]["at_risk"].as_array().unwrap();
+    let not_cold =
+        revisions[0]["warm"].as_u64().unwrap() + revisions[0]["unknown"].as_u64().unwrap();
+    assert_eq!(at_risk.len() as u64, not_cold, "{revisions:?}");
+    if not_cold > 0 {
+        assert_eq!(at_risk[0], "pinned-lane");
+    }
 }
 
 #[tokio::test]

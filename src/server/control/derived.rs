@@ -58,6 +58,9 @@ pub(crate) struct Inputs<'a, L> {
     pub hits: &'a HitCounts,
     /// Lanes pinned to each revision, by revision.
     pub revision_lanes: &'a BTreeMap<i64, RoutingLaneImpacts>,
+    /// Which lanes pinned to each revision hold a cache that moving them onto
+    /// another revision would lose, by revision.
+    pub revision_at_risk: &'a BTreeMap<i64, Vec<String>>,
 }
 
 /// What every fact about a record is worked out from: one policy, one
@@ -163,6 +166,13 @@ pub(crate) fn build<L: LearningView>(inputs: &Inputs<'_, L>) -> Value {
             .map(|(revision_id, lanes)| {
                 let mut body = lanes_body(Some(lanes));
                 body["revision_id"] = json!(revision_id);
+                body["at_risk"] = json!(
+                    inputs
+                        .revision_at_risk
+                        .get(revision_id)
+                        .cloned()
+                        .unwrap_or_default()
+                );
                 body
             })
             .collect::<Vec<_>>(),

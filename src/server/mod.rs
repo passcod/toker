@@ -863,7 +863,7 @@ impl Server {
         let lane_impacts = self.routing_lane_impacts_locked(&state, now)?;
         let publications = self.store.load_publications()?;
         let active_policy = compile_stored_policy(&revision, &self.registry, &inventory).ok();
-        let (pinned, revision_lanes) = self.pinned_lanes(now)?;
+        let (pinned, revision_lanes, at_risk) = self.pinned_lanes(now)?;
         let hit_counts = self.store.routing_hit_counts(now)?;
         let learning = crate::policy::LearningView::snapshot(self.binding_learning.as_ref());
         let circuits = self
@@ -880,6 +880,7 @@ impl Server {
             document: Some(revision.document.document()),
             hits: &hit_counts,
             revision_lanes: &revision_lanes,
+            revision_at_risk: &at_risk,
         });
         Ok(RoutingControlSnapshot {
             active_revision: revision,
@@ -940,6 +941,7 @@ impl Server {
         (
             std::collections::BTreeMap<crate::policy::RouteId, RoutingLaneImpacts>,
             std::collections::BTreeMap<i64, RoutingLaneImpacts>,
+            std::collections::BTreeMap<i64, Vec<String>>,
         ),
         crate::store::Error,
     > {
@@ -947,12 +949,23 @@ impl Server {
             std::collections::BTreeMap::new();
         let mut by_revision: std::collections::BTreeMap<i64, RoutingLaneImpacts> =
             std::collections::BTreeMap::new();
+        let mut at_risk: std::collections::BTreeMap<i64, Vec<String>> =
+            std::collections::BTreeMap::new();
         for lane in self.store.load_lanes()? {
             let Some(pin) = lane.pin.as_ref() else {
                 continue;
             };
             let temperature =
                 cache_temperature(&lane, self.registry.binding(&pin.binding_id), None, now);
+            // Moving a lane onto another revision costs the cache of one that
+            // is warm, or not provably cold. Its name is its session's, or
+            // its key where it has none.
+            if temperature != crate::policy::CacheTemperature::Cold {
+                let names = at_risk.entry(pin.policy_revision_id).or_default();
+                if names.len() < AT_RISK_LANES_NAMED {
+                    names.push(lane.session_id.clone().unwrap_or_else(|| lane.key.clone()));
+                }
+            }
             for impacts in [
                 by_route.entry(pin.policy_route_id.clone()).or_default(),
                 by_revision.entry(pin.policy_revision_id).or_default(),
@@ -965,7 +978,7 @@ impl Server {
                 }
             }
         }
-        Ok((by_route, by_revision))
+        Ok((by_route, by_revision, at_risk))
     }
 
     pub(crate) fn routing_revisions(&self) -> Result<Vec<PolicyRevision>, crate::store::Error> {
@@ -2329,6 +2342,10 @@ pub(crate) enum RoutingControlError {
     #[error("an immediate activation needs explicit warm-cache consent")]
     ForcedTransitionRequired { impacts: RoutingLaneImpacts },
 }
+
+/// How many lanes a revision's entry names as holding a cache that moving
+/// them would lose; the rest are counted.
+const AT_RISK_LANES_NAMED: usize = 20;
 
 /// An immediate activation can strand a warm cache, so it needs explicit
 /// consent whenever any lane is warm or not provably cold.

@@ -267,6 +267,7 @@ fn derive(document: Value, availability: &AvailabilitySnapshot, hits: &HitCounts
         document: Some(&document),
         hits,
         revision_lanes: &revision_lanes,
+        revision_at_risk: &Default::default(),
     })["active"]
         .clone()
 }
@@ -702,6 +703,7 @@ fn a_route_carries_its_providers_reach_and_the_lanes_it_holds() {
         document: Some(&document),
         hits: &hits(HitCoverage::Complete),
         revision_lanes: &revision_lanes,
+        revision_at_risk: &Default::default(),
     });
 
     let route = find(&derived["active"]["routes"], "claude-sub");
