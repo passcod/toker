@@ -68,6 +68,11 @@ The winner is looked up again whenever the catalogue refreshes, so a new release
 
 For mapping Claude tiers onto another provider, the selector is the direct fit.
 
+## Starting from scratch
+
+Stop the service before deleting the state dir: `systemctl --user stop toker.socket toker.service`.
+A running service keeps the deleted store open and goes on writing to it, so routing edits look live until the next restart and are then gone.
+
 ## Rough edges found
 
 - No way to configure a second key or login for the same provider.
