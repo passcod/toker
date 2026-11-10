@@ -1435,7 +1435,7 @@ impl State {
             .filter_map(|offer| Some((text(offer, "binding_id")?, text(offer, "model_id")?)))
             .collect();
         if let Some(policy) = data::policy(snapshot) {
-            for collection in ["routes", "classifiers", "upgrades"] {
+            for collection in ["routes", "classifiers", "upgrades", "rewrites"] {
                 context.ids.insert(
                     collection,
                     array(policy, collection)
@@ -1567,7 +1567,11 @@ impl State {
             .as_ref()
             .and_then(data::policy)
             .map_or(&[][..], |policy| array(policy, target.kind));
-        if let Some(id) = value.get("id").and_then(Value::as_str) {
+        // A rewrite's form names it, after what it matches and where it
+        // sends, as it names any new rewrite.
+        if target.kind != "rewrites"
+            && let Some(id) = value.get("id").and_then(Value::as_str)
+        {
             let taken: Vec<&str> = records.iter().map(|record| text(record, "id")).collect();
             let fresh = template::fresh_id(id, &taken);
             value["id"] = Value::from(fresh);
@@ -2816,8 +2820,9 @@ mod tests {
             .expect("kept");
         assert_eq!((replay.replayed, replay.unreplayable), (5, 2));
         assert_eq!(replay.changed_total, 3);
-        // A change asks about the form again, not about traffic first.
-        typed(&mut state, "9");
+        // A change asks about the form again, not about traffic first: the
+        // first field is the scope's kind.
+        press(&mut state, KeyCode::Right);
         assert_eq!(state.next_check().expect("check").name, "validate");
     }
 
@@ -2960,6 +2965,42 @@ mod tests {
             ops(&state.key(CTRL_S).expect("save"))[0]["kind"],
             "add_rewrite"
         );
+    }
+
+    /// A new rewrite is saved under an id made for it, unlike every rule's;
+    /// an edited one is saved under the id it has.
+    #[test]
+    fn a_rewrite_is_saved_under_an_id_it_was_never_asked_for() {
+        let mut state = on(Tab::Rewrites);
+        state.move_selection(1);
+        press(&mut state, KeyCode::Char('n'));
+        accepted(&mut state);
+        let added = ops(&state.key(CTRL_S).expect("add"))[0]["rewrite"]["id"].clone();
+        assert_eq!(added, "model-name-to-claude-sub");
+        let rewrites = array(
+            data::policy(state.snapshot().expect("snapshot")).expect("policy"),
+            "rewrites",
+        );
+        assert!(rewrites.iter().all(|rule| rule["id"] != added));
+
+        let mut state = on(Tab::Rewrites);
+        state.move_selection(1);
+        let id = state.target().expect("a rule").id.expect("its id");
+        press(&mut state, KeyCode::Char('e'));
+        // Send it somewhere else: the id stays.
+        let rows = state.editing().expect("editing").form.lines();
+        let route = rows
+            .iter()
+            .position(|line| line.text.contains("route:"))
+            .and_then(|at| rows[at].row)
+            .expect("the route field");
+        state.focus_form_row(route);
+        typed(&mut state, "-x");
+        accepted(&mut state);
+        let operation = ops(&state.key(CTRL_S).expect("save"))[0].clone();
+        assert_eq!(operation["kind"], "replace_rewrite");
+        assert_eq!(operation["id"], id);
+        assert_eq!(operation["rewrite"]["id"], id);
     }
 
     #[test]

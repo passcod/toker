@@ -64,13 +64,16 @@ pub(super) fn template(kind: &str, route_id: Option<&str>) -> Value {
             "scope": { "kind": "protocol", "protocol": "openai_chat" },
             "target": { "route_id": route_id },
         }),
-        "rewrites" => json!({
-            "id": "new-rewrite",
-            "scope": { "kind": "protocol", "protocol": "openai_chat" },
-            "priority": 0,
-            "model_matcher": { "kind": "exact", "value": "model-name" },
-            "target": { "route_id": route_id },
-        }),
+        "rewrites" => {
+            let matcher = json!({ "kind": "exact", "value": "model-name" });
+            json!({
+                "id": rewrite_id(&matcher, route_id, &[]),
+                "scope": { "kind": "protocol", "protocol": "openai_chat" },
+                "priority": 0,
+                "model_matcher": matcher,
+                "target": { "route_id": route_id },
+            })
+        }
         "classifiers" => json!({
             "id": "new-classifier",
             "binding_id": "anthropic_sub.anthropic_messages",
@@ -113,6 +116,38 @@ pub(super) fn fresh_id(id: &str, taken: &[&str]) -> String {
     unique(format!("{stem}-copy"), taken)
 }
 
+/// The identifier of a new rewrite, which the page never shows and so never
+/// asks for (spec: UTUI#editing): what it matches and the route it sends to,
+/// in the spelling an identifier allows (spec: RDOC#parsing), unlike any in
+/// `taken`.
+pub(super) fn rewrite_id(matcher: &Value, route_id: &str, taken: &[&str]) -> String {
+    let part = (MAX_ID_BYTES - SUFFIX_ROOM - "-to-".len()) / 2;
+    let matched = slug(matcher.get("value").and_then(Value::as_str).unwrap_or(""));
+    let route = slug(route_id);
+    let (matched, route) = (clip(&matched, part), clip(&route, part));
+    let base = match (matched.is_empty(), route.is_empty()) {
+        (true, true) => "rewrite".to_owned(),
+        (false, true) => matched.to_owned(),
+        (true, false) => format!("to-{route}"),
+        (false, false) => format!("{matched}-to-{route}"),
+    };
+    unique(base, taken)
+}
+
+/// `text` lower-cased, with each run of characters an identifier cannot
+/// hold, or of separators, made one hyphen: `^claude-(.+)$` is `claude`.
+fn slug(text: &str) -> String {
+    let mut slug = String::new();
+    for character in text.chars().map(|character| character.to_ascii_lowercase()) {
+        if character.is_ascii_lowercase() || character.is_ascii_digit() {
+            slug.push(character);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_end_matches('-').to_owned()
+}
+
 /// `base`, or `base-2`, `base-3` and so on: the first that is not taken.
 fn unique(base: String, taken: &[&str]) -> String {
     if !taken.contains(&base.as_str()) {
@@ -132,7 +167,7 @@ fn clip(id: &str, bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{fresh_id, kind_for, template};
+    use super::{fresh_id, kind_for, rewrite_id, template};
     use crate::policy::{PolicyDocument, PolicyEdit};
     use crate::tui::routing::editing::add_edit;
     use crate::tui::routing::model::{Panel, Tab};
@@ -171,6 +206,34 @@ mod tests {
         assert_eq!(default["target"]["route_id"], "my-route");
         let default = template("defaults", None);
         assert_eq!(default["target"]["route_id"], "route-id");
+    }
+
+    #[test]
+    fn a_rewrites_identifier_is_made_from_its_match_and_route() {
+        let exact = serde_json::json!({"kind": "exact", "value": "Claude-Sonnet-4.5"});
+        assert_eq!(rewrite_id(&exact, "fast", &[]), "claude-sonnet-4-5-to-fast");
+        let regex = serde_json::json!({"kind": "regex", "value": "^claude-(?P<model>.+)$"});
+        assert_eq!(rewrite_id(&regex, "fast", &[]), "claude-p-model-to-fast");
+        let glob = serde_json::json!({"kind": "glob", "value": "*"});
+        assert_eq!(rewrite_id(&glob, "fast", &[]), "to-fast");
+        assert_eq!(rewrite_id(&glob, "", &[]), "rewrite");
+        // One already taken is told apart.
+        assert_eq!(
+            rewrite_id(&exact, "fast", &["claude-sonnet-4-5-to-fast"]),
+            "claude-sonnet-4-5-to-fast-2"
+        );
+        // However long what it is made from, it is an identifier the
+        // document accepts.
+        let long = serde_json::json!({"kind": "exact", "value": "x".repeat(1_000)});
+        let route = "r".repeat(crate::policy::MAX_ID_BYTES);
+        let id = rewrite_id(&long, &route, &[]);
+        assert!(crate::policy::StableId::new(id.clone()).is_ok(), "{id}");
+        let taken = [id.as_str()];
+        let again = rewrite_id(&long, &route, &taken);
+        assert!(
+            crate::policy::StableId::new(again.clone()).is_ok(),
+            "{again}"
+        );
     }
 
     #[test]

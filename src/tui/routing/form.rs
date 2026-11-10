@@ -366,8 +366,10 @@ const DEFAULT: &[Field] = &[
     field("target", "route", ROUTE_REFERENCE),
 ];
 
+/// A rewrite is shown by what it matches and the route it picks, so its form
+/// does not ask for the identifier it has: a new one is made one
+/// (`Form::name_rewrite`), and an existing one keeps its own.
 const REWRITE: &[Field] = &[
-    field("id", "id", Node::Text),
     field("scope", "scope", SCOPE),
     field("priority", "priority", Node::Int),
     field("model_matcher", "matches", MATCHER),
@@ -783,8 +785,38 @@ impl Form {
         for (path, _) in form.route_choices() {
             form.fill_arguments(&path);
         }
+        form.name_rewrite();
         form.focus_first();
         form
+    }
+
+    /// Name a new rewrite after what it matches and the route it sends to,
+    /// again as either changes (spec: UTUI#editing). A rewrite that exists
+    /// keeps its identifier through an edit: its provenance and its count
+    /// of catches are kept by it.
+    fn name_rewrite(&mut self) {
+        if self.purpose
+            != (Purpose::Record {
+                kind: "rewrites",
+                adding: true,
+            })
+        {
+            return;
+        }
+        let taken: Vec<&str> = self
+            .context
+            .ids
+            .get("rewrites")
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let id = super::template::rewrite_id(
+            &self.value["model_matcher"],
+            self.value["target"]["route_id"].as_str().unwrap_or(""),
+            &taken,
+        );
+        self.value["id"] = Value::from(id);
     }
 
     /// Each field naming the route a reference sends to, by its path, with
@@ -1501,6 +1533,7 @@ impl Form {
                 self.fill_arguments(&path);
             }
         }
+        self.name_rewrite();
         outcome
     }
 
@@ -2454,6 +2487,10 @@ mod tests {
             let form = record(kind);
             let rows = form.rows();
             for name in form.value().as_object().expect("an object").keys() {
+                // A rewrite's id is made for it, not asked for.
+                if (kind, name.as_str()) == ("rewrites", "id") {
+                    continue;
+                }
                 assert!(
                     rows.iter().any(|row| row.path.first() == Some(&key(name))),
                     "{kind}: no field for {name}"
@@ -2482,17 +2519,69 @@ mod tests {
 
     #[test]
     fn typing_edits_the_focused_text_and_the_cursor_moves() {
-        let mut form = record("rewrites");
+        let mut form = record("classifiers");
         focus_label(&mut form, "id");
-        // The cursor starts at the end of "new-rewrite".
+        // The cursor starts at the end of "new-classifier".
         type_text(&mut form, "-x");
-        assert_eq!(form.value()["id"], "new-rewrite-x");
+        assert_eq!(form.value()["id"], "new-classifier-x");
         press(&mut form, KeyCode::Home);
         press(&mut form, KeyCode::Delete);
-        assert_eq!(form.value()["id"], "ew-rewrite-x");
+        assert_eq!(form.value()["id"], "ew-classifier-x");
         press(&mut form, KeyCode::End);
         press(&mut form, KeyCode::Backspace);
-        assert_eq!(form.value()["id"], "ew-rewrite-");
+        assert_eq!(form.value()["id"], "ew-classifier-");
+    }
+
+    /// A rewrite's form has no id to fill in: a new one is named after what
+    /// it matches and where it sends, as those change, unlike any other.
+    #[test]
+    fn a_new_rewrite_is_named_for_it() {
+        let mut context = Context::default();
+        context
+            .ids
+            .insert("rewrites", vec!["model-name-to-fast".to_owned()]);
+        let mut form = Form::new(
+            Purpose::Record {
+                kind: "rewrites",
+                adding: true,
+            },
+            template("rewrites", Some("fast")),
+            context,
+        );
+        assert!(form.rows().iter().all(|row| row.label != "id"));
+        assert_eq!(form.value()["id"], "model-name-to-fast-2");
+        focus_label(&mut form, "value");
+        for _ in 0.."model-name".len() {
+            press(&mut form, KeyCode::Backspace);
+        }
+        type_text(&mut form, "claude-opus");
+        assert_eq!(form.value()["id"], "claude-opus-to-fast");
+        focus_label(&mut form, "route");
+        type_text(&mut form, "er");
+        assert_eq!(form.value()["id"], "claude-opus-to-faster");
+    }
+
+    /// Provenance and catch counts are kept by a rewrite's id, so an edit
+    /// never changes it, whatever else does.
+    #[test]
+    fn an_edited_rewrite_keeps_its_id() {
+        let mut value = template("rewrites", Some("fast"));
+        value["id"] = Value::from("chosen-long-ago");
+        let mut form = Form::new(
+            Purpose::Record {
+                kind: "rewrites",
+                adding: false,
+            },
+            value,
+            Context::default(),
+        );
+        assert_eq!(form.value()["id"], "chosen-long-ago");
+        focus_label(&mut form, "value");
+        type_text(&mut form, "-2");
+        focus_label(&mut form, "route");
+        type_text(&mut form, "er");
+        assert_eq!(form.value()["model_matcher"]["value"], "model-name-2");
+        assert_eq!(form.value()["id"], "chosen-long-ago");
     }
 
     #[test]
@@ -3132,18 +3221,18 @@ mod tests {
     fn the_id_of_an_existing_record_is_fixed() {
         let mut form = Form::new(
             Purpose::Record {
-                kind: "rewrites",
+                kind: "classifiers",
                 adding: false,
             },
-            template("rewrites", Some("route-id")),
+            template("classifiers", None),
             Context::default(),
         );
         focus_label(&mut form, "id");
         type_text(&mut form, "x");
-        assert_eq!(form.value()["id"], "new-rewrite");
+        assert_eq!(form.value()["id"], "new-classifier");
         assert!(form.note().is_some_and(|note| note.contains("fixed")));
         press(&mut form, KeyCode::Backspace);
-        assert_eq!(form.value()["id"], "new-rewrite");
+        assert_eq!(form.value()["id"], "new-classifier");
         // Moving the cursor is not an edit.
         press(&mut form, KeyCode::Left);
         assert!(form.note().is_none());
@@ -3167,7 +3256,7 @@ mod tests {
 
     #[test]
     fn a_blank_id_is_not_submitted() {
-        let mut form = record("rewrites");
+        let mut form = record("classifiers");
         focus_label(&mut form, "id");
         for _ in 0..20 {
             press(&mut form, KeyCode::Backspace);
@@ -3258,7 +3347,7 @@ mod tests {
         let mut promote = Form::new(Purpose::Promote, json!({}), offered());
         assert_eq!(press(&mut promote, KeyCode::Enter), Outcome::Submit);
         let mut record = record("rewrites");
-        focus_label(&mut record, "id");
+        focus_label(&mut record, "priority");
         assert_eq!(press(&mut record, KeyCode::Enter), Outcome::Keep);
         assert_eq!(record.rows()[record.focus()].label, "kind");
     }
