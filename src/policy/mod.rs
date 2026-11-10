@@ -9,6 +9,7 @@ pub mod compile;
 pub mod diagnostic;
 pub mod document;
 pub mod edit;
+pub mod facts;
 pub mod force_newest;
 pub mod learning;
 pub mod legacy;
@@ -38,6 +39,7 @@ pub use edit::{
     CandidateMoveDestination, MAX_POLICY_EDIT_OPERATIONS, PolicyEdit, PolicyEditError,
     PolicyEditOperation,
 };
+pub use facts::RecordedFacts;
 pub use learning::{
     BindingLearningView, LearnedEvidence, LearningSnapshot, LearningView, RecencyEvidence,
 };

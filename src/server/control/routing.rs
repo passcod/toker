@@ -1,9 +1,10 @@
 //! Gated, local routing-control endpoints.
 //!
 //! The handlers decode bounded, strict control DTOs and project only policy
-//! metadata. The daemon owns draft generations, compilation, activation, and
-//! publication state, so this boundary cannot split an active revision from
-//! its durable state.
+//! metadata. The daemon owns compilation, activation and publication state,
+//! so this boundary cannot split an active revision from its durable state.
+//! Every operation that changes anything names the active revision it was
+//! made against and is refused, changing nothing, where that has moved.
 
 use axum::body::Bytes;
 use axum::extract::{Request, State};
@@ -14,19 +15,28 @@ use serde_json::{Value, json};
 
 use super::{MAX_CONTROL_BODY, control_token_ok, forbidden, json_content_type, store_error};
 use crate::policy::{
-    BindingId, CanonicalLimits, CapabilityFlags, FrontendProtocol, FrontendScope, PolicyEdit,
-    PolicyEditError, ProfileId, StableId, decode_policy, policy_bytes,
+    ActivationScope, BindingId, CapabilityFlags, FrontendProtocol, FrontendScope, PolicyEdit,
+    PolicyEditError, ProfileId, RecordedFacts, StableId, policy_bytes,
+};
+use crate::server::routing_ops::{
+    InventedRequest, NotReplayable, PreviewAgainst, PreviewOutcome, PreviewSubject, ReplayChange,
+    ReplayOutcome, RoutingPreviewRequest,
 };
 use crate::server::{RoutingControlError, RoutingControlSnapshot, RoutingLaneImpacts, Server};
 use crate::store::{
-    DraftCasResult, PolicyDraft, PolicyRevision, PublicationAdapter, PublicationCasResult,
-    PublicationKey, PublicationState, RoutingPolicyState, RoutingPublication,
+    HitCounts, HitCoverage, PolicyRevision, PublicationAdapter, PublicationCasResult,
+    PublicationKey, PublicationState, RecentRequest, RoutingPublication,
 };
 
-/// A policy document has its own cap. Promotion requests remain subject to the
-/// small generic control cap; an envelope gets a little room around the
-/// document's independently bounded canonical form.
-const MAX_ROUTING_POLICY_BODY: usize = crate::policy::MAX_DOCUMENT_BYTES + 16 * 1024;
+/// A save carries an edit of up to the policy module's own operation bound,
+/// which is independently limited, so its envelope gets a little room above
+/// the generic control cap.
+const MAX_ROUTING_EDIT_BODY: usize = crate::policy::MAX_DOCUMENT_BYTES + 16 * 1024;
+
+/// The most recent requests one listing returns when it names no limit, and
+/// the most it will.
+const DEFAULT_RECENT_REQUESTS: u32 = 50;
+const MAX_RECENT_REQUESTS: u32 = 200;
 
 pub(crate) async fn snapshot(State(server): State<Server>, request: Request) -> Response {
     if !control_token_ok(request.headers(), "routing-snapshot") || request.method() != Method::GET {
@@ -58,73 +68,24 @@ pub(crate) async fn revisions(State(server): State<Server>, request: Request) ->
     }
 }
 
-/// Replace the daemon-owned draft. The JSON policy itself stays a raw value
-/// until it reaches the canonical bounded decoder, which is the one parser for
-/// control, persistence, and activation documents.
+/// An edit and the revision it was made against. The edit is the policy
+/// module's closed typed vocabulary, which keeps an editor from smuggling
+/// arbitrary JSON-pointer writes through the control plane.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReplaceDraftRequest<'a> {
-    expected_generation: i64,
-    #[serde(borrow)]
-    policy: &'a serde_json::value::RawValue,
-}
-
-pub(crate) async fn draft(State(server): State<Server>, request: Request) -> Response {
-    match *request.method() {
-        Method::PUT => replace_draft(State(server), request).await,
-        Method::PATCH => patch_draft(State(server), request).await,
-        _ => forbidden(),
-    }
-}
-
-async fn replace_draft(State(server): State<Server>, request: Request) -> Response {
-    let bytes = match decode_body(
-        request,
-        "routing-draft-replace",
-        Method::PUT,
-        MAX_ROUTING_POLICY_BODY,
-    )
-    .await
-    {
-        Ok(bytes) => bytes,
-        Err(response) => return *response,
-    };
-    let request: ReplaceDraftRequest<'_> = match serde_json::from_slice(&bytes) {
-        Ok(request) => request,
-        Err(_) => return invalid_request("routing-draft-replace"),
-    };
-    let policy = match decode_policy(request.policy.get().as_bytes(), CanonicalLimits::default()) {
-        Ok(policy) => policy,
-        Err(_) => return invalid_policy(Vec::new()),
-    };
-    match server.replace_routing_draft(request.expected_generation, policy) {
-        Ok(DraftCasResult::Updated { generation, draft }) => draft_updated_response(
-            "routing-draft-replace",
-            generation,
-            draft.expect("a replacement always retains a draft"),
-        ),
-        Ok(DraftCasResult::Conflict { current }) => {
-            draft_conflict_response("routing-draft-replace", current)
-        }
-        Err(error) => routing_internal_error(error),
-    }
-}
-
-/// The edit is the policy module's closed typed vocabulary. It keeps an editor
-/// from smuggling arbitrary JSON-pointer writes through the control plane.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PatchDraftRequest {
-    expected_generation: i64,
+struct SaveRequest {
+    expected_revision_id: i64,
     edit: PolicyEdit,
+    #[serde(default)]
+    description: Option<String>,
 }
 
-async fn patch_draft(State(server): State<Server>, request: Request) -> Response {
-    let request = match decode_request::<PatchDraftRequest>(
+pub(crate) async fn save(State(server): State<Server>, request: Request) -> Response {
+    let request = match decode_request::<SaveRequest>(
         request,
-        "routing-draft-edit",
-        Method::PATCH,
-        MAX_ROUTING_POLICY_BODY,
+        "routing-save",
+        Method::POST,
+        MAX_ROUTING_EDIT_BODY,
     )
     .await
     {
@@ -132,65 +93,68 @@ async fn patch_draft(State(server): State<Server>, request: Request) -> Response
         Err(response) => return *response,
     };
     if request.edit.operations.is_empty() {
-        return invalid_request("routing-draft-edit");
+        return invalid_request("routing-save");
     }
-    match server.patch_routing_draft(request.expected_generation, &request.edit) {
-        Ok(DraftCasResult::Updated { generation, draft }) => draft_updated_response(
-            "routing-draft-edit",
-            generation,
-            draft.expect("a successful patch always retains a draft"),
-        ),
-        Ok(DraftCasResult::Conflict { current }) => {
-            draft_conflict_response("routing-draft-edit", current)
-        }
-        Err(RoutingControlError::DraftMissing) => routing_error(
-            StatusCode::CONFLICT,
-            "routing-draft-edit",
-            "draft_missing",
-            None,
-        ),
-        Err(RoutingControlError::StaleDraft { current }) => {
-            draft_conflict_response("routing-draft-edit", *current)
-        }
-        Err(RoutingControlError::DraftEdit(error)) => draft_edit_error_response(error),
-        Err(error) => routing_internal_error(error),
+    match server.save_routing_edit(
+        request.expected_revision_id,
+        &request.edit,
+        request.description.as_deref(),
+    ) {
+        Ok(activation) => activated_response("routing-save", activation),
+        Err(error) => activation_error("routing-save", error),
     }
 }
 
-fn draft_edit_error_response(error: PolicyEditError) -> Response {
-    // Edit errors name record kinds, ids and policy paths only, so the text is
-    // safe to return and is the only way a terminal can say what was wrong.
-    let detail = Some(json!({ "detail": error.to_string() }));
-    match error {
-        PolicyEditError::RecordNotFound { .. }
-        | PolicyEditError::DefaultNotFound
-        | PolicyEditError::CompactionNotFound
-        | PolicyEditError::CandidateNotFound { .. } => routing_error(
-            StatusCode::NOT_FOUND,
-            "routing-draft-edit",
-            "record_not_found",
-            detail,
-        ),
-        PolicyEditError::InvalidDocument(_) => routing_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "routing-control",
-            "invalid_policy",
-            detail,
-        ),
-        _ => routing_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "routing-draft-edit",
-            "invalid_policy_edit",
-            detail,
-        ),
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WidenRequest {
+    expected_revision_id: i64,
+    scope: ActivationScope,
+    #[serde(default)]
+    force_cache_transition: bool,
+}
+
+pub(crate) async fn widen(State(server): State<Server>, request: Request) -> Response {
+    let request = match decode_request::<WidenRequest>(
+        request,
+        "routing-widen",
+        Method::POST,
+        MAX_CONTROL_BODY,
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    match server.widen_routing_activation(
+        request.expected_revision_id,
+        request.scope,
+        request.force_cache_transition,
+    ) {
+        Ok(widening) => (
+            StatusCode::OK,
+            axum::Json(json!({
+                "toker": "routing-widen",
+                "ok": true,
+                "revision_id": widening.revision_id,
+                "activation": {
+                    "scope": widening.scope,
+                    "forced_cache_transition": widening.forced_cache_transition,
+                    "widened_ms": widening.widened_ms,
+                },
+                "lane_impacts": lane_impacts_body(&widening.lane_impacts),
+            })),
+        )
+            .into_response(),
+        Err(error) => activation_error("routing-widen", error),
     }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ValidateRequest {
-    #[serde(default)]
-    expected_generation: Option<i64>,
+    expected_revision_id: i64,
+    edit: PolicyEdit,
 }
 
 pub(crate) async fn validate(State(server): State<Server>, request: Request) -> Response {
@@ -198,62 +162,94 @@ pub(crate) async fn validate(State(server): State<Server>, request: Request) -> 
         request,
         "routing-validate",
         Method::POST,
-        MAX_CONTROL_BODY,
+        MAX_ROUTING_EDIT_BODY,
     )
     .await
     {
         Ok(request) => request,
         Err(response) => return *response,
     };
-    match server.validate_routing_draft(request.expected_generation) {
+    match server.validate_routing_edit(request.expected_revision_id, &request.edit) {
         Ok(validation) => (
             StatusCode::OK,
             axum::Json(json!({
                 "toker": "routing-validate",
                 "ok": true,
-                "generation": validation.generation,
+                "active_revision_id": validation.active_revision_id,
                 "valid": validation.valid,
                 "diagnostics": diagnostics_body(validation.diagnostics),
+                "refusal": validation.refusal.map(|refusal| edit_refusal_body(&refusal)),
             })),
         )
             .into_response(),
-        Err(RoutingControlError::DraftMissing) => routing_error(
-            StatusCode::CONFLICT,
-            "routing-validate",
-            "draft_missing",
-            None,
-        ),
-        Err(RoutingControlError::StaleDraft { current }) => {
-            draft_conflict_response("routing-validate", *current)
-        }
-        Err(error) => routing_internal_error(error),
+        Err(error) => activation_error("routing-validate", error),
     }
 }
 
+/// What a preview does. `resolve` traces one request, `replay_recent`
+/// compares the last 24 hours' routing under an unsaved edit with how it
+/// stands, and `recent_requests` lists what a preview can be taken from.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PreviewRequest {
-    #[serde(default)]
-    expected_generation: Option<i64>,
-    protocol: FrontendProtocol,
-    #[serde(default)]
-    profile: Option<ProfileId>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    lane_key: Option<String>,
-    #[serde(default)]
-    prompt_bound: u64,
-    #[serde(default)]
-    message_count: Option<u64>,
-    #[serde(default)]
-    tool_count: u64,
-    #[serde(default)]
-    required_capabilities: CapabilityFlags,
-    #[serde(default)]
-    asks_server_safeguards: bool,
-    #[serde(default)]
-    binding_affinity: Option<BindingId>,
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum PreviewRequest {
+    Resolve {
+        #[serde(default)]
+        expected_revision_id: Option<i64>,
+        #[serde(default)]
+        against: AgainstBody,
+        request: SubjectBody,
+    },
+    ReplayRecent {
+        #[serde(default)]
+        expected_revision_id: Option<i64>,
+        edit: PolicyEdit,
+    },
+    RecentRequests {
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+}
+
+#[derive(Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum AgainstBody {
+    #[default]
+    Active,
+    Edit {
+        edit: PolicyEdit,
+    },
+    Revision {
+        revision_id: i64,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum SubjectBody {
+    Invented {
+        protocol: FrontendProtocol,
+        #[serde(default)]
+        profile: Option<ProfileId>,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        lane_key: Option<String>,
+        #[serde(default)]
+        prompt_bound: u64,
+        #[serde(default)]
+        message_count: Option<u64>,
+        #[serde(default)]
+        tool_count: u64,
+        #[serde(default)]
+        required_capabilities: CapabilityFlags,
+        #[serde(default)]
+        asks_server_safeguards: bool,
+        #[serde(default)]
+        binding_affinity: Option<BindingId>,
+    },
+    Recorded {
+        request_id: i64,
+    },
 }
 
 pub(crate) async fn preview(State(server): State<Server>, request: Request) -> Response {
@@ -261,109 +257,130 @@ pub(crate) async fn preview(State(server): State<Server>, request: Request) -> R
         request,
         "routing-preview",
         Method::POST,
-        MAX_CONTROL_BODY,
+        MAX_ROUTING_EDIT_BODY,
     )
     .await
     {
         Ok(request) => request,
         Err(response) => return *response,
     };
-    match server.preview_routing_draft(crate::server::RoutingPreviewRequest {
-        expected_generation: request.expected_generation,
-        protocol: request.protocol,
-        profile: request.profile,
-        model: request.model,
-        lane_key: request.lane_key,
-        prompt_bound: request.prompt_bound,
-        message_count: request.message_count,
-        tool_count: request.tool_count,
-        required_capabilities: request.required_capabilities,
-        asks_server_safeguards: request.asks_server_safeguards,
-        binding_affinity: request.binding_affinity,
-    }) {
-        Ok(preview) => (
-            StatusCode::OK,
-            axum::Json(json!({
-                "toker": "routing-preview",
-                "ok": true,
-                "generation": preview.generation,
-                "diagnostics": diagnostics_body(preview.diagnostics),
-                "result": preview.result,
-            })),
-        )
-            .into_response(),
-        Err(RoutingControlError::DraftMissing) => routing_error(
-            StatusCode::CONFLICT,
-            "routing-preview",
-            "draft_missing",
-            None,
-        ),
-        Err(RoutingControlError::StaleDraft { current }) => {
-            draft_conflict_response("routing-preview", *current)
+    match request {
+        PreviewRequest::Resolve {
+            expected_revision_id,
+            against,
+            request,
+        } => {
+            let against = match against {
+                AgainstBody::Active => PreviewAgainst::Active,
+                AgainstBody::Edit { edit } => PreviewAgainst::Edit(edit),
+                AgainstBody::Revision { revision_id } => PreviewAgainst::Revision(revision_id),
+            };
+            let subject = match request {
+                SubjectBody::Invented {
+                    protocol,
+                    profile,
+                    model,
+                    lane_key,
+                    prompt_bound,
+                    message_count,
+                    tool_count,
+                    required_capabilities,
+                    asks_server_safeguards,
+                    binding_affinity,
+                } => PreviewSubject::Invented(InventedRequest {
+                    protocol,
+                    profile,
+                    model,
+                    lane_key,
+                    prompt_bound,
+                    message_count,
+                    tool_count,
+                    required_capabilities,
+                    asks_server_safeguards,
+                    binding_affinity,
+                }),
+                SubjectBody::Recorded { request_id } => PreviewSubject::Recorded(request_id),
+            };
+            match server.preview_routing(RoutingPreviewRequest {
+                expected_revision_id,
+                against,
+                subject,
+            }) {
+                Ok(preview) => {
+                    let (request, result) = match preview.outcome {
+                        PreviewOutcome::Resolved { facts, result } => (facts_body(&facts), result),
+                        PreviewOutcome::NotReplayable { reason } => (
+                            Value::Null,
+                            json!({ "outcome": "not_replayable", "reason": reason.code() }),
+                        ),
+                    };
+                    (
+                        StatusCode::OK,
+                        axum::Json(json!({
+                            "toker": "routing-preview",
+                            "ok": true,
+                            "mode": "resolve",
+                            "active_revision_id": preview.active_revision_id,
+                            "against_revision_id": preview.against_revision_id,
+                            "diagnostics": diagnostics_body(preview.diagnostics),
+                            "request": request,
+                            "result": result,
+                        })),
+                    )
+                        .into_response()
+                }
+                Err(error) => activation_error("routing-preview", error),
+            }
         }
-        Err(RoutingControlError::Compilation(diagnostics)) => invalid_policy(diagnostics),
-        Err(error) => routing_internal_error(error),
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ActivateRequest {
-    expected_generation: i64,
-    scope: crate::policy::ActivationScope,
-    #[serde(default)]
-    force_cache_transition: bool,
-    #[serde(default)]
-    description: Option<String>,
-}
-
-pub(crate) async fn activate(State(server): State<Server>, request: Request) -> Response {
-    let request = match decode_request::<ActivateRequest>(
-        request,
-        "routing-activate",
-        Method::POST,
-        MAX_CONTROL_BODY,
-    )
-    .await
-    {
-        Ok(request) => request,
-        Err(response) => return *response,
-    };
-    match server.activate_routing_draft(
-        request.expected_generation,
-        request.scope,
-        request.force_cache_transition,
-        request.description.as_deref(),
-    ) {
-        Ok(activation) => activated_response("routing-activate", activation),
-        Err(RoutingControlError::DraftMissing) => routing_error(
-            StatusCode::CONFLICT,
-            "routing-activate",
-            "draft_missing",
-            None,
-        ),
-        Err(RoutingControlError::StaleDraft { current }) => {
-            draft_conflict_response("routing-activate", *current)
+        PreviewRequest::ReplayRecent {
+            expected_revision_id,
+            edit,
+        } => match server.replay_recent_routing(expected_revision_id, &edit) {
+            Ok(replay) => (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "toker": "routing-preview",
+                    "ok": true,
+                    "mode": "replay_recent",
+                    "active_revision_id": replay.active_revision_id,
+                    "window": { "since_ms": replay.since_ms, "until_ms": replay.until_ms },
+                    "replayed": replay.replayed,
+                    "unreplayable": replay.unreplayable,
+                    "truncated": replay.truncated,
+                    "changed_total": replay.changed_total,
+                    "changed": replay.changed.iter().map(replay_change_body).collect::<Vec<_>>(),
+                    "diagnostics": diagnostics_body(replay.diagnostics),
+                })),
+            )
+                .into_response(),
+            Err(error) => activation_error("routing-preview", error),
+        },
+        PreviewRequest::RecentRequests { limit } => {
+            let limit = limit
+                .unwrap_or(DEFAULT_RECENT_REQUESTS)
+                .clamp(1, MAX_RECENT_REQUESTS);
+            match server.recent_routing_requests(limit) {
+                Ok(requests) => (
+                    StatusCode::OK,
+                    axum::Json(json!({
+                        "toker": "routing-preview",
+                        "ok": true,
+                        "mode": "recent_requests",
+                        "requests": requests.iter().map(recent_request_body).collect::<Vec<_>>(),
+                    })),
+                )
+                    .into_response(),
+                Err(error) => store_error(error),
+            }
         }
-        Err(RoutingControlError::ForcedTransitionRequired { impacts }) => routing_error(
-            StatusCode::CONFLICT,
-            "routing-activate",
-            "forced_cache_transition_required",
-            Some(json!({ "lane_impacts": lane_impacts_body(&impacts) })),
-        ),
-        Err(RoutingControlError::Compilation(diagnostics)) => invalid_policy(diagnostics),
-        Err(error) => routing_internal_error(error),
     }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReactivateRequest {
-    expected_generation: i64,
+    expected_revision_id: i64,
     revision_id: i64,
-    scope: crate::policy::ActivationScope,
-    #[serde(default)]
-    force_cache_transition: bool,
     #[serde(default)]
     description: Option<String>,
 }
@@ -381,31 +398,88 @@ pub(crate) async fn reactivate(State(server): State<Server>, request: Request) -
         Err(response) => return *response,
     };
     match server.reactivate_routing_policy(
-        request.expected_generation,
+        request.expected_revision_id,
         request.revision_id,
-        request.scope,
-        request.force_cache_transition,
         request.description.as_deref(),
     ) {
         Ok(activation) => activated_response("routing-reactivate", activation),
-        Err(RoutingControlError::MissingRevision(revision_id)) => routing_error(
+        Err(error) => activation_error("routing-reactivate", error),
+    }
+}
+
+/// How an operation made against the active revision fails. Every one of
+/// these changed nothing.
+fn activation_error(operation: &str, error: RoutingControlError) -> Response {
+    match error {
+        RoutingControlError::StaleRevision { live_revision_id } => routing_error(
+            StatusCode::CONFLICT,
+            operation,
+            "stale_revision",
+            Some(json!({ "live_revision_id": live_revision_id })),
+        ),
+        RoutingControlError::NotAWidening {
+            scope,
+            forced_cache_transition,
+        } => routing_error(
+            StatusCode::CONFLICT,
+            operation,
+            "not_a_widening",
+            Some(json!({
+                "current": { "scope": scope, "forced_cache_transition": forced_cache_transition },
+            })),
+        ),
+        RoutingControlError::MissingRevision(revision_id) => routing_error(
             StatusCode::NOT_FOUND,
-            "routing-reactivate",
+            operation,
             "revision_not_found",
             Some(json!({ "revision_id": revision_id })),
         ),
-        Err(RoutingControlError::StaleDraft { current }) => {
-            draft_conflict_response("routing-reactivate", *current)
-        }
-        Err(RoutingControlError::ForcedTransitionRequired { impacts }) => routing_error(
+        RoutingControlError::RequestNotFound(request_id) => routing_error(
+            StatusCode::NOT_FOUND,
+            operation,
+            "request_not_found",
+            Some(json!({ "request_id": request_id })),
+        ),
+        RoutingControlError::ForcedTransitionRequired { impacts } => routing_error(
             StatusCode::CONFLICT,
-            "routing-reactivate",
+            operation,
             "forced_cache_transition_required",
             Some(json!({ "lane_impacts": lane_impacts_body(&impacts) })),
         ),
-        Err(RoutingControlError::Compilation(diagnostics)) => invalid_policy(diagnostics),
-        Err(error) => routing_internal_error(error),
+        RoutingControlError::Compilation(diagnostics) => invalid_policy(diagnostics),
+        RoutingControlError::Edit(error) => edit_error_response(operation, &error),
+        error => routing_internal_error(error),
     }
+}
+
+/// Edit errors name record kinds, ids and policy paths only, so the text is
+/// safe to return and is the only way a terminal can say what was wrong.
+fn edit_refusal_body(error: &PolicyEditError) -> Value {
+    let code = match error {
+        PolicyEditError::RecordNotFound { .. }
+        | PolicyEditError::DefaultNotFound
+        | PolicyEditError::CompactionNotFound
+        | PolicyEditError::CandidateNotFound { .. } => "record_not_found",
+        PolicyEditError::InvalidDocument(_) => "invalid_policy",
+        _ => "invalid_policy_edit",
+    };
+    json!({ "error": code, "detail": error.to_string() })
+}
+
+fn edit_error_response(operation: &str, error: &PolicyEditError) -> Response {
+    let body = edit_refusal_body(error);
+    let code = body["error"].as_str().unwrap_or("invalid_policy_edit");
+    let (status, operation) = match code {
+        "record_not_found" => (StatusCode::NOT_FOUND, operation),
+        "invalid_policy" => (StatusCode::UNPROCESSABLE_ENTITY, "routing-control"),
+        _ => (StatusCode::UNPROCESSABLE_ENTITY, operation),
+    };
+    routing_error(
+        status,
+        operation,
+        code,
+        Some(json!({ "detail": error.to_string() })),
+    )
 }
 
 #[derive(Deserialize)]
@@ -574,42 +648,27 @@ fn routing_snapshot_response(operation: &str, snapshot: RoutingControlSnapshot) 
             "toker": operation,
             "ok": true,
             "active_revision": revision_body(&snapshot.active_revision),
-            "draft_generation": snapshot.state.draft_generation,
-            "draft": snapshot.state.draft.map(draft_body),
-            "draft_diagnostics": diagnostics_body(snapshot.draft_diagnostics),
+            "activation": activation_body(&snapshot.state, &snapshot.active_revision),
             "inventory_generation": snapshot.inventory_generation,
             "offers": snapshot.inventory.iter().map(offer_body).collect::<Vec<_>>(),
             "lane_impacts": lane_impacts_body(&snapshot.lane_impacts),
             "publications": snapshot.publications.into_iter().map(publication_body).collect::<Vec<_>>(),
             "derived": snapshot.derived,
+            "hit_counts": hit_counts_body(&snapshot.hit_counts),
         })),
     )
         .into_response()
 }
 
-fn draft_updated_response(operation: &str, generation: i64, draft: PolicyDraft) -> Response {
-    (
-        StatusCode::OK,
-        axum::Json(json!({
-            "toker": operation,
-            "ok": true,
-            "generation": generation,
-            "draft": draft_body(draft),
-        })),
-    )
-        .into_response()
-}
-
-fn draft_conflict_response(operation: &str, current: RoutingPolicyState) -> Response {
-    routing_error(
-        StatusCode::CONFLICT,
-        operation,
-        "stale_draft",
-        Some(json!({
-            "generation": current.draft_generation,
-            "draft": current.draft.map(draft_body),
-        })),
-    )
+/// The scope and force consent the active revision's lanes are governed by:
+/// its own, as last widened where it was.
+fn activation_body(state: &crate::store::RoutingPolicyState, revision: &PolicyRevision) -> Value {
+    let (scope, forced_cache_transition) = state.effective_activation(revision);
+    json!({
+        "scope": scope,
+        "forced_cache_transition": forced_cache_transition,
+        "widened_ms": state.widened.map(|widening| widening.widened_ms),
+    })
 }
 
 fn activated_response(operation: &str, activation: crate::server::RoutingActivation) -> Response {
@@ -619,13 +678,113 @@ fn activated_response(operation: &str, activation: crate::server::RoutingActivat
             "toker": operation,
             "ok": true,
             "active_revision": revision_body(&activation.activation.revision),
-            "generation": activation.activation.state.draft_generation,
-            "draft": activation.activation.state.draft.map(draft_body),
+            "activation": activation_body(
+                &activation.activation.state,
+                &activation.activation.revision,
+            ),
             "lane_impacts": lane_impacts_body(&activation.lane_impacts),
             "publications": activation.activation.publications.into_iter().map(publication_body).collect::<Vec<_>>(),
         })),
     )
         .into_response()
+}
+
+fn hit_counts_body(counts: &HitCounts) -> Value {
+    json!({
+        "since_ms": counts.since_ms,
+        "until_ms": counts.until_ms,
+        "coverage": match counts.coverage {
+            HitCoverage::Complete => "complete",
+            HitCoverage::Floor => "floor",
+            HitCoverage::NotRecorded => "not_recorded",
+        },
+        "recorded_requests": counts.recorded_requests,
+        "unrecorded_requests": counts.unrecorded_requests,
+        "presentations": counts
+            .presentations
+            .iter()
+            .map(|(id, hits)| (id.to_string(), json!(hits)))
+            .collect::<serde_json::Map<_, _>>(),
+        "rewrites": counts
+            .rewrites
+            .iter()
+            .map(|(id, hits)| (id.to_string(), json!(hits)))
+            .collect::<serde_json::Map<_, _>>(),
+        "defaults": counts
+            .defaults
+            .iter()
+            .map(|default| json!({ "scope": default.scope, "hits": default.hits }))
+            .collect::<Vec<_>>(),
+        "compactions": counts.compactions,
+        "unrouted": counts.unrouted,
+    })
+}
+
+/// The facts the resolver was given, content-free.
+fn facts_body(facts: &RecordedFacts) -> Value {
+    json!({
+        "profile": facts.profile.as_ref().map(ProfileId::as_str),
+        "protocol": facts.protocol,
+        "model": facts.requested_model,
+        "prompt_bound": facts.prompt_bound,
+        "message_count": facts.message_count,
+        "tool_count": facts.tool_count,
+        "required_capabilities": facts.required_capabilities,
+        "asks_server_safeguards": facts.asks_server_safeguards,
+        "binding_affinity": facts.binding_affinity,
+        "class": crate::policy::facts::class_name(facts.class),
+    })
+}
+
+fn replay_outcome_body(outcome: &ReplayOutcome) -> Value {
+    json!({
+        "outcome": outcome.outcome,
+        "route_id": outcome.route_id,
+        "candidate_id": outcome.candidate_id,
+        "binding_id": outcome.binding_id,
+        "effective_model": outcome.effective_model,
+        "failure": outcome.failure,
+        "matched": outcome.matched,
+    })
+}
+
+fn replay_change_body(change: &ReplayChange) -> Value {
+    json!({
+        "request_id": change.request_id,
+        "ts_ms": change.ts_ms,
+        "request": facts_body(&change.facts),
+        "under_active": replay_outcome_body(&change.under_active),
+        "under_edit": replay_outcome_body(&change.under_edit),
+    })
+}
+
+fn recent_request_body(request: &RecentRequest) -> Value {
+    let reason = match &request.facts {
+        None => Some(NotReplayable::FactsNotRecorded),
+        Some(facts) if !facts.replayable() => Some(NotReplayable::CompactionEvidenceNotRecorded),
+        Some(_) => None,
+    };
+    json!({
+        "id": request.id,
+        "ts_ms": request.ts_ms,
+        "policy_revision_id": request.policy_revision_id,
+        "replayable": request.replayable(),
+        "not_replayable_reason": reason.map(NotReplayable::code),
+        "kind": request.kind,
+        "requested_model": request.requested_model,
+        "routed": {
+            "route_id": request.route_id,
+            "candidate_id": request.candidate_id,
+            "binding_id": request.binding_id,
+            "effective_model": request.effective_model,
+        },
+        "matched": request.matched.as_ref().map(|matched| json!({
+            "kind": matched.kind.as_str(),
+            "scope": matched.scope.map(|scope| scope.as_str()),
+            "id": matched.id,
+        })),
+        "request": request.facts.as_ref().map(facts_body),
+    })
 }
 
 fn invalid_policy(diagnostics: Vec<crate::policy::Diagnostic>) -> Response {
@@ -684,18 +843,6 @@ fn revision_summary_body(revision: &PolicyRevision) -> Value {
         "source": revision_source_name(revision.source),
         "parent_revision_id": revision.parent_revision_id,
         "fingerprint": revision.fingerprint.to_string(),
-    })
-}
-
-fn draft_body(draft: PolicyDraft) -> Value {
-    let policy = policy_bytes(&draft.document)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
-    json!({
-        "base_revision_id": draft.base_revision_id,
-        "fingerprint": draft.fingerprint.to_string(),
-        "updated_ms": draft.updated_ms,
-        "policy": policy,
     })
 }
 
@@ -761,6 +908,7 @@ fn revision_source_name(source: crate::store::PolicyRevisionSource) -> &'static 
         crate::store::PolicyRevisionSource::Legacy => "legacy",
         crate::store::PolicyRevisionSource::Draft => "draft",
         crate::store::PolicyRevisionSource::Reactivation => "reactivation",
+        crate::store::PolicyRevisionSource::Save => "save",
     }
 }
 

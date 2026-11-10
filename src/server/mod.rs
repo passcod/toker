@@ -73,6 +73,7 @@ pub(crate) mod quota_events;
 pub(crate) mod quota_gate;
 mod record;
 mod record_anthropic;
+pub(crate) mod routing_ops;
 
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
@@ -90,16 +91,16 @@ use crate::config::Config;
 use crate::middleware::awake::{self, AwakeState, LockSpawner};
 use crate::middleware::lanes;
 use crate::policy::{
-    AvailabilitySnapshot, BindingAvailability, CatalogueAvailability, Evidence, FrontendProtocol,
-    LaneFacts, ProfileId, RequestClass, RequestFacts,
+    AvailabilitySnapshot, BindingAvailability, CatalogueAvailability, Evidence, LaneFacts,
+    ProfileId, RequestClass, RequestFacts,
 };
 use crate::providers::{AnthropicApi, AnthropicSub, CodexSub, OpenAiApi, OpenRouter, Provider};
 use crate::routing::{FrontendProfile, ModelTarget, ProtocolId, RouteRegistry};
 use crate::secrets::{self, KEYRING_READ_TIMEOUT, OsKeyring, SecretStore};
 use crate::store::{
-    ActivatePolicyRevision, ActivatedPolicyRevision, BindingLearning, CredentialDigest,
-    DraftCasResult, PolicyRevision, PolicyRevisionSource, PublicationCasResult, PublicationKey,
-    PublicationResultUpdate, PublicationState, RoutingPolicyState, RoutingPublication, Store,
+    ActivatedPolicyRevision, BindingLearning, CredentialDigest, PolicyRevision,
+    PublicationCasResult, PublicationKey, PublicationResultUpdate, PublicationState,
+    RoutingPolicyState, RoutingPublication, Store,
 };
 
 use record::now_ms;
@@ -197,9 +198,11 @@ impl PolicyAttemptError {
     /// and gets no row.
     pub(crate) fn unroutable_provenance(
         &self,
+        facts: &RequestFacts,
     ) -> Option<crate::store::Result<crate::store::PolicyRouteProvenance>> {
         use crate::store::{AttemptGroupId, PolicyRouteProvenance};
         let group = AttemptGroupId::fresh();
+        let facts = crate::policy::RecordedFacts::of(facts);
         match self {
             Self::Resolve {
                 revision_id,
@@ -217,11 +220,16 @@ impl PolicyAttemptError {
                 provenance,
                 trace,
                 group,
+                facts,
             )),
             Self::Resolve {
                 revision_id,
                 failure: crate::policy::ResolveFailure::NoRoute,
-            } => Some(PolicyRouteProvenance::from_no_route(*revision_id, group)),
+            } => Some(PolicyRouteProvenance::from_no_route(
+                *revision_id,
+                group,
+                facts,
+            )),
             Self::Transition {
                 revision_id,
                 reason,
@@ -238,6 +246,7 @@ impl PolicyAttemptError {
                 }),
                 *reason,
                 group,
+                facts,
             )),
             _ => None,
         }
@@ -612,6 +621,16 @@ impl Server {
             Arc::new(inventory),
             availability,
         ));
+        // A widening lies beside the revision it widened, so a restart reads
+        // it back from the state row.
+        let state = store.load_routing_policy_state()?;
+        if let Some(widening) = state.widened {
+            policy_runtime.widen_active(
+                revision.revision_id,
+                widening.scope,
+                widening.forced_cache_transition,
+            );
+        }
         let safeguards_marks = store
             .load_safeguards_marks()?
             .into_iter()
@@ -832,27 +851,14 @@ impl Server {
     }
 
     fn routing_snapshot_locked(&self) -> anyhow::Result<RoutingControlSnapshot> {
-        let revision_id = self.policy_runtime.capture().revision_id();
-        let revision = self
-            .store
-            .load_policy_revision(revision_id)?
-            .ok_or_else(|| anyhow::anyhow!("active policy revision {revision_id} is missing"))?;
-        let catalogs = self
-            .catalogs
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let inventory = offers::inventory(&self.registry, &catalogs);
-        let availability = availability_for(&self.registry, &catalogs);
-        let state = self.store.load_routing_policy_state()?;
-        let draft_compilation = state
-            .draft
-            .as_ref()
-            .map(|draft| compile_control(&draft.document, &self.registry, &inventory));
-        let draft_diagnostics = draft_compilation
-            .as_ref()
-            .map(|compilation| compilation.diagnostics().to_vec())
-            .unwrap_or_default();
+        let basis = self.control_basis_locked()?;
+        let routing_ops::ControlBasis {
+            active_revision: revision,
+            state,
+            inventory,
+            availability,
+            inventory_generation,
+        } = basis;
         let now = now_ms();
         let lane_impacts = self.routing_lane_impacts_locked(&state, now)?;
         let publications = self.store.load_publications()?;
@@ -870,328 +876,18 @@ impl Server {
             pinned: &pinned,
             publications: &publications,
             active: active_policy.as_ref(),
-            draft: draft_compilation
-                .as_ref()
-                .and_then(|compilation| compilation.policy()),
         });
+        let hit_counts = self.store.routing_hit_counts(now)?;
         Ok(RoutingControlSnapshot {
             active_revision: revision,
             state,
-            draft_diagnostics,
-            inventory_generation: fetched::snapshot_generation(&catalogs),
+            inventory_generation,
             inventory,
-            availability,
             lane_impacts,
             publications,
             derived,
+            hit_counts,
         })
-    }
-
-    /// Replace the only daemon-owned draft with a canonical policy document.
-    pub(crate) fn replace_routing_draft(
-        &self,
-        expected_generation: i64,
-        document: crate::policy::ValidatedPolicyDocument,
-    ) -> Result<DraftCasResult, RoutingControlError> {
-        let _control = self
-            .routing_control
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let state = self.store.load_routing_policy_state()?;
-        let base_revision_id = state.active_revision_id.ok_or_else(|| {
-            anyhow::anyhow!("cannot edit a draft without an active policy revision")
-        })?;
-        Ok(self.store.compare_and_swap_policy_draft(
-            expected_generation,
-            base_revision_id,
-            &document,
-            now_ms(),
-        )?)
-    }
-
-    /// Applies one typed edit to the current draft under the server mutation
-    /// lock. The policy module owns edit semantics and validation; this method
-    /// owns the draft generation CAS and durable replacement.
-    pub(crate) fn patch_routing_draft(
-        &self,
-        expected_generation: i64,
-        edit: &crate::policy::PolicyEdit,
-    ) -> Result<DraftCasResult, RoutingControlError> {
-        let _control = self
-            .routing_control
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let state = self.store.load_routing_policy_state()?;
-        if state.draft_generation != expected_generation {
-            return Err(RoutingControlError::StaleDraft {
-                current: Box::new(state),
-            });
-        }
-        let draft = state.draft.ok_or(RoutingControlError::DraftMissing)?;
-        let document = edit
-            .apply_validated(&draft.document)
-            .map_err(RoutingControlError::DraftEdit)?;
-        Ok(self.store.compare_and_swap_policy_draft(
-            expected_generation,
-            draft.base_revision_id,
-            &document,
-            now_ms(),
-        )?)
-    }
-
-    /// Compile the current draft against exactly one captured offer inventory.
-    pub(crate) fn validate_routing_draft(
-        &self,
-        expected_generation: Option<i64>,
-    ) -> Result<RoutingDraftValidation, RoutingControlError> {
-        let _control = self
-            .routing_control
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let snapshot = self.routing_snapshot_locked()?;
-        self.expect_draft_generation(&snapshot.state, expected_generation)?;
-        let draft = snapshot
-            .state
-            .draft
-            .ok_or(RoutingControlError::DraftMissing)?;
-        let compilation = compile_control(&draft.document, &self.registry, &snapshot.inventory);
-        // Info and warning findings ride along with a policy that compiled,
-        // so validate shows the notes (an unconfigured binding, an offer the
-        // catalogue lacks) the same way it shows the errors.
-        Ok(RoutingDraftValidation {
-            generation: snapshot.state.draft_generation,
-            valid: compilation.policy().is_some(),
-            diagnostics: compilation.diagnostics().to_vec(),
-        })
-    }
-
-    /// Resolve content-free preview facts through the exact same pure resolver
-    /// inference uses, against the draft rather than the active revision.
-    pub(crate) fn preview_routing_draft(
-        &self,
-        request: RoutingPreviewRequest,
-    ) -> Result<RoutingDraftPreview, RoutingControlError> {
-        let _control = self
-            .routing_control
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let snapshot = self.routing_snapshot_locked()?;
-        self.expect_draft_generation(&snapshot.state, request.expected_generation)?;
-        let draft = snapshot
-            .state
-            .draft
-            .ok_or(RoutingControlError::DraftMissing)?;
-        let policy = compile_control_policy(&draft.document, &self.registry, &snapshot.inventory)?;
-        let lane = request
-            .lane_key
-            .as_deref()
-            .map(|key| self.store.load_lane(key))
-            .transpose()?;
-        let now = now_ms();
-        let lane = lane.as_ref().and_then(|lane| {
-            lane.as_ref().and_then(|lane| {
-                self.lane_facts(
-                    Some(lane),
-                    lane.pin
-                        .as_ref()
-                        .and_then(|pin| self.registry.binding(&pin.binding_id)),
-                    &Default::default(),
-                    now,
-                    false,
-                )
-            })
-        });
-        let facts = crate::policy::RequestFacts {
-            profile: request.profile,
-            protocol: request.protocol,
-            requested_model: request.model,
-            lane_reference: request.lane_key,
-            prompt_bound: request.prompt_bound,
-            message_count: request.message_count,
-            tool_count: request.tool_count,
-            required_capabilities: request.required_capabilities,
-            asks_server_safeguards: request.asks_server_safeguards,
-            binding_affinity: request.binding_affinity,
-            class: RequestClass::Inference,
-            compaction_evidence: None,
-            // A dry run has no request behind it, so no credential to
-            // name an account.
-            accounts: Default::default(),
-            now_ms: now,
-        };
-        let availability = snapshot
-            .availability
-            .at(now, crate::catalog::fetched::CACHE_TTL_MS)
-            .with_safeguards_marks(&self.safeguards_marks());
-        let learning = crate::policy::LearningView::snapshot(self.binding_learning.as_ref());
-        let result = crate::policy::resolve(
-            &policy,
-            &snapshot.inventory,
-            &learning,
-            lane.as_ref(),
-            &availability,
-            &facts,
-        );
-        Ok(RoutingDraftPreview {
-            generation: snapshot.state.draft_generation,
-            diagnostics: Vec::new(),
-            result: preview_result_body(result, &availability),
-        })
-    }
-
-    /// Activate the current draft. The store checks the generation as part of
-    /// the immediate activation transaction, so a completed validation cannot
-    /// be mistaken for permission to activate a later draft.
-    pub(crate) fn activate_routing_draft(
-        &self,
-        expected_generation: i64,
-        scope: crate::policy::ActivationScope,
-        forced_cache_transition: bool,
-        description: Option<&str>,
-    ) -> Result<RoutingActivation, RoutingControlError> {
-        self.activate_current_draft(
-            expected_generation,
-            description,
-            DraftActivationOptions {
-                scope,
-                forced_cache_transition,
-                source: PolicyRevisionSource::Draft,
-                parent_revision_id: None,
-            },
-        )
-    }
-
-    /// Reactivating history always copies it into a fresh revision. It also
-    /// refreshes the draft to that document before the generation-CAS
-    /// activation, so the active pointer can never move backwards.
-    pub(crate) fn reactivate_routing_policy(
-        &self,
-        expected_generation: i64,
-        selected_revision_id: i64,
-        scope: crate::policy::ActivationScope,
-        forced_cache_transition: bool,
-        description: Option<&str>,
-    ) -> Result<RoutingActivation, RoutingControlError> {
-        let _control = self
-            .routing_control
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let state = self.store.load_routing_policy_state()?;
-        if state.draft_generation != expected_generation {
-            return Err(RoutingControlError::StaleDraft {
-                current: Box::new(state),
-            });
-        }
-        let selected = self
-            .store
-            .load_policy_revision(selected_revision_id)?
-            .ok_or(RoutingControlError::MissingRevision(selected_revision_id))?;
-        let base_revision_id = state.active_revision_id.ok_or_else(|| {
-            anyhow::anyhow!("cannot reactivate without an active policy revision")
-        })?;
-        // Everything that can refuse the activation is checked before the
-        // draft is replaced: a refusal must leave the user's draft, and the
-        // generation they hold, untouched.
-        let snapshot = self.routing_snapshot_locked()?;
-        let impacts = self.routing_lane_impacts_locked(&state, now_ms())?;
-        require_cache_consent(&impacts, scope, forced_cache_transition)?;
-        compile_control_policy(&selected.document, &self.registry, &snapshot.inventory)?;
-        match self.store.compare_and_swap_policy_draft(
-            expected_generation,
-            base_revision_id,
-            &selected.document,
-            now_ms(),
-        )? {
-            DraftCasResult::Updated { generation, .. } => self.activate_current_draft_locked(
-                generation,
-                description,
-                DraftActivationOptions {
-                    scope,
-                    forced_cache_transition,
-                    source: PolicyRevisionSource::Reactivation,
-                    parent_revision_id: Some(selected_revision_id),
-                },
-            ),
-            DraftCasResult::Conflict { current } => Err(RoutingControlError::StaleDraft {
-                current: Box::new(current),
-            }),
-        }
-    }
-
-    fn activate_current_draft(
-        &self,
-        expected_generation: i64,
-        description: Option<&str>,
-        options: DraftActivationOptions,
-    ) -> Result<RoutingActivation, RoutingControlError> {
-        let _control = self
-            .routing_control
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.activate_current_draft_locked(expected_generation, description, options)
-    }
-
-    fn activate_current_draft_locked(
-        &self,
-        expected_generation: i64,
-        description: Option<&str>,
-        options: DraftActivationOptions,
-    ) -> Result<RoutingActivation, RoutingControlError> {
-        let snapshot = self.routing_snapshot_locked()?;
-        if snapshot.state.draft_generation != expected_generation {
-            return Err(RoutingControlError::StaleDraft {
-                current: Box::new(snapshot.state),
-            });
-        }
-        let draft = snapshot
-            .state
-            .draft
-            .clone()
-            .ok_or(RoutingControlError::DraftMissing)?;
-        let impacts = self.routing_lane_impacts_locked(&snapshot.state, now_ms())?;
-        require_cache_consent(&impacts, options.scope, options.forced_cache_transition)?;
-        let policy = compile_control_policy(&draft.document, &self.registry, &snapshot.inventory)?;
-        let activation = self
-            .store
-            .activate_policy_revision(&ActivatePolicyRevision {
-                created_ms: now_ms(),
-                expected_draft_generation: Some(expected_generation),
-                description,
-                activation_scope: options.scope,
-                forced_cache_transition: options.forced_cache_transition,
-                source: options.source,
-                parent_revision_id: options.parent_revision_id,
-                expected_active_revision_id: snapshot.active_revision.revision_id,
-                document: &draft.document,
-                desired_inventory_generation: snapshot.inventory_generation,
-                publications: &crate::store::publication_targets()?,
-            })?;
-        self.policy_runtime.replace_active(
-            &activation.revision,
-            Arc::new(policy),
-            Arc::new(snapshot.inventory),
-            Arc::new(snapshot.availability),
-            &std::collections::BTreeSet::new(),
-        );
-        Ok(RoutingActivation {
-            activation,
-            lane_impacts: impacts,
-        })
-    }
-
-    fn expect_draft_generation(
-        &self,
-        state: &RoutingPolicyState,
-        expected_generation: Option<i64>,
-    ) -> Result<(), RoutingControlError> {
-        if let Some(expected_generation) = expected_generation
-            && state.draft_generation != expected_generation
-        {
-            return Err(RoutingControlError::StaleDraft {
-                current: Box::new(state.clone()),
-            });
-        }
-        Ok(())
     }
 
     fn routing_lane_impacts_locked(
@@ -1975,14 +1671,14 @@ impl Server {
                 any(control::config::clear_safeguards_mark),
             )
             .route("/_toker/routing/snapshot", any(control::routing::snapshot))
-            .route("/_toker/routing/draft", any(control::routing::draft))
             .route(
                 "/_toker/routing/revisions",
                 any(control::routing::revisions),
             )
             .route("/_toker/routing/validate", any(control::routing::validate))
             .route("/_toker/routing/preview", any(control::routing::preview))
-            .route("/_toker/routing/activate", any(control::routing::activate))
+            .route("/_toker/routing/save", any(control::routing::save))
+            .route("/_toker/routing/widen", any(control::routing::widen))
             .route(
                 "/_toker/routing/reactivate",
                 any(control::routing::reactivate),
@@ -2245,8 +1941,17 @@ impl Server {
                     tracing::error!(%error, revision_id, "active publication handoff failed");
                     return;
                 }
-                runtime.replace_active(
+                // The recompiled revision keeps the scope it was widened to.
+                let activation = match self.store.load_routing_policy_state() {
+                    Ok(state) => state.effective_activation(&revision),
+                    Err(error) => {
+                        tracing::error!(%error, revision_id, "active policy refresh state load failed");
+                        return;
+                    }
+                };
+                runtime.replace_active_as(
                     &revision,
+                    activation,
                     Arc::new(policy),
                     Arc::new(inventory),
                     Arc::new(availability),
@@ -2556,15 +2261,15 @@ fn effective_catalogue<'a>(
 pub(crate) struct RoutingControlSnapshot {
     pub(crate) active_revision: PolicyRevision,
     pub(crate) state: RoutingPolicyState,
-    pub(crate) draft_diagnostics: Vec<crate::policy::Diagnostic>,
     pub(crate) inventory_generation: i64,
     pub(crate) inventory: crate::catalog::offers::OfferInventory,
-    pub(crate) availability: AvailabilitySnapshot,
     pub(crate) lane_impacts: RoutingLaneImpacts,
     pub(crate) publications: Vec<RoutingPublication>,
     /// What the routing page shows beyond the documents; see
     /// `control::derived`.
     pub(crate) derived: serde_json::Value,
+    /// The last 24 hours' requests by the record that caught them.
+    pub(crate) hit_counts: crate::store::HitCounts,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -2577,47 +2282,9 @@ pub(crate) struct RoutingLaneImpacts {
 }
 
 #[derive(Debug)]
-pub(crate) struct RoutingDraftValidation {
-    pub(crate) generation: i64,
-    pub(crate) valid: bool,
-    pub(crate) diagnostics: Vec<crate::policy::Diagnostic>,
-}
-
-#[derive(Debug)]
-pub(crate) struct RoutingPreviewRequest {
-    pub(crate) expected_generation: Option<i64>,
-    pub(crate) protocol: FrontendProtocol,
-    pub(crate) profile: Option<ProfileId>,
-    pub(crate) model: Option<String>,
-    pub(crate) lane_key: Option<String>,
-    pub(crate) prompt_bound: u64,
-    pub(crate) message_count: Option<u64>,
-    pub(crate) tool_count: u64,
-    pub(crate) required_capabilities: crate::policy::CapabilityFlags,
-    /// The invented request asks for server safeguards.
-    pub(crate) asks_server_safeguards: bool,
-    pub(crate) binding_affinity: Option<crate::policy::BindingId>,
-}
-
-#[derive(Debug)]
-pub(crate) struct RoutingDraftPreview {
-    pub(crate) generation: i64,
-    pub(crate) diagnostics: Vec<crate::policy::Diagnostic>,
-    pub(crate) result: serde_json::Value,
-}
-
-#[derive(Debug)]
 pub(crate) struct RoutingActivation {
     pub(crate) activation: ActivatedPolicyRevision,
     pub(crate) lane_impacts: RoutingLaneImpacts,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct DraftActivationOptions {
-    scope: crate::policy::ActivationScope,
-    forced_cache_transition: bool,
-    source: PolicyRevisionSource,
-    parent_revision_id: Option<i64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2630,12 +2297,19 @@ pub(crate) enum RoutingControlError {
     Compilation(Vec<crate::policy::Diagnostic>),
     #[error("routing policy revision {0} does not exist")]
     MissingRevision(i64),
-    #[error("routing draft is absent")]
-    DraftMissing,
-    #[error("routing draft generation changed")]
-    StaleDraft { current: Box<RoutingPolicyState> },
-    #[error("routing draft edit is invalid")]
-    DraftEdit(#[from] crate::policy::PolicyEditError),
+    /// The operation was made against a revision that is no longer the
+    /// active one.
+    #[error("the active routing revision moved to {live_revision_id}")]
+    StaleRevision { live_revision_id: i64 },
+    #[error("routing edit is invalid")]
+    Edit(#[from] crate::policy::PolicyEditError),
+    #[error("the activation scope is already as wide as that")]
+    NotAWidening {
+        scope: crate::policy::ActivationScope,
+        forced_cache_transition: bool,
+    },
+    #[error("request {0} is not in the ledger as a routed request")]
+    RequestNotFound(i64),
     #[error("an immediate activation needs explicit warm-cache consent")]
     ForcedTransitionRequired { impacts: RoutingLaneImpacts },
 }
@@ -3207,6 +2881,75 @@ api_key = "sk-test"
             first_revision
         );
         assert_eq!(store.load_policy_revisions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_widened_scope_governs_the_live_revision_across_a_refresh_and_a_restart() {
+        let dir = crate::setup::test_dir("widened-scope-survives");
+        let path = dir.join("toker.toml");
+        std::fs::write(
+            &path,
+            r#"
+awake = false
+default_backend_openai_chat = "openrouter"
+
+[providers.openrouter]
+upstream = "http://127.0.0.1:9/v1"
+api_key = "sk-test"
+"#,
+        )
+        .unwrap();
+        let mut config = Config::load_from(&path).unwrap();
+        config.db_path = dir.join("toker.db");
+        let store = Arc::new(Store::open(&config.db_path).unwrap());
+        let server = Server::with_seams(config.clone(), store.clone(), Seams::isolated()).unwrap();
+        let scope = |server: &Server| {
+            let snapshot = server.policy_runtime.capture();
+            (
+                snapshot.activation_scope(),
+                snapshot.forced_cache_transition(),
+            )
+        };
+        assert_eq!(
+            scope(&server),
+            (crate::policy::ActivationScope::NewLanes, false)
+        );
+
+        server
+            .widen_routing_activation(1, crate::policy::ActivationScope::NewAndColdLanes, false)
+            .expect("widens");
+        let widened = (crate::policy::ActivationScope::NewAndColdLanes, false);
+        assert_eq!(scope(&server), widened);
+
+        // Recompiling the live revision, as a catalogue refresh does, keeps
+        // the scope it was widened to: the widening lies beside the revision.
+        server.replace_catalogs(crate::catalog::fetched::FetchedCatalogs::default());
+        assert_eq!(scope(&server), widened);
+
+        // So does a restart.
+        let restarted = Server::with_seams(config, store.clone(), Seams::isolated()).unwrap();
+        assert_eq!(scope(&restarted), widened);
+
+        // Widened again to immediate, with consent, and then saved over: the
+        // new revision starts from its own scope, with the widening cleared.
+        restarted
+            .widen_routing_activation(1, crate::policy::ActivationScope::Immediate, true)
+            .expect("widens again");
+        assert_eq!(
+            scope(&restarted),
+            (crate::policy::ActivationScope::Immediate, true)
+        );
+        let edit = crate::policy::PolicyEdit {
+            operations: vec![crate::policy::PolicyEditOperation::SetDescription {
+                description: Some("saved".to_owned()),
+            }],
+        };
+        restarted.save_routing_edit(1, &edit, None).expect("saves");
+        assert_eq!(
+            scope(&restarted),
+            (crate::policy::ActivationScope::NewAndColdLanes, false)
+        );
+        assert_eq!(store.load_routing_policy_state().unwrap().widened, None);
     }
 
     #[test]
@@ -4071,12 +3814,18 @@ api_key = "sk-proj-test"
                 Some("policy-alias"),
                 lineage.clone(),
                 &error,
+                &facts,
             );
             let rows = server.store.requests_since(0, 10).unwrap();
             let row = rows.last().expect("a row per refusal");
             assert_eq!(row.kind, Some(crate::store::RowKind::RouteUnavailable));
             assert_eq!(row.lineage, lineage);
             let routing = row.policy_routing.as_ref().expect("provenance");
+            assert_eq!(
+                routing.facts,
+                Some(crate::policy::RecordedFacts::of(&facts)),
+                "a refusal records the facts it was resolved from"
+            );
             assert_eq!(routing.route.is_some(), expect_route);
             assert!(matches!(
                 routing.trace.events.last(),
@@ -4099,6 +3848,7 @@ api_key = "sk-proj-test"
                 revision_id: 1,
                 failure: crate::policy::ResolveFailure::InvalidTemplate,
             },
+            &facts,
         );
         assert_eq!(server.store.requests_since(0, 10).unwrap().len(), before);
     }

@@ -38,12 +38,9 @@ pub(crate) struct Inputs<'a, L> {
     pub pinned: &'a BTreeMap<RouteId, RoutingLaneImpacts>,
     pub publications: &'a [RoutingPublication],
     pub active: Option<&'a CompiledPolicy>,
-    pub draft: Option<&'a CompiledPolicy>,
 }
 
-/// The derived content for the active revision and, when it compiles, the
-/// draft. A draft that does not compile has no derived content: its
-/// diagnostics say why.
+/// The derived content for the active revision.
 pub(crate) fn build<L: LearningView>(inputs: &Inputs<'_, L>) -> Value {
     json!({
         "availability": inputs
@@ -63,7 +60,6 @@ pub(crate) fn build<L: LearningView>(inputs: &Inputs<'_, L>) -> Value {
             }))
             .collect::<Vec<_>>(),
         "active": inputs.active.map(|policy| policy_body(policy, inputs)),
-        "draft": inputs.draft.map(|policy| policy_body(policy, inputs)),
     })
 }
 

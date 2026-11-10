@@ -1046,6 +1046,7 @@ impl OwnedRouting {
             PolicyRevisionSource::Legacy => "compiled from the legacy config",
             PolicyRevisionSource::Draft => "from a draft",
             PolicyRevisionSource::Reactivation => "reactivated",
+            PolicyRevisionSource::Save => "saved",
         };
         format!("revision {} ({source})", self.revision_id)
     }

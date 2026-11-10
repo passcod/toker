@@ -9,13 +9,14 @@
 //! window's reset passes, the 30-day lane prune) are the caller's too — the
 //! store has no clock beyond `ts_ms` values handed to it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 use crate::ir::Release;
 use crate::policy::{
-    ActivationScope, BindingId, CandidateId, CanonicalLimits, PolicyFingerprint, RouteFingerprint,
-    RouteId, StableId, ValidatedPolicyDocument, decode_policy, policy_bytes, policy_fingerprint,
+    ActivationScope, BindingId, CandidateId, CanonicalLimits, FrontendScope, PolicyFingerprint,
+    PresentationId, RecordedFacts, RewriteId, RouteFingerprint, RouteId, StableId,
+    ValidatedPolicyDocument, decode_policy, policy_bytes, policy_fingerprint,
 };
 use serde_json::Value;
 
@@ -87,6 +88,8 @@ pub enum PolicyRevisionSource {
     Legacy,
     Draft,
     Reactivation,
+    /// An edit applied to the active revision's document and activated.
+    Save,
 }
 
 impl PolicyRevisionSource {
@@ -95,6 +98,7 @@ impl PolicyRevisionSource {
             Self::Legacy => "legacy",
             Self::Draft => "draft",
             Self::Reactivation => "reactivation",
+            Self::Save => "save",
         }
     }
 
@@ -103,6 +107,7 @@ impl PolicyRevisionSource {
             "legacy" => Some(Self::Legacy),
             "draft" => Some(Self::Draft),
             "reactivation" => Some(Self::Reactivation),
+            "save" => Some(Self::Save),
             _ => None,
         }
     }
@@ -136,31 +141,53 @@ pub struct NewPolicyRevision<'a> {
     pub document: &'a ValidatedPolicyDocument,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PolicyDraft {
-    pub base_revision_id: i64,
-    pub document: ValidatedPolicyDocument,
-    pub fingerprint: PolicyFingerprint,
-    pub updated_ms: i64,
+/// An activation scope widened after the revision was activated, with the
+/// consent given for it (spec: RREV#widening-an-activation). The revision
+/// itself is never edited, so this lies beside it and the next activation
+/// clears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivationWidening {
+    pub scope: ActivationScope,
+    pub forced_cache_transition: bool,
+    pub widened_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingPolicyState {
     /// NULL until the server first establishes revision one.
     pub active_revision_id: Option<i64>,
-    pub draft_generation: i64,
-    pub draft: Option<PolicyDraft>,
     pub legacy_imported_ms: Option<i64>,
+    /// The active revision's scope as last widened, where it was.
+    pub widened: Option<ActivationWidening>,
 }
 
+impl RoutingPolicyState {
+    /// The scope and force consent the active revision's lanes are governed
+    /// by: its own, as last widened where it was
+    /// (spec: RPIN#revision-selection).
+    pub fn effective_activation(&self, revision: &PolicyRevision) -> (ActivationScope, bool) {
+        match self.widened {
+            Some(widening) => (widening.scope, widening.forced_cache_transition),
+            None => (revision.activation_scope, revision.forced_cache_transition),
+        }
+    }
+}
+
+/// How an attempt to widen the active revision's scope came out.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DraftCasResult {
-    Updated {
-        generation: i64,
-        draft: Option<PolicyDraft>,
+pub enum WidenResult {
+    Widened {
+        state: RoutingPolicyState,
     },
+    /// The active revision is not the one the widening was made against.
     Conflict {
         current: RoutingPolicyState,
+    },
+    /// The requested scope is narrower than, or no wider than, the one
+    /// standing, and carries no consent it lacked.
+    NotAWidening {
+        current_scope: ActivationScope,
+        current_forced_cache_transition: bool,
     },
 }
 
@@ -188,7 +215,6 @@ pub enum RevisionOneActivation {
 #[derive(Debug, Clone)]
 pub struct ActivatePolicyRevision<'a> {
     pub created_ms: i64,
-    pub expected_draft_generation: Option<i64>,
     pub description: Option<&'a str>,
     pub activation_scope: ActivationScope,
     pub forced_cache_transition: bool,
@@ -858,7 +884,7 @@ pub(super) fn activate_revision_one(
         ));
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let retired = retire_generated_revisions(&tx, activated_ms)?;
+    let retired = retire_generated_revisions(&tx)?;
     let current = load_routing_policy_state(&tx)?;
     if let Some(revision_id) = current.active_revision_id {
         let revision = load_policy_revision(&tx, revision_id)?.ok_or_else(|| {
@@ -906,22 +932,13 @@ pub(super) fn activate_revision_one(
             document,
         },
     )?;
-    let document_json = String::from_utf8(
-        policy_bytes(document).map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?,
-    )
-    .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?;
     let changed = tx.execute(
         "UPDATE routing_policy_state SET active_revision_id = ?1,
-             draft_generation = draft_generation + 1, draft_base_revision_id = ?1,
-             draft_document_json = ?2, draft_fingerprint = ?3,
-             draft_updated_ms = ?4, legacy_imported_ms = ?4
+             legacy_imported_ms = ?2,
+             widened_scope = NULL, widened_forced_cache_transition = NULL,
+             widened_ms = NULL
          WHERE id = 1 AND active_revision_id IS NULL AND legacy_imported_ms IS NULL",
-        rusqlite::params![
-            revision.revision_id,
-            document_json,
-            revision.fingerprint.to_string(),
-            activated_ms
-        ],
+        rusqlite::params![revision.revision_id, activated_ms],
     )?;
     if changed != 1 {
         return Err(Error::InvalidRoutingState(
@@ -975,12 +992,11 @@ pub(super) fn activate_revision_one(
 /// semantics, which no longer decode, and return their ids.
 ///
 /// Runs inside the first-revision transaction, before anything reads the
-/// pointer or the draft. Lanes pinned to one lose their pin. Where the
-/// pointer named one, the pointer, draft and import marker are cleared so the caller
-/// establishes the first revision afresh; where only the draft was based on
-/// one, the draft restarts from the active revision.
+/// pointer. Lanes pinned to one lose their pin. Where the pointer named one,
+/// the pointer, the widening and the import marker are cleared so the caller
+/// establishes the first revision afresh.
 // spec: RMIG#retiring-generated-revisions
-fn retire_generated_revisions(conn: &Connection, now_ms: i64) -> Result<Vec<i64>> {
+fn retire_generated_revisions(conn: &Connection) -> Result<Vec<i64>> {
     let retired: Vec<i64> = conn
         .prepare(
             "SELECT revision_id FROM routing_policy_revisions
@@ -1007,55 +1023,24 @@ fn retire_generated_revisions(conn: &Connection, now_ms: i64) -> Result<Vec<i64>
     // The rows still referring to the retired revisions are repointed or
     // cleared below and by the caller, all before this transaction commits.
     conn.pragma_update(None, "defer_foreign_keys", true)?;
-    let (active, draft_base, draft_json): (Option<i64>, Option<i64>, Option<String>) = conn
-        .query_row(
-            "SELECT active_revision_id, draft_base_revision_id, draft_document_json
-             FROM routing_policy_state WHERE id = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-    let is_retired = |id: Option<i64>| id.is_some_and(|id| retired.contains(&id));
-    if is_retired(active) {
-        conn.execute(
-            "UPDATE routing_policy_state SET active_revision_id = NULL,
-                 draft_base_revision_id = NULL, draft_document_json = NULL,
-                 draft_fingerprint = NULL, draft_updated_ms = NULL,
-                 legacy_imported_ms = NULL
-             WHERE id = 1",
-            [],
-        )?;
-    } else if let Some(active) = active {
-        // An imported draft carries the same generated semantics whatever
-        // revision it was based on, so a draft that no longer decodes goes
-        // the same way as one based on a retired revision.
-        let undecodable = draft_json.is_some_and(|json| {
-            decode_policy(json.as_bytes(), CanonicalLimits::default()).is_err()
-        });
-        if is_retired(draft_base) || undecodable {
-            let revision = load_policy_revision(conn, active)?.ok_or_else(|| {
-                Error::InvalidRoutingState(format!(
-                    "active policy revision {active} does not exist"
-                ))
-            })?;
-            let document_json = String::from_utf8(
-                policy_bytes(&revision.document)
-                    .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?,
-            )
-            .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?;
-            conn.execute(
-                "UPDATE routing_policy_state SET draft_generation = draft_generation + 1,
-                     draft_base_revision_id = ?1, draft_document_json = ?2,
-                     draft_fingerprint = ?3, draft_updated_ms = ?4
-                 WHERE id = 1",
-                rusqlite::params![
-                    active,
-                    document_json,
-                    revision.fingerprint.to_string(),
-                    now_ms
-                ],
-            )?;
-        }
-    }
+    // The draft columns are no longer read or written, but a draft an earlier
+    // version left on a retired revision still names it by foreign key, so
+    // it goes with the revision.
+    conn.execute(
+        "UPDATE routing_policy_state SET
+             draft_base_revision_id = NULL, draft_document_json = NULL,
+             draft_fingerprint = NULL, draft_updated_ms = NULL
+         WHERE id = 1 AND draft_base_revision_id IN (SELECT value FROM json_each(?1))",
+        [id_list(&retired)],
+    )?;
+    conn.execute(
+        "UPDATE routing_policy_state SET active_revision_id = NULL,
+             legacy_imported_ms = NULL,
+             widened_scope = NULL, widened_forced_cache_transition = NULL,
+             widened_ms = NULL
+         WHERE id = 1 AND active_revision_id IN (SELECT value FROM json_each(?1))",
+        [id_list(&retired)],
+    )?;
     // Only a generated revision derives from a generated one, but a lineage
     // pointer to a deleted row cannot be kept whatever wrote it.
     conn.execute(
@@ -1123,13 +1108,6 @@ pub(super) fn activate_policy_revision(
             "active policy revision changed before activation".into(),
         ));
     }
-    if let Some(expected_generation) = activation.expected_draft_generation
-        && current.draft_generation != expected_generation
-    {
-        return Err(Error::InvalidRoutingState(
-            "routing draft generation changed before activation".into(),
-        ));
-    }
     if let Some(parent_revision_id) = activation.parent_revision_id
         && load_policy_revision(&tx, parent_revision_id)?.is_none()
     {
@@ -1150,25 +1128,14 @@ pub(super) fn activate_policy_revision(
             document: activation.document,
         },
     )?;
+    // A widening belonged to the revision it widened, so the new one starts
+    // from its own scope.
     let changed = tx.execute(
         "UPDATE routing_policy_state SET active_revision_id = ?1,
-             draft_generation = draft_generation + 1,
-             draft_base_revision_id = ?1, draft_document_json = ?2,
-             draft_fingerprint = ?3, draft_updated_ms = ?4
-         WHERE id = 1 AND active_revision_id = ?5
-           AND (?6 IS NULL OR draft_generation = ?6)",
-        rusqlite::params![
-            revision.revision_id,
-            String::from_utf8(
-                policy_bytes(activation.document)
-                    .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?,
-            )
-            .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?,
-            revision.fingerprint.to_string(),
-            activation.created_ms,
-            active_revision_id,
-            activation.expected_draft_generation,
-        ],
+             widened_scope = NULL, widened_forced_cache_transition = NULL,
+             widened_ms = NULL
+         WHERE id = 1 AND active_revision_id = ?2",
+        rusqlite::params![revision.revision_id, active_revision_id],
     )?;
     if changed != 1 {
         return Err(Error::InvalidRoutingState(
@@ -1270,37 +1237,37 @@ fn read_policy_revision(row: &rusqlite::Row<'_>) -> Result<PolicyRevision> {
 pub(super) fn load_routing_policy_state(conn: &Connection) -> Result<RoutingPolicyState> {
     row_of(
         conn,
-        "SELECT active_revision_id, draft_generation, draft_base_revision_id,
-                draft_document_json, draft_fingerprint, draft_updated_ms, legacy_imported_ms
+        "SELECT active_revision_id, legacy_imported_ms, widened_scope,
+                widened_forced_cache_transition, widened_ms
          FROM routing_policy_state WHERE id = 1",
         [],
         |row| {
-            let base: Option<i64> = row.get("draft_base_revision_id")?;
-            let json: Option<String> = row.get("draft_document_json")?;
-            let fingerprint: Option<String> = row.get("draft_fingerprint")?;
-            let updated: Option<i64> = row.get("draft_updated_ms")?;
-            let draft = match (base, json, fingerprint, updated) {
-                (None, None, None, None) => None,
-                (Some(base_revision_id), Some(json), Some(fingerprint), Some(updated_ms)) => {
-                    let (document, fingerprint) = validated_stored_document(json, fingerprint)?;
-                    Some(PolicyDraft {
-                        base_revision_id,
-                        document,
-                        fingerprint,
-                        updated_ms,
+            let scope: Option<String> = row.get("widened_scope")?;
+            let forced: Option<bool> = row.get("widened_forced_cache_transition")?;
+            let widened_ms: Option<i64> = row.get("widened_ms")?;
+            let widened = match (scope, forced, widened_ms) {
+                (None, None, None) => None,
+                (Some(scope), Some(forced_cache_transition), Some(widened_ms)) => {
+                    Some(ActivationWidening {
+                        scope: parse_required(
+                            "routing_policy_state.widened_scope",
+                            scope,
+                            parse_activation_scope,
+                        )?,
+                        forced_cache_transition,
+                        widened_ms,
                     })
                 }
                 _ => {
                     return Err(Error::InvalidRoutingState(
-                        "draft fields must be all NULL or all present".into(),
+                        "widening fields must be all NULL or all present".into(),
                     ));
                 }
             };
             Ok(RoutingPolicyState {
                 active_revision_id: row.get("active_revision_id")?,
-                draft_generation: row.get("draft_generation")?,
-                draft,
                 legacy_imported_ms: row.get("legacy_imported_ms")?,
+                widened,
             })
         },
     )?
@@ -1309,79 +1276,75 @@ pub(super) fn load_routing_policy_state(conn: &Connection) -> Result<RoutingPoli
     })
 }
 
-pub(super) fn compare_and_swap_policy_draft(
-    conn: &Connection,
-    expected_generation: i64,
-    base_revision_id: i64,
-    document: &ValidatedPolicyDocument,
-    updated_ms: i64,
-) -> Result<DraftCasResult> {
-    if expected_generation < 0 {
+/// Widen the active revision's activation scope, without creating a revision
+/// (spec: RREV#widening-an-activation). One immediate transaction checks the
+/// active revision, refuses a scope that is not wider and records the new
+/// one, so a widening made against a revision that has since been replaced
+/// changes nothing. Whether an immediate widening needs consent, and has it,
+/// is the caller's to settle before this: the store holds no lane evidence.
+pub(super) fn widen_activation(
+    conn: &mut Connection,
+    expected_active_revision_id: i64,
+    scope: ActivationScope,
+    forced_cache_transition: bool,
+    widened_ms: i64,
+) -> Result<WidenResult> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current = load_routing_policy_state(&tx)?;
+    let Some(active) = current.active_revision_id else {
         return Err(Error::InvalidRoutingState(
-            "negative draft generation".into(),
+            "cannot widen without an active policy revision".into(),
         ));
+    };
+    if active != expected_active_revision_id {
+        return Ok(WidenResult::Conflict { current });
     }
-    let bytes =
-        policy_bytes(document).map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?;
-    let json = String::from_utf8(bytes)
-        .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?;
-    let fingerprint = policy_fingerprint(document)
-        .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?;
-    let changed = conn.execute(
-        "UPDATE routing_policy_state SET draft_generation = draft_generation + 1,
-             draft_base_revision_id = ?1, draft_document_json = ?2,
-             draft_fingerprint = ?3, draft_updated_ms = ?4
-         WHERE id = 1 AND draft_generation = ?5",
+    let revision = load_policy_revision(&tx, active)?.ok_or_else(|| {
+        Error::InvalidRoutingState(format!("active policy revision {active} does not exist"))
+    })?;
+    let (current_scope, current_forced) = current.effective_activation(&revision);
+    if !is_widening(
+        (current_scope, current_forced),
+        (scope, forced_cache_transition),
+    ) {
+        return Ok(WidenResult::NotAWidening {
+            current_scope,
+            current_forced_cache_transition: current_forced,
+        });
+    }
+    tx.execute(
+        "UPDATE routing_policy_state SET widened_scope = ?1,
+             widened_forced_cache_transition = ?2, widened_ms = ?3
+         WHERE id = 1 AND active_revision_id = ?4",
         rusqlite::params![
-            base_revision_id,
-            json,
-            fingerprint.to_string(),
-            updated_ms,
-            expected_generation
+            activation_scope_name(scope),
+            forced_cache_transition,
+            widened_ms,
+            active
         ],
     )?;
-    if changed == 1 {
-        Ok(DraftCasResult::Updated {
-            generation: expected_generation + 1,
-            draft: Some(PolicyDraft {
-                base_revision_id,
-                document: document.clone(),
-                fingerprint,
-                updated_ms,
-            }),
-        })
-    } else {
-        Ok(DraftCasResult::Conflict {
-            current: load_routing_policy_state(conn)?,
-        })
-    }
+    let state = load_routing_policy_state(&tx)?;
+    tx.commit()?;
+    Ok(WidenResult::Widened { state })
 }
 
-pub(super) fn clear_policy_draft(
-    conn: &Connection,
-    expected_generation: i64,
-) -> Result<DraftCasResult> {
-    if expected_generation < 0 {
-        return Err(Error::InvalidRoutingState(
-            "negative draft generation".into(),
-        ));
-    }
-    let changed = conn.execute(
-        "UPDATE routing_policy_state SET draft_generation = draft_generation + 1,
-             draft_base_revision_id = NULL, draft_document_json = NULL,
-             draft_fingerprint = NULL, draft_updated_ms = NULL
-         WHERE id = 1 AND draft_generation = ?1",
-        [expected_generation],
-    )?;
-    if changed == 1 {
-        Ok(DraftCasResult::Updated {
-            generation: expected_generation + 1,
-            draft: None,
-        })
-    } else {
-        Ok(DraftCasResult::Conflict {
-            current: load_routing_policy_state(conn)?,
-        })
+/// Whether moving from the scope and consent standing to another is a
+/// widening: a wider scope, or immediate again with the consent it lacked. A
+/// scope is never narrowed, and consent given is never taken back.
+pub fn is_widening(
+    (current, current_forced): (ActivationScope, bool),
+    (scope, forced): (ActivationScope, bool),
+) -> bool {
+    scope_rank(scope) > scope_rank(current)
+        || (scope == current && scope == ActivationScope::Immediate && forced && !current_forced)
+}
+
+/// How wide an activation scope is: the lanes it can move grow with it.
+pub fn scope_rank(scope: ActivationScope) -> u8 {
+    match scope {
+        ActivationScope::NewLanes => 0,
+        ActivationScope::NewAndColdLanes => 1,
+        ActivationScope::Immediate => 2,
     }
 }
 
@@ -2343,4 +2306,269 @@ mod tests {
         // A timestamp that cannot exist answers None, never a guess.
         assert_eq!(local_day(i64::MAX, &tz), None);
     }
+}
+
+/// The window the routing page counts and replays over: the last 24 hours
+/// (spec: UTUI#rules).
+pub const ROUTING_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// What a window's rows can say about which rule caught a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitCoverage {
+    /// Every policy-routed row in the window recorded what matched.
+    Complete,
+    /// Some did and some predate it, so each count is at least that many.
+    Floor,
+    /// None did. The counts are empty because nothing was recorded, not
+    /// because nothing matched.
+    NotRecorded,
+}
+
+/// How many requests a default caught, by the scope it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultHits {
+    pub scope: FrontendScope,
+    pub hits: u64,
+}
+
+/// The last 24 hours' requests counted by the record that decided their
+/// route, by the record's identifier across every revision the window
+/// spans (spec: UTUI#rules). A request is its first attempt, or its
+/// terminal where nothing was sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HitCounts {
+    pub since_ms: i64,
+    pub until_ms: i64,
+    pub coverage: HitCoverage,
+    /// Requests whose rows recorded what matched.
+    pub recorded_requests: u64,
+    /// Requests from before that was recorded. They are in no count below.
+    pub unrecorded_requests: u64,
+    pub presentations: BTreeMap<PresentationId, u64>,
+    pub rewrites: BTreeMap<RewriteId, u64>,
+    pub defaults: Vec<DefaultHits>,
+    /// Caught by the compaction policy's own route rather than by a rule.
+    pub compactions: u64,
+    /// Recorded requests no lookup matched, or whose lane's pin refused
+    /// before a route was chosen.
+    pub unrouted: u64,
+}
+
+/// Count the 24 hours ending at `until_ms`. One indexed range scan of
+/// `requests` on `ts_ms`; the three rule kinds are counted from the rows
+/// that carry the facts marker only, never inferred for older rows.
+pub(super) fn hit_counts(conn: &Connection, until_ms: i64) -> Result<HitCounts> {
+    let since_ms = until_ms - ROUTING_WINDOW_MS;
+    let rows = rows_of(
+        conn,
+        "SELECT facts_recorded, lookup_kind, lookup_scope, presentation_id, rewrite_id,
+                facts_profile, facts_protocol, COUNT(*) AS hits
+         FROM requests
+         WHERE ts_ms >= ?1 AND ts_ms <= ?2 AND policy_revision_id IS NOT NULL
+           AND (attempt_index = 0 OR attempt_index IS NULL)
+         GROUP BY facts_recorded, lookup_kind, lookup_scope, presentation_id,
+                  rewrite_id, facts_profile, facts_protocol",
+        [since_ms, until_ms],
+        |row| {
+            Ok((
+                row.get::<_, Option<i64>>("facts_recorded")?,
+                row.get::<_, Option<String>>("lookup_kind")?,
+                row.get::<_, Option<String>>("lookup_scope")?,
+                row.get::<_, Option<String>>("presentation_id")?,
+                row.get::<_, Option<String>>("rewrite_id")?,
+                row.get::<_, Option<String>>("facts_profile")?,
+                row.get::<_, Option<String>>("facts_protocol")?,
+                u64::try_from(row.get::<_, i64>("hits")?).unwrap_or(0),
+            ))
+        },
+    )?;
+    let mut counts = HitCounts {
+        since_ms,
+        until_ms,
+        coverage: HitCoverage::Complete,
+        recorded_requests: 0,
+        unrecorded_requests: 0,
+        presentations: BTreeMap::new(),
+        rewrites: BTreeMap::new(),
+        defaults: Vec::new(),
+        compactions: 0,
+        unrouted: 0,
+    };
+    let mut defaults: BTreeMap<String, DefaultHits> = BTreeMap::new();
+    for (marker, kind, scope, presentation, rewrite, profile, protocol, hits) in rows {
+        if marker.is_none() {
+            counts.unrecorded_requests += hits;
+            continue;
+        }
+        counts.recorded_requests += hits;
+        let kind = parse_required("requests.lookup_kind", kind.unwrap_or_default(), |value| {
+            super::ledger::LookupKind::parse(value)
+        });
+        let Ok(kind) = kind else {
+            counts.unrouted += hits;
+            continue;
+        };
+        match kind {
+            super::ledger::LookupKind::Compaction => counts.compactions += hits,
+            super::ledger::LookupKind::Presentation => {
+                let id: PresentationId =
+                    parse_id("requests.presentation_id", presentation.unwrap_or_default())?;
+                *counts.presentations.entry(id).or_default() += hits;
+            }
+            super::ledger::LookupKind::Rewrite => {
+                let id: RewriteId = parse_id("requests.rewrite_id", rewrite.unwrap_or_default())?;
+                *counts.rewrites.entry(id).or_default() += hits;
+            }
+            super::ledger::LookupKind::Default => {
+                let protocol = parse_required(
+                    "requests.facts_protocol",
+                    protocol.unwrap_or_default(),
+                    crate::policy::facts::parse_protocol,
+                )?;
+                let scope = parse_required(
+                    "requests.lookup_scope",
+                    scope.unwrap_or_default(),
+                    super::ledger::LookupScope::parse,
+                )?;
+                let scope = match scope {
+                    super::ledger::LookupScope::Protocol => FrontendScope::Protocol { protocol },
+                    super::ledger::LookupScope::Profile => FrontendScope::Profile {
+                        profile: parse_id("requests.facts_profile", profile.unwrap_or_default())?,
+                        protocol,
+                    },
+                };
+                let key = serde_json::to_string(&scope)
+                    .map_err(|error| Error::InvalidRoutingState(error.to_string()))?;
+                defaults
+                    .entry(key)
+                    .or_insert(DefaultHits { scope, hits: 0 })
+                    .hits += hits;
+            }
+        }
+    }
+    counts.defaults = defaults.into_values().collect();
+    counts.coverage = match (counts.unrecorded_requests, counts.recorded_requests) {
+        (0, _) => HitCoverage::Complete,
+        (_, 0) => HitCoverage::NotRecorded,
+        _ => HitCoverage::Floor,
+    };
+    Ok(counts)
+}
+
+/// One recent policy-routed request, with the facts a preview needs where its
+/// row recorded them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentRequest {
+    pub id: i64,
+    pub ts_ms: i64,
+    pub policy_revision_id: i64,
+    /// Present on a row of nothing sent (`route-unavailable`).
+    pub kind: Option<String>,
+    /// What the row says the request was, for a row that predates the facts
+    /// to be shown by.
+    pub requested_model: Option<String>,
+    /// How it routed at the time.
+    pub route_id: Option<String>,
+    pub candidate_id: Option<String>,
+    pub binding_id: Option<String>,
+    pub effective_model: Option<String>,
+    /// The record that decided the route, as recorded: its kind, scope and
+    /// identifier. Absent on a row from before the lookup was recorded.
+    pub matched: Option<RecentMatch>,
+    /// The facts the resolver was given. Absent on a row from before they
+    /// were recorded, which cannot be replayed.
+    pub facts: Option<RecordedFacts>,
+}
+
+impl RecentRequest {
+    /// Whether the request can be resolved again without a fact assumed.
+    pub fn replayable(&self) -> bool {
+        self.facts.as_ref().is_some_and(RecordedFacts::replayable)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentMatch {
+    pub kind: super::ledger::LookupKind,
+    pub scope: Option<super::ledger::LookupScope>,
+    pub id: Option<String>,
+}
+
+const RECENT_REQUEST_COLUMNS: &str = "id, ts_ms, policy_revision_id, kind, requested_model,
+    policy_route_id, candidate_id, binding_id, effective_model,
+    presentation_id, rewrite_id, lookup_kind, lookup_scope,
+    facts_recorded, facts_profile, facts_protocol, facts_requested_model,
+    facts_prompt_bound, facts_message_count, facts_tool_count, facts_capabilities,
+    facts_asks_safeguards, facts_binding_affinity, facts_class";
+
+fn read_recent_request(row: &rusqlite::Row<'_>) -> Result<RecentRequest> {
+    let matched = match row.get::<_, Option<String>>("lookup_kind")? {
+        None => None,
+        Some(kind) => Some(RecentMatch {
+            kind: parse_required("requests.lookup_kind", kind, |value| {
+                super::ledger::LookupKind::parse(value)
+            })?,
+            scope: row
+                .get::<_, Option<String>>("lookup_scope")?
+                .map(|scope| {
+                    parse_required(
+                        "requests.lookup_scope",
+                        scope,
+                        super::ledger::LookupScope::parse,
+                    )
+                })
+                .transpose()?,
+            id: row
+                .get::<_, Option<String>>("presentation_id")?
+                .or(row.get::<_, Option<String>>("rewrite_id")?),
+        }),
+    };
+    Ok(RecentRequest {
+        id: row.get("id")?,
+        ts_ms: row.get("ts_ms")?,
+        policy_revision_id: row.get("policy_revision_id")?,
+        kind: row.get("kind")?,
+        requested_model: row.get("requested_model")?,
+        route_id: row.get("policy_route_id")?,
+        candidate_id: row.get("candidate_id")?,
+        binding_id: row.get("binding_id")?,
+        effective_model: row.get("effective_model")?,
+        matched,
+        facts: super::ledger::read_recorded_facts(row)?,
+    })
+}
+
+/// The newest policy-routed requests since `since_ms`, newest first, at most
+/// `limit`. A request is its first attempt, or its terminal where nothing was
+/// sent, as the hit counts take it.
+pub(super) fn recent_requests(
+    conn: &Connection,
+    since_ms: i64,
+    limit: u32,
+) -> Result<Vec<RecentRequest>> {
+    rows_of(
+        conn,
+        &format!(
+            "SELECT {RECENT_REQUEST_COLUMNS} FROM requests
+             WHERE ts_ms >= ?1 AND policy_revision_id IS NOT NULL
+               AND (attempt_index = 0 OR attempt_index IS NULL)
+             ORDER BY ts_ms DESC, id DESC LIMIT ?2"
+        ),
+        rusqlite::params![since_ms, limit],
+        read_recent_request,
+    )
+}
+
+/// One policy-routed request by its row id, where it is one.
+pub(super) fn recent_request(conn: &Connection, id: i64) -> Result<Option<RecentRequest>> {
+    row_of(
+        conn,
+        &format!(
+            "SELECT {RECENT_REQUEST_COLUMNS} FROM requests
+             WHERE id = ?1 AND policy_revision_id IS NOT NULL
+               AND (attempt_index = 0 OR attempt_index IS NULL)"
+        ),
+        [id],
+        read_recent_request,
+    )
 }

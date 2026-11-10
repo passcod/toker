@@ -52,26 +52,26 @@ The README's routing paragraph describes the draft, validate and activate flow, 
 
 ### Store
 
-- [ ] Migration: rebuild `routing_policy_revisions` to allow `save` as a source, recreating its triggers as v9 did; add `PolicyRevisionSource::Save`.
-- [ ] Migration: add the widened scope, its force consent and when it was widened to `routing_policy_state`.
-- [ ] Migration: add to `requests` the profile, the matched lookup source and scope, and the resolver facts that are not already columns, with a marker that this row records them, so hit counts and replay can tell an older row from one with nothing in it.
-- [ ] `server/record*.rs` and `store/ledger.rs`: write those columns on every policy-routed row.
-- [ ] `store/state.rs`: stop `activate_policy_revision`, `activate_revision_one` and `retire_generated_revisions` writing the draft columns; remove `compare_and_swap_policy_draft` and `clear_policy_draft`; drop the draft fields from `load_routing_policy_state` and its callers.
-- [ ] `store/state.rs`: a query counting the last 24 hours' requests by presentation, rewrite and default, per record identifier across revisions, returning floor or not recorded where the window reaches rows older than the marker.
-- [ ] `store/state.rs`: a query listing recent requests with the facts preview needs, each flagged replayable or not.
-- [ ] Check `requests` has an index serving a 24-hour window, and add one if not.
+- [x] Migration: rebuild `routing_policy_revisions` to allow `save` as a source, recreating its triggers as v9 did; add `PolicyRevisionSource::Save`.
+- [x] Migration: add the widened scope, its force consent and when it was widened to `routing_policy_state`.
+- [x] Migration: add to `requests` the profile, the matched lookup source and scope, and the resolver facts that are not already columns, with a marker that this row records them, so hit counts and replay can tell an older row from one with nothing in it.
+- [x] `server/record*.rs` and `store/ledger.rs`: write those columns on every policy-routed row.
+- [x] `store/state.rs`: stop `activate_policy_revision`, `activate_revision_one` and `retire_generated_revisions` writing the draft columns; remove `compare_and_swap_policy_draft` and `clear_policy_draft`; drop the draft fields from `load_routing_policy_state` and its callers.
+- [x] `store/state.rs`: a query counting the last 24 hours' requests by presentation, rewrite and default, per record identifier across revisions, returning floor or not recorded where the window reaches rows older than the marker.
+- [x] `store/state.rs`: a query listing recent requests with the facts preview needs, each flagged replayable or not.
+- [x] Check `requests` has an index serving a 24-hour window, and add one if not.
 
 ### Control operations
 
-- [ ] `server/control/routing.rs` and `server/mod.rs`: `POST routing/save`, carrying the expected active revision, an edit and an optional description; applies the edit to the active document, compiles, and activates with `new_and_cold_lanes` and source `save`; a moved revision answers a conflict naming the live one.
-- [ ] `POST routing/widen`, carrying the expected active revision, the scope and force consent; refuses a narrowing; goes through `require_cache_consent` for immediate.
-- [ ] `policy/transition.rs` and `policy/pinning.rs`: read the widened scope and consent where set (RPINS).
-- [ ] `POST routing/validate`: compile an edit against the active revision (the body carries the edit and the expected active revision), returning diagnostics with their paths.
-- [ ] `POST routing/preview`: resolve against the active revision, an unsaved edit or a kept revision; take invented facts or a recorded request's identifier, answering not replayable for a row without the facts.
-- [ ] Preview over recent traffic: for an unsaved edit, replay the last 24 hours' requests it bears on under the active revision and under the edit, returning each changed one with both outcomes and a count of unreplayable rows.
-- [ ] `POST routing/reactivate`: carry the expected active revision, activate with `new_and_cold_lanes`, stop writing the draft.
-- [ ] Remove `PUT draft`, `PATCH draft` and `POST activate`, their handlers and the `Server` methods behind them; the snapshot drops `draft`, `draft_generation` and `draft_diagnostics`.
-- [ ] Resolver test for a disabled-provider prefix with and without a fallback (RSOLV).
+- [x] `server/control/routing.rs` and `server/mod.rs`: `POST routing/save`, carrying the expected active revision, an edit and an optional description; applies the edit to the active document, compiles, and activates with `new_and_cold_lanes` and source `save`; a moved revision answers a conflict naming the live one.
+- [x] `POST routing/widen`, carrying the expected active revision, the scope and force consent; refuses a narrowing; goes through `require_cache_consent` for immediate.
+- [x] `policy/transition.rs` and `policy/pinning.rs`: read the widened scope and consent where set (RPINS).
+- [x] `POST routing/validate`: compile an edit against the active revision (the body carries the edit and the expected active revision), returning diagnostics with their paths.
+- [x] `POST routing/preview`: resolve against the active revision, an unsaved edit or a kept revision; take invented facts or a recorded request's identifier, answering not replayable for a row without the facts.
+- [x] Preview over recent traffic: for an unsaved edit, replay the last 24 hours' requests it bears on under the active revision and under the edit, returning each changed one with both outcomes and a count of unreplayable rows.
+- [x] `POST routing/reactivate`: carry the expected active revision, activate with `new_and_cold_lanes`, stop writing the draft.
+- [x] Remove `PUT draft`, `PATCH draft` and `POST activate`, their handlers and the `Server` methods behind them; the snapshot drops `draft`, `draft_generation` and `draft_diagnostics`.
+- [x] Resolver test for a disabled-provider prefix with and without a fallback (RSOLV).
 
 ### Facts the page reads
 

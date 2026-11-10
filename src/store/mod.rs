@@ -37,20 +37,22 @@ pub use accounts::{
 pub use config::{Configuration, ProviderConfigRow, SettingsConfigRow};
 pub use ledger::{
     AttemptGroupId, AttemptIndex, AttemptProvenance, AttemptReason, ChildRole, CostKind,
-    DisplayRow, JSON_TEXT_COLUMNS, KindFilter, LaneSystemRow, LocalisationRow,
-    MAX_ROUTING_TRACE_EVENTS, MeterRow, PolicyRouteProvenance, PolicyRoutingOutcome, RebuildRow,
-    RelationSource, RequestFilter, RequestLookupProvenance, RequestRow, ResolvedRoute, RowKind,
-    SafeguardsRow, SessionCostGroup, SessionLineage, SessionSummary, StoredCandidateState,
+    DisplayRow, JSON_TEXT_COLUMNS, KindFilter, LaneSystemRow, LocalisationRow, LookupKind,
+    LookupScope, MAX_ROUTING_TRACE_EVENTS, MeterRow, PolicyRouteProvenance, PolicyRoutingOutcome,
+    RebuildRow, RelationSource, RequestFilter, RequestLookupProvenance, RequestRow, ResolvedRoute,
+    RowKind, SafeguardsRow, SessionCostGroup, SessionLineage, SessionSummary, StoredCandidateState,
     StoredLadders, StoredLookupSource, StoredRoutingTrace, StoredRoutingTraceEvent,
     StoredSkipReason, StoredTransitionDenied, is_api_measurement,
 };
 pub use state::{
-    ActivatePolicyRevision, ActivatedPolicyRevision, Allowance, BindingLearning,
-    BindingLearningUpdate, DraftCasResult, InitialPublication, Lane, LanePin, LanePinCasResult,
-    MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction, PingRecord, PolicyDraft,
-    PolicyRevision, PolicyRevisionSource, PublicationAdapter, PublicationCasResult, PublicationKey,
-    PublicationResultUpdate, PublicationState, RevisionOneActivation, RoutingPolicyState,
-    RoutingPublication, SafeguardsMark, local_day, publication_targets,
+    ActivatePolicyRevision, ActivatedPolicyRevision, ActivationWidening, Allowance,
+    BindingLearning, BindingLearningUpdate, DefaultHits, HitCounts, HitCoverage,
+    InitialPublication, Lane, LanePin, LanePinCasResult, MetersSnapshot, ModelEntry,
+    NewPolicyRevision, PingAction, PingRecord, PolicyRevision, PolicyRevisionSource,
+    PublicationAdapter, PublicationCasResult, PublicationKey, PublicationResultUpdate,
+    PublicationState, ROUTING_WINDOW_MS, RecentMatch, RecentRequest, RevisionOneActivation,
+    RoutingPolicyState, RoutingPublication, SafeguardsMark, WidenResult, is_widening, local_day,
+    publication_targets, scope_rank,
 };
 
 use std::env;
@@ -645,24 +647,40 @@ impl Store {
         state::load_routing_policy_state(&*self.conn()?)
     }
 
-    pub fn compare_and_swap_policy_draft(
+    /// Widen the active revision's activation scope, without creating a
+    /// revision (spec: RREV#widening-an-activation). Consent for a widening to
+    /// immediate is the caller's to check before this.
+    pub fn widen_activation(
         &self,
-        expected_generation: i64,
-        base_revision_id: i64,
-        document: &crate::policy::ValidatedPolicyDocument,
-        updated_ms: i64,
-    ) -> Result<DraftCasResult> {
-        state::compare_and_swap_policy_draft(
-            &*self.conn()?,
-            expected_generation,
-            base_revision_id,
-            document,
-            updated_ms,
+        expected_active_revision_id: i64,
+        scope: crate::policy::ActivationScope,
+        forced_cache_transition: bool,
+        widened_ms: i64,
+    ) -> Result<WidenResult> {
+        state::widen_activation(
+            &mut *self.conn()?,
+            expected_active_revision_id,
+            scope,
+            forced_cache_transition,
+            widened_ms,
         )
     }
 
-    pub fn clear_policy_draft(&self, expected_generation: i64) -> Result<DraftCasResult> {
-        state::clear_policy_draft(&*self.conn()?, expected_generation)
+    /// The 24 hours ending at `until_ms`, counted by the record that decided
+    /// each request's route.
+    pub fn routing_hit_counts(&self, until_ms: i64) -> Result<HitCounts> {
+        state::hit_counts(&*self.conn()?, until_ms)
+    }
+
+    /// The newest policy-routed requests since `since_ms`, each with its
+    /// recorded facts where it has them.
+    pub fn recent_routed_requests(&self, since_ms: i64, limit: u32) -> Result<Vec<RecentRequest>> {
+        state::recent_requests(&*self.conn()?, since_ms, limit)
+    }
+
+    /// One policy-routed request by its row id.
+    pub fn routed_request(&self, id: i64) -> Result<Option<RecentRequest>> {
+        state::recent_request(&*self.conn()?, id)
     }
 
     pub fn set_publication_desired(
@@ -1012,14 +1030,14 @@ mod tests {
     use super::{
         AccountIdentity, AccountNameSource, ActivatePolicyRevision, Allowance, AttemptGroupId,
         AttemptIndex, AttemptProvenance, AttemptReason, BindingLearningUpdate, CostKind,
-        CredentialDigest, DisplayRow, DraftCasResult, Error, InitialPublication, Lane, LanePin,
-        LanePinCasResult, MAX_ROUTING_TRACE_EVENTS, MetersSnapshot, ModelEntry, NewPolicyRevision,
-        PingAction, PingRecord, PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome,
-        PublicationAdapter, PublicationCasResult, PublicationKey, PublicationResultUpdate,
-        PublicationState, RequestLookupProvenance, RequestRow, ResolvedRoute,
-        RevisionOneActivation, RowKind, SessionCostGroup, SessionLineage, Store,
+        CredentialDigest, DisplayRow, Error, InitialPublication, Lane, LanePin, LanePinCasResult,
+        MAX_ROUTING_TRACE_EVENTS, MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction,
+        PingRecord, PolicyRevision, PolicyRevisionSource, PolicyRouteProvenance,
+        PolicyRoutingOutcome, PublicationAdapter, PublicationCasResult, PublicationKey,
+        PublicationResultUpdate, PublicationState, RequestLookupProvenance, RequestRow,
+        ResolvedRoute, RevisionOneActivation, RowKind, SessionCostGroup, SessionLineage, Store,
         StoredCandidateState, StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason,
-        is_api_measurement,
+        WidenResult, is_api_measurement,
     };
     use crate::ir::Release;
     use crate::policy::{
@@ -1104,6 +1122,26 @@ mod tests {
             .revision_id
     }
 
+    /// Facts with every field set, so a round trip shows each column.
+    pub(super) fn facts() -> crate::policy::RecordedFacts {
+        crate::policy::RecordedFacts {
+            profile: Some(crate::policy::ProfileId::new("work").unwrap()),
+            protocol: crate::policy::FrontendProtocol::AnthropicMessages,
+            requested_model: Some("claude-sonnet-4".to_owned()),
+            prompt_bound: 12_345,
+            message_count: Some(7),
+            tool_count: 3,
+            required_capabilities: crate::policy::CapabilityFlags {
+                tools: true,
+                images: true,
+                ..Default::default()
+            },
+            asks_server_safeguards: true,
+            binding_affinity: Some(BindingId::new("anthropic_sub.anthropic_messages").unwrap()),
+            class: crate::policy::RequestClass::Inference,
+        }
+    }
+
     fn provenanced_row(revision_id: i64) -> RequestRow {
         let mut row = bare_row(1_800_000_000_000);
         row.session_id = Some("guardian:parent-session".to_owned());
@@ -1144,6 +1182,7 @@ mod tests {
                 candidate_id: CandidateId::new("candidate").unwrap(),
                 baseline_model: "baseline".to_owned(),
             },
+            facts: Some(facts()),
         });
         row.lineage = Some(SessionLineage::codex_guardian("guardian:parent-session").unwrap());
         row
@@ -1609,6 +1648,7 @@ mod tests {
                         attempt_group_id: AttemptGroupId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
                             .unwrap(),
                     },
+                    facts: None,
                 });
             }
             store.record_request(&row).expect("record");
@@ -3381,8 +3421,7 @@ mod tests {
         let store = mem_store();
         let state = store.load_routing_policy_state().expect("state");
         assert_eq!(state.active_revision_id, None);
-        assert_eq!(state.draft_generation, 0);
-        assert_eq!(state.draft, None);
+        assert_eq!(state.widened, None);
         assert_eq!(state.legacy_imported_ms, None);
 
         let id = revision(&store, "first", None);
@@ -3454,12 +3493,6 @@ mod tests {
         assert_eq!(revision.source, PolicyRevisionSource::Legacy);
         assert_eq!(state.active_revision_id, Some(revision.revision_id));
         assert_eq!(state.legacy_imported_ms, Some(200));
-        assert_eq!(state.draft_generation, 1);
-        assert_eq!(
-            state.draft.as_ref().unwrap().base_revision_id,
-            revision.revision_id
-        );
-        assert_eq!(state.draft.as_ref().unwrap().document, document);
         assert_eq!(publications.len(), 1);
         assert_eq!(publications[0].desired_revision_id, revision.revision_id);
         assert_eq!(publications[0].desired_inventory_generation, 7);
@@ -3523,7 +3556,6 @@ mod tests {
         let state = store.load_routing_policy_state().unwrap();
         assert_eq!(state.active_revision_id, None);
         assert_eq!(state.legacy_imported_ms, None);
-        assert_eq!(state.draft_generation, 0);
         assert_eq!(store.load_policy_revisions().unwrap(), vec![]);
         assert_eq!(store.load_publications().unwrap(), vec![]);
 
@@ -3564,7 +3596,6 @@ mod tests {
         let activated = store
             .activate_policy_revision(&ActivatePolicyRevision {
                 created_ms: 200,
-                expected_draft_generation: None,
                 description: Some("restore the initial routing"),
                 activation_scope: ActivationScope::Immediate,
                 forced_cache_transition: false,
@@ -3626,7 +3657,6 @@ mod tests {
             store
                 .activate_policy_revision(&ActivatePolicyRevision {
                     created_ms: 200,
-                    expected_draft_generation: None,
                     description: None,
                     activation_scope: ActivationScope::Immediate,
                     forced_cache_transition: false,
@@ -3651,38 +3681,130 @@ mod tests {
         assert_eq!(store.load_policy_revisions().unwrap().len(), 1);
     }
 
-    #[test]
-    fn policy_draft_cas_updates_conflicts_and_clears() {
+    /// A store whose revision one is active, and the document it holds.
+    fn store_with_active_revision() -> (Store, PolicyRevision) {
         let store = mem_store();
-        let base = revision(&store, "base", None);
-        let first = policy("draft one");
+        let RevisionOneActivation::Activated { revision, .. } = store
+            .activate_revision_one(&policy("revision one"), 100, 0, &[])
+            .expect("activate revision one")
+        else {
+            panic!("revision one is activated")
+        };
+        (store, revision)
+    }
+
+    fn activate(store: &Store, expected: i64, source: PolicyRevisionSource) -> i64 {
+        store
+            .activate_policy_revision(&ActivatePolicyRevision {
+                created_ms: 200,
+                description: None,
+                activation_scope: ActivationScope::NewAndColdLanes,
+                forced_cache_transition: false,
+                source,
+                parent_revision_id: None,
+                expected_active_revision_id: expected,
+                document: &policy("next"),
+                desired_inventory_generation: 0,
+                publications: &[],
+            })
+            .expect("activate")
+            .revision
+            .revision_id
+    }
+
+    #[test]
+    fn a_save_is_recorded_as_a_save() {
+        let (store, first) = store_with_active_revision();
+        let id = activate(&store, first.revision_id, PolicyRevisionSource::Save);
+        let saved = store.load_policy_revision(id).unwrap().unwrap();
+        assert_eq!(saved.source, PolicyRevisionSource::Save);
+        // Revisions written before the source was widened keep theirs.
+        assert_eq!(first.source, PolicyRevisionSource::Legacy);
+    }
+
+    #[test]
+    fn widening_never_narrows_and_the_next_activation_clears_it() {
+        let (store, first) = store_with_active_revision();
+        let active = first.revision_id;
+        assert_eq!(first.activation_scope, ActivationScope::NewLanes);
+
+        // New lanes to new and cold lanes, then on to immediate with consent.
+        let WidenResult::Widened { state } = store
+            .widen_activation(active, ActivationScope::NewAndColdLanes, false, 300)
+            .unwrap()
+        else {
+            panic!("new lanes widens to new and cold lanes")
+        };
+        assert_eq!(
+            state.effective_activation(&first),
+            (ActivationScope::NewAndColdLanes, false)
+        );
+        assert_eq!(state.widened.unwrap().widened_ms, 300);
+
+        // Narrowing, and widening to what already stands, change nothing.
+        for scope in [ActivationScope::NewLanes, ActivationScope::NewAndColdLanes] {
+            assert_eq!(
+                store.widen_activation(active, scope, false, 301).unwrap(),
+                WidenResult::NotAWidening {
+                    current_scope: ActivationScope::NewAndColdLanes,
+                    current_forced_cache_transition: false,
+                }
+            );
+        }
+        assert_eq!(
+            store
+                .load_routing_policy_state()
+                .unwrap()
+                .widened
+                .unwrap()
+                .widened_ms,
+            300
+        );
+
         assert!(matches!(
             store
-                .compare_and_swap_policy_draft(0, base, &first, 200)
+                .widen_activation(active, ActivationScope::Immediate, false, 302)
                 .unwrap(),
-            DraftCasResult::Updated {
-                generation: 1,
-                draft: Some(_)
-            }
+            WidenResult::Widened { .. }
         ));
-        let second = policy("draft two");
-        let stale = store
-            .compare_and_swap_policy_draft(0, base, &second, 201)
-            .unwrap();
-        assert!(
-            matches!(stale, DraftCasResult::Conflict { current } if current.draft_generation == 1)
-        );
-        let state = store.load_routing_policy_state().unwrap();
-        assert_eq!(state.active_revision_id, None);
-        assert_eq!(state.draft.as_ref().unwrap().document, first);
+        // Immediate may be widened again only to add the consent it lacked.
         assert!(matches!(
-            store.clear_policy_draft(1).unwrap(),
-            DraftCasResult::Updated {
-                generation: 2,
-                draft: None
-            }
+            store
+                .widen_activation(active, ActivationScope::Immediate, true, 303)
+                .unwrap(),
+            WidenResult::Widened { .. }
         ));
-        assert_eq!(store.load_routing_policy_state().unwrap().draft, None);
+        assert!(matches!(
+            store
+                .widen_activation(active, ActivationScope::Immediate, true, 304)
+                .unwrap(),
+            WidenResult::NotAWidening { .. }
+        ));
+        let state = store.load_routing_policy_state().unwrap();
+        assert_eq!(
+            state.effective_activation(&first),
+            (ActivationScope::Immediate, true)
+        );
+
+        // The next activation starts from its own scope.
+        let next = activate(&store, active, PolicyRevisionSource::Save);
+        let state = store.load_routing_policy_state().unwrap();
+        assert_eq!(state.widened, None);
+        assert_eq!(state.active_revision_id, Some(next));
+    }
+
+    #[test]
+    fn widening_a_revision_that_is_no_longer_active_conflicts_and_changes_nothing() {
+        let (store, first) = store_with_active_revision();
+        let next = activate(&store, first.revision_id, PolicyRevisionSource::Save);
+        let WidenResult::Conflict { current } = store
+            .widen_activation(first.revision_id, ActivationScope::Immediate, true, 300)
+            .unwrap()
+        else {
+            panic!("a moved revision conflicts")
+        };
+        assert_eq!(current.active_revision_id, Some(next));
+        assert_eq!(store.load_routing_policy_state().unwrap().widened, None);
     }
 
     #[test]
@@ -4775,6 +4897,7 @@ mod tests {
                 candidate_id: CandidateId::new("candidate").unwrap(),
                 baseline_model: "model".to_owned(),
             },
+            facts: None,
         });
         assert!(matches!(
             store.record_request(&row),
@@ -4949,6 +5072,7 @@ mod tests {
                     candidate_id: CandidateId::new("candidate").unwrap(),
                     baseline_model: "model".to_owned(),
                 },
+                facts: None,
             }
         }
 
@@ -5006,6 +5130,7 @@ mod tests {
             outcome: PolicyRoutingOutcome::RouteUnavailable {
                 attempt_group_id: terminal_group,
             },
+            facts: None,
         });
         store.record_request(&terminal).unwrap();
         let mut wrong_kind = terminal.clone();
@@ -5040,7 +5165,7 @@ mod tests {
 
         let no_route = terminal(
             1,
-            PolicyRouteProvenance::from_no_route(revision_id, group(1)).unwrap(),
+            PolicyRouteProvenance::from_no_route(revision_id, group(1), facts()).unwrap(),
         );
         store.record_request(&no_route).unwrap();
         let denied = terminal(
@@ -5050,6 +5175,7 @@ mod tests {
                 None,
                 TransitionDenied::StaleRevision,
                 group(2),
+                facts(),
             )
             .unwrap(),
         );
@@ -5099,6 +5225,7 @@ mod tests {
                 candidate_id: CandidateId::new("candidate").unwrap(),
                 baseline_model: "model".to_owned(),
             },
+            facts: None,
             ..no_route.policy_routing.clone().unwrap()
         });
         let mut found_route_says_none = terminal(
@@ -5112,6 +5239,7 @@ mod tests {
                     crate::policy::RouteProvenance::ProtocolDefault,
                 )],
                 group(4),
+                facts(),
             )
             .unwrap(),
         );
@@ -5150,6 +5278,7 @@ mod tests {
             )),
             TransitionDenied::WarmCacheLoss,
             AttemptGroupId::fresh(),
+            facts(),
         )
         .unwrap();
         assert_eq!(
@@ -5601,7 +5730,6 @@ mod tests {
         assert_eq!(revision.document, fresh);
         assert_eq!(state.active_revision_id, Some(revision.revision_id));
         assert_eq!(state.legacy_imported_ms, Some(200));
-        assert_eq!(state.draft.unwrap().base_revision_id, revision.revision_id);
         assert!(
             store
                 .load_policy_revision(old.revision_id)
@@ -5620,7 +5748,8 @@ mod tests {
     }
 
     #[test]
-    fn retiring_generated_history_keeps_an_authored_active_revision_and_rebases_its_draft() {
+    fn retiring_generated_history_keeps_an_authored_active_revision_and_drops_a_draft_naming_a_retired_one()
+     {
         let store = mem_store();
         let RevisionOneActivation::Activated { revision: old, .. } = store
             .activate_revision_one(&policy("generated"), 100, 4, &[])
@@ -5631,7 +5760,6 @@ mod tests {
         let authored = store
             .activate_policy_revision(&ActivatePolicyRevision {
                 created_ms: 150,
-                expected_draft_generation: None,
                 description: None,
                 activation_scope: ActivationScope::Immediate,
                 forced_cache_transition: false,
@@ -5645,15 +5773,24 @@ mod tests {
             .unwrap()
             .revision;
         mark_generated(&store, old.revision_id);
-        let before = store.load_routing_policy_state().unwrap();
-        // A draft based on the retired revision, as an import or an edit
-        // made before the authored activation would leave.
+        // A draft an earlier version left on the retired revision. Nothing
+        // reads the draft columns now, but the draft still names the revision
+        // by foreign key, so it has to go for the revision to be deleted.
+        let stale = policy("draft on generated");
         store
-            .compare_and_swap_policy_draft(
-                before.draft_generation,
-                old.revision_id,
-                &policy("draft on generated"),
-                160,
+            .conn()
+            .unwrap()
+            .execute(
+                "UPDATE routing_policy_state SET draft_generation = 3,
+                     draft_base_revision_id = ?1, draft_document_json = ?2,
+                     draft_fingerprint = ?3, draft_updated_ms = 160 WHERE id = 1",
+                rusqlite::params![
+                    old.revision_id,
+                    String::from_utf8(crate::policy::policy_bytes(&stale).unwrap()).unwrap(),
+                    crate::policy::policy_fingerprint(&stale)
+                        .unwrap()
+                        .to_string(),
+                ],
             )
             .unwrap();
 
@@ -5666,10 +5803,7 @@ mod tests {
             panic!("an authored active revision stays active")
         };
         assert_eq!(revision.revision_id, authored.revision_id);
-        let draft = state.draft.unwrap();
-        assert_eq!(draft.base_revision_id, authored.revision_id);
-        assert_eq!(draft.document, authored.document);
-        assert_eq!(state.draft_generation, before.draft_generation + 2);
+        assert_eq!(state.active_revision_id, Some(authored.revision_id));
         assert!(
             store
                 .load_policy_revision(old.revision_id)
@@ -5775,6 +5909,480 @@ mod tests {
         assert_eq!(version, 11);
     }
 
+    /// A policy-routed first attempt (or the terminal where nothing was
+    /// sent) that the lookup `lookup` decided, written with or without the
+    /// resolver's facts.
+    fn routed_row(
+        revision_id: i64,
+        ts_ms: i64,
+        group: u8,
+        lookup: RequestLookupProvenance,
+        facts: Option<crate::policy::RecordedFacts>,
+    ) -> RequestRow {
+        let (source, presentation_id, rewrite_id) = match &lookup {
+            RequestLookupProvenance::ProfilePresentation(id) => (
+                super::StoredLookupSource::ProfilePresentation,
+                Some(id.clone()),
+                None,
+            ),
+            RequestLookupProvenance::ProtocolPresentation(id) => (
+                super::StoredLookupSource::ProtocolPresentation,
+                Some(id.clone()),
+                None,
+            ),
+            RequestLookupProvenance::ProfileRewrite(id) => (
+                super::StoredLookupSource::ProfileRewrite,
+                None,
+                Some(id.clone()),
+            ),
+            RequestLookupProvenance::ProtocolRewrite(id) => (
+                super::StoredLookupSource::ProtocolRewrite,
+                None,
+                Some(id.clone()),
+            ),
+            RequestLookupProvenance::ProfileDefault => {
+                (super::StoredLookupSource::ProfileDefault, None, None)
+            }
+            RequestLookupProvenance::ProtocolDefault => {
+                (super::StoredLookupSource::ProtocolDefault, None, None)
+            }
+            RequestLookupProvenance::Compaction => {
+                (super::StoredLookupSource::Compaction, None, None)
+            }
+        };
+        let mut row = bare_row(ts_ms);
+        row.binding_id = Some(BindingId::new("codex_sub.codex_responses").unwrap());
+        row.attempt = Some(AttemptProvenance {
+            attempt_group_id: AttemptGroupId::new(format!("{group:02x}").repeat(16)).unwrap(),
+            attempt_index: AttemptIndex::zero(),
+            reason: AttemptReason::Initial,
+        });
+        row.policy_routing = Some(PolicyRouteProvenance {
+            policy_revision_id: revision_id,
+            route: Some(ResolvedRoute {
+                lookup,
+                route_id: RouteId::new("route").unwrap(),
+                route_fingerprint: "22".repeat(32).parse().unwrap(),
+            }),
+            trace: StoredRoutingTrace {
+                version: 2,
+                events: vec![
+                    StoredRoutingTraceEvent::Lookup {
+                        source,
+                        presentation_id,
+                        rewrite_id,
+                    },
+                    StoredRoutingTraceEvent::Candidate {
+                        candidate_id: CandidateId::new("candidate").unwrap(),
+                        crossed_from: None,
+                        binding_id: BindingId::new("codex_sub.codex_responses").unwrap(),
+                        model: Some("baseline".to_owned()),
+                        state: StoredCandidateState::Available,
+                        reason: None,
+                    },
+                ],
+            },
+            outcome: PolicyRoutingOutcome::Attempt {
+                candidate_id: CandidateId::new("candidate").unwrap(),
+                baseline_model: "baseline".to_owned(),
+            },
+            facts,
+        });
+        row
+    }
+
+    #[test]
+    fn resolver_facts_round_trip_and_an_older_row_reads_as_lacking_them() {
+        let store = mem_store();
+        let revision_id = revision(&store, "facts", None);
+        let with = routed_row(
+            revision_id,
+            1_000,
+            1,
+            RequestLookupProvenance::ProtocolDefault,
+            Some(facts()),
+        );
+        let without = routed_row(
+            revision_id,
+            2_000,
+            2,
+            RequestLookupProvenance::ProtocolDefault,
+            None,
+        );
+        store.record_request(&with).unwrap();
+        store.record_request(&without).unwrap();
+        let rows = store.requests_since(0, 10).unwrap();
+        assert_eq!(rows[0].policy_routing, with.policy_routing);
+        assert_eq!(
+            rows[1].policy_routing.as_ref().unwrap().facts,
+            None,
+            "a row without the marker is not filled in from anywhere"
+        );
+        let columns: (Option<i64>, Option<String>, Option<String>, Option<String>) = store
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT facts_recorded, lookup_kind, lookup_scope, facts_profile
+                 FROM requests WHERE ts_ms = 2000",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            columns,
+            (None, None, None, None),
+            "neither the facts nor the lookup beside them is written without the marker"
+        );
+
+        // The columns cannot say anything without the marker, and the
+        // marker cannot stand on a row with the facts half written.
+        let conn = store.conn().unwrap();
+        let loose = conn.execute(
+            "INSERT INTO requests (ts_ms, facts_protocol) VALUES (3, 'openai_chat')",
+            [],
+        );
+        assert!(loose.is_err(), "facts without their marker");
+        let partial = conn.execute(
+            "INSERT INTO requests (ts_ms, policy_revision_id, facts_recorded)
+             VALUES (4, ?1, 1)",
+            [revision_id],
+        );
+        assert!(partial.is_err(), "a marker without its facts");
+    }
+
+    #[test]
+    fn hit_counts_are_exact_a_floor_or_not_recorded_by_what_the_window_holds() {
+        use crate::policy::{FrontendScope, RewriteId};
+        let store = mem_store();
+        let revision_one = revision(&store, "one", None);
+        let revision_two = revision(&store, "two", Some(revision_one));
+        let now = 10 * 24 * 60 * 60 * 1000;
+        let hours = |n: i64| n * 60 * 60 * 1000;
+        let rewrite = |name: &str| RewriteId::new(name).unwrap();
+        let record = |row: RequestRow| store.record_request(&row).unwrap();
+
+        // Nothing in the window: exact, and empty.
+        let counts = store.routing_hit_counts(now).unwrap();
+        assert_eq!(counts.coverage, super::HitCoverage::Complete);
+        assert_eq!(counts.recorded_requests + counts.unrecorded_requests, 0);
+
+        // A request before the facts were recorded.
+        record(routed_row(
+            revision_one,
+            now - hours(2),
+            1,
+            RequestLookupProvenance::ProtocolRewrite(rewrite("sonnet")),
+            None,
+        ));
+        let counts = store.routing_hit_counts(now).unwrap();
+        assert_eq!(counts.coverage, super::HitCoverage::NotRecorded);
+        assert_eq!(counts.unrecorded_requests, 1);
+        assert!(counts.rewrites.is_empty(), "never inferred for old rows");
+
+        // Requests after it, under two revisions: counted by the record's
+        // identifier across both, and the older row makes it a floor.
+        record(routed_row(
+            revision_one,
+            now - hours(3),
+            2,
+            RequestLookupProvenance::ProtocolRewrite(rewrite("sonnet")),
+            Some(facts()),
+        ));
+        record(routed_row(
+            revision_two,
+            now - hours(1),
+            3,
+            RequestLookupProvenance::ProtocolRewrite(rewrite("sonnet")),
+            Some(facts()),
+        ));
+        record(routed_row(
+            revision_two,
+            now - hours(1),
+            4,
+            RequestLookupProvenance::ProfilePresentation(PresentationId::new("picker").unwrap()),
+            Some(facts()),
+        ));
+        record(routed_row(
+            revision_two,
+            now - hours(1),
+            5,
+            RequestLookupProvenance::ProfileDefault,
+            Some(facts()),
+        ));
+        record(routed_row(
+            revision_two,
+            now - hours(1),
+            6,
+            RequestLookupProvenance::ProtocolDefault,
+            Some(facts()),
+        ));
+        // A fallback is the same request, and a row outside the window is
+        // not in it.
+        let mut retry = routed_row(
+            revision_two,
+            now - hours(1),
+            5,
+            RequestLookupProvenance::ProfileDefault,
+            Some(facts()),
+        );
+        retry.attempt.as_mut().unwrap().attempt_index = AttemptIndex::try_from(1).unwrap();
+        retry.attempt.as_mut().unwrap().reason = AttemptReason::Overload;
+        record(retry);
+        record(routed_row(
+            revision_two,
+            now - hours(30),
+            7,
+            RequestLookupProvenance::ProtocolRewrite(rewrite("sonnet")),
+            None,
+        ));
+        let counts = store.routing_hit_counts(now).unwrap();
+        assert_eq!(counts.coverage, super::HitCoverage::Floor);
+        assert_eq!(counts.recorded_requests, 5);
+        assert_eq!(counts.unrecorded_requests, 1);
+        assert_eq!(counts.rewrites.get(&rewrite("sonnet")), Some(&2));
+        assert_eq!(
+            counts
+                .presentations
+                .get(&PresentationId::new("picker").unwrap()),
+            Some(&1)
+        );
+        let mut defaults: Vec<_> = counts
+            .defaults
+            .iter()
+            .map(|default| (default.scope.clone(), default.hits))
+            .collect();
+        defaults.sort_by_key(|(_, hits)| *hits);
+        assert_eq!(
+            defaults,
+            vec![
+                (
+                    FrontendScope::Profile {
+                        profile: ProfileId::new("work").unwrap(),
+                        protocol: FrontendProtocol::AnthropicMessages,
+                    },
+                    1
+                ),
+                (
+                    FrontendScope::Protocol {
+                        protocol: FrontendProtocol::AnthropicMessages,
+                    },
+                    1
+                ),
+            ]
+        );
+
+        // Once the window holds only rows that recorded it, it is exact.
+        let counts = store.routing_hit_counts(now + hours(23)).unwrap();
+        assert_eq!(counts.coverage, super::HitCoverage::Complete);
+        assert_eq!(counts.recorded_requests, 4);
+    }
+
+    #[test]
+    fn recent_requests_carry_their_facts_and_say_which_can_be_replayed() {
+        let store = mem_store();
+        let revision_id = revision(&store, "recent", None);
+        store
+            .record_request(&routed_row(
+                revision_id,
+                1_000,
+                1,
+                RequestLookupProvenance::ProtocolDefault,
+                None,
+            ))
+            .unwrap();
+        store
+            .record_request(&routed_row(
+                revision_id,
+                2_000,
+                2,
+                RequestLookupProvenance::ProfileDefault,
+                Some(facts()),
+            ))
+            .unwrap();
+        let mut compaction = facts();
+        compaction.class = crate::policy::RequestClass::Compaction;
+        store
+            .record_request(&routed_row(
+                revision_id,
+                3_000,
+                3,
+                RequestLookupProvenance::Compaction,
+                Some(compaction),
+            ))
+            .unwrap();
+        // A row that was never policy-routed is not a routed request.
+        store.record_request(&bare_row(4_000)).unwrap();
+
+        let recent = store.recent_routed_requests(0, 10).unwrap();
+        assert_eq!(
+            recent.iter().map(|row| row.ts_ms).collect::<Vec<_>>(),
+            [3_000, 2_000, 1_000],
+            "newest first"
+        );
+        assert_eq!(
+            recent
+                .iter()
+                .map(|row| row.replayable())
+                .collect::<Vec<_>>(),
+            [false, true, false],
+            "a compaction's cold-lane evidence is not recorded, and an old row has no facts"
+        );
+        assert_eq!(recent[1].facts, Some(facts()));
+        assert_eq!(recent[2].facts, None);
+        assert_eq!(
+            recent[1].binding_id.as_deref(),
+            Some("codex_sub.codex_responses")
+        );
+        assert_eq!(store.recent_routed_requests(0, 1).unwrap().len(), 1);
+        assert_eq!(store.recent_routed_requests(2_500, 10).unwrap().len(), 1);
+        assert!(store.routed_request(recent[1].id).unwrap().is_some());
+        assert!(store.routed_request(9_999).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_day_window_over_the_ledger_is_served_by_the_time_index() {
+        let store = mem_store();
+        let plan: Vec<String> = store
+            .conn()
+            .unwrap()
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT lookup_kind, COUNT(*) FROM requests
+                 WHERE ts_ms >= 1 AND ts_ms <= 2 AND policy_revision_id IS NOT NULL
+                   AND (attempt_index = 0 OR attempt_index IS NULL)
+                 GROUP BY lookup_kind",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|step| step.contains("requests_ts_ms_idx")),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn migration_v22_keeps_the_revision_tables_and_their_triggers_whole() {
+        let dir = test_dir("v21-revision-rebuild");
+        let db = dir.join("toker.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let document = policy("kept");
+        let json = String::from_utf8(crate::policy::policy_bytes(&document).unwrap()).unwrap();
+        let fingerprint = crate::policy::policy_fingerprint(&document)
+            .unwrap()
+            .to_string();
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            for script in &schema::MIGRATIONS[..21] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 21).unwrap();
+            conn.execute(
+                "INSERT INTO routing_policy_revisions
+                 (revision_id, created_ms, activated_ms, description, activation_scope,
+                  forced_cache_transition, source, parent_revision_id, document_json,
+                  fingerprint, compiler_origin)
+                 VALUES (1, 1, 2, 'first', 'new_lanes', 0, 'legacy', NULL, ?1, ?2,
+                         'generated_revision_one'),
+                        (2, 3, 4, 'second', 'immediate', 1, 'draft', 1, ?1, ?2, 'authored')",
+                rusqlite::params![json, fingerprint],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE routing_policy_state SET active_revision_id = 2,
+                     legacy_imported_ms = 5 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO routing_publications
+                 (scope_key, adapter, desired_revision_id, applied_revision_id,
+                  desired_inventory_generation, applied_inventory_generation, state,
+                  updated_ms, applied_identities_json)
+                 VALUES ('protocol:anthropic_messages', 'claude_settings', 2, 2, 3, 3,
+                         'applied', 6, '[\"row\"]')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO requests
+                 (ts_ms, policy_revision_id, policy_route_id, route_fingerprint,
+                  candidate_id, binding_id, baseline_model, attempt_group_id,
+                  attempt_index, fallback_reason, routing_trace, presentation_id)
+                 VALUES (8, 2, 'route', ?1, 'candidate', 'openrouter.openrouter_messages',
+                         'base', 'abcdefabcdefabcdefabcdefabcdefab', 0, 'initial', ?2, 'picker')",
+                rusqlite::params![
+                    "22".repeat(32),
+                    r#"{"version":1,"events":[{"kind":"lookup","source":"protocol_presentation","presentation_id":"picker","rewrite_id":null}]}"#,
+                ],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&db).unwrap();
+        assert_eq!(user_version(&store), schema::MIGRATIONS.len() as i64);
+
+        // Every revision, its origin and the references to it survived.
+        let revisions = store.load_policy_revisions().unwrap();
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(revisions[1].source, PolicyRevisionSource::Draft);
+        assert_eq!(revisions[1].parent_revision_id, Some(1));
+        assert_eq!(
+            store
+                .load_routing_policy_state()
+                .unwrap()
+                .active_revision_id,
+            Some(2)
+        );
+        let publication = store.load_publications().unwrap().pop().unwrap();
+        assert_eq!(publication.applied_revision_id, Some(2));
+        assert_eq!(publication.applied_identities.unwrap().len(), 1);
+
+        // The row written before the facts reads as lacking them, and is the
+        // one thing the window's hit counts say they did not record.
+        let rows = store.requests_since(0, 10).unwrap();
+        assert_eq!(rows[0].policy_routing.as_ref().unwrap().facts, None);
+        let counts = store.routing_hit_counts(8).unwrap();
+        assert_eq!(counts.unrecorded_requests, 1);
+        assert_eq!(counts.coverage, super::HitCoverage::NotRecorded);
+
+        // The widened source is accepted, and the triggers that name the
+        // revision table still guard the tables that reference it.
+        let saved = store
+            .activate_policy_revision(&ActivatePolicyRevision {
+                created_ms: 9,
+                description: None,
+                activation_scope: ActivationScope::NewAndColdLanes,
+                forced_cache_transition: false,
+                source: PolicyRevisionSource::Save,
+                parent_revision_id: None,
+                expected_active_revision_id: 2,
+                document: &policy("saved"),
+                desired_inventory_generation: 3,
+                publications: &[],
+            })
+            .unwrap();
+        assert_eq!(saved.revision.source, PolicyRevisionSource::Save);
+        let conn = store.conn().unwrap();
+        for (sql, what) in [
+            (
+                "INSERT INTO lanes (key, updated_ms, pin_generation, policy_revision_id,
+                    policy_route_id, route_fingerprint, candidate_id, binding_id,
+                    baseline_model, effective_model)
+                 VALUES ('lane', 1, 1, 999, 'r', 'ff', 'c', 'b', 'x', 'y')",
+                "a lane pin to a missing revision",
+            ),
+            (
+                "INSERT INTO requests (ts_ms, policy_revision_id) VALUES (1, 999)",
+                "a request naming a missing revision",
+            ),
+        ] {
+            assert!(conn.execute(sql, []).is_err(), "{what}");
+        }
+    }
+
     #[test]
     fn migration_v9_preserves_all_revision_references_and_foreign_keys() {
         let dir = test_dir("v8-revision-rebuild");
@@ -5860,15 +6468,17 @@ mod tests {
                 .parent_revision_id,
             Some(1)
         );
-        assert_eq!(
-            store
-                .load_routing_policy_state()
-                .unwrap()
-                .draft
-                .unwrap()
-                .base_revision_id,
-            2
-        );
+        // The draft columns are carried across unread.
+        let draft_base: Option<i64> = store
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT draft_base_revision_id FROM routing_policy_state",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(draft_base, Some(2));
         let publication = store.load_publications().unwrap().pop().unwrap();
         assert_eq!(publication.desired_revision_id, 2);
         assert_eq!(publication.applied_revision_id, Some(1));

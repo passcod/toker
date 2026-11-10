@@ -312,6 +312,8 @@ pub struct AttemptPlan {
     pub trace: Vec<TraceEvent>,
     /// What server safeguards meant for this attempt, content-free.
     pub safeguards: SafeguardsPlan,
+    /// The facts the resolver was given, for the ledger to record.
+    pub facts: super::RecordedFacts,
     continuation: Option<PostSendContinuation>,
 }
 
@@ -764,6 +766,7 @@ fn walk_selected<L: LearningView>(
             fallback_cache_transition: None,
             trace,
             safeguards: SafeguardsPlan::default(),
+            facts: super::RecordedFacts::of(facts),
             continuation: None,
         });
     }
@@ -986,6 +989,7 @@ fn walk_selected<L: LearningView>(
                     })
             }),
             safeguards: SafeguardsPlan::default(),
+            facts: super::RecordedFacts::of(facts),
             continuation: Some(PostSendContinuation {
                 policy_fingerprint: policy.fingerprint().clone(),
                 policy_revision: None,
@@ -3366,6 +3370,128 @@ mod tests {
                 if matches!(&trace[1], TraceEvent::Candidate(evidence)
                     if evidence.result == Err(SkipReason::Disabled))
         ));
+    }
+
+    /// A provider prefix names its provider's rewrite, so a disabled provider
+    /// leaves that rewrite's route to walk on to a fallback where it has one,
+    /// and to refuse where it has not. It never falls to the default the
+    /// prefix would otherwise have missed.
+    // spec: RSOLV#provider-prefixes
+    #[test]
+    fn a_prefix_naming_a_disabled_provider_is_served_by_a_fallback_or_refused() {
+        let inventory = OfferInventory::default();
+        let mut disabled = availability(true, false);
+        disabled = AvailabilitySnapshot::new(
+            disabled
+                .iter()
+                .map(|(binding, live)| {
+                    let mut live = live.clone();
+                    if binding == ANTHROPIC_SUB_MESSAGES.id() {
+                        live.enabled = Evidence::Negative("disabled");
+                    }
+                    (binding.clone(), live)
+                })
+                .collect(),
+        );
+        let catch_all = route(
+            candidate(
+                "catch-all",
+                &ANTHROPIC_API_MESSAGES,
+                CandidateModel::RequestedModel,
+            ),
+            vec![],
+        );
+        let fallback_step = RouteStep {
+            edge: CandidateEdge {
+                preflight: FallbackPermission::Enabled,
+                post_send: vec![],
+                billed_boundary: BoundaryConsent::Allow,
+                ambiguous_transport: BoundaryConsent::Deny,
+                cache_transition: CacheTransitionPolicy::AllowCacheLoss,
+            },
+            candidate: candidate(
+                "fallback",
+                &ANTHROPIC_API_MESSAGES,
+                CandidateModel::RequestedModel,
+            ),
+        };
+        let compile_with = |steps: Vec<RouteStep>| {
+            let mut prefixed = route(
+                candidate(
+                    "prefixed",
+                    &ANTHROPIC_SUB_MESSAGES,
+                    CandidateModel::RequestedModel,
+                ),
+                steps,
+            );
+            prefixed.id = id("prefix-route");
+            let mut document = document(catch_all.clone());
+            document.routes.push(prefixed);
+            document.rewrites.push(RewriteRule {
+                id: id("prefix-rewrite"),
+                scope: scope(None),
+                priority: 1,
+                model_matcher: MatcherSpec::Glob("acme/*".to_owned()),
+                target: reference("prefix-route", ArgumentBinding::RequestedModel),
+            });
+            compile(document, &inventory)
+        };
+
+        // With a fallback on the route, the fallback serves it.
+        let policy = compile_with(vec![fallback_step]);
+        let served = resolve(
+            &policy,
+            &inventory,
+            &NoLearning,
+            None,
+            &disabled,
+            &facts("acme/model"),
+        )
+        .unwrap();
+        assert_eq!(served.route_id, Some(id("prefix-route")));
+        assert_eq!(served.candidate_id, Some(id("fallback")));
+        assert_eq!(
+            served.provenance,
+            RouteProvenance::ProtocolRewrite(id("prefix-rewrite"))
+        );
+
+        // Without one, the request is refused, and not sent on to the
+        // default route that would have taken an unprefixed name.
+        let policy = compile_with(vec![]);
+        let refused = resolve(
+            &policy,
+            &inventory,
+            &NoLearning,
+            None,
+            &disabled,
+            &facts("acme/model"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                ResolveFailure::RouteUnavailable { route_id, provenance, trace, .. }
+                    if *route_id == id("prefix-route")
+                        && *provenance == RouteProvenance::ProtocolRewrite(id("prefix-rewrite"))
+                        && matches!(&trace[1], TraceEvent::Candidate(evidence)
+                            if evidence.result == Err(SkipReason::Disabled)
+                                || evidence.result == Err(SkipReason::BindingDisabled))
+            ),
+            "{refused:?}"
+        );
+
+        // A name no prefix recognises still goes to the default.
+        let plain = resolve(
+            &policy,
+            &inventory,
+            &NoLearning,
+            None,
+            &disabled,
+            &facts("claude-opus-5"),
+        )
+        .unwrap();
+        assert_eq!(plain.route_id, Some(id("route")));
+        assert_eq!(plain.provenance, RouteProvenance::ProtocolDefault);
     }
 
     #[test]

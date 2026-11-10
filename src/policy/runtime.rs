@@ -305,17 +305,65 @@ impl PolicyRuntime {
         availability: Arc<AvailabilitySnapshot>,
         changed_catalogue_bindings: &BTreeSet<BindingId>,
     ) -> Arc<PolicySnapshot> {
+        self.replace_active_as(
+            revision,
+            (revision.activation_scope, revision.forced_cache_transition),
+            policy,
+            inventory,
+            availability,
+            changed_catalogue_bindings,
+        )
+    }
+
+    /// As [`Self::replace_active`], for the same revision under the scope and
+    /// force consent it was last widened to. A recompilation of the active
+    /// revision must carry the widening across, since it lies beside the
+    /// revision rather than in it (spec: RPIN#revision-selection).
+    pub fn replace_active_as(
+        &self,
+        revision: &crate::store::PolicyRevision,
+        (activation_scope, forced_cache_transition): (ActivationScope, bool),
+        policy: Arc<CompiledPolicy>,
+        inventory: Arc<OfferInventory>,
+        availability: Arc<AvailabilitySnapshot>,
+        changed_catalogue_bindings: &BTreeSet<BindingId>,
+    ) -> Arc<PolicySnapshot> {
         self.replace_policy(
             CurrentPolicy {
                 revision_id: revision.revision_id,
-                activation_scope: revision.activation_scope,
-                forced_cache_transition: revision.forced_cache_transition,
+                activation_scope,
+                forced_cache_transition,
                 policy,
             },
             inventory,
             availability,
             changed_catalogue_bindings,
         )
+    }
+
+    /// Widen the active revision's scope in place, where `revision_id` is
+    /// still the active one. Requests already in flight keep the snapshot
+    /// they captured.
+    pub fn widen_active(
+        &self,
+        revision_id: i64,
+        activation_scope: ActivationScope,
+        forced_cache_transition: bool,
+    ) -> bool {
+        let _mutation = self
+            .mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.current.revision_id != revision_id {
+            return false;
+        }
+        state.current.activation_scope = activation_scope;
+        state.current.forced_cache_transition = forced_cache_transition;
+        true
     }
 
     fn replace_policy(

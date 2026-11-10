@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::policy::{
-    BindingId, CandidateId, PresentationId, RewriteId, RouteFingerprint, RouteId, TraceEvent,
+    BindingId, CandidateId, PresentationId, RecordedFacts, RewriteId, RouteFingerprint, RouteId,
+    TraceEvent,
 };
 
 use super::{Error, Result, rows_of};
@@ -744,6 +745,89 @@ pub enum RequestLookupProvenance {
     Compaction,
 }
 
+impl RequestLookupProvenance {
+    /// What kind of record matched: the stored `lookup_kind`.
+    pub fn kind(&self) -> LookupKind {
+        match self {
+            Self::ProfilePresentation(_) | Self::ProtocolPresentation(_) => {
+                LookupKind::Presentation
+            }
+            Self::ProfileRewrite(_) | Self::ProtocolRewrite(_) => LookupKind::Rewrite,
+            Self::ProfileDefault | Self::ProtocolDefault => LookupKind::Default,
+            Self::Compaction => LookupKind::Compaction,
+        }
+    }
+
+    /// The scope it matched in: the stored `lookup_scope`. A compaction's
+    /// route is chosen by the compaction policy, which has no scope.
+    pub fn scope(&self) -> Option<LookupScope> {
+        match self {
+            Self::ProfilePresentation(_) | Self::ProfileRewrite(_) | Self::ProfileDefault => {
+                Some(LookupScope::Profile)
+            }
+            Self::ProtocolPresentation(_) | Self::ProtocolRewrite(_) | Self::ProtocolDefault => {
+                Some(LookupScope::Protocol)
+            }
+            Self::Compaction => None,
+        }
+    }
+}
+
+/// What kind of record decided a request's route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupKind {
+    Presentation,
+    Rewrite,
+    Default,
+    Compaction,
+}
+
+impl LookupKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Presentation => "presentation",
+            Self::Rewrite => "rewrite",
+            Self::Default => "default",
+            Self::Compaction => "compaction",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "presentation" => Self::Presentation,
+            "rewrite" => Self::Rewrite,
+            "default" => Self::Default,
+            "compaction" => Self::Compaction,
+            _ => return None,
+        })
+    }
+}
+
+/// Whether a record that matched belongs to the request's profile or to its
+/// protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupScope {
+    Profile,
+    Protocol,
+}
+
+impl LookupScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Profile => "profile",
+            Self::Protocol => "protocol",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "profile" => Self::Profile,
+            "protocol" => Self::Protocol,
+            _ => return None,
+        })
+    }
+}
+
 impl From<&crate::policy::RouteProvenance> for RequestLookupProvenance {
     fn from(provenance: &crate::policy::RouteProvenance) -> Self {
         use crate::policy::RouteProvenance;
@@ -768,6 +852,10 @@ pub struct PolicyRouteProvenance {
     pub route: Option<ResolvedRoute>,
     pub trace: StoredRoutingTrace,
     pub outcome: PolicyRoutingOutcome,
+    /// The facts the resolver was given. Every row written now carries them;
+    /// a row from before they were recorded has none, and reads as lacking
+    /// them rather than as having been given nothing (spec: RPROV).
+    pub facts: Option<RecordedFacts>,
 }
 
 /// How a request found its route: the lookup that matched, and the route's
@@ -798,6 +886,7 @@ impl PolicyRouteProvenance {
         provenance: &crate::policy::RouteProvenance,
         trace: &[TraceEvent],
         attempt_group_id: AttemptGroupId,
+        facts: RecordedFacts,
     ) -> Result<Self> {
         Ok(Self {
             policy_revision_id,
@@ -808,6 +897,7 @@ impl PolicyRouteProvenance {
             }),
             trace: StoredRoutingTrace::from_resolver(trace)?,
             outcome: PolicyRoutingOutcome::RouteUnavailable { attempt_group_id },
+            facts: Some(facts),
         })
     }
 
@@ -815,6 +905,7 @@ impl PolicyRouteProvenance {
     pub fn from_no_route(
         policy_revision_id: i64,
         attempt_group_id: AttemptGroupId,
+        facts: RecordedFacts,
     ) -> Result<Self> {
         let trace = StoredRoutingTrace {
             version: ROUTING_TRACE_VERSION,
@@ -826,6 +917,7 @@ impl PolicyRouteProvenance {
             route: None,
             trace,
             outcome: PolicyRoutingOutcome::RouteUnavailable { attempt_group_id },
+            facts: Some(facts),
         })
     }
 
@@ -841,6 +933,7 @@ impl PolicyRouteProvenance {
         )>,
         reason: crate::policy::TransitionDenied,
         attempt_group_id: AttemptGroupId,
+        facts: RecordedFacts,
     ) -> Result<Self> {
         let denied = StoredRoutingTraceEvent::TransitionDenied {
             reason: reason.into(),
@@ -869,6 +962,7 @@ impl PolicyRouteProvenance {
             route,
             trace,
             outcome: PolicyRoutingOutcome::RouteUnavailable { attempt_group_id },
+            facts: Some(facts),
         })
     }
 
@@ -897,6 +991,7 @@ impl PolicyRouteProvenance {
                 candidate_id,
                 baseline_model: plan.baseline_model.clone(),
             },
+            facts: Some(plan.facts.clone()),
         }))
     }
 }
@@ -1099,6 +1194,9 @@ struct FlatPolicyRouting<'a> {
     baseline_model: Option<&'a str>,
     terminal_group_id: Option<&'a AttemptGroupId>,
     trace: &'a StoredRoutingTrace,
+    lookup_kind: Option<LookupKind>,
+    lookup_scope: Option<LookupScope>,
+    facts: Option<&'a RecordedFacts>,
 }
 
 impl<'a> From<&'a PolicyRouteProvenance> for FlatPolicyRouting<'a> {
@@ -1139,6 +1237,12 @@ impl<'a> From<&'a PolicyRouteProvenance> for FlatPolicyRouting<'a> {
             baseline_model,
             terminal_group_id,
             trace: &routing.trace,
+            lookup_kind: routing.route.as_ref().map(|route| route.lookup.kind()),
+            lookup_scope: routing
+                .route
+                .as_ref()
+                .and_then(|route| route.lookup.scope()),
+            facts: routing.facts.as_ref(),
         }
     }
 }
@@ -1302,6 +1406,17 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
         .transpose()?;
     let kind = row.kind.map(RowKind::as_str);
     let cost_kind = row.cost_kind.map(CostKind::as_str);
+    let facts = flattened.as_ref().and_then(|routing| routing.facts);
+    // The matched record is recorded with the facts and never without them: a
+    // row from before they were recorded stays as it was, and reads as
+    // lacking both.
+    let lookup = flattened
+        .as_ref()
+        .filter(|routing| routing.facts.is_some())
+        .and_then(|routing| routing.lookup_kind.map(|kind| (kind, routing.lookup_scope)));
+    let facts_capabilities = facts
+        .map(|facts| serde_json::to_string(&facts.required_capabilities))
+        .transpose()?;
 
     let mut stmt = conn.prepare_cached(
         "INSERT INTO requests (
@@ -1323,7 +1438,11 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
             parent_session_id, child_role, relation_source,
             safeguards_asked, safeguards_support, safeguards_marked,
             safeguards_results_seen, safeguards_results_replayed,
-            safeguards_skipped_candidate, safeguards_walked_again
+            safeguards_skipped_candidate, safeguards_walked_again,
+            facts_recorded, facts_profile, facts_protocol, facts_requested_model,
+            facts_prompt_bound, facts_message_count, facts_tool_count,
+            facts_capabilities, facts_asks_safeguards, facts_binding_affinity,
+            facts_class, lookup_kind, lookup_scope
         ) VALUES (
             :ts_ms, :duration_ms, :kind, :frontend, :provider, :route, :session_id, :ping,
             :credential_digest, :account_number,
@@ -1343,7 +1462,11 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
             :parent_session_id, :child_role, :relation_source,
             :safeguards_asked, :safeguards_support, :safeguards_marked,
             :safeguards_results_seen, :safeguards_results_replayed,
-            :safeguards_skipped_candidate, :safeguards_walked_again
+            :safeguards_skipped_candidate, :safeguards_walked_again,
+            :facts_recorded, :facts_profile, :facts_protocol, :facts_requested_model,
+            :facts_prompt_bound, :facts_message_count, :facts_tool_count,
+            :facts_capabilities, :facts_asks_safeguards, :facts_binding_affinity,
+            :facts_class, :lookup_kind, :lookup_scope
         )",
     )?;
     stmt.execute(rusqlite::named_params! {
@@ -1429,6 +1552,19 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
         ":safeguards_results_replayed": row.safeguards.results_replayed,
         ":safeguards_skipped_candidate": row.safeguards.skipped_candidate,
         ":safeguards_walked_again": row.safeguards.walked_again,
+        ":facts_recorded": facts.map(|_| 1),
+        ":facts_profile": facts.and_then(|facts| facts.profile.as_ref()).map(crate::policy::ProfileId::as_str),
+        ":facts_protocol": facts.map(|facts| crate::policy::facts::protocol_name(facts.protocol)),
+        ":facts_requested_model": facts.and_then(|facts| facts.requested_model.as_deref()),
+        ":facts_prompt_bound": facts.map(|facts| i64::try_from(facts.prompt_bound).unwrap_or(i64::MAX)),
+        ":facts_message_count": facts.and_then(|facts| facts.message_count).map(|count| i64::try_from(count).unwrap_or(i64::MAX)),
+        ":facts_tool_count": facts.map(|facts| i64::try_from(facts.tool_count).unwrap_or(i64::MAX)),
+        ":facts_capabilities": facts_capabilities,
+        ":facts_asks_safeguards": facts.map(|facts| facts.asks_server_safeguards),
+        ":facts_binding_affinity": facts.and_then(|facts| facts.binding_affinity.as_ref()).map(BindingId::as_str),
+        ":facts_class": facts.map(|facts| crate::policy::facts::class_name(facts.class)),
+        ":lookup_kind": lookup.map(|(kind, _)| kind.as_str()),
+        ":lookup_scope": lookup.and_then(|(_, scope)| scope).map(LookupScope::as_str),
     })?;
     Ok(())
 }
@@ -2684,9 +2820,67 @@ fn read_policy_routing(
         route,
         trace,
         outcome,
+        facts: read_recorded_facts(row)?,
     };
     provenance.validate_shape()?;
     Ok(Some(provenance))
+}
+
+/// The facts a row recorded, or none where it predates them (marker NULL).
+/// A marked row missing a fact the resolver reads is corrupt, not old.
+pub(super) fn read_recorded_facts(row: &rusqlite::Row<'_>) -> Result<Option<RecordedFacts>> {
+    let marker: Option<i64> = row.get("facts_recorded")?;
+    if marker.is_none() {
+        return Ok(None);
+    }
+    let missing = |column: &str| {
+        Error::InvalidRoutingState(format!("a row recording resolver facts lacks {column}"))
+    };
+    let protocol: String = row
+        .get::<_, Option<String>>("facts_protocol")?
+        .ok_or_else(|| missing("facts_protocol"))?;
+    let class: String = row
+        .get::<_, Option<String>>("facts_class")?
+        .ok_or_else(|| missing("facts_class"))?;
+    let capabilities: String = row
+        .get::<_, Option<String>>("facts_capabilities")?
+        .ok_or_else(|| missing("facts_capabilities"))?;
+    let count = |column: &'static str| -> Result<Option<u64>> {
+        row.get::<_, Option<i64>>(column)?
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    Error::InvalidRoutingState(format!("negative {column} in a stored row"))
+                })
+            })
+            .transpose()
+    };
+    Ok(Some(RecordedFacts {
+        profile: parse_optional_id("requests.facts_profile", row.get("facts_profile")?)?,
+        protocol: parse_stored(
+            "facts_protocol",
+            Some(protocol),
+            crate::policy::facts::parse_protocol,
+        )?
+        .ok_or_else(|| missing("facts_protocol"))?,
+        requested_model: row.get("facts_requested_model")?,
+        prompt_bound: count("facts_prompt_bound")?.ok_or_else(|| missing("facts_prompt_bound"))?,
+        message_count: count("facts_message_count")?,
+        tool_count: count("facts_tool_count")?.ok_or_else(|| missing("facts_tool_count"))?,
+        required_capabilities: serde_json::from_str(&capabilities)?,
+        asks_server_safeguards: row
+            .get::<_, Option<bool>>("facts_asks_safeguards")?
+            .ok_or_else(|| missing("facts_asks_safeguards"))?,
+        binding_affinity: parse_optional_id(
+            "requests.facts_binding_affinity",
+            row.get("facts_binding_affinity")?,
+        )?,
+        class: parse_stored(
+            "facts_class",
+            Some(class),
+            crate::policy::facts::parse_class,
+        )?
+        .ok_or_else(|| missing("facts_class"))?,
+    }))
 }
 
 fn parse_optional_id<T>(column: &'static str, value: Option<String>) -> Result<Option<T>>
@@ -2844,6 +3038,7 @@ impl RequestFilter {
 const EXPORTED_DIGEST_CHARS: usize = 12;
 
 pub const JSON_TEXT_COLUMNS: &[&str] = &[
+    "facts_capabilities",
     "usage_presence",
     "usage_raw",
     "rate_limits",
