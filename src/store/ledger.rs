@@ -1894,8 +1894,6 @@ pub struct DisplayRow {
     pub requested_model: Option<String>,
     /// The model the request was routed to.
     pub effective_model: Option<String>,
-    /// HTTP status of an error row.
-    pub status: Option<i64>,
 }
 
 /// The display tick's window read ([`DisplayRow`]s): every row with
@@ -1930,7 +1928,7 @@ pub(super) fn display_rows_since(
                    input, cache_read, cache_write_5m, cache_write_1h, output,
                    reasoning,
                    cost_usd, cost_kind, req_messages, compact_generations, forced_to,
-                   started_ms, requested_model, effective_model, status,
+                   started_ms, requested_model, effective_model,
                    json_extract(extra, '$.serving_provider') AS serving_provider
             FROM requests
             WHERE ts_ms >= ?1
@@ -1988,7 +1986,6 @@ fn read_display_row(row: &rusqlite::Row<'_>) -> Result<DisplayRow> {
         started_ms: row.get("started_ms")?,
         requested_model: row.get("requested_model")?,
         effective_model: row.get("effective_model")?,
-        status: row.get("status")?,
     })
 }
 

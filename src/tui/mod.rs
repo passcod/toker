@@ -813,7 +813,10 @@ struct DisplayWindow {
     rows: Vec<crate::store::DisplayRow>,
     /// The ledger's total row count.
     total: i64,
-    /// The newest ledger row's timestamp, of any kind.
+    /// The requests in flight at the read.
+    in_flight: Vec<crate::store::InFlightRequest>,
+    /// When the newest request began being handled, in flight or
+    /// recorded.
     latest: Option<i64>,
     /// Labels for the rows' sessions, as of the read.
     labels: HashMap<String, labels::Label>,
@@ -841,9 +844,10 @@ fn read_window(
     let now_ms = jiff::Timestamp::now().as_millisecond();
     let rows = store.display_rows_since(window_start(now_ms, window_mins), ROW_CAP)?;
     let total = store.count_logical_requests()?;
-    // The header's freshness: the newest row of ANY kind in the whole
-    // ledger, not the window's — an empty window must still say how
-    // long ago the proxy last wrote anything.
+    let in_flight = store.in_flight_rows()?;
+    // The header's freshness: the newest request in the whole ledger, in
+    // flight or recorded, not the window's — an empty window must still
+    // say how long ago the proxy last saw one.
     let latest = store.latest_started_ms()?;
     labels.start_refresh();
     let mut session_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -858,6 +862,18 @@ fn read_window(
             session_ids.insert(session_id);
         }
     }
+    // A session with a request in flight but no row yet needs its label too.
+    for request in &in_flight {
+        if let Some(parent) = request
+            .lineage
+            .as_ref()
+            .map(crate::store::SessionLineage::parent_session_id)
+        {
+            session_ids.insert(parent);
+        } else if let Some(session_id) = request.session_id.as_deref() {
+            session_ids.insert(session_id);
+        }
+    }
     let mut resolved = HashMap::new();
     for session_id in session_ids {
         if let Some(label) = labels.resolve(session_id) {
@@ -866,6 +882,7 @@ fn read_window(
     }
     Ok(DisplayWindow {
         rows,
+        in_flight,
         total,
         latest,
         labels: resolved,
@@ -901,8 +918,9 @@ impl DisplayWindow {
     ) -> model::Snapshot {
         let now_ms = jiff::Timestamp::now().as_millisecond();
         self.age_out(window_start(now_ms, window_mins));
-        let mut snapshot = model::aggregate(
+        let mut snapshot = model::aggregate_in_flight(
             &self.rows,
+            &self.in_flight,
             quota,
             released,
             &self.labels,
@@ -912,7 +930,7 @@ impl DisplayWindow {
             now_ms,
             self.total,
         );
-        snapshot.latest_row_ts_ms = self.latest;
+        snapshot.latest_started_ms = self.latest;
         snapshot
     }
 }
@@ -1401,7 +1419,6 @@ pub(crate) mod testrows {
             started_ms: None,
             requested_model: None,
             effective_model: None,
-            status: None,
         }
     }
 
@@ -1476,7 +1493,6 @@ pub(crate) mod testrows {
                 started_ms: None,
                 requested_model: None,
                 effective_model: None,
-                status: None,
             })
             .collect()
     }
@@ -1714,7 +1730,7 @@ mod tests {
 
         let empty = refresh(&mut labels);
         assert!(empty.window_empty);
-        assert_eq!(empty.latest_row_ts_ms, None, "empty ledger: no freshness");
+        assert_eq!(empty.latest_started_ms, None, "empty ledger: no freshness");
 
         // An hour old: well outside the 30-minute window.
         let old = jiff::Timestamp::now().as_millisecond() - 3_600_000;
@@ -1723,7 +1739,7 @@ mod tests {
             .expect("record");
         let snap = refresh(&mut labels);
         assert!(snap.window_empty, "the row is outside the window");
-        assert_eq!(snap.latest_row_ts_ms, Some(old));
+        assert_eq!(snap.latest_started_ms, Some(old));
     }
 
     /// The tick's schedule: a quiet ledger reads nothing until the
@@ -1798,6 +1814,7 @@ mod tests {
                 .into_iter()
                 .map(super::testrows::display_bare)
                 .collect(),
+            in_flight: Vec::new(),
             total: 4,
             latest: Some(300),
             labels: HashMap::new(),

@@ -28,7 +28,10 @@ use super::rebuilds::RebuildAgg;
 use crate::catalog::fetched::FetchedCatalogs;
 use crate::catalog::windows::{ContextWindow, resolve_context_window};
 use crate::ir::Release;
-use crate::store::{ChildRole, CostKind, DisplayRow, RowKind, is_api_measurement};
+use crate::store::{
+    AttemptGroupId, ChildRole, CostKind, DisplayRow, InFlightRequest, RowKind, SessionLineage,
+    is_api_measurement,
+};
 
 /// The sessions holding a live allowance for the running window, and
 /// which release each holds (see [`SessionAgg::released`]).
@@ -54,12 +57,13 @@ pub(crate) struct Snapshot {
     pub now_ms: i64,
     /// Total rows in the ledger, from the count query.
     pub total_requests: i64,
-    /// The newest ledger row's timestamp, of any kind — the header's
-    /// freshness. `None` when the ledger is empty. It comes from its own
-    /// `MAX(ts_ms)` read, never from the window rows: a dead proxy
-    /// empties the window, and this age is how that gets noticed.
-    /// [`aggregate`] leaves it `None`; the display tick fills it.
-    pub latest_row_ts_ms: Option<i64>,
+    /// When the newest request began being handled, in flight or
+    /// recorded — the header's freshness. `None` when the ledger is
+    /// empty. It comes from its own read, never from the window rows: a
+    /// dead proxy empties the window, and this age is how that gets
+    /// noticed. [`aggregate_in_flight`] leaves it `None`; the display
+    /// tick fills it.
+    pub latest_started_ms: Option<i64>,
     /// API-measurement rows in the window (proxy-written kinds excluded).
     pub window_requests: usize,
     /// True when the window holds no rows at all — the explicit "no data"
@@ -200,6 +204,19 @@ pub(crate) struct SessionAgg {
     /// and the table's order. A subagent's turn does not touch the
     /// cache worth keeping warm, so it does not reset idle either.
     pub latest_ts_ms: i64,
+    /// The session's requests in flight, longest-running first, each
+    /// from its own [in-flight record](crate::store::InFlightRequest).
+    /// Empty when none is.
+    pub in_flight: Vec<InFlightRequest>,
+    /// The newest of the session's requests to reach a final outcome
+    /// failed — the `✗` marker. A request still in flight neither sets
+    /// nor clears it, and a failure a fallback recovered from is not a
+    /// final outcome.
+    pub failed: bool,
+    /// [`SessionAgg::model`], [`SessionAgg::provider`] and
+    /// [`SessionAgg::ctx`] come from the newest model the session was
+    /// routed to, because no response of the session has named one yet.
+    pub model_unserved: bool,
 }
 
 /// Billed-cost aggregation. Only `cost_kind = billed` is summed today;
@@ -376,7 +393,8 @@ pub(crate) enum HitRate {
 
 /// The pre-refresh placeholder: an empty window of the right shape.
 pub(crate) fn empty(window_mins: u64) -> Snapshot {
-    aggregate(
+    aggregate_in_flight(
+        &[],
         &[],
         None,
         &Released::new(),
@@ -410,9 +428,44 @@ pub(crate) fn empty(window_mins: u64) -> Snapshot {
 /// of a frame's inputs: the rows plus the precomputed/resolved
 /// sections, the catalogues, and the window anchors. Rows may arrive
 /// in any order — "latest" is decided by `ts_ms` throughout.
+/// [`aggregate_in_flight`] over a window with nothing in flight, which is
+/// what most of the aggregation's own tests are about.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn aggregate(
     rows: &[DisplayRow],
+    quota: Option<&QuotaAgg>,
+    released: &Released,
+    labels: &HashMap<String, Label>,
+    catalogs: &FetchedCatalogs,
+    rebuilds: Option<RebuildAgg>,
+    window_mins: u64,
+    now_ms: i64,
+    total_requests: i64,
+) -> Snapshot {
+    aggregate_in_flight(
+        rows,
+        &[],
+        quota,
+        released,
+        labels,
+        catalogs,
+        rebuilds,
+        window_mins,
+        now_ms,
+        total_requests,
+    )
+}
+
+/// [`aggregate`]'s real form, with the requests `in_flight` at the
+/// moment of the read: each shows on its session's row, counts as a
+/// request and as its session's latest activity from when the server
+/// began handling it, and holds its attempt group in flight whatever
+/// rows of the group are already written.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn aggregate_in_flight(
+    rows: &[DisplayRow],
+    in_flight: &[InFlightRequest],
     quota: Option<&QuotaAgg>,
     released: &Released,
     labels: &HashMap<String, Label>,
@@ -457,7 +510,26 @@ pub(crate) fn aggregate(
     // group that only failed is still a request. Its final row decides
     // whether it failed: the greatest attempt index, or the terminal row of a
     // group that never made an attempt.
-    let mut finals: HashMap<crate::store::AttemptGroupId, (Option<i64>, bool)> = HashMap::new();
+    let mut finals: HashMap<AttemptGroupId, Outcome> = HashMap::new();
+    // Groups counted once into their session's request count.
+    let mut counted_groups = std::collections::HashSet::new();
+    // The newest model each session was routed to, by session slot, with
+    // when and the provider, for a session no response has yet named one
+    // for.
+    let mut routed: HashMap<usize, Routed> = HashMap::new();
+    // Each session's newest outcome, which the `✗` marker reads.
+    let mut outcomes: HashMap<String, (i64, bool)> = HashMap::new();
+    // A request's server-side start is not known until it has an id, so an
+    // unidentified record (read between its arrival and its first update)
+    // is left out: it names no session and no model yet.
+    let in_flight: Vec<&InFlightRequest> = in_flight
+        .iter()
+        .filter(|request| request.session_id.is_some() || request.requested_model.is_some())
+        .collect();
+    let live_groups: HashMap<&AttemptGroupId, &InFlightRequest> = in_flight
+        .iter()
+        .filter_map(|request| Some((request.attempt_group_id.as_ref()?, *request)))
+        .collect();
 
     // Per session, whether its newest decision row was a gate notice.
     // Only measurements, releases and notices decide: an error, a
@@ -472,14 +544,12 @@ pub(crate) fn aggregate(
             Some(RowKind::Blocked | RowKind::Cold | RowKind::ColdRecap) => Some(true),
             Some(_) => None,
         };
+        let named = display_key(row.lineage.as_ref(), row.session_id.as_deref());
         if let Some(is_stop) = decides {
-            let key = row
-                .lineage
-                .as_ref()
-                .map(|lineage| lineage.parent_session_id().to_owned())
-                .or_else(|| row.session_id.clone())
-                .unwrap_or_else(|| NO_SESSION.to_owned());
-            stopped.insert(key, is_stop);
+            stopped.insert(
+                named.clone().unwrap_or_else(|| NO_SESSION.to_owned()),
+                is_stop,
+            );
         }
         // Error/drift metrics see every row kind — proxy-written rows are
         // their only source — and error rows mark their minute's bucket.
@@ -491,33 +561,116 @@ pub(crate) fn aggregate(
             Some(RowKind::FidelityDrift) => drift += 1,
             _ => {}
         }
+        let measurement = is_api_measurement(row.kind);
+        let failed = matches!(row.kind, Some(RowKind::Error | RowKind::RouteUnavailable));
+        // A request is placed in the minute the server began handling it,
+        // which a row from before that was recorded cannot say: it falls
+        // back to when the row was written. One still in flight is placed
+        // by its record, whatever its first row says.
+        let began = |group: Option<&AttemptGroupId>| {
+            group
+                .and_then(|group| live_groups.get(group))
+                .map(|live| live.started_ms)
+                .or(row.started_ms)
+                .unwrap_or(row.ts_ms)
+        };
         if let Some(group) = &row.attempt_group_id {
-            let failed = matches!(row.kind, Some(RowKind::Error | RowKind::RouteUnavailable));
             let index = row.attempt_index.map(crate::store::AttemptIndex::get);
+            let outcome = Outcome {
+                index,
+                failed,
+                ts_ms: row.ts_ms,
+                session: named
+                    .clone()
+                    .or_else(|| measurement.then(|| NO_SESSION.to_owned())),
+            };
             match finals.entry(group.clone()) {
                 std::collections::hash_map::Entry::Vacant(slot) => {
                     window_requests += 1;
-                    buckets[bucket_of(row.ts_ms, now_ms, window_mins)].requests += 1;
-                    slot.insert((index, failed));
+                    buckets[bucket_of(began(Some(group)), now_ms, window_mins)].requests += 1;
+                    slot.insert(outcome);
                 }
                 std::collections::hash_map::Entry::Occupied(mut slot) => {
-                    if index >= slot.get().0 {
-                        slot.insert((index, failed));
+                    if index >= slot.get().index {
+                        slot.insert(outcome);
                     }
                 }
             }
+        } else if measurement {
+            window_requests += 1;
+            buckets[bucket_of(began(None), now_ms, window_mins)].requests += 1;
         }
-        if !is_api_measurement(row.kind) {
+        // A request outcome with no group is its own request: a
+        // measurement, a failure, or a gate stopping it.
+        if row.attempt_group_id.is_none()
+            && matches!(
+                row.kind,
+                None | Some(
+                    RowKind::Error
+                        | RowKind::RouteUnavailable
+                        | RowKind::Blocked
+                        | RowKind::Cold
+                        | RowKind::ColdRecap
+                )
+            )
+        {
+            note_outcome(
+                &mut outcomes,
+                named.as_deref().unwrap_or(NO_SESSION),
+                row.ts_ms,
+                failed,
+            );
+        }
+
+        // Every row naming a session gives it a row, whatever its kind: a
+        // session only a gate has stopped is the one most in need of a
+        // release. Rows naming none give a row only as measurements, as
+        // they always have.
+        let slot = (named.is_some() || measurement).then(|| {
+            let key = named.clone().unwrap_or_else(|| NO_SESSION.to_owned());
+            let slot = session_slot(&mut sessions, &mut index, &mut lanes, key, released, labels);
+            sessions[slot].latest_ts_ms = sessions[slot].latest_ts_ms.max(row.ts_ms);
+            slot
+        });
+        if let Some(slot) = slot {
+            let first = match &row.attempt_group_id {
+                Some(group) => counted_groups.insert(group.clone()),
+                None => measurement,
+            };
+            if first {
+                let session = &mut sessions[slot];
+                session.requests += 1;
+                if let Some(lineage) = &row.lineage {
+                    let role = lineage.child_role();
+                    if let Some(aggregate) = session
+                        .child_roles
+                        .iter_mut()
+                        .find(|aggregate| aggregate.role == role)
+                    {
+                        aggregate.requests += 1;
+                    } else {
+                        session.child_roles.push(ChildRoleAgg { role, requests: 1 });
+                    }
+                }
+            }
+            if let Some(model) = &row.effective_model {
+                routed.insert(
+                    slot,
+                    Routed {
+                        at_ms: row.started_ms.unwrap_or(row.ts_ms),
+                        model: model.clone(),
+                        provider: row.provider.clone(),
+                    },
+                );
+            }
+        }
+        if !measurement {
             continue; // every panel below is measurements-only
         }
         let counts_as_request = row
             .attempt_group_id
             .as_ref()
             .is_none_or(|group| measured_groups.insert(group.clone()));
-        if row.attempt_group_id.is_none() {
-            window_requests += 1;
-            buckets[bucket_of(row.ts_ms, now_ms, window_mins)].requests += 1;
-        }
 
         // TOKENS: every measurement row reports into the buckets it
         // carries and counts against the ones it does not.
@@ -551,51 +704,8 @@ pub(crate) fn aggregate(
             .session_id
             .clone()
             .unwrap_or_else(|| NO_SESSION.to_owned());
-        let key = row
-            .lineage
-            .as_ref()
-            .map(|lineage| lineage.parent_session_id().to_owned())
-            .unwrap_or_else(|| raw_session.clone());
-        let slot = *index.entry(key.clone()).or_insert_with(|| {
-            sessions.push(SessionAgg {
-                session: key.clone(),
-                child_roles: Vec::new(),
-                requests: 0,
-                lane_requests: 0,
-                model: None,
-                provider: None,
-                input_now: None,
-                input_peak: None,
-                output_total: None,
-                req_messages: None,
-                compact_generations: None,
-                forced_latest: false,
-                forced_any: false,
-                released: released.get(&key).copied(),
-                stopped: false,
-                ctx: ContextWindow::Unknown,
-                label: labels.get(&key).cloned(),
-                latest_ts_ms: row.ts_ms,
-            });
-            lanes.push(HashMap::new());
-            sessions.len() - 1
-        });
+        let slot = slot.expect("a measurement row has a session slot");
         let session = &mut sessions[slot];
-        if counts_as_request {
-            if let Some(lineage) = &row.lineage {
-                let role = lineage.child_role();
-                if let Some(aggregate) = session
-                    .child_roles
-                    .iter_mut()
-                    .find(|aggregate| aggregate.role == role)
-                {
-                    aggregate.requests += 1;
-                } else {
-                    session.child_roles.push(ChildRoleAgg { role, requests: 1 });
-                }
-            }
-            session.requests += 1;
-        }
         if let Some(output) = row.output {
             session.output_total = Some(session.output_total.unwrap_or(0) + output);
         }
@@ -638,6 +748,69 @@ pub(crate) fn aggregate(
         }
     }
 
+    // Requests in flight, oldest first. Each is a request of its session
+    // from when the server began handling it, unless rows of its group
+    // already counted it; and each is its session's latest activity.
+    for request in &in_flight {
+        let key = display_key(request.lineage.as_ref(), request.session_id.as_deref())
+            .unwrap_or_else(|| NO_SESSION.to_owned());
+        let slot = session_slot(&mut sessions, &mut index, &mut lanes, key, released, labels);
+        let session = &mut sessions[slot];
+        session.latest_ts_ms = session.latest_ts_ms.max(request.started_ms);
+        session.in_flight.push((*request).clone());
+        let seen = request
+            .attempt_group_id
+            .as_ref()
+            .is_some_and(|group| finals.contains_key(group));
+        if !seen {
+            window_requests += 1;
+            buckets[bucket_of(request.started_ms, now_ms, window_mins)].requests += 1;
+        }
+        let counted = request
+            .attempt_group_id
+            .as_ref()
+            .is_some_and(|group| counted_groups.contains(group));
+        if !counted {
+            session.requests += 1;
+            if let Some(lineage) = &request.lineage {
+                let role = lineage.child_role();
+                if let Some(aggregate) = session
+                    .child_roles
+                    .iter_mut()
+                    .find(|aggregate| aggregate.role == role)
+                {
+                    aggregate.requests += 1;
+                } else {
+                    session.child_roles.push(ChildRoleAgg { role, requests: 1 });
+                }
+            }
+        }
+        if let Some(model) = &request.effective_model
+            && routed
+                .get(&slot)
+                .is_none_or(|routed| request.started_ms > routed.at_ms)
+        {
+            routed.insert(
+                slot,
+                Routed {
+                    at_ms: request.started_ms,
+                    model: model.clone(),
+                    provider: request.provider.clone(),
+                },
+            );
+        }
+    }
+    // A group's outcome is its final row's, and a group still in flight has
+    // none yet: its rows so far may hold a failure the client will never
+    // see.
+    for (group, outcome) in &finals {
+        if !live_groups.contains_key(group)
+            && let Some(session) = &outcome.session
+        {
+            note_outcome(&mut outcomes, session, outcome.ts_ms, outcome.failed);
+        }
+    }
+
     // Each display session reads a main lane from its own raw session when
     // present; only a parent absent from this window falls back to a child
     // lane. Children never displace an observed parent conversation lane.
@@ -646,8 +819,11 @@ pub(crate) fn aggregate(
     // named it — resolved as of the lane's latest row, so a phased
     // capability resolves to the phase that applied, never to today's
     // against historical rows.
-    for (session, lanes) in sessions.iter_mut().zip(lanes) {
+    for (slot, (session, lanes)) in sessions.iter_mut().zip(lanes).enumerate() {
         session.stopped = stopped.get(&session.session).copied().unwrap_or(false);
+        session.failed = outcomes
+            .get(&session.session)
+            .is_some_and(|(_, failed)| *failed);
         let has_parent_lane = lanes
             .keys()
             .any(|(raw_session, _)| raw_session == &session.session);
@@ -671,6 +847,31 @@ pub(crate) fn aggregate(
             session.compact_generations = main.compact_generations;
             session.forced_latest = main.forced_latest;
             session.latest_ts_ms = main.latest_ts_ms;
+        }
+        // A request in flight is its session's latest activity, and one on
+        // the session's own conversation, rather than a child's, is the
+        // newest word on how long it is. Everything only a response
+        // reports keeps the latest completed request's value.
+        if let Some(newest) = session.in_flight.iter().map(|req| req.started_ms).max() {
+            session.latest_ts_ms = session.latest_ts_ms.max(newest);
+        }
+        if let Some(messages) = session
+            .in_flight
+            .iter()
+            .rev()
+            .filter(|request| request.lineage.is_none())
+            .find_map(|request| request.req_messages)
+        {
+            session.req_messages = Some(messages);
+        }
+        // No response of the session has named a model: the one it was
+        // routed to is the nearest thing, marked as not yet served.
+        if session.model.is_none()
+            && let Some(routed) = routed.get(&slot)
+        {
+            session.model = Some(routed.model.clone());
+            session.provider = routed.provider.clone();
+            session.model_unserved = true;
         }
         session.ctx = session_ctx(
             session.model.as_deref(),
@@ -703,9 +904,9 @@ pub(crate) fn aggregate(
         total_requests,
         // Not a window figure: the display tick reads it separately
         // (see the field) and sets it on the returned snapshot.
-        latest_row_ts_ms: None,
+        latest_started_ms: None,
         window_requests,
-        window_empty: rows.is_empty(),
+        window_empty: rows.is_empty() && in_flight.is_empty(),
         sessions,
         spend,
         rate: RateAgg {
@@ -717,13 +918,97 @@ pub(crate) fn aggregate(
         // walk's 24 h read is far too heavy for the display tick.
         rebuilds,
         errors,
-        failed_requests: finals.values().filter(|(_, failed)| *failed).count(),
+        failed_requests: finals
+            .iter()
+            .filter(|(group, outcome)| outcome.failed && !live_groups.contains_key(group))
+            .count(),
         drift,
         // Precomputed by the caller on the QUOTA cadence — the meter
         // lookback's 20k-row read and its aggregation are far too heavy
         // for the display tick (the spin this split fixed).
         quota: quota.cloned(),
     }
+}
+
+/// A group's final outcome so far, as the ts-ordered pass reads it.
+struct Outcome {
+    /// The attempt index of the row that decides it.
+    index: Option<i64>,
+    failed: bool,
+    /// When that row was written.
+    ts_ms: i64,
+    /// The display session the group belongs to, where its rows say one.
+    session: Option<String>,
+}
+
+/// The newest model a session was routed to, from a row or a request in
+/// flight.
+struct Routed {
+    at_ms: i64,
+    model: String,
+    provider: Option<String>,
+}
+
+/// The display session a row or request belongs to: the explicit parent
+/// where lineage links one, else its own session; `None` for neither.
+fn display_key(lineage: Option<&SessionLineage>, session_id: Option<&str>) -> Option<String> {
+    lineage
+        .map(|lineage| lineage.parent_session_id().to_owned())
+        .or_else(|| session_id.map(str::to_owned))
+}
+
+/// Keep a session's newest outcome, ties going to the later write.
+fn note_outcome(
+    outcomes: &mut HashMap<String, (i64, bool)>,
+    session: &str,
+    ts_ms: i64,
+    failed: bool,
+) {
+    match outcomes.get_mut(session) {
+        Some(entry) if entry.0 > ts_ms => {}
+        Some(entry) => *entry = (ts_ms, failed),
+        None => {
+            outcomes.insert(session.to_owned(), (ts_ms, failed));
+        }
+    }
+}
+
+/// The slot of a display session, creating it on first sight.
+fn session_slot(
+    sessions: &mut Vec<SessionAgg>,
+    index: &mut HashMap<String, usize>,
+    lanes: &mut Vec<HashMap<(String, Option<String>), LaneAgg>>,
+    key: String,
+    released: &Released,
+    labels: &HashMap<String, Label>,
+) -> usize {
+    *index.entry(key.clone()).or_insert_with(|| {
+        sessions.push(SessionAgg {
+            session: key.clone(),
+            child_roles: Vec::new(),
+            requests: 0,
+            lane_requests: 0,
+            model: None,
+            provider: None,
+            input_now: None,
+            input_peak: None,
+            output_total: None,
+            req_messages: None,
+            compact_generations: None,
+            forced_latest: false,
+            forced_any: false,
+            released: released.get(&key).copied(),
+            stopped: false,
+            ctx: ContextWindow::Unknown,
+            label: labels.get(&key).cloned(),
+            latest_ts_ms: i64::MIN,
+            in_flight: Vec::new(),
+            failed: false,
+            model_unserved: false,
+        });
+        lanes.push(HashMap::new());
+        sessions.len() - 1
+    })
 }
 
 /// One lane's running state over the ts-ordered pass: what the session

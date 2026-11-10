@@ -2330,7 +2330,6 @@ mod tests {
                 started_ms: None,
                 requested_model: None,
                 effective_model: None,
-                status: None,
             },
             "the eighteen display columns round-trip; the rest never cross"
         );
@@ -2365,7 +2364,6 @@ mod tests {
                 started_ms: None,
                 requested_model: None,
                 effective_model: None,
-                status: None,
             }
         );
     }

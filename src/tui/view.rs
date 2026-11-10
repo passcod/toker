@@ -823,7 +823,7 @@ fn meter_keys(quota: &QuotaAgg) -> Vec<&'static str> {
 /// window" — absence, not "0 requests".
 ///
 /// The freshness is the age of the ledger's newest row of any kind
-/// ([`Snapshot::latest_row_ts_ms`]), and it renders whether or not the
+/// ([`Snapshot::latest_started_ms`]), and it renders whether or not the
 /// window holds rows: an empty window is exactly when it matters,
 /// because a dead proxy looks like a quiet one everywhere else.
 ///
@@ -896,7 +896,7 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &Snapshot, clock: &str) {
 /// is against the snapshot's `now_ms`, so it moves on the display tick
 /// like every other figure in the frame.
 fn freshness(snap: &Snapshot) -> (String, Style) {
-    let Some(latest) = snap.latest_row_ts_ms else {
+    let Some(latest) = snap.latest_started_ms else {
         return ("no data".to_owned(), Style::new().fg(Color::Red));
     };
     // Rounded to the nearest second, as the predecessor did; a row
@@ -3270,7 +3270,7 @@ mod tests {
     }
 
     fn with_latest(mut snap: model::Snapshot, latest: Option<i64>) -> model::Snapshot {
-        snap.latest_row_ts_ms = latest;
+        snap.latest_started_ms = latest;
         snap
     }
 
