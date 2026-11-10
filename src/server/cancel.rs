@@ -63,6 +63,11 @@ impl PrecommitCancellationGuard {
         self.record = record.cloned().map(CancellationRecord::Anthropic);
     }
 
+    /// The request's in-flight hold, as the attempt was armed with it.
+    pub(crate) fn in_flight(&self) -> Option<&InFlightGuard> {
+        self.in_flight.as_ref()
+    }
+
     pub(crate) fn disarm(&mut self) {
         self.record = None;
     }

@@ -365,7 +365,6 @@ impl ReadyMessagesAttempt {
             sent,
             upstream.response,
             &mut self.record,
-            self.in_flight.as_ref(),
             &mut cancellation,
         )
         .await

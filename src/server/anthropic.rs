@@ -1614,7 +1614,6 @@ pub(crate) async fn retry_thinking_off(
     sent: Bytes,
     upstream: reqwest::Response,
     record: &mut Option<AnthropicRecordCtx>,
-    in_flight: Option<&super::InFlightGuard>,
     cancellation: &mut super::cancel::PrecommitCancellationGuard,
 ) -> Result<ThinkingRetry, Box<ThinkingRetryFailure>> {
     if upstream.status() != StatusCode::BAD_REQUEST {
@@ -1700,7 +1699,7 @@ pub(crate) async fn retry_thinking_off(
         }
         cancellation.update_anthropic(Some(ctx));
         server.note_attempt_sent(
-            in_flight,
+            cancellation.in_flight(),
             ctx.attempt.as_ref(),
             ctx.backend.id(),
             &ctx.binding_id,
