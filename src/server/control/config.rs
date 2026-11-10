@@ -594,7 +594,8 @@ pub(crate) async fn credential(State(server): State<Server>, request: Request) -
         |row| server.store.put_config_provider(row),
     );
     // A new credential may be enrolled where the old one was not, so the
-    // provider's refused asks are worth trying again (spec: WSAFE#a-rejection-mark).
+    // provider's refused asks are worth trying again
+    // (spec: WSAFE#a-rejection-mark).
     if response.status() == StatusCode::OK {
         server.clear_safeguards_marks_for_provider(&edit.provider);
     }
