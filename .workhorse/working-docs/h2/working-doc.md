@@ -46,8 +46,31 @@ Add one rewrite per Claude tier, each sending its requests to the codex route wi
 - The route's `requested_model` parameter is how a rewrite overrides the model: the generated per-provider routes all take it, so no new route is needed.
 - A glob matches the dated snapshot spellings too.
 
+## Recipe: always send a tier to the newest matching model
+
+Instead of a literal model in each rewrite, point the rewrite at a route whose candidate picks the newest matching offer from the catalogue.
+
+1. On the models tab, add a classifier on `codex_sub.codex_responses` that splits the model ids into family and version.
+   The codex listing carries no release dates, so catalogue chronology cannot order its offers and a classifier is the only way to rank them.
+2. On the routes tab, add a route with one candidate on `codex_sub.codex_responses` whose model is an offer selector: include a glob for the tier's models, ordered by classified version with that classifier.
+3. Point the tier's rewrite at that route, with no arguments.
+
+The winner is looked up again whenever the catalogue refreshes, so a new release is picked up within a day without editing the policy.
+
+### Selector or upgrade
+
+- A **selector** is "always the newest that matches", with no evidence bar.
+  A refreshed winner on a warm lane is a change under the same revision, so the route's own cache transition decides whether that lane moves.
+- An **upgrade** keeps the literal model and moves to a newer version in the same family, only where no cache can be lost, and keeps the move for the rest of the conversation.
+  It reads served-day evidence, and a model a rewrite never sends is never served, so the scaled and day-count bars never clear and promotion refuses a never-served model.
+  On a rewrite target it only works with the `none` bar.
+  It is attached to a candidate, so on the generated codex route it would also apply to `codex_sub/…` prefixed requests and the default.
+
+For mapping Claude tiers onto another provider, the selector is the direct fit.
+
 ## Rough edges found
 
 - No way to configure a second key or login for the same provider.
 - A codex-only Anthropic default passes `claude-*` names to codex, and nothing on the routing page flags it.
 - No way to duplicate a record, so each tier's rewrite is entered from the blank template.
+- Codex has no generated classifier, and its listing has no release dates, so "newest codex model" needs a hand-written classifier regex first.
