@@ -47,8 +47,9 @@
 //! path, and the wake SYSTEM timer with the do-nothing service it
 //! starts — the only root-level pieces — staged into the units dir and
 //! linked and enabled by path through
-//! [`SystemRunner::systemctl_system`], which production runs as
-//! `sudo systemctl` (it says so first: sudo will be asked). Every
+//! [`SystemRunner::systemctl_system`], which production runs as plain
+//! `systemctl`, leaving authorisation to the platform (it says so
+//! first: the system may ask). Every
 //! timers failure is non-fatal with manual commands printed — a
 //! machine that never sleeps-or-wakes still pings fine while up. A no
 //! removes whatever an earlier run installed, and a changed slot list
@@ -86,7 +87,7 @@ pub const SERVICE_UNIT: &str = "toker.service";
 /// The wake SYSTEM timer's name —
 /// the only root-level piece. Staged into the user units dir (the one
 /// place the wizard can write without root) and enabled by path into
-/// the system manager through sudo; `WakeSystem=true` needs
+/// the system manager; `WakeSystem=true` needs
 /// `CAP_WAKE_ALARM`, which the user manager lacks.
 pub const WAKE_TIMER_UNIT: &str = "toker-wake.timer";
 
@@ -95,6 +96,12 @@ pub const WAKE_TIMER_UNIT: &str = "toker-wake.timer";
 /// this the wake timer never armed at all: the first install shipped
 /// the timer alone.
 pub const WAKE_SERVICE_UNIT: &str = "toker-wake.service";
+
+/// The line before the wake pair's manual commands. Setup itself never
+/// runs sudo, so the commands carry none either: how the operator gets
+/// root is theirs to choose, and only the file operations need it.
+const WAKE_MANUAL_LEAD: &str =
+    "finish by hand (changing /etc/systemd/system needs root; systemctl asks for itself):";
 
 /// The hold USER timer's name (same name, timer + service pair).
 pub const HOLD_TIMER_UNIT: &str = "toker-hold.timer";
@@ -231,10 +238,11 @@ pub trait SystemRunner {
     /// Run `systemctl --user <args>` to completion.
     fn systemctl_user(&self, args: &[&str]) -> Result<Output>;
 
-    /// Run `systemctl <args>` against the SYSTEM manager, as root —
-    /// production goes through `sudo systemctl` (say so before
-    /// calling: sudo will ask). The wake pair's link, enable and
-    /// disable are the only calls the wizard makes here.
+    /// Run `systemctl <args>` against the SYSTEM manager, which
+    /// authorises the call itself, through polkit where the platform
+    /// uses it (say so before calling: the system may ask). The wake
+    /// pair's link, enable and disable are the only calls the wizard
+    /// makes here.
     fn systemctl_system(&self, args: &[&str]) -> Result<Output>;
 
     /// Ask the installed binary to replace the running service through
@@ -277,13 +285,16 @@ impl SystemRunner for ProcessRunner {
     }
 
     fn systemctl_system(&self, args: &[&str]) -> Result<Output> {
-        // sudo, so the wizard says so before every call: the wake
-        // pair is the only root-level thing toker touches.
-        std::process::Command::new("sudo")
-            .arg("systemctl")
+        // Plain systemctl, never sudo: the system manager asks the
+        // platform to authorise the call, and some machines authorise
+        // through polkit and have no working sudo
+        // (spec: USETUP#installing-units). The wizard says so before
+        // every call, because the wake pair is the only root-level
+        // thing toker touches.
+        std::process::Command::new("systemctl")
             .args(args)
             .output()
-            .with_context(|| format!("running sudo systemctl {}", args.join(" ")))
+            .with_context(|| format!("running systemctl {}", args.join(" ")))
     }
 
     fn graceful_restart(&self, exe: &Path) -> Result<ExitStatus> {
@@ -574,7 +585,7 @@ Description=toker wake timer (wakes the machine at the chosen slots)
 [Timer]
 # The only root-level piece toker installs: WakeSystem=true needs
 # CAP_WAKE_ALARM, which the user manager lacks, so this unit belongs to
-# the system manager and `toker setup` enables it through sudo. Wakes
+# the system manager and `toker setup` enables it. Wakes
 # from suspend only — a machine that is powered off stays off.
 WakeSystem=true
 {on_calendar}# A missed wake is not worth honouring late: the ping would refuse its
@@ -1110,7 +1121,8 @@ pub struct RunReport {
     /// Manual commands for the user timers when [`RunReport::timers_ok`]
     /// is false.
     pub timers_manual: Vec<String>,
-    /// The wake SYSTEM timer was enabled through sudo this run.
+    /// The wake SYSTEM timer was enabled through the system manager this
+    /// run.
     pub wake_enabled: bool,
     /// Manual commands for the wake timer when not enabled.
     pub wake_manual: Vec<String>,
@@ -2228,10 +2240,10 @@ impl<'a> Wizard<'a> {
     /// report (it is config, edited on the dashboard), the
     /// wake/hold/ping timers (a yes/no, then the slots: they install
     /// the hold and ping user timers and attempt the wake system timer
-    /// through sudo; a no removes any an earlier run installed), and
-    /// the history import offer (when
-    /// the source exists: the existing `toker import` logic,
-    /// in-process, into the ledger the config names).
+    /// through the system manager; a no removes any an earlier run
+    /// installed), and the history import offer (when the source
+    /// exists: the existing `toker import` logic, in-process, into the
+    /// ledger the config names).
     /// Move a store's pre-account rows onto the account that served them
     /// (spec: ACCT#moving-a-machine-onto-accounts).
     ///
@@ -2621,8 +2633,9 @@ impl<'a> Wizard<'a> {
 
     /// The timers were declined while an earlier run's are installed:
     /// disable and remove them all — the user units through the user
-    /// manager, the wake pair through the same sudo path that enabled
-    /// it. Non-fatal like the install, with the manual commands printed.
+    /// manager, the wake pair through the same system-manager path that
+    /// enabled it. Non-fatal like the install, with the manual commands
+    /// printed.
     fn remove_timers_step(
         &mut self,
         installed: &InstalledTimers,
@@ -2678,12 +2691,12 @@ impl<'a> Wizard<'a> {
         if installed.wake_service {
             wake.push(WAKE_SERVICE_UNIT);
         }
-        self.say("disabling the wake system timer — sudo will be asked")?;
+        self.say("disabling the wake system timer — the system may ask to authorise it")?;
         let mut args = vec!["disable", "--now"];
         args.extend(&wake);
         match self.runner.systemctl_system(&args) {
             Ok(output) if output.status.success() => {
-                self.say(&format!("sudo systemctl {} — ok", args.join(" ")))?;
+                self.say(&format!("systemctl {} — ok", args.join(" ")))?;
                 for name in &wake {
                     match self.runner.remove_unit(name) {
                         Ok(()) => {
@@ -2707,14 +2720,14 @@ impl<'a> Wizard<'a> {
                 // The staged files stay: the system manager may still
                 // link to them, and the manual disable needs them.
                 report.wake_manual = vec![
-                    format!("sudo systemctl {}", args.join(" ")),
+                    format!("systemctl {}", args.join(" ")),
                     format!(
-                        "sudo rm -f /etc/systemd/system/{WAKE_TIMER_UNIT} \
-                         /etc/systemd/system/{WAKE_SERVICE_UNIT} && sudo systemctl daemon-reload"
+                        "rm -f /etc/systemd/system/{WAKE_TIMER_UNIT} \
+                         /etc/systemd/system/{WAKE_SERVICE_UNIT} && systemctl daemon-reload"
                     ),
                 ];
                 self.say("the wake timer is still enabled — it will keep waking the machine;")?;
-                self.say("finish by hand:")?;
+                self.say(WAKE_MANUAL_LEAD)?;
                 for command in &report.wake_manual {
                     self.say(&format!("  {command}"))?;
                 }
@@ -2726,13 +2739,13 @@ impl<'a> Wizard<'a> {
     /// The wake SYSTEM timer — the only root-level piece. The timer and
     /// the do-nothing service it activates are staged where the wizard
     /// can write (the user units dir), the service is linked into the
-    /// system manager by path (`sudo systemctl link`), and the timer is
-    /// enabled by path (`sudo systemctl enable --now`): systemctl links
+    /// system manager by path (`systemctl link`), and the timer is
+    /// enabled by path (`systemctl enable --now`): systemctl links
     /// a unit file outside the search paths into `/etc/systemd/system`
     /// itself. The service is linked rather than enabled because it has
     /// no `[Install]` — the timer is what starts it. Where the staging
     /// filesystem is one the system manager refuses to link from (or
-    /// sudo is declined), the failure is non-fatal and the manual
+    /// authorisation is declined), the failure is non-fatal and the manual
     /// commands — a plain copy of both into `/etc/systemd/system`, then
     /// enable by name — are printed.
     fn wake_step(&mut self, slots: &[String], report: &mut RunReport) -> Result<()> {
@@ -2762,7 +2775,7 @@ impl<'a> Wizard<'a> {
         }
         if staged.len() != units.len() {
             report.wake_manual.push(format!(
-                "sudo systemctl daemon-reload && sudo systemctl enable --now {WAKE_TIMER_UNIT}"
+                "systemctl daemon-reload && systemctl enable --now {WAKE_TIMER_UNIT}"
             ));
             self.say_wake_manual(report)?;
             return Ok(());
@@ -2770,13 +2783,13 @@ impl<'a> Wizard<'a> {
         let (service_path, timer_path) = (&staged[0], &staged[1]);
 
         self.say(
-            "enabling the wake system timer — sudo will be asked \
+            "enabling the wake system timer — the system may ask to authorise it \
              (WakeSystem=true needs the system manager: the user manager lacks CAP_WAKE_ALARM)",
         )?;
         let link = self.runner.systemctl_system(&["link", service_path]);
         let linked = match &link {
             Ok(output) if output.status.success() => {
-                self.say(&format!("sudo systemctl link {service_path} — ok"))?;
+                self.say(&format!("systemctl link {service_path} — ok"))?;
                 true
             }
             other => {
@@ -2793,7 +2806,7 @@ impl<'a> Wizard<'a> {
                 .systemctl_system(&["enable", "--now", timer_path])
             {
                 Ok(output) if output.status.success() => {
-                    self.say(&format!("sudo systemctl enable --now {timer_path} — ok"))?;
+                    self.say(&format!("systemctl enable --now {timer_path} — ok"))?;
                     true
                 }
                 other => {
@@ -2808,11 +2821,9 @@ impl<'a> Wizard<'a> {
             report.wake_enabled = true;
         } else {
             report.wake_manual = vec![
-                format!("sudo cp {service_path} /etc/systemd/system/{WAKE_SERVICE_UNIT}"),
-                format!("sudo cp {timer_path} /etc/systemd/system/{WAKE_TIMER_UNIT}"),
-                format!(
-                    "sudo systemctl daemon-reload && sudo systemctl enable --now {WAKE_TIMER_UNIT}"
-                ),
+                format!("cp {service_path} /etc/systemd/system/{WAKE_SERVICE_UNIT}"),
+                format!("cp {timer_path} /etc/systemd/system/{WAKE_TIMER_UNIT}"),
+                format!("systemctl daemon-reload && systemctl enable --now {WAKE_TIMER_UNIT}"),
             ];
             self.say_wake_manual(report)?;
         }
@@ -2823,7 +2834,7 @@ impl<'a> Wizard<'a> {
     /// two commands that finish it by hand.
     fn say_wake_manual(&mut self, report: &RunReport) -> Result<()> {
         self.say("the wake timer is NOT enabled — the machine will not wake for its slots;")?;
-        self.say("finish by hand:")?;
+        self.say(WAKE_MANUAL_LEAD)?;
         for command in &report.wake_manual {
             self.say(&format!("  {command}"))?;
         }
@@ -3326,7 +3337,7 @@ mod tests {
     // ── the recording fake runner ─────────────────────────────────
 
     /// The fake runner: scripted systemctl outcomes in call order,
-    /// every call and every unit install recorded (user and sudo
+    /// every call and every unit install recorded (user and system
     /// systemctl recorded separately). Install writes the scratch
     /// units dir so a run's files exist like they would for real.
     /// NO systemctl is ever executed — user or system — the machine's
@@ -3400,7 +3411,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or_else(|| panic!("no scripted sudo systemctl outcome for {args:?}"))
+                .unwrap_or_else(|| panic!("no scripted system systemctl outcome for {args:?}"))
         }
 
         fn graceful_restart(&self, exe: &Path) -> Result<ExitStatus> {
@@ -3510,10 +3521,10 @@ mod tests {
             }
         }
 
-        /// Script the sudo outcomes (the wake timer's enables). A run
-        /// without any scripted sudo outcome panics if it reaches a
-        /// `systemctl_system` call — the wake leg must be scripted
-        /// deliberately.
+        /// Script the system-manager outcomes (the wake timer's
+        /// enables). A run without any scripted system outcome panics
+        /// if it reaches a `systemctl_system` call — the wake leg must
+        /// be scripted deliberately.
         fn with_system(self, system: Vec<Result<Output>>) -> Rig {
             *self.runner.system_outcomes.lock().unwrap() = system.into();
             self
@@ -5234,7 +5245,7 @@ default_backend_anthropic = "codex_sub"
 
     /// The full slots leg: the hold pair and both ping pairs install
     /// and enable through the user manager, the wake unit is staged
-    /// into the units dir and enabled by path through sudo.
+    /// into the units dir and enabled by path through the system manager.
     #[tokio::test]
     async fn slots_install_and_enable_the_hold_ping_and_wake_timers() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
@@ -5314,7 +5325,7 @@ default_backend_anthropic = "codex_sub"
             .collect::<Vec<_>>(),
         );
 
-        // The wake leg: two sudo calls, both by path — link the
+        // The wake leg: two system-manager calls, both by path — link the
         // service the timer starts (it has no [Install] to enable),
         // then enable the timer. A timer whose unit is missing is
         // refused, which is how the first install never armed.
@@ -5330,45 +5341,47 @@ default_backend_anthropic = "codex_sub"
                     staged.display().to_string(),
                 ],
             ],
-            "sudo systemctl link <service>, then enable --now <timer>"
+            "systemctl link <service>, then enable --now <timer>"
         );
 
         assert_eq!(report.timer_slots, slots);
         assert!(report.timers_ok, "the user timers came up");
-        assert!(report.wake_enabled, "the wake timer was sudo-enabled");
+        assert!(report.wake_enabled, "the wake timer was enabled");
         assert!(report.units_ok, "the main spine is unaffected");
 
-        // The transcript: the sudo warning appears before the call,
-        // and the summary reports all three timers.
+        // The transcript: the authorisation warning appears before the
+        // call, and the summary reports all three timers. Setup never
+        // runs sudo (spec: USETUP#installing-units).
         let out = rig.out();
         transcript_snapshot("timers_slots_transcript", &rig, port, &out);
         assert!(
-            out.contains("sudo will be asked"),
-            "the sudo prompt is in the transcript: {out}"
+            out.contains("the system may ask to authorise it"),
+            "the authorisation warning is in the transcript: {out}"
         );
         assert!(
             out.contains("CAP_WAKE_ALARM"),
-            "the sudo warning says why: {out}"
+            "the warning says why: {out}"
         );
         assert!(
-            out.contains(&format!("sudo systemctl enable --now {}", staged.display())),
+            out.contains(&format!("systemctl enable --now {}", staged.display())),
             "{out}"
         );
+        assert!(!out.contains("sudo"), "{out}");
         assert!(
             out.contains("timers    : slots 09:00, 12:30"),
             "the summary's timers line: {out}"
         );
     }
 
-    /// The sudo-failure leg: the wake enable fails, and the user
-    /// timers it leaves standing are still installed and enabled —
+    /// The system-manager failure leg: the wake enable fails, and the
+    /// user timers it leaves standing are still installed and enabled —
     /// the manual commands carry the copy into /etc and the enable by
     /// name.
     #[tokio::test]
-    async fn a_failed_sudo_keeps_the_user_timers_and_prints_manual_commands() {
+    async fn a_failed_wake_link_keeps_the_user_timers_and_prints_manual_commands() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
-            "timers-sudo-fail",
+            "timers-wake-link-fail",
             {
                 let mut answers = answers_fresh(port);
                 answers.splice(5..6, [confirm(true), text("09:00")]); // one slot
@@ -5384,8 +5397,8 @@ default_backend_anthropic = "codex_sub"
             ]),
         )
         .with_keys(FRESH_KEYS)
-        // sudo cannot run at all on this leg.
-        .with_system(vec![Err(anyhow::anyhow!("sudo: command not found"))]);
+        // systemctl cannot run at all on this leg.
+        .with_system(vec![Err(anyhow::anyhow!("systemctl: command not found"))]);
         seed_claude(&rig.root);
         seed_opencode(&rig.root);
         seed_rc(&rig.root);
@@ -5409,9 +5422,9 @@ default_backend_anthropic = "codex_sub"
         );
         assert!(!report.wake_enabled);
         let out = rig.out();
-        transcript_snapshot("failed_sudo_transcript", &rig, port, &out);
+        transcript_snapshot("failed_wake_link_transcript", &rig, port, &out);
         assert!(
-            out.contains("linking the wake service failed: sudo: command not found"),
+            out.contains("linking the wake service failed: systemctl: command not found"),
             "{out}"
         );
         assert_eq!(
@@ -5424,22 +5437,24 @@ default_backend_anthropic = "codex_sub"
         // name — and they ride the summary too.
         let staged = rig.paths().units_dir.join(WAKE_TIMER_UNIT);
         let cp = format!(
-            "sudo cp {} /etc/systemd/system/{WAKE_TIMER_UNIT}",
+            "cp {} /etc/systemd/system/{WAKE_TIMER_UNIT}",
             staged.display()
         );
         assert!(out.contains(&cp), "the copy command: {out}");
         let staged_service = rig.paths().units_dir.join(WAKE_SERVICE_UNIT);
         let cp_service = format!(
-            "sudo cp {} /etc/systemd/system/{WAKE_SERVICE_UNIT}",
+            "cp {} /etc/systemd/system/{WAKE_SERVICE_UNIT}",
             staged_service.display()
         );
         assert!(out.contains(&cp_service), "the service copy: {out}");
         assert!(
             out.contains(&format!(
-                "sudo systemctl daemon-reload && sudo systemctl enable --now {WAKE_TIMER_UNIT}"
+                "systemctl daemon-reload && systemctl enable --now {WAKE_TIMER_UNIT}"
             )),
             "the enable-by-name command: {out}"
         );
+        assert!(out.contains("needs root"), "{out}");
+        assert!(!out.contains("sudo"), "no command names sudo: {out}");
         assert!(
             out.contains("NOT fully up"),
             "the summary carries it: {out}"
@@ -5796,8 +5811,8 @@ default_backend_anthropic = "codex_sub"
 
     /// A no while an earlier run's timers are installed takes them all
     /// out: the user pairs through the user manager, the wake timer
-    /// through sudo — here an install from before the wake service
-    /// existed, so only the timer is named to systemd.
+    /// through the system manager — here an install from before the
+    /// wake service existed, so only the timer is named to systemd.
     #[tokio::test]
     async fn declining_removes_the_timers_an_earlier_run_installed() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
@@ -5881,18 +5896,19 @@ default_backend_anthropic = "codex_sub"
         );
     }
 
-    /// A refused sudo on the decline leaves the wake pair staged, since
-    /// the system manager may still link to it, and says how to finish.
+    /// A refused authorisation on the decline leaves the wake pair
+    /// staged, since the system manager may still link to it, and says
+    /// how to finish.
     #[tokio::test]
     async fn a_refused_wake_disable_keeps_the_staged_pair_and_says_so() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
-            "timers-decline-sudo-fail",
+            "timers-decline-unauthorised",
             answers_fresh(port),
             with_picker(vec![inactive(), ok_empty(), ok_empty()]),
         )
         .with_keys(FRESH_KEYS)
-        .with_system(vec![Err(anyhow::anyhow!("sudo: a password is required"))]);
+        .with_system(vec![Err(anyhow::anyhow!("Access denied"))]);
         seed_units(&rig, &[WAKE_TIMER_UNIT, WAKE_SERVICE_UNIT]);
         seed_claude(&rig.root);
         seed_opencode(&rig.root);

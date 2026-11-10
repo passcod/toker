@@ -61,9 +61,9 @@ systemctl --user enable --now toker-ping-0720.timer — ok
 systemctl --user enable --now toker-ping-1220.timer — ok
 staged toker-wake.service ([ROOT]/.config/systemd/user/toker-wake.service)
 staged toker-wake.timer ([ROOT]/.config/systemd/user/toker-wake.timer)
-enabling the wake system timer — sudo will be asked (WakeSystem=true needs the system manager: the user manager lacks CAP_WAKE_ALARM)
-sudo systemctl link [ROOT]/.config/systemd/user/toker-wake.service — ok
-sudo systemctl enable --now [ROOT]/.config/systemd/user/toker-wake.timer — ok
+enabling the wake system timer — the system may ask to authorise it (WakeSystem=true needs the system manager: the user manager lacks CAP_WAKE_ALARM)
+systemctl link [ROOT]/.config/systemd/user/toker-wake.service — ok
+systemctl enable --now [ROOT]/.config/systemd/user/toker-wake.timer — ok
   predecessor history: none to import
 installed toker-picker.timer ([ROOT]/.config/systemd/user/toker-picker.timer)
 installed toker-picker.service ([ROOT]/.config/systemd/user/toker-picker.service)

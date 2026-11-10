@@ -55,13 +55,13 @@ systemctl --user enable --now toker-hold.timer — ok
 systemctl --user enable --now toker-ping-0900.timer — ok
 staged toker-wake.service ([ROOT]/.config/systemd/user/toker-wake.service)
 staged toker-wake.timer ([ROOT]/.config/systemd/user/toker-wake.timer)
-enabling the wake system timer — sudo will be asked (WakeSystem=true needs the system manager: the user manager lacks CAP_WAKE_ALARM)
-linking the wake service failed: sudo: command not found
+enabling the wake system timer — the system may ask to authorise it (WakeSystem=true needs the system manager: the user manager lacks CAP_WAKE_ALARM)
+linking the wake service failed: systemctl: command not found
 the wake timer is NOT enabled — the machine will not wake for its slots;
-finish by hand:
-  sudo cp [ROOT]/.config/systemd/user/toker-wake.service /etc/systemd/system/toker-wake.service
-  sudo cp [ROOT]/.config/systemd/user/toker-wake.timer /etc/systemd/system/toker-wake.timer
-  sudo systemctl daemon-reload && sudo systemctl enable --now toker-wake.timer
+finish by hand (changing /etc/systemd/system needs root; systemctl asks for itself):
+  cp [ROOT]/.config/systemd/user/toker-wake.service /etc/systemd/system/toker-wake.service
+  cp [ROOT]/.config/systemd/user/toker-wake.timer /etc/systemd/system/toker-wake.timer
+  systemctl daemon-reload && systemctl enable --now toker-wake.timer
   predecessor history: none to import
 installed toker-picker.timer ([ROOT]/.config/systemd/user/toker-picker.timer)
 installed toker-picker.service ([ROOT]/.config/systemd/user/toker-picker.service)
@@ -79,6 +79,6 @@ systemctl --user start toker-picker.service — ok
     patched: opencode ([ROOT]/.config/opencode/opencode.json)
     patched: shell rc ([ROOT]/.bashrc)
   ledger    : not imported
-  timers    : slots 09:00 — NOT fully up — finish by hand: sudo cp [ROOT]/.config/systemd/user/toker-wake.service /etc/systemd/system/toker-wake.service && sudo cp [ROOT]/.config/systemd/user/toker-wake.timer /etc/systemd/system/toker-wake.timer && sudo systemctl daemon-reload && sudo systemctl enable --now toker-wake.timer
+  timers    : slots 09:00 — NOT fully up — finish by hand: cp [ROOT]/.config/systemd/user/toker-wake.service /etc/systemd/system/toker-wake.service && cp [ROOT]/.config/systemd/user/toker-wake.timer /etc/systemd/system/toker-wake.timer && systemctl daemon-reload && systemctl enable --now toker-wake.timer
   picker    : Claude /model rows synced; toker-picker.timer refreshes them daily
 re-run `toker setup` any time to change anything.

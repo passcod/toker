@@ -47,12 +47,12 @@ opencode plugin: installed to [ROOT]/.config/opencode/plugins/toker-cost
 optional toggles
   awake (idle-sleep lock while sessions are live): on
 removing the wake/hold/ping timers an earlier run installed
-disabling the wake system timer — sudo will be asked
-disabling the wake system timer failed: sudo: a password is required
+disabling the wake system timer — the system may ask to authorise it
+disabling the wake system timer failed: Access denied
 the wake timer is still enabled — it will keep waking the machine;
-finish by hand:
-  sudo systemctl disable --now toker-wake.timer toker-wake.service
-  sudo rm -f /etc/systemd/system/toker-wake.timer /etc/systemd/system/toker-wake.service && sudo systemctl daemon-reload
+finish by hand (changing /etc/systemd/system needs root; systemctl asks for itself):
+  systemctl disable --now toker-wake.timer toker-wake.service
+  rm -f /etc/systemd/system/toker-wake.timer /etc/systemd/system/toker-wake.service && systemctl daemon-reload
   predecessor history: none to import
 installed toker-picker.timer ([ROOT]/.config/systemd/user/toker-picker.timer)
 installed toker-picker.service ([ROOT]/.config/systemd/user/toker-picker.service)
@@ -70,6 +70,6 @@ systemctl --user start toker-picker.service — ok
     patched: opencode ([ROOT]/.config/opencode/opencode.json)
     patched: shell rc ([ROOT]/.bashrc)
   ledger    : not imported
-  timers    : none — NOT fully removed — finish by hand: sudo systemctl disable --now toker-wake.timer toker-wake.service && sudo rm -f /etc/systemd/system/toker-wake.timer /etc/systemd/system/toker-wake.service && sudo systemctl daemon-reload
+  timers    : none — NOT fully removed — finish by hand: systemctl disable --now toker-wake.timer toker-wake.service && rm -f /etc/systemd/system/toker-wake.timer /etc/systemd/system/toker-wake.service && systemctl daemon-reload
   picker    : Claude /model rows synced; toker-picker.timer refreshes them daily
 re-run `toker setup` any time to change anything.
