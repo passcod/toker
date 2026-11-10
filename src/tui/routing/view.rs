@@ -771,7 +771,9 @@ mod tests {
         let mut state = page(World::AT_REST, Tab::Rewrites);
         state.move_selection(12);
         let (text, drawn) = drawn_at(&state, 120, 16);
-        assert!(text.contains("above"), "{text}");
+        // The counts are of records, not of the lines groups take.
+        assert!(text.contains("… 12 records above"), "{text}");
+        assert!(text.contains("… 4 more records"), "{text}");
         assert!(text.contains("codex_sub/${model}"), "{text}");
         let selected = state.selected_in(Tab::Rewrites);
         assert!(

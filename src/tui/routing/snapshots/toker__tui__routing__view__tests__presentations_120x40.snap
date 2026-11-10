@@ -21,7 +21,7 @@ expression: "frame(&state, 120, 40)"
 │ │ 13  anthropic/claude-sonnet-*      -                             sonnet      4   anthropic/claude-sonnet-5         │
 │ │ 14  anthropic/claude-haiku-*       -                             haiku       3   anthropic/claude-haiku-4-5        │
 │ │ 15  anthropic/claude-fable-*       -                             fable       1   anthropic/claude-fable-5          │
-│ └─ else  no slug equals it           → rewrites                                                                      │
+│ └─ else  no slug equals it             → rewrites                                                                    │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌PRESENTATION──────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ z-ai/glm-*                                                                                                           │

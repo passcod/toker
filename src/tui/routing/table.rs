@@ -45,9 +45,30 @@ pub(super) struct Table {
 
 /// What a table's rows are called in the count it leaves where it was cut.
 pub(super) const NOUN: Noun = Noun {
-    one: "row",
-    many: "rows",
+    one: "record",
+    many: "records",
 };
+
+/// How many of the records a table leaves out of the lines `range` hides,
+/// which count lines instead where no record is among them: a group's head
+/// is not a record, and a count of nothing would say nothing.
+fn hidden(body: &[BodyLine], range: std::ops::Range<usize>) -> (usize, Noun) {
+    let records = body[range.clone()]
+        .iter()
+        .filter(|line| line.entry.is_some())
+        .count();
+    if records > 0 {
+        (records, NOUN)
+    } else {
+        (
+            range.len(),
+            Noun {
+                one: "line",
+                many: "lines",
+            },
+        )
+    }
+}
 
 /// `spans` as exactly `width` cells: clipped with an ellipsis where too long,
 /// padded where short.
@@ -207,12 +228,19 @@ pub(super) fn draw_table(
     let at = table.body.iter().position(on).unwrap_or(0);
     let window = chrome::selection_window(table.body.len(), room, at);
     let mut rows: Vec<(Line<'static>, Option<usize>)> = Vec::new();
-    if let Some(above) = window.above {
+    // The counts say how many records are out of view, not how many lines.
+    let first = window.shown.start.min(table.body.len());
+    let last = window.shown.end.min(table.body.len());
+    if window.above.is_some() {
+        let (above, noun) = hidden(&table.body, 0..first);
         rows.push((
-            Line::styled(format!("… {above} {} above", NOUN.of(above)), dim()),
+            Line::styled(format!("… {above} {} above", noun.of(above)), dim()),
             None,
         ));
     }
+    let below = window
+        .below
+        .map(|_| hidden(&table.body, last..table.body.len()));
     let shown = window.shown.clone();
     for (index, body) in table.body.into_iter().enumerate() {
         if !shown.contains(&index) {
@@ -225,9 +253,9 @@ pub(super) fn draw_table(
         };
         rows.push((line, body.entry));
     }
-    if let Some(below) = window.below {
+    if let Some((below, noun)) = below {
         rows.push((
-            Line::styled(format!("… {below} more {}", NOUN.of(below)), dim()),
+            Line::styled(format!("… {below} more {}", noun.of(below)), dim()),
             None,
         ));
     }
