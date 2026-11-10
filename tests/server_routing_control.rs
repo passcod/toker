@@ -1090,6 +1090,59 @@ async fn a_reactivation_copies_a_kept_revision_for_new_and_cold_lanes() {
     assert_eq!(store.load_policy_revisions().unwrap().len(), 3);
 }
 
+#[tokio::test]
+async fn each_revision_says_what_it_changed_from_the_one_before_it() {
+    let (server, _store) = server();
+    let app = server.router();
+    let (status, _) = post(
+        &app,
+        "save",
+        "routing-save",
+        json!({"expected_revision_id": 1, "edit": describe("second")}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = post(
+        &app,
+        "reactivate",
+        "routing-reactivate",
+        json!({"expected_revision_id": 2, "revision_id": 1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            "/_toker/routing/revisions",
+            Some("routing-revisions"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let revisions = body_of(response).await;
+    let revisions = revisions["revisions"].as_array().unwrap();
+    assert_eq!(revisions.len(), 3);
+    let at = |id: i64| {
+        revisions
+            .iter()
+            .find(|revision| revision["revision_id"] == id)
+            .unwrap()
+    };
+    // Nothing is before the first, so it is counted, not diffed.
+    assert!(at(1)["summary"].as_str().unwrap().starts_with("setup: "));
+    assert_eq!(at(1)["changes"], json!([]));
+    // A save that only described the policy says so.
+    assert_eq!(at(2)["summary"], "describe the policy");
+    assert_eq!(at(2)["changes"][0]["change"], "changed");
+    assert_eq!(at(2)["changes"][0]["kind"], "policy");
+    // A reactivation names what it copied, and its diff is from what was live.
+    assert_eq!(at(3)["summary"], "reactivate rev 1");
+    assert_eq!(at(3)["changes"][0]["kind"], "policy");
+}
+
 fn snapshot_policy_description(store: &Store, revision: i64) -> Value {
     let revision = store.load_policy_revision(revision).unwrap().unwrap();
     let bytes = toker::policy::policy_bytes(&revision.document).unwrap();

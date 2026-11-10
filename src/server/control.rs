@@ -29,6 +29,7 @@ use serde_json::{Value, json};
 
 pub(super) mod config;
 pub(crate) mod derived;
+mod revision_diff;
 pub(super) mod routing;
 
 use super::Server;

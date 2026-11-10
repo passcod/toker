@@ -13,6 +13,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::revision_diff;
 use super::{MAX_CONTROL_BODY, control_token_ok, forbidden, json_content_type, store_error};
 use crate::policy::{
     ActivationScope, BindingId, CapabilityFlags, FrontendProtocol, FrontendScope, PolicyEdit,
@@ -60,7 +61,7 @@ pub(crate) async fn revisions(State(server): State<Server>, request: Request) ->
             axum::Json(json!({
                 "toker": "routing-revisions",
                 "ok": true,
-                "revisions": revisions.iter().map(revision_summary_body).collect::<Vec<_>>(),
+                "revisions": revision_summaries(revisions),
             })),
         )
             .into_response(),
@@ -835,6 +836,34 @@ fn revision_body(revision: &PolicyRevision) -> Value {
         "fingerprint": revision.fingerprint.to_string(),
         "policy": document,
     })
+}
+
+/// Each revision with what it changed from the one before it, which is the
+/// one with the next lower number: the active pointer never moves backwards,
+/// so that is what was live when it was made. A revision's own `parent` is
+/// what it was made from, which for a reactivation is the one copied.
+fn revision_summaries(mut revisions: Vec<PolicyRevision>) -> Vec<Value> {
+    revisions.sort_by_key(|revision| revision.revision_id);
+    let mut bodies = Vec::with_capacity(revisions.len());
+    let mut before: Option<&PolicyRevision> = None;
+    for revision in &revisions {
+        let after = revision.document.document();
+        let changes =
+            before.map(|before| revision_diff::changes(before.document.document(), after));
+        let summary = match (&changes, revision.source, revision.parent_revision_id) {
+            (None, ..) => revision_diff::first_summary(after),
+            (Some(_), crate::store::PolicyRevisionSource::Reactivation, Some(parent)) => {
+                format!("reactivate rev {parent}")
+            }
+            (Some(changes), ..) => revision_diff::summary(changes),
+        };
+        let mut body = revision_summary_body(revision);
+        body["summary"] = json!(summary);
+        body["changes"] = json!(changes.unwrap_or_default());
+        bodies.push(body);
+        before = Some(revision);
+    }
+    bodies
 }
 
 fn revision_summary_body(revision: &PolicyRevision) -> Value {
