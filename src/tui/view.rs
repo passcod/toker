@@ -827,8 +827,9 @@ fn meter_keys(quota: &QuotaAgg) -> Vec<&'static str> {
 /// window holds rows: an empty window is exactly when it matters,
 /// because a dead proxy looks like a quiet one everywhere else.
 ///
-/// A narrow header sheds in this order: the window summary first (it
-/// clips into whatever the right side leaves), then the clock (the
+/// A narrow header sheds in this order: the window summary first (a part
+/// at a time, into whatever the page buttons and the right side leave),
+/// then the clock (the
 /// time is on every other screen; nothing else says the proxy went
 /// quiet), then the "last req" label — the coloured age goes last.
 fn render_header(frame: &mut Frame, area: Rect, snap: &Snapshot, clock: &str) {
@@ -855,9 +856,11 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &Snapshot, clock: &str) {
     let [left, right] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(right_width)]).areas(area);
 
-    let mut text = format!("last {}m", snap.window_mins);
+    // The summary sheds a part at a time, last part first, rather than
+    // clipping mid-word into the readout beside it.
+    let mut parts = vec![format!("last {}m", snap.window_mins)];
     if snap.window_empty {
-        text.push_str(" · no requests in window");
+        parts.push("no requests in window".into());
     } else {
         let sessions = snap.sessions.len();
         let idle = snap
@@ -865,15 +868,21 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &Snapshot, clock: &str) {
             .iter()
             .filter(|session| snap.now_ms - session.latest_ts_ms >= IDLE_SECS * 1_000)
             .count();
-        text.push_str(&format!(
-            " · {sessions} session{}",
+        parts.push(format!(
+            "{sessions} session{}",
             if sessions == 1 { "" } else { "s" },
         ));
         if idle > 0 {
-            text.push_str(&format!(" · {idle} idle"));
+            parts.push(format!("{idle} idle"));
         }
-        text.push_str(&format!(" · {} requests", snap.window_requests));
+        parts.push(format!("{} requests", snap.window_requests));
     }
+    let room = usize::from(left.width).saturating_sub(1);
+    let text = (1..=parts.len())
+        .rev()
+        .map(|count| parts[..count].join(" · "))
+        .find(|text| text.width() <= room)
+        .unwrap_or_default();
     frame.render_widget(Paragraph::new(text.bold()), left);
     frame.render_widget(
         Paragraph::new(right_line).alignment(Alignment::Right),
@@ -3405,17 +3414,23 @@ mod tests {
     #[test]
     fn narrow_header_sheds_summary_then_clock_then_label() {
         let snap = with_latest(snapshot(), Some(NOW - 4_000));
-        // "last req 4s ago · 12:34:56" is 26 cells; one more for the gap.
-        let (row, _) = header_fg(&snap, 40, "4s ago");
+        // The page buttons take the first 46 cells, so the readout has
+        // what is left. "last req 4s ago · 12:34:56" is 26 cells; one
+        // more for the gap.
+        let (row, _) = header_fg(&snap, 90, "4s ago");
         assert!(row.contains("last req 4s ago · 12:34:56"), "{row:?}");
-        assert!(row.starts_with(" ?  last 30m"), "summary clips: {row:?}");
-        assert!(!row.contains("2 sessions"), "summary clips: {row:?}");
+        assert!(row.contains("last 30m"), "{row:?}");
+        assert!(!row.contains("2 sessions"), "summary sheds a part: {row:?}");
 
-        let (row, _) = header_fg(&snap, 20, "4s ago");
+        let (row, _) = header_fg(&snap, 80, "4s ago");
+        assert!(row.contains("last req 4s ago · 12:34:56"), "{row:?}");
+        assert!(!row.contains("last 30m"), "the summary goes: {row:?}");
+
+        let (row, _) = header_fg(&snap, 64, "4s ago");
         assert!(row.contains("last req 4s ago"), "{row:?}");
         assert!(!row.contains("12:34:56"), "the clock goes next: {row:?}");
 
-        let (row, fg) = header_fg(&snap, 10, "4s ago");
+        let (row, fg) = header_fg(&snap, 54, "4s ago");
         assert!(!row.contains("last req"), "the label goes last: {row:?}");
         assert_eq!(fg, Color::Green, "the coloured age survives");
     }
@@ -4664,7 +4679,6 @@ mod tests {
             "estimating",
             "green under 30s",
             "KEYS",
-            "next page",
             "? or esc close",
         ] {
             assert!(on.contains(expected), "{expected:?} in:\n{on}");

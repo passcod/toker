@@ -2,7 +2,7 @@
 source: src/tui/routing/view.rs
 expression: frame(&state)
 ---
- ? ⇄ 1  2 routes, candidates & defaults  3  4                                                                 revision 3
+ ?   dashboard   routing   config   accounts   1  2 routes, candidates & defaults  3  4                       revision 3
 ┌ROUT┌EDIT ROUTE──────────────────────────────────────────────────────────────────────────────────────────────────┐────┐
 │mixe│        [ ] images                                                                                          │    │
 │defa│        [ ] tools                                                                                           │    │

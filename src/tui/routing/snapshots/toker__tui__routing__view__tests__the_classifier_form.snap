@@ -2,7 +2,7 @@
 source: src/tui/routing/view.rs
 expression: "frame(&adding(super::View::Rewrites, '2'))"
 ---
- ? ⇄ 1  2  3 rewrites, families, upgrades & compaction  4                                                     revision 3
+ ?   dashboard   routing   config   accounts   1  2  3 rewrites, families, upgrades & compaction  4           revision 3
 ┌REWR┌ADD CLASSIFIER──────────────────────────────────────────────────────────────────────────────────────────────┐────┐
 │r-so│> id: new-classifier▏                                                                                       │    │
 │gpt-│  binding: anthropic_sub.anthropic_messages                                                                 │    │

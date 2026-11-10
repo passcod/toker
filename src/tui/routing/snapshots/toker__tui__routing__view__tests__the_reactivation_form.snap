@@ -2,7 +2,7 @@
 source: src/tui/routing/view.rs
 expression: frame(&state)
 ---
- ? ⇄ 1  2  3  4 preview, revisions & activation                                                               revision 3
+ ?   dashboard   routing   config   accounts   1  2  3  4 preview, revisions & activation                     revision 3
 ┌PREVIEW, REVISIONS & ACTIVATION─────────────────┐┌DETAIL──────────────────────────────────────────────────────────────┐
 │3  {"revision_id":3,"policy":{"description":"ex…││revision 3 is live                                                  │
 │2  {"revision_id":2}                            ││{                                                                   │

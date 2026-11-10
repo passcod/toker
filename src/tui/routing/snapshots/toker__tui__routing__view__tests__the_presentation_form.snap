@@ -2,7 +2,7 @@
 source: src/tui/routing/view.rs
 expression: "frame(&adding(super::View::Presentations, '1'))"
 ---
- ? ⇄ 1 presentations  2  3  4                                                                                 revision 3
+ ?   dashboard   routing   config   accounts   1 presentations  2  3  4                                       revision 3
 ┌PRES┌ADD PRESENTATION────────────────────────────────────────────────────────────────────────────────────────────┐────┐
 │mixe│> id: new-presentation▏                                                                                     │    │
 │    │  SCOPE                                                                                                     │    │

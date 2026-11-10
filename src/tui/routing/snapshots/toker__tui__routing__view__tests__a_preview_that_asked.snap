@@ -2,7 +2,7 @@
 source: src/tui/routing/view.rs
 expression: frame(&asked)
 ---
- ? ⇄ 1  2  3  4 preview, revi┌ROUTING PREVIEW────────────────────────────────────────────┐                    revision 3
+ ?   dashboard   routing   co┌ROUTING PREVIEW────────────────────────────────────────────┐                    revision 3
 PREVIEW, REVISIONS & ACTIVATI│any key close                                              │─────────────────────────────
  3  {"revision_id":3,"policy"│{                                                          │
  dynamic_responses_models  {"│  "toker": "routing-preview",                              │

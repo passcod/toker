@@ -2,7 +2,7 @@
 source: src/tui/config/view.rs
 expression: "frame(&loaded(), 100, 24)"
 ---
- ? ⇄ 1 providers  2 settings
+ ?   dashboard   routing   config   accounts   1 providers 3  2 settings
 ┌PROVIDERS─────────────────────────────────────────────────────────────────────────────────────────┐
 │anthropic_sub    on                                                                               │
 │    endpoint           (the built-in one)                                                         │

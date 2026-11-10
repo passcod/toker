@@ -1,9 +1,8 @@
 ---
 source: src/tui/config/view.rs
-assertion_line: 305
 expression: "frame(&state, 100, 24)"
 ---
- ? ⇄ 1 providers  2 settings
+ ?   dashboard   routing   config   accounts   1 providers 3  2 settings
  config-snapshot: the service is not answering
 ┌CONFIGURATION─────────────────────────────────────────────────────────────────────────────────────┐
 │the service is not answering                                                                      │

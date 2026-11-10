@@ -2,7 +2,7 @@
 source: src/tui/routing/view.rs
 expression: frame(&state)
 ---
- ? ⇄ 1  2  3  4 preview, revisions & activation                                                               revision 3
+ ?   dashboard   routing   config   accounts   1  2  3  4 preview, revisions & activation                     revision 3
 PREVI┌PROMOTE LEARNED MODEL───────────────────────────────────────────────────────────────────────────────────────┐────
  3  {│> binding: ▏                                                                                                │
  dyna│    Tab: anthropic_sub.anthropic_messages | anthropic_api.anthropic_messages | openai_api.openai_chat_comple│

@@ -2,7 +2,7 @@
 source: src/tui/routing/view.rs
 expression: "frame(&page_in(super::View::Presentations))"
 ---
- ? ⇄ 1 presentations  2  3  4                                                                                 revision 3
+ ?   dashboard   routing   config   accounts   1 presentations  2  3  4                                       revision 3
 ┌PRESENTATIONS───────────────────────────────────┐┌DETAIL──────────────────────────────────────────────────────────────┐
 │mixed  {"id":"p-mixed","slug":"mixed","label":"…││revision 3 is live                                                  │
 │                                                ││mixed  Mixed                                                        │

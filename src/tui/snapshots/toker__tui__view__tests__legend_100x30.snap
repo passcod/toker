@@ -1,9 +1,8 @@
 ---
 source: src/tui/view.rs
-assertion_line: 3072
 expression: "rows.join(\"\\n\")"
 ---
- ? ⇄last 3┌LEGEND───────────────────────────────────────────────────────────────────────┐ · 12:34:56
+ ?   dashb┌LEGEND───────────────────────────────────────────────────────────────────────┐ · 12:34:56
 ┌SESSIONS─│ ↑           served on a newer model: bright on the latest turn, dim earlier │──────────┐
 │session  │ $           released past the armed quota gate for this window              │  out idle│
 │ses-free │ %           released to the end of the plan, stopping before overage        │   60   1m│
@@ -30,6 +29,6 @@ expression: "rows.join(\"\\n\")"
 │new prefi│ wheel       scroll the list under the pointer                               │          │
 │· ses-hot│ ←/→ h/l     scroll the accounts in rate & quota                             │          │
 └─────────│ r           refresh now                                                     │──────────┘
-┌RATE & QU│ tab or ⇄    next page                                                       │──────────┐
-│  request│ q           quit                                                            │          │
-└─────────└? or esc close───────────────────────────────────────────────────────────────┘──────────┘
+┌RATE & QU│ q           quit                                                            │──────────┐
+│  request└? or esc close───────────────────────────────────────────────────────────────┘          │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘

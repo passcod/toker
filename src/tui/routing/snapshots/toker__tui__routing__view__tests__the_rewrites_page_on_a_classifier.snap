@@ -2,7 +2,7 @@
 source: src/tui/routing/view.rs
 expression: frame(&state)
 ---
- ? ⇄ 1  2  3 rewrites, families, upgrades & compaction  4                                                     revision 3
+ ?   dashboard   routing   config   accounts   1  2  3 rewrites, families, upgrades & compaction  4           revision 3
 ┌REWRITES, FAMILIES, UPGRADES & COMPACTION───────┐┌DETAIL──────────────────────────────────────────────────────────────┐
 │r-sonnet  {"id":"r-sonnet","scope":{"kind":"pro…││revision 3 is live                                                  │
 │gpt-family  {"id":"gpt-family","binding_id":"co…││gpt-family  on codex_sub.codex_responses                            │

@@ -2,7 +2,7 @@
 source: src/tui/routing/view.rs
 expression: "frame(&page_in(super::View::Routes))"
 ---
- ? ⇄ 1  2 routes, candidates & defaults  3  4                                                                 revision 3
+ ?   dashboard   routing   config   accounts   1  2 routes, candidates & defaults  3  4                       revision 3
 ┌ROUTES, CANDIDATES & DEFAULTS───────────────────┐┌DETAIL──────────────────────────────────────────────────────────────┐
 │mixed  {"id":"mixed","display_name":"Subscripti…││revision 3 is live                                                  │
 │default openai_responses  {"scope":{"kind":"pro…││mixed  Subscription then billed                                     │
