@@ -9,15 +9,21 @@
 
 use serde_json::{Value, json};
 
-use super::model::View;
+use super::model::{Panel, Tab};
 
-/// The record kinds a view lists, in the order the add chooser offers them.
-pub(super) fn kinds(view: View) -> &'static [&'static str] {
-    match view {
-        View::Presentations => &["presentations"],
-        View::Routes => &["routes", "defaults"],
-        View::Rewrites => &["rewrites", "classifiers", "upgrades", "compaction"],
-        View::Status => &[],
+/// The record kinds a tab holds, in the order the add chooser offers them.
+/// The models tab holds several, by the panel the focus is in.
+pub(super) fn kinds(tab: Tab, focus: Panel) -> &'static [&'static str] {
+    match tab {
+        Tab::Presentations => &["presentations"],
+        Tab::Rewrites => &["rewrites"],
+        Tab::Defaults => &["defaults"],
+        Tab::Routes => &["routes"],
+        Tab::Models => match focus {
+            Panel::Families => &["classifiers"],
+            Panel::Upgrades | Panel::Compaction | Panel::Offers => &["upgrades", "compaction"],
+        },
+        Tab::History => &[],
     }
 }
 
@@ -112,7 +118,7 @@ pub(super) fn template(kind: &str, route_id: Option<&str>) -> Value {
 mod tests {
     use super::{kinds, template};
     use crate::policy::{PolicyDocument, PolicyEdit};
-    use crate::tui::routing::model::{View, add_edit};
+    use crate::tui::routing::model::{Panel, Tab, add_edit};
 
     fn empty() -> PolicyDocument {
         serde_json::from_value(serde_json::json!({ "format_version": 3 })).expect("document")
@@ -122,8 +128,15 @@ mod tests {
     /// it will add, so each one is pushed through it.
     #[test]
     fn every_template_is_an_addition_the_daemon_accepts() {
-        for view in [View::Presentations, View::Routes, View::Rewrites] {
-            for kind in kinds(view) {
+        for (tab, focus) in [
+            (Tab::Presentations, Panel::Upgrades),
+            (Tab::Rewrites, Panel::Upgrades),
+            (Tab::Defaults, Panel::Upgrades),
+            (Tab::Routes, Panel::Upgrades),
+            (Tab::Models, Panel::Families),
+            (Tab::Models, Panel::Upgrades),
+        ] {
+            for kind in kinds(tab, focus) {
                 let operation = add_edit(kind, template(kind, None));
                 let edit: PolicyEdit =
                     serde_json::from_value(serde_json::json!({ "operations": [operation] }))

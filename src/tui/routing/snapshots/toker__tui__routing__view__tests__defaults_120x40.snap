@@ -1,0 +1,20 @@
+---
+source: src/tui/routing/view.rs
+expression: "frame(&state, 120, 40)"
+---
+ ?   dashboard   routing   config   accounts   1 presentations → 2 rewrites → 3 defaults 4 → 4 routes ›       rev 9 live
+┌DEFAULTS──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│   default for                          route                   reach                                        hits 24h │
+│   unprefixed/anthropic_messages      → claude-sub              no cred · billed fallback                           - │
+│   anthropic_messages                 → claude-sub              no cred · billed fallback                          ≥3 │
+│   openai_chat                        → openrouter-chat         ok                                                  - │
+│   unprefixed/openai_chat             → openrouter-chat         ok                                                  - │
+│   openai_responses  no default       → refused · no route                                                          - │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌DEFAULT───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ unprefixed/anthropic_messages                                                                                        │
+│ sends to  claude-sub  2 candidates · anthropic_sub → openrouter                                                      │
+│ reach     no cred · billed fallback  anthropic_sub has no credential, so openrouter serves it, billed                │
+│ recent    -                                                                                                          │
+│ [e] edit   [n] new   [space] turn off   [d] delete   [t] trace   [enter] open route                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

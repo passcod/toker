@@ -1,11 +1,21 @@
 //! Routing policy page.
 
+mod data;
 mod detail;
 mod form;
+mod history;
 mod model;
+mod models_tab;
 mod reconcile;
+mod routes;
+mod rules;
+mod status;
+mod table;
 mod template;
+#[cfg(test)]
+mod testing;
 mod view;
+mod words;
 
 use crate::tui::control::{Client, Command, Reply};
 use crossterm::event::KeyEvent;
@@ -41,7 +51,8 @@ fn activated(reply: &Reply) -> bool {
 pub(super) fn owns_key(code: crossterm::event::KeyCode) -> bool {
     matches!(
         code,
-        crossterm::event::KeyCode::Char('e' | 'n' | 'd' | 'v' | 'x' | 'p')
+        crossterm::event::KeyCode::Char('e' | 'n' | 'd' | 'v' | 'a' | 'p')
+            | crossterm::event::KeyCode::Enter
             | crossterm::event::KeyCode::PageUp
             | crossterm::event::KeyCode::PageDown
     )
@@ -106,13 +117,13 @@ impl Page {
     }
 
     pub(super) fn set_view(&mut self, view: usize) {
-        let view = match view {
-            0 => model::View::Presentations,
-            1 => model::View::Routes,
-            2 => model::View::Rewrites,
-            _ => model::View::Status,
-        };
         self.state.set_view(view);
+    }
+
+    /// Whether `esc` has something of the page's own to close before it
+    /// leaves the page: a route opened whole.
+    pub(super) fn captures_esc(&self) -> bool {
+        self.state.mode() == model::Mode::Route
     }
 
     /// Handle a key owned by the routing page.  Only this page owns its modal
@@ -182,8 +193,6 @@ impl Page {
         } else if self.state.modal().active() {
         } else if drawn.entries.contains(at) {
             self.state.move_selection(delta as isize);
-        } else if drawn.detail.contains(at) {
-            self.state.scroll_detail(delta * 3);
         }
     }
 }
@@ -221,7 +230,7 @@ mod tests {
 
     #[test]
     fn every_key_the_legend_documents_reaches_the_page() {
-        for key in ['e', 'n', 'd', 'v', 'x', 'p'] {
+        for key in ['e', 'n', 'd', 'v', 'a', 'p'] {
             assert!(owns_key(KeyCode::Char(key)), "{key}");
         }
         for key in [KeyCode::PageUp, KeyCode::PageDown] {

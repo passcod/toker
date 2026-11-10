@@ -198,7 +198,6 @@ impl<'a> Tab<'a> {
     /// Set the text between the previous tab and this one: ` → ` for a
     /// tab a request passes through after it, ` · ` for one that sits
     /// apart.
-    #[allow(dead_code)] // the routing page joins its lookup tabs with arrows
     pub(super) const fn after(self, joiner: &'a str) -> Self {
         Tab { joiner, ..self }
     }
@@ -545,7 +544,7 @@ pub(super) struct Noun {
 }
 
 impl Noun {
-    fn of(self, count: usize) -> &'static str {
+    pub(super) fn of(self, count: usize) -> &'static str {
         if count == 1 { self.one } else { self.many }
     }
 }

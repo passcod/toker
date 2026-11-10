@@ -1,56 +1,136 @@
 //! Content-free routing snapshot, editing, and navigation state.
+//!
+//! The page is six tabs, in the order a request is resolved
+//! (spec: UTUI#the-routing-page). Each lookup tab is a table of records, the
+//! selected one's detail beneath it; the routes tab can open one route whole;
+//! the models tab is a stack of panels with one focus among them.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use reqwest::Method;
 use serde_json::{Value, json};
 
+use super::data::{self, array, text};
 use super::form::{Context, Form, Outcome, Purpose};
+use super::{models_tab, routes, rules};
 use crate::tui::control::{Command, Reply, Response};
 
-/// Lines a page key moves the detail pane.
-const DETAIL_PAGE: i32 = 10;
+/// How many rows a page key moves a selection.
+const PAGE: isize = 10;
 
-/// The routing page's four master/detail views.
+/// The routing page's tabs. The first four are the lookup a request walks, in
+/// order; models and history shape a route and record it rather than find
+/// one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum View {
+pub(super) enum Tab {
     Presentations,
-    Routes,
     Rewrites,
-    Status,
+    Defaults,
+    Routes,
+    Models,
+    History,
 }
 
-impl View {
-    pub(super) const ALL: [View; 4] = [
-        View::Presentations,
-        View::Routes,
-        View::Rewrites,
-        View::Status,
+impl Tab {
+    pub(super) const ALL: [Tab; 6] = [
+        Tab::Presentations,
+        Tab::Rewrites,
+        Tab::Defaults,
+        Tab::Routes,
+        Tab::Models,
+        Tab::History,
     ];
 
+    pub(super) fn index(self) -> usize {
+        Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0)
+    }
+
+    /// The tab's label in the strip: lower case, like every other tab.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Tab::Presentations => "presentations",
+            Tab::Rewrites => "rewrites",
+            Tab::Defaults => "defaults",
+            Tab::Routes => "routes",
+            Tab::Models => "models",
+            Tab::History => "history",
+        }
+    }
+
+    /// The title of the tab's table panel.
     pub(super) fn title(self) -> &'static str {
         match self {
-            View::Presentations => "PRESENTATIONS",
-            View::Routes => "ROUTES, CANDIDATES & DEFAULTS",
-            View::Rewrites => "REWRITES, FAMILIES, UPGRADES & COMPACTION",
-            View::Status => "PREVIEW, REVISIONS & ACTIVATION",
+            Tab::Presentations => "PRESENTATIONS",
+            Tab::Rewrites => "REWRITES",
+            Tab::Defaults => "DEFAULTS",
+            Tab::Routes => "ROUTES",
+            Tab::Models => "MODELS",
+            Tab::History => "HISTORY",
         }
     }
 
-    /// The view's tab label: its title, in lower case like every other
-    /// tab.
-    pub(super) fn tab(self) -> &'static str {
+    /// What stands between the previous tab and this one: an arrow where a
+    /// request goes on from the one before, a dot where this tab sits apart
+    /// from the sequence.
+    pub(super) fn joiner(self) -> &'static str {
         match self {
-            View::Presentations => "presentations",
-            View::Routes => "routes, candidates & defaults",
-            View::Rewrites => "rewrites, families, upgrades & compaction",
-            View::Status => "preview, revisions & activation",
+            Tab::Presentations | Tab::Rewrites | Tab::Defaults | Tab::Routes => " → ",
+            Tab::Models | Tab::History => " · ",
         }
     }
 
-    fn next(self, delta: isize) -> View {
-        let here = Self::ALL.iter().position(|view| *view == self).unwrap_or(0) as isize;
+    /// The tab a name in `first_refused_tab` stands for.
+    fn named(name: &str) -> Option<Tab> {
+        Self::ALL
+            .into_iter()
+            .find(|tab| tab.label() == name && !matches!(tab, Tab::Models | Tab::History))
+    }
+
+    fn next(self, delta: isize) -> Tab {
         let len = Self::ALL.len() as isize;
-        Self::ALL[(here + delta).rem_euclid(len) as usize]
+        Self::ALL[(self.index() as isize + delta).rem_euclid(len) as usize]
+    }
+}
+
+/// Whether the routes tab shows its table or one route whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Mode {
+    Table,
+    /// The selected route, in the page of its own.
+    Route,
+}
+
+/// The panels of the models tab that hold the focus, top to bottom. The
+/// compaction line holds it only where there is a policy to hold it on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Panel {
+    Families,
+    Upgrades,
+    Compaction,
+    Offers,
+}
+
+/// Where the models tab's focus and selections are. Only the focused panel
+/// shows a selection, and the focus moves on past a panel's edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Models {
+    pub(super) focus: Panel,
+    pub(super) family: usize,
+    pub(super) upgrade: usize,
+    /// How far the offers window is scrolled: the first offer it shows.
+    pub(super) offers_at: usize,
+    /// Which binding's catalogue the offers show.
+    pub(super) offers_binding: usize,
+}
+
+impl Default for Models {
+    fn default() -> Self {
+        Models {
+            focus: Panel::Upgrades,
+            family: 0,
+            upgrade: 0,
+            offers_at: 0,
+            offers_binding: 0,
+        }
     }
 }
 
@@ -97,13 +177,19 @@ impl Modal {
 /// Data and selection the page preserves while the dashboard is visible.
 #[derive(Debug)]
 pub(super) struct State {
-    view: View,
+    tab: Tab,
+    mode: Mode,
+    /// Whether the page has chosen its first tab from the first snapshot.
+    opened: bool,
     snapshot: Option<Value>,
     revisions: Vec<Value>,
     /// The revision the last snapshot said is live: what an edit is made
     /// against.
     active_revision_id: Option<i64>,
-    selected: usize,
+    /// The selected entry of each tab, by [`Tab::index`], so a tab keeps its
+    /// place while another is looked at.
+    selected: [usize; 6],
+    models: Models,
     error: Option<String>,
     /// The outcome of the last post-activation Claude settings sync.
     settings_note: Option<String>,
@@ -113,35 +199,56 @@ pub(super) struct State {
     /// Whether the preview shown asked for server safeguards. The result of
     /// a route with no candidate left does not say, so the page remembers.
     preview_asked: bool,
-    /// How far the detail pane is scrolled, and how far it can be; the view
-    /// owns the second because only it knows the pane's height and wrapping.
-    detail_scroll: u16,
-    detail_furthest: std::cell::Cell<u16>,
 }
 
 impl Default for State {
     fn default() -> Self {
         State {
-            view: View::Presentations,
+            tab: Tab::Presentations,
+            mode: Mode::Table,
+            opened: false,
             snapshot: None,
             revisions: Vec::new(),
             active_revision_id: None,
-            selected: 0,
+            selected: [0; 6],
+            models: Models::default(),
             error: None,
             settings_note: None,
             loading: false,
             in_flight: false,
             modal: Modal::None,
             preview_asked: false,
-            detail_scroll: 0,
-            detail_furthest: std::cell::Cell::new(0),
         }
     }
 }
 
+/// The record a selected row stands for, in the policy document: what an edit
+/// or a removal addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Target {
+    /// The document's collection: `rewrites`, `routes`, `defaults` and so on.
+    pub(super) kind: &'static str,
+    /// Its identifier; a default is addressed by its scope instead.
+    pub(super) id: Option<String>,
+    pub(super) scope: Option<Value>,
+}
+
 impl State {
-    pub(super) fn view(&self) -> View {
-        self.view
+    pub(super) fn tab(&self) -> Tab {
+        self.tab
+    }
+
+    pub(super) fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub(super) fn models(&self) -> &Models {
+        &self.models
+    }
+
+    /// The selected entry of `tab`.
+    pub(super) fn selected_in(&self, tab: Tab) -> usize {
+        self.selected[tab.index()]
     }
 
     /// The revision the daemon last reported live.
@@ -149,28 +256,19 @@ impl State {
         self.active_revision_id
     }
 
-    /// What the daemon last sent, for the detail pane to lay out.
+    /// What the daemon last sent.
     pub(super) fn snapshot(&self) -> Option<&Value> {
         self.snapshot.as_ref()
     }
 
-    pub(super) fn detail_scroll(&self) -> u16 {
-        self.detail_scroll
+    /// The facts derived for the live revision, when it compiled.
+    pub(super) fn active(&self) -> Option<&Value> {
+        self.snapshot.as_ref().and_then(data::active)
     }
 
-    /// Scroll the detail pane. The view reports how far it can go, so the
-    /// offset never runs past the last line and a key back always shows
-    /// movement.
-    pub(super) fn scroll_detail(&mut self, delta: i32) {
-        let furthest = self.detail_furthest.get();
-        self.detail_scroll =
-            (i32::from(self.detail_scroll) + delta).clamp(0, i32::from(furthest)) as u16;
-    }
-
-    /// Called by the view each draw with the last offset that still shows a
-    /// line.
-    pub(super) fn set_detail_furthest(&self, furthest: u16) {
-        self.detail_furthest.set(furthest);
+    /// The revisions, newest first.
+    pub(super) fn revisions(&self) -> &[Value] {
+        &self.revisions
     }
 
     pub(super) fn error(&self) -> Option<&str> {
@@ -234,37 +332,244 @@ impl State {
         self.preview_asked
     }
 
-    pub(super) fn move_view(&mut self, delta: isize) {
-        self.set_view(self.view.next(delta));
-    }
-
-    pub(super) fn set_view(&mut self, view: View) {
-        self.view = view;
-        self.selected = 0;
-        self.detail_scroll = 0;
-    }
-
-    pub(super) fn move_selection(&mut self, delta: isize) {
-        let count = self.entries().len();
-        if count == 0 {
-            self.selected = 0;
-        } else {
-            self.selected = self.selected.saturating_add_signed(delta).min(count - 1);
+    /// How many records a tab holds, for the strip. Models counts its
+    /// families, upgrades and compaction together.
+    pub(super) fn tab_count(&self, tab: Tab) -> Option<usize> {
+        match tab {
+            Tab::History => Some(self.revisions.len()),
+            Tab::Models => self.active().map(models_tab::record_count),
+            _ => self.active().map(|active| rules::record_count(active, tab)),
         }
-        self.detail_scroll = 0;
     }
 
-    pub(super) fn selected(&self) -> usize {
-        self.selected
+    // --- navigation -------------------------------------------------------
+
+    /// Left or right: between the tabs, or, inside a route, from one route to
+    /// the next, or, in the offers, from one catalogue to the next.
+    pub(super) fn move_view(&mut self, delta: isize) {
+        match (self.tab, self.mode) {
+            (Tab::Routes, Mode::Route) => self.step_route(delta),
+            (Tab::Models, _) if self.models.focus == Panel::Offers => {
+                let count = self.offer_bindings().len();
+                if count > 0 {
+                    self.models.offers_binding = (self.models.offers_binding as isize + delta)
+                        .rem_euclid(count as isize)
+                        as usize;
+                    self.models.offers_at = 0;
+                }
+            }
+            _ => self.set_tab(self.tab.next(delta)),
+        }
+    }
+
+    /// Show `binding`'s offers from the `at`th, for a test.
+    #[cfg(test)]
+    pub(super) fn show_offers(&mut self, binding: &str, at: usize) {
+        if let Some(index) = self
+            .offer_bindings()
+            .iter()
+            .position(|have| *have == binding)
+        {
+            self.models.offers_binding = index;
+        }
+        self.models.offers_at = at;
+    }
+
+    pub(super) fn set_view(&mut self, index: usize) {
+        if let Some(tab) = Tab::ALL.get(index) {
+            self.set_tab(*tab);
+        }
+    }
+
+    pub(super) fn set_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+        self.mode = Mode::Table;
+    }
+
+    /// Up or down within the tab; in the models tab, on into the next panel
+    /// past a panel's edge.
+    pub(super) fn move_selection(&mut self, delta: isize) {
+        match (self.tab, self.mode) {
+            (_, Mode::Route) => {}
+            (Tab::Models, _) => self.move_models(delta),
+            (tab, _) => {
+                let count = self.entry_count(tab);
+                let at = &mut self.selected[tab.index()];
+                *at = if count == 0 {
+                    0
+                } else {
+                    at.saturating_add_signed(delta).min(count - 1)
+                };
+            }
+        }
+    }
+
+    pub(super) fn page(&mut self, down: bool) {
+        self.move_selection(if down { PAGE } else { -PAGE });
     }
 
     /// Select the entry at `index`, as a click does.
     pub(super) fn select(&mut self, index: usize) {
-        let count = self.entries().len();
-        if index < count {
-            self.selected = index;
-            self.detail_scroll = 0;
+        if self.mode == Mode::Route || self.tab == Tab::Models {
+            return;
         }
+        if index < self.entry_count(self.tab) {
+            self.selected[self.tab.index()] = index;
+        }
+    }
+
+    /// Open the selected record's route: from the routes tab, the route
+    /// itself; from a rule, a default or a presentation, the route it sends
+    /// to, in the routes tab.
+    pub(super) fn open(&mut self) {
+        let Some(active) = self.active() else {
+            return;
+        };
+        let route = match self.tab {
+            Tab::Routes => Some(self.selected[Tab::Routes.index()]),
+            Tab::Presentations | Tab::Rewrites | Tab::Defaults => rules::entries(active, self.tab)
+                .get(self.selected[self.tab.index()])
+                .and_then(|entry| entry.route_id())
+                .and_then(|id| routes::position(active, id)),
+            Tab::Models | Tab::History => None,
+        };
+        if let Some(route) = route {
+            self.selected[Tab::Routes.index()] = route;
+            self.tab = Tab::Routes;
+            self.mode = Mode::Route;
+        }
+    }
+
+    /// Leave the route page for the table, the selection where it was.
+    /// Returns whether there was a page to leave.
+    pub(super) fn close(&mut self) -> bool {
+        let was = self.mode == Mode::Route;
+        self.mode = Mode::Table;
+        was
+    }
+
+    fn step_route(&mut self, delta: isize) {
+        let count = self.entry_count(Tab::Routes);
+        if count == 0 {
+            return;
+        }
+        let at = &mut self.selected[Tab::Routes.index()];
+        *at = (*at as isize + delta).rem_euclid(count as isize) as usize;
+    }
+
+    fn move_models(&mut self, delta: isize) {
+        let Some(active) = self.active() else {
+            return;
+        };
+        let families = models_tab::families(active).len();
+        let upgrades = models_tab::upgrades(active).len();
+        let compaction = models_tab::compaction(active).is_some();
+        let offers = self.offers_shown().len();
+        let models = &mut self.models;
+        // Whether a step of `delta` stayed inside a list of `count`.
+        let step = |at: &mut usize, count: usize| -> bool {
+            match at.checked_add_signed(delta) {
+                Some(next) if next < count => {
+                    *at = next;
+                    true
+                }
+                _ => false,
+            }
+        };
+        // The panel past `models.focus`'s lower edge, and the one past its
+        // upper edge: the focus moves on where there is one.
+        let below_upgrades = if compaction {
+            Panel::Compaction
+        } else {
+            Panel::Offers
+        };
+        let above_offers = if compaction {
+            Panel::Compaction
+        } else {
+            Panel::Upgrades
+        };
+        match models.focus {
+            Panel::Families => {
+                if !step(&mut models.family, families) && delta > 0 {
+                    models.focus = Panel::Upgrades;
+                    models.upgrade = 0;
+                }
+            }
+            Panel::Upgrades => {
+                if !step(&mut models.upgrade, upgrades) {
+                    if delta < 0 && families > 0 {
+                        models.focus = Panel::Families;
+                        models.family = families - 1;
+                    } else if delta > 0 {
+                        models.focus = below_upgrades;
+                    }
+                }
+            }
+            Panel::Compaction => {
+                if delta < 0 && upgrades > 0 {
+                    models.focus = Panel::Upgrades;
+                    models.upgrade = upgrades - 1;
+                } else if delta > 0 {
+                    models.focus = Panel::Offers;
+                }
+            }
+            Panel::Offers => {
+                let at = models.offers_at;
+                match at.checked_add_signed(delta) {
+                    Some(next) if next < offers => models.offers_at = next,
+                    Some(_) => models.offers_at = offers.saturating_sub(1),
+                    None if at == 0 => {
+                        models.focus = above_offers;
+                        models.upgrade = upgrades.saturating_sub(1);
+                    }
+                    None => models.offers_at = 0,
+                }
+            }
+        }
+    }
+
+    /// The bindings the catalogue holds offers for, sorted.
+    pub(super) fn offer_bindings(&self) -> Vec<&str> {
+        let mut bindings: Vec<&str> = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                array(snapshot, "offers")
+                    .iter()
+                    .map(|offer| text(offer, "binding_id"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        bindings.sort_unstable();
+        bindings.dedup();
+        bindings
+    }
+
+    /// The offers of the binding the models tab is showing, by model.
+    pub(super) fn offers_shown(&self) -> Vec<&Value> {
+        let bindings = self.offer_bindings();
+        let Some(binding) = bindings
+            .get(
+                self.models
+                    .offers_binding
+                    .min(bindings.len().saturating_sub(1)),
+            )
+            .copied()
+        else {
+            return Vec::new();
+        };
+        let mut offers: Vec<&Value> = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                array(snapshot, "offers")
+                    .iter()
+                    .filter(|offer| text(offer, "binding_id") == binding)
+                    .collect()
+            })
+            .unwrap_or_default();
+        offers.sort_by_key(|offer| text(offer, "model_id"));
+        offers
     }
 
     /// Focus a field of the open form, as a click does.
@@ -281,94 +586,87 @@ impl State {
         }
     }
 
-    pub(super) fn entries(&self) -> Vec<Entry<'_>> {
-        let Some(snapshot) = &self.snapshot else {
-            return Vec::new();
-        };
-        let policy = active_policy(snapshot);
-        match self.view {
-            View::Presentations => policy
-                .into_iter()
-                .flat_map(|document| array(document, "presentations"))
-                .map(|value| Entry {
-                    key: "presentations",
-                    value,
-                })
-                .collect(),
-            View::Routes => policy
-                .into_iter()
-                .flat_map(|document| {
-                    ["routes", "defaults"].into_iter().flat_map(move |key| {
-                        array(document, key)
-                            .iter()
-                            .map(move |value| Entry { key, value })
-                    })
-                })
-                .collect(),
-            View::Rewrites => policy
-                .into_iter()
-                .flat_map(|document| {
-                    let records = ["rewrites", "classifiers", "upgrades"]
-                        .into_iter()
-                        .flat_map(move |key| {
-                            array(document, key)
-                                .iter()
-                                .map(move |value| Entry { key, value })
-                        });
-                    // The compaction policy is one optional record, not a list.
-                    let compaction = document
-                        .get("compaction")
-                        .filter(|value| !value.is_null())
-                        .map(|value| Entry {
-                            key: "compaction",
-                            value,
-                        });
-                    records.chain(compaction)
-                })
-                .collect(),
-            View::Status => {
-                let active = snapshot
-                    .get("active_revision")
-                    .into_iter()
-                    .map(|value| Entry {
-                        key: "active_revision",
-                        value,
-                    });
-                let revisions = self.revisions.iter().map(|value| Entry {
-                    key: "revision",
-                    value,
-                });
-                let publications = array(snapshot, "publications").iter().map(|value| Entry {
-                    key: "publications",
-                    value,
-                });
-                let availability = snapshot
-                    .get("derived")
-                    .map(|derived| array(derived, "availability"))
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|value| Entry {
-                        key: "availability",
-                        value,
-                    });
-                let lane_impacts = snapshot.get("lane_impacts").into_iter().map(|value| Entry {
-                    key: "lane_impacts",
-                    value,
-                });
-                let offers = array(snapshot, "offers").iter().map(|value| Entry {
-                    key: "offer",
-                    value,
-                });
-                active
-                    .chain(revisions)
-                    .chain(publications)
-                    .chain(availability)
-                    .chain(lane_impacts)
-                    .chain(offers)
-                    .collect()
-            }
+    // --- entries ----------------------------------------------------------
+
+    /// How many selectable entries `tab` has.
+    pub(super) fn entry_count(&self, tab: Tab) -> usize {
+        match tab {
+            Tab::History => self.revisions.len(),
+            Tab::Models => 0,
+            Tab::Routes => self
+                .active()
+                .map_or(0, |active| array(active, "routes").len()),
+            _ => self
+                .active()
+                .map_or(0, |active| rules::entries(active, tab).len()),
         }
     }
+
+    /// The record the selection stands for, where it stands for one.
+    pub(super) fn target(&self) -> Option<Target> {
+        let active = self.active()?;
+        match self.tab {
+            Tab::Presentations | Tab::Rewrites | Tab::Defaults => {
+                let entry = rules::entries(active, self.tab)
+                    .into_iter()
+                    .nth(self.selected_in(self.tab))?;
+                entry.target()
+            }
+            Tab::Routes => {
+                let route = array(active, "routes").get(self.selected_in(Tab::Routes))?;
+                Some(Target {
+                    kind: "routes",
+                    id: Some(text(route, "id").to_owned()),
+                    scope: None,
+                })
+            }
+            Tab::Models => match self.models.focus {
+                Panel::Families => {
+                    let family = models_tab::families(active).get(self.models.family)?;
+                    Some(Target {
+                        kind: "classifiers",
+                        id: Some(text(family, "id").to_owned()),
+                        scope: None,
+                    })
+                }
+                Panel::Upgrades => {
+                    let row = models_tab::upgrades(active)
+                        .into_iter()
+                        .nth(self.models.upgrade)?;
+                    Some(Target {
+                        kind: "upgrades",
+                        id: Some(row.policy_id.to_owned()),
+                        scope: None,
+                    })
+                }
+                Panel::Compaction => models_tab::compaction(active).map(|_| Target {
+                    kind: "compaction",
+                    id: None,
+                    scope: None,
+                }),
+                Panel::Offers => None,
+            },
+            Tab::History => None,
+        }
+    }
+
+    /// The document's record for `target`.
+    pub(super) fn record(&self, target: &Target) -> Option<&Value> {
+        let policy = data::policy(self.snapshot.as_ref()?)?;
+        match (target.kind, &target.scope, &target.id) {
+            // The one policy a document holds, if any.
+            ("compaction", ..) => policy.get("compaction").filter(|record| !record.is_null()),
+            ("defaults", Some(scope), _) => array(policy, "defaults")
+                .iter()
+                .find(|record| record.get("scope") == Some(scope)),
+            (kind, _, Some(id)) => array(policy, kind)
+                .iter()
+                .find(|record| text(record, "id") == id),
+            _ => None,
+        }
+    }
+
+    // --- replies ----------------------------------------------------------
 
     /// Begin a refresh. The caller sends it only when this returns true.
     pub(super) fn begin_refresh(&mut self) -> bool {
@@ -419,7 +717,12 @@ impl State {
         }
         if command.name == "revisions" && response.status / 100 == 2 {
             self.revisions = array(&response.body, "revisions").to_vec();
+            // Newest first, whatever order they were sent in.
+            self.revisions.sort_by_key(|revision| {
+                std::cmp::Reverse(revision.get("revision_id").and_then(Value::as_i64))
+            });
             self.error = None;
+            self.clamp_selection();
             return;
         }
         if response.status / 100 != 2 {
@@ -445,7 +748,18 @@ impl State {
     }
 
     fn receive_snapshot(&mut self, snapshot: Value) {
-        self.active_revision_id = active_revision_id(&snapshot);
+        self.active_revision_id = data::revision_id(&snapshot);
+        // The page opens where something is refused, once: a later refresh
+        // must not move an operator off the tab they chose
+        // (spec: UTUI#the-routing-page).
+        if !self.opened {
+            self.opened = true;
+            self.tab = data::active(&snapshot)
+                .and_then(|active| active.get("first_refused_tab"))
+                .and_then(Value::as_str)
+                .and_then(Tab::named)
+                .unwrap_or(Tab::Presentations);
+        }
         self.snapshot = Some(snapshot);
         self.error = None;
         self.clamp_selection();
@@ -463,15 +777,32 @@ impl State {
                     snapshot[key] = value.clone();
                 }
             }
-            self.active_revision_id = active_revision_id(snapshot);
+            self.active_revision_id = data::revision_id(snapshot);
         }
         self.error = None;
         self.clamp_selection();
     }
 
     fn clamp_selection(&mut self) {
-        let count = self.entries().len();
-        self.selected = self.selected.min(count.saturating_sub(1));
+        for tab in Tab::ALL {
+            let count = self.entry_count(tab);
+            let at = &mut self.selected[tab.index()];
+            *at = (*at).min(count.saturating_sub(1));
+        }
+        if let Some(active) = self.snapshot.as_ref().and_then(data::active) {
+            self.models.family = self
+                .models
+                .family
+                .min(models_tab::families(active).len().saturating_sub(1));
+            self.models.upgrade = self
+                .models
+                .upgrade
+                .min(models_tab::upgrades(active).len().saturating_sub(1));
+        }
+        let bindings = self.offer_bindings().len();
+        self.models.offers_binding = self.models.offers_binding.min(bindings.saturating_sub(1));
+        let offers = self.offers_shown().len();
+        self.models.offers_at = self.models.offers_at.min(offers.saturating_sub(1));
     }
 
     /// Handle a routing-page key.  Returned commands must be sent by the page's
@@ -503,7 +834,7 @@ impl State {
                 self.open_preview();
                 None
             }
-            KeyCode::Char('x') if self.view == View::Status => {
+            KeyCode::Char('a') if self.tab == Tab::History => {
                 self.open_reactivate();
                 None
             }
@@ -511,12 +842,20 @@ impl State {
                 self.open_promote();
                 None
             }
+            KeyCode::Enter => {
+                self.open();
+                None
+            }
+            KeyCode::Esc => {
+                self.close();
+                None
+            }
             KeyCode::PageDown => {
-                self.scroll_detail(DETAIL_PAGE);
+                self.page(true);
                 None
             }
             KeyCode::PageUp => {
-                self.scroll_detail(-DETAIL_PAGE);
+                self.page(false);
                 None
             }
             _ => None,
@@ -524,12 +863,12 @@ impl State {
     }
 
     fn open_edit(&mut self) {
-        let on_policy = self
-            .entries()
-            .get(self.selected)
-            .is_some_and(|entry| entry.key == "active_revision");
-        if on_policy {
-            let description = active_policy(self.snapshot.as_ref().unwrap_or(&Value::Null))
+        // The live revision's description is edited from the top of history.
+        if self.tab == Tab::History && self.selected_in(Tab::History) == 0 {
+            let description = self
+                .snapshot
+                .as_ref()
+                .and_then(data::policy)
                 .and_then(|policy| policy.get("description"))
                 .cloned()
                 .unwrap_or(Value::Null);
@@ -541,24 +880,18 @@ impl State {
             return;
         }
         let selected = self
-            .entries()
-            .get(self.selected)
-            .map(|entry| (entry.key.to_owned(), entry.value.clone()));
-        if let Some((record_key, value)) = selected {
-            match record_kind(&record_key) {
-                Some(kind) => {
-                    let context = self.form_context();
-                    self.modal = Modal::Form(Box::new(Form::new(
-                        Purpose::Record {
-                            kind,
-                            adding: false,
-                        },
-                        value,
-                        context,
-                    )));
-                }
-                None => self.error = Some("this item is not a policy record".to_owned()),
-            }
+            .target()
+            .and_then(|target| Some((target.kind, self.record(&target)?.clone())));
+        if let Some((kind, value)) = selected {
+            let context = self.form_context();
+            self.modal = Modal::Form(Box::new(Form::new(
+                Purpose::Record {
+                    kind,
+                    adding: false,
+                },
+                value,
+                context,
+            )));
         }
     }
 
@@ -582,7 +915,7 @@ impl State {
             .iter()
             .filter_map(|offer| Some((text(offer, "binding_id")?, text(offer, "model_id")?)))
             .collect();
-        if let Some(policy) = active_policy(snapshot) {
+        if let Some(policy) = data::policy(snapshot) {
             for collection in ["routes", "classifiers", "upgrades"] {
                 context.ids.insert(
                     collection,
@@ -596,11 +929,10 @@ impl State {
         context
     }
 
-    /// Start adding a record. A view that lists one kind goes straight to its
-    /// template; one that lists several asks which kind first, defaulting to
-    /// the kind under the cursor.
+    /// Start adding a record. A tab that holds one kind goes straight to its
+    /// template; one that holds several asks which kind first.
     fn open_add(&mut self) {
-        let kinds = super::template::kinds(self.view);
+        let kinds = super::template::kinds(self.tab, self.models.focus);
         match kinds {
             [] => {
                 self.error = Some("there is nothing to add in this view".to_owned());
@@ -608,9 +940,8 @@ impl State {
             [kind] => self.open_template(kind),
             _ => {
                 let preselected = self
-                    .entries()
-                    .get(self.selected)
-                    .and_then(|entry| kinds.iter().position(|kind| *kind == entry.key))
+                    .target()
+                    .and_then(|target| kinds.iter().position(|kind| *kind == target.kind))
                     .unwrap_or(0);
                 self.modal = Modal::NewKind { kinds, preselected };
             }
@@ -621,7 +952,7 @@ impl State {
         let route_id = self
             .snapshot
             .as_ref()
-            .and_then(active_policy)
+            .and_then(data::policy)
             .and_then(|policy| array(policy, "routes").first())
             .and_then(|route| route.get("id"))
             .and_then(Value::as_str);
@@ -635,12 +966,11 @@ impl State {
 
     fn open_remove(&mut self) {
         let selected = self
-            .entries()
-            .get(self.selected)
-            .map(|entry| (entry.key.to_owned(), entry.value.clone()));
-        if let Some((record_key, value)) = selected.filter(|(key, _)| record_kind(key).is_some()) {
+            .target()
+            .and_then(|target| Some((target.kind, self.record(&target)?.clone())));
+        if let Some((kind, value)) = selected {
             self.modal = Modal::Remove {
-                key: record_key,
+                key: kind.to_owned(),
                 value,
             };
         }
@@ -656,16 +986,10 @@ impl State {
 
     fn open_reactivate(&mut self) {
         let revision_id = self
-            .entries()
-            .get(self.selected)
-            .and_then(|entry| entry.value.get("revision_id"))
-            .and_then(Value::as_i64)
-            .or_else(|| {
-                self.revisions
-                    .first()
-                    .and_then(|revision| revision.get("revision_id"))
-                    .and_then(Value::as_i64)
-            });
+            .revisions
+            .get(self.selected_in(Tab::History))
+            .and_then(|revision| revision.get("revision_id"))
+            .and_then(Value::as_i64);
         if let Some(revision_id) = revision_id {
             self.modal = Modal::Reactivate { revision_id };
         } else {
@@ -673,11 +997,22 @@ impl State {
         }
     }
 
+    /// Promote a learned model. With an upgrade selected, the form starts
+    /// from the model its evidence bar is holding back.
     fn open_promote(&mut self) {
         let context = self.form_context();
+        let held = (self.tab == Tab::Models && self.models.focus == Panel::Upgrades)
+            .then(|| {
+                let row = models_tab::upgrades(self.active()?)
+                    .into_iter()
+                    .nth(self.models.upgrade)?;
+                Some((row.binding_id.to_owned(), row.held_back_model()?.to_owned()))
+            })
+            .flatten();
+        let (binding, model) = held.unwrap_or_default();
         self.modal = Modal::Form(Box::new(Form::new(
             Purpose::Promote,
-            json!({ "binding_id": "", "model_id": "" }),
+            json!({ "binding_id": binding, "model_id": model }),
             context,
         )));
     }
@@ -843,13 +1178,6 @@ enum ModalAction {
     Promote { binding: String, model: String },
 }
 
-/// One content-free item supplied by the snapshot.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct Entry<'a> {
-    pub(super) key: &'a str,
-    pub(super) value: &'a Value,
-}
-
 fn command(
     name: &'static str,
     method: Method,
@@ -864,42 +1192,6 @@ fn command(
         control,
         body: Some(body),
     }
-}
-
-fn array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
-    value
-        .get(key)
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-}
-
-fn active_policy(snapshot: &Value) -> Option<&Value> {
-    snapshot
-        .get("active_revision")
-        .and_then(|revision| revision.get("policy"))
-}
-
-fn active_revision_id(snapshot: &Value) -> Option<i64> {
-    snapshot
-        .get("active_revision")
-        .and_then(|revision| revision.get("revision_id"))
-        .and_then(Value::as_i64)
-}
-
-/// The collection a list entry belongs to, if it is a policy record.
-fn record_kind(key: &str) -> Option<&'static str> {
-    [
-        "presentations",
-        "routes",
-        "defaults",
-        "rewrites",
-        "classifiers",
-        "upgrades",
-        "compaction",
-    ]
-    .into_iter()
-    .find(|kind| *kind == key)
 }
 
 fn replace_edit(key: &str, value: Value) -> Value {
@@ -950,24 +1242,6 @@ fn remove_edit(key: &str, value: &Value) -> Value {
         "classifiers" => json!({ "kind": "remove_classifier", "id": id }),
         "upgrades" => json!({ "kind": "remove_upgrade", "id": id }),
         _ => Value::Null,
-    }
-}
-
-/// A default's identity is the scope it covers, as the daemon addresses it.
-pub(super) fn scope_label(record: &Value) -> String {
-    let scope = record.get("scope");
-    let text = |key: &str| {
-        scope
-            .and_then(|scope| scope.get(key))
-            .and_then(Value::as_str)
-            .unwrap_or("?")
-    };
-    match scope
-        .and_then(|scope| scope.get("kind"))
-        .and_then(Value::as_str)
-    {
-        Some("profile") => format!("{}/{}", text("profile"), text("protocol")),
-        _ => text("protocol").to_owned(),
     }
 }
 
@@ -1057,37 +1331,35 @@ fn control_error(command: &Command, response: &Response) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Modal, State, View};
-    use crate::tui::control::{Command, Reply, Response};
-    use crate::tui::routing::form::Purpose;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use reqwest::Method;
 
-    fn snapshot() -> serde_json::Value {
-        serde_json::json!({
-            "active_revision": {"revision_id": 7, "policy": {"description": "live", "routes": [{
-                "id": "route", "chain": {"first": {"id": "one"}, "steps": [
-                    {"edge": {"preflight": "enabled"}, "candidate": {"id": "two"}}
-                ]}
-            }]}},
-        })
+    use super::{Modal, Mode, Panel, State, Tab};
+    use crate::tui::control::{Command, Reply, Response};
+    use crate::tui::routing::form::Purpose;
+    use crate::tui::routing::testing::{self, World};
+
+    const CTRL_ENTER: KeyEvent = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+
+    fn reply(name: &'static str, status: u16, body: serde_json::Value) -> Reply {
+        let mut command = Command::snapshot("routing-snapshot");
+        command.name = name;
+        Reply::Command(command, Ok(Response { status, body }))
     }
 
-    #[test]
-    fn the_live_revision_and_its_policy_are_what_the_page_lists() {
+    /// A page that has read the snapshot and the revisions of `world`.
+    fn loaded(world: World) -> State {
         let mut state = State::default();
-        state.receive(Reply::Command(
-            Command::snapshot("routing-snapshot"),
-            Ok(Response {
-                status: 200,
-                body: snapshot(),
-            }),
-        ));
-        state.set_view(View::Routes);
-        assert_eq!(state.active_revision_id(), Some(7));
-        assert_eq!(state.entries()[0].value["id"], "route");
+        state.receive(reply("snapshot", 200, testing::snapshot(world)));
+        state.receive(reply("revisions", 200, testing::revisions(world)));
+        state
     }
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    fn on(tab: Tab) -> State {
+        let mut state = loaded(World::AT_REST);
+        state.set_tab(tab);
+        state
+    }
 
     fn press(state: &mut State, code: KeyCode) -> Option<Command> {
         state.key(KeyEvent::new(code, KeyModifiers::NONE))
@@ -1118,87 +1390,154 @@ mod tests {
         form.value().clone()
     }
 
-    fn loaded(body: serde_json::Value) -> State {
+    fn first_operation(command: Command) -> serde_json::Value {
+        command.body.expect("body")["edit"]["operations"][0].clone()
+    }
+
+    // --- navigation -------------------------------------------------------
+
+    #[test]
+    fn the_page_opens_on_the_first_tab_holding_a_refused_reach_once() {
+        let mut snapshot = testing::snapshot(World::AT_REST);
+        snapshot["derived"]["active"]["first_refused_tab"] = serde_json::json!("defaults");
         let mut state = State::default();
-        state.receive(Reply::Command(
-            Command::snapshot("routing-snapshot"),
-            Ok(Response { status: 200, body }),
-        ));
-        state
-    }
-
-    fn reply(name: &'static str, status: u16, body: serde_json::Value) -> Reply {
-        let mut command = Command::snapshot("routing-snapshot");
-        command.name = name;
-        Reply::Command(command, Ok(Response { status, body }))
-    }
-
-    fn full_snapshot() -> serde_json::Value {
-        serde_json::json!({
-            "active_revision": {"revision_id": 3, "policy": {
-                "description": "live",
-                "presentations": [{"id": "kept", "slug": "k"}, {"id": "added", "slug": "a"}],
-                "routes": [{"id": "changed", "chain": {"first": {"id": "b"}, "steps": []}}],
-            }},
-            "lane_impacts": {"total": 5, "unpinned": 1, "warm": 2, "cold": 1, "unknown": 1},
-            "offers": [
-                {"binding_id": "openrouter.chat", "model_id": "vendor/one"},
-                {"binding_id": "openrouter.chat", "model_id": "vendor/two"},
-            ],
-            "publications": [{"adapter": "claude", "state": "applied"}],
-        })
+        state.receive(reply("snapshot", 200, snapshot.clone()));
+        assert_eq!(state.tab(), Tab::Defaults);
+        // A refresh does not move an operator off the tab they chose.
+        state.set_tab(Tab::Routes);
+        state.receive(reply("snapshot", 200, snapshot));
+        assert_eq!(state.tab(), Tab::Routes);
+        // With nothing refused, the first tab.
+        assert_eq!(loaded(World::AT_REST).tab(), Tab::Presentations);
     }
 
     #[test]
-    fn views_wrap_and_selection_clamps_without_a_snapshot() {
-        let mut state = State::default();
-        state.move_selection(5);
-        assert_eq!(state.selected(), 0);
-        state.move_view(-1);
-        assert_eq!(state.view(), View::Status);
-        state.move_view(1);
-        assert_eq!(state.view(), View::Presentations);
-        let mut state = loaded(full_snapshot());
-        state.move_selection(9);
-        assert_eq!(state.selected(), 1, "clamped to the last presentation");
-        state.set_view(View::Routes);
-        assert_eq!(state.selected(), 0, "a view change resets the selection");
-    }
-
-    #[test]
-    fn a_failed_refresh_keeps_the_last_snapshot_readable() {
-        let mut state = loaded(full_snapshot());
-        assert!(state.begin_refresh());
-        assert!(!state.begin_refresh(), "one refresh at a time");
-        state.receive(Reply::Command(
-            Command::snapshot("routing-snapshot"),
-            Err("down".to_owned()),
-        ));
-        assert!(state.error().is_some_and(|error| error.contains("down")));
-        assert_eq!(state.entries().len(), 2);
-        assert!(state.begin_refresh(), "refresh can resume once it settled");
-    }
-
-    #[test]
-    fn status_view_lists_lane_impact_and_offers() {
-        let mut state = loaded(full_snapshot());
-        state.set_view(View::Status);
-        let keys: Vec<_> = state.entries().iter().map(|entry| entry.key).collect();
+    fn each_tab_counts_the_records_it_holds() {
+        let state = loaded(World::FULL);
+        let counts: Vec<_> = Tab::ALL.iter().map(|tab| state.tab_count(*tab)).collect();
+        // Presentations, rewrites, existing defaults, routes, then the
+        // models tab's families, upgrades and compaction, and the revisions.
         assert_eq!(
-            keys,
-            [
-                "active_revision",
-                "publications",
-                "lane_impacts",
-                "offer",
-                "offer"
-            ]
+            counts,
+            [Some(15), Some(14), Some(4), Some(7), Some(11), Some(9)]
+        );
+        assert_eq!(State::default().tab_count(Tab::Rewrites), None);
+    }
+
+    #[test]
+    fn left_and_right_move_between_tabs_and_wrap() {
+        let mut state = loaded(World::AT_REST);
+        state.move_view(-1);
+        assert_eq!(state.tab(), Tab::History);
+        state.move_view(1);
+        assert_eq!(state.tab(), Tab::Presentations);
+        state.set_view(3);
+        assert_eq!(state.tab(), Tab::Routes);
+        state.set_view(9);
+        assert_eq!(state.tab(), Tab::Routes, "no tab is nine");
+    }
+
+    #[test]
+    fn a_tab_keeps_its_selection_while_another_is_looked_at() {
+        let mut state = on(Tab::Rewrites);
+        state.move_selection(3);
+        assert_eq!(state.selected_in(Tab::Rewrites), 3);
+        state.set_tab(Tab::Routes);
+        assert_eq!(state.selected_in(Tab::Routes), 0);
+        state.set_tab(Tab::Rewrites);
+        assert_eq!(state.selected_in(Tab::Rewrites), 3);
+        // The selection stops at the last entry: fourteen rules and the
+        // three defaults that end the groups (one of them the want of one).
+        state.move_selection(99);
+        assert_eq!(state.selected_in(Tab::Rewrites), 14 + 3 - 1);
+    }
+
+    #[test]
+    fn enter_opens_the_route_a_rule_sends_to_and_esc_returns_with_the_selection_kept() {
+        let mut state = on(Tab::Rewrites);
+        state.move_selection(1);
+        press(&mut state, KeyCode::Enter);
+        assert_eq!((state.tab(), state.mode()), (Tab::Routes, Mode::Route));
+        assert_eq!(state.selected_in(Tab::Routes), 0, "claude-sub, the first");
+        // Left and right step between routes without returning, and wrap.
+        state.move_view(1);
+        assert_eq!(state.selected_in(Tab::Routes), 1);
+        state.move_view(-2);
+        assert_eq!(state.selected_in(Tab::Routes), 6);
+        assert_eq!(state.mode(), Mode::Route);
+        assert!(state.close());
+        assert_eq!((state.tab(), state.mode()), (Tab::Routes, Mode::Table));
+        assert_eq!(
+            state.selected_in(Tab::Routes),
+            6,
+            "the route last looked at"
+        );
+        assert!(!state.close(), "nothing left to close");
+    }
+
+    #[test]
+    fn a_default_with_no_route_opens_nothing() {
+        let mut state = on(Tab::Defaults);
+        state.move_selection(99);
+        press(&mut state, KeyCode::Enter);
+        assert_eq!((state.tab(), state.mode()), (Tab::Defaults, Mode::Table));
+    }
+
+    #[test]
+    fn the_models_focus_moves_on_past_a_panels_edge() {
+        let mut state = on(Tab::Models);
+        assert_eq!(state.models().focus, Panel::Upgrades);
+        state.move_selection(-1);
+        assert_eq!(state.models().focus, Panel::Families);
+        assert_eq!(state.models().family, 4, "the last family, not the first");
+        state.move_selection(-1);
+        assert_eq!(state.models().family, 3);
+        state.move_selection(99);
+        assert_eq!(
+            (state.models().focus, state.models().upgrade),
+            (Panel::Upgrades, 0),
+            "past the last family: the first upgrade"
+        );
+        state.move_selection(4);
+        assert_eq!(state.models().upgrade, 4);
+        state.move_selection(1);
+        assert_eq!(state.models().focus, Panel::Compaction);
+        state.move_selection(1);
+        assert_eq!(state.models().focus, Panel::Offers);
+        state.show_offers(testing::OR_CHAT, 0);
+        state.move_selection(3);
+        assert_eq!(state.models().offers_at, 3, "the offers scroll");
+        state.move_selection(-3);
+        state.move_selection(-1);
+        assert_eq!(state.models().focus, Panel::Compaction);
+        state.move_selection(-1);
+        assert_eq!(
+            (state.models().focus, state.models().upgrade),
+            (Panel::Upgrades, 4)
         );
     }
 
     #[test]
+    fn left_and_right_in_the_offers_change_the_catalogue_not_the_tab() {
+        let mut state = on(Tab::Models);
+        state.move_selection(99);
+        state.move_selection(1);
+        state.move_selection(1);
+        assert_eq!(state.models().focus, Panel::Offers);
+        state.show_offers(testing::OR_CHAT, 0);
+        let first = state.offers_shown()[0]["binding_id"].clone();
+        state.move_selection(5);
+        state.move_view(1);
+        assert_eq!(state.tab(), Tab::Models);
+        assert_ne!(state.offers_shown()[0]["binding_id"], first);
+        assert_eq!(state.models().offers_at, 0, "a catalogue starts at its top");
+    }
+
+    // --- editing ----------------------------------------------------------
+
+    #[test]
     fn escape_cancels_every_confirmation_without_a_command() {
-        let mut state = loaded(full_snapshot());
+        let mut state = loaded(World::AT_REST);
         for key in ['d', 'p', 'v'] {
             press(&mut state, KeyCode::Char(key));
             assert!(state.modal().active(), "{key} opens a form");
@@ -1209,8 +1548,9 @@ mod tests {
         assert_eq!(form_purpose(&state), record_form("presentations", false));
         press(&mut state, KeyCode::Esc);
         assert!(!state.modal().active());
-        state.set_view(View::Status);
-        // Entry 0 is the live revision, whose description is edited.
+        state.set_tab(Tab::History);
+        // The top of history is the live revision, whose description is
+        // edited.
         press(&mut state, KeyCode::Char('e'));
         assert_eq!(form_purpose(&state), Some(Purpose::Description));
         press(&mut state, KeyCode::Esc);
@@ -1222,44 +1562,57 @@ mod tests {
 
     #[test]
     fn removal_needs_a_yes_and_names_the_record() {
-        let mut state = loaded(full_snapshot());
+        let mut state = loaded(World::AT_REST);
         press(&mut state, KeyCode::Char('d'));
         assert!(
             press(&mut state, KeyCode::Char('x')).is_none(),
             "other keys do nothing"
         );
         let command = press(&mut state, KeyCode::Char('y')).expect("confirmed");
-        let operation = &command.body.expect("body")["edit"]["operations"][0];
+        let operation = first_operation(command);
         assert_eq!(operation["kind"], "remove_presentation");
-        assert_eq!(operation["id"], "kept");
+        assert_eq!(operation["id"], "pick-1");
+    }
+
+    #[test]
+    fn a_rule_is_edited_and_removed_by_its_id() {
+        let mut state = on(Tab::Rewrites);
+        state.move_selection(1);
+        press(&mut state, KeyCode::Char('e'));
+        assert_eq!(form_purpose(&state), record_form("rewrites", false));
+        assert_eq!(form_value(&state)["id"], "anthropic-messages-2");
+        press(&mut state, KeyCode::Esc);
+        press(&mut state, KeyCode::Char('d'));
+        let operation = first_operation(press(&mut state, KeyCode::Char('y')).expect("sent"));
+        assert_eq!(operation["kind"], "remove_rewrite");
+        assert_eq!(operation["id"], "anthropic-messages-2");
     }
 
     #[test]
     fn a_record_edit_sends_the_typed_replacement() {
-        let mut state = loaded(full_snapshot());
-        state.set_view(View::Routes);
+        let mut state = on(Tab::Routes);
         press(&mut state, KeyCode::Char('e'));
         assert_eq!(form_purpose(&state), record_form("routes", false));
-        assert_eq!(form_value(&state)["id"], "changed");
+        assert_eq!(form_value(&state)["id"], "claude-sub");
         // The id names the record the edit replaces, so it is fixed.
         typed(&mut state, "x");
-        assert_eq!(form_value(&state)["id"], "changed");
+        assert_eq!(form_value(&state)["id"], "claude-sub");
         // Move to the route's name and change it.
         press(&mut state, KeyCode::Down);
         typed(&mut state, "named");
         let command = state.key(CTRL_ENTER).expect("edit command");
-        assert_eq!(command.method, reqwest::Method::POST);
-        let operation = &command.body.expect("body")["edit"]["operations"][0];
+        assert_eq!(command.method, Method::POST);
+        let operation = first_operation(command);
         assert_eq!(operation["kind"], "replace_route");
-        assert_eq!(operation["id"], "changed");
-        assert_eq!(operation["route"]["display_name"], "named");
+        assert_eq!(operation["id"], "claude-sub");
+        assert_eq!(operation["route"]["display_name"], "claude-subnamed");
         // What the schema does not name is carried through as it was.
-        assert_eq!(operation["route"]["chain"]["first"]["id"], "b");
+        assert_eq!(operation["route"]["chain"]["first"]["id"], "sub");
     }
 
     #[test]
     fn keys_are_ignored_while_a_command_is_in_flight() {
-        let mut state = loaded(full_snapshot());
+        let mut state = loaded(World::AT_REST);
         press(&mut state, KeyCode::Char('d'));
         press(&mut state, KeyCode::Char('y'));
         assert!(state.in_flight());
@@ -1276,13 +1629,16 @@ mod tests {
 
     #[test]
     fn the_summary_names_lane_impact_and_publications() {
-        let state = loaded(full_snapshot());
+        let state = loaded(World::AT_REST);
         let summary = state.activation_summary().join("\n");
         assert!(
-            summary.contains("lanes: 5 total, 1 unpinned, 2 warm, 1 cold, 1 unknown"),
+            summary.contains("lanes: 10 total, 0 unpinned, 2 warm, 8 cold, 0 unknown"),
             "{summary}"
         );
-        assert!(summary.contains("publication claude: applied"), "{summary}");
+        assert!(
+            summary.contains("publication claude_settings: applied"),
+            "{summary}"
+        );
         assert_eq!(
             State::default().activation_summary(),
             ["no daemon snapshot loaded"]
@@ -1291,24 +1647,24 @@ mod tests {
 
     #[test]
     fn a_save_moved_past_names_the_live_revision_and_keeps_the_form() {
-        let mut state = loaded(full_snapshot());
+        let mut state = loaded(World::AT_REST);
         press(&mut state, KeyCode::Char('n'));
         let command = state.key(CTRL_ENTER).expect("add command");
-        assert_eq!(command.body.expect("body")["expected_revision_id"], 3);
+        assert_eq!(command.body.expect("body")["expected_revision_id"], 9);
         state.receive(reply(
             "save",
             409,
-            serde_json::json!({"error": "stale_revision", "live_revision_id": 9}),
+            serde_json::json!({"error": "stale_revision", "live_revision_id": 12}),
         ));
         assert_eq!(form_purpose(&state), record_form("presentations", true));
         assert!(!state.in_flight());
         let error = state.error().expect("the refusal is shown");
-        assert!(error.contains("revision 9 is now live"), "{error}");
+        assert!(error.contains("revision 12 is now live"), "{error}");
     }
 
     #[test]
     fn an_invalid_save_names_its_diagnostics() {
-        let mut state = loaded(full_snapshot());
+        let mut state = loaded(World::AT_REST);
         press(&mut state, KeyCode::Char('d'));
         press(&mut state, KeyCode::Char('y'));
         state.receive(reply(
@@ -1327,16 +1683,17 @@ mod tests {
 
     #[test]
     fn reactivation_confirms_the_selected_revision() {
-        let mut state = loaded(full_snapshot());
+        let mut state = on(Tab::History);
+        // Newest first, whatever order the daemon sent them in.
         state.receive(reply(
             "revisions",
             200,
-            serde_json::json!({"revisions": [{"revision_id": 9}, {"revision_id": 4}]}),
+            serde_json::json!({"revisions": [
+                {"revision_id": 4}, {"revision_id": 9}, {"revision_id": 7},
+            ]}),
         ));
-        state.set_view(View::Status);
-        // Entries: the live revision, then the revisions.
         state.move_selection(2);
-        assert!(press(&mut state, KeyCode::Char('x')).is_none());
+        assert!(press(&mut state, KeyCode::Char('a')).is_none());
         assert!(matches!(
             state.modal(),
             Modal::Reactivate { revision_id: 4 }
@@ -1345,13 +1702,13 @@ mod tests {
         let body = command.body.expect("body");
         assert_eq!(command.name, "reactivate");
         assert_eq!(body["revision_id"], 4);
-        assert_eq!(body["expected_revision_id"], 3);
+        assert_eq!(body["expected_revision_id"], 9);
         assert!(body.get("scope").is_none(), "a reactivation names no scope");
     }
 
     #[test]
     fn promotion_needs_a_binding_and_a_model_and_completes_from_offers() {
-        let mut state = loaded(full_snapshot());
+        let mut state = loaded(World::AT_REST);
         press(&mut state, KeyCode::Char('p'));
         assert!(press(&mut state, KeyCode::Enter).is_none());
         assert!(
@@ -1362,21 +1719,39 @@ mod tests {
         assert_eq!(form_purpose(&state), Some(Purpose::Promote));
         // A binding is typed, or completed from the ones toker implements;
         // a model completes from what that binding offers.
-        typed(&mut state, "openrouter.chat");
+        typed(&mut state, testing::OR_CHAT);
         press(&mut state, KeyCode::Down);
         press(&mut state, KeyCode::Tab);
-        assert_eq!(form_value(&state)["model_id"], "vendor/one");
+        assert_eq!(form_value(&state)["model_id"], "anthropic/model-000");
         // A second Tab moves to the next offer.
         press(&mut state, KeyCode::Tab);
         let command = press(&mut state, KeyCode::Enter).expect("promotion");
         let body = command.body.expect("body");
-        assert_eq!(body["binding_id"], "openrouter.chat");
-        assert_eq!(body["model_id"], "vendor/two");
+        assert_eq!(body["binding_id"], testing::OR_CHAT);
+        assert_eq!(body["model_id"], "anthropic/model-001");
+    }
+
+    /// An upgrade whose evidence bar is holding a model back starts the
+    /// promotion form from that model and its binding.
+    #[test]
+    fn promoting_from_an_upgrade_starts_from_the_model_it_holds_back() {
+        let mut snapshot = testing::snapshot(World::AT_REST);
+        snapshot["derived"]["active"]["upgrades"][0]["used_by"][1]["held_back"] = serde_json::json!(
+            [{"family": "sonnet", "model": "claude-sonnet-5", "distinct_days": 1, "promoted": false}]
+        );
+        let mut state = State::default();
+        state.receive(reply("snapshot", 200, snapshot));
+        state.set_tab(Tab::Models);
+        state.move_selection(1);
+        press(&mut state, KeyCode::Char('p'));
+        let value = form_value(&state);
+        assert_eq!(value["binding_id"], testing::API);
+        assert_eq!(value["model_id"], "claude-sonnet-5");
     }
 
     #[test]
     fn the_preview_form_sends_only_the_facts_that_were_filled_in() {
-        let mut state = loaded(full_snapshot());
+        let mut state = loaded(World::AT_REST);
         press(&mut state, KeyCode::Char('v'));
         assert_eq!(form_purpose(&state), Some(Purpose::Preview));
         // protocol, then profile, model, lane key, prompt bound.
@@ -1402,7 +1777,7 @@ mod tests {
 
     #[test]
     fn the_preview_form_can_ask_for_server_safeguards() {
-        let mut state = loaded(full_snapshot());
+        let mut state = loaded(World::AT_REST);
         press(&mut state, KeyCode::Char('v'));
         // Down to the last field: protocol, profile, model, lane key,
         // prompt bound, message count, tool count, then the switch.
@@ -1436,7 +1811,7 @@ mod tests {
 
     #[test]
     fn a_preview_that_does_not_ask_sends_no_such_fact() {
-        let mut state = loaded(full_snapshot());
+        let mut state = loaded(World::AT_REST);
         press(&mut state, KeyCode::Char('v'));
         let body = state
             .key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
@@ -1448,11 +1823,10 @@ mod tests {
 
     #[test]
     fn a_route_save_sets_or_clears_its_honour_flag_by_its_own_operation() {
-        let mut state = loaded(full_snapshot());
-        state.set_view(View::Routes);
+        let mut state = on(Tab::Routes);
         press(&mut state, KeyCode::Char('e'));
         // Down to the last field and switch it on.
-        for _ in 0..40 {
+        for _ in 0..200 {
             press(&mut state, KeyCode::Down);
         }
         press(&mut state, KeyCode::Char(' '));
@@ -1468,7 +1842,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(operations[1]["kind"], "set_route_server_safeguards");
-        assert_eq!(operations[1]["route_id"], "changed");
+        assert_eq!(operations[1]["route_id"], "claude-sub");
         assert_eq!(operations[1]["honours"], true);
         state.receive(reply("save", 200, serde_json::json!({})));
 
@@ -1481,7 +1855,7 @@ mod tests {
 
     #[test]
     fn only_a_route_save_carries_the_honour_flag_operation() {
-        let mut state = loaded(full_snapshot());
+        let mut state = loaded(World::AT_REST);
         press(&mut state, KeyCode::Char('e'));
         let command = state.key(CTRL_ENTER).expect("edit command");
         let operations = command.body.expect("body")["edit"]["operations"].clone();
@@ -1513,7 +1887,7 @@ mod tests {
 
     #[test]
     fn a_read_reply_does_not_release_a_pending_edit() {
-        let mut state = loaded(full_snapshot());
+        let mut state = loaded(World::AT_REST);
         press(&mut state, KeyCode::Char('d'));
         press(&mut state, KeyCode::Char('y'));
         assert!(state.in_flight());
@@ -1523,7 +1897,7 @@ mod tests {
             200,
             serde_json::json!({"revisions": []}),
         ));
-        state.receive(reply("snapshot", 200, full_snapshot()));
+        state.receive(reply("snapshot", 200, testing::snapshot(World::AT_REST)));
         assert!(state.in_flight());
         assert!(press(&mut state, KeyCode::Char('y')).is_none());
         state.receive(reply(
@@ -1536,7 +1910,7 @@ mod tests {
 
     #[test]
     fn a_refused_queue_slot_releases_the_busy_guards() {
-        let mut state = loaded(full_snapshot());
+        let mut state = loaded(World::AT_REST);
         assert!(state.begin_refresh());
         state.refresh_refused();
         assert!(state.begin_refresh(), "a refused refresh can be retried");
@@ -1547,72 +1921,66 @@ mod tests {
         assert!(state.error().is_some_and(|error| error.contains("busy")));
     }
 
-    fn defaults_snapshot() -> serde_json::Value {
-        serde_json::json!({
-            "active_revision": {"revision_id": 5, "policy": {
-                "routes": [{"id": "route-a"}],
-                "defaults": [
-                    {"scope": {"kind": "protocol", "protocol": "openai_chat"},
-                     "target": {"route_id": "route-a"}},
-                    {"scope": {"kind": "profile", "profile": "unprefixed", "protocol": "openai_chat"},
-                     "target": {"route_id": "route-a"}},
-                ],
-                "compaction": {
-                    "target": {"route_id": "route-a"},
-                    "lane_transition": "move_when_cold",
-                    "cache_transition": "allow_when_cold",
-                },
-            }},
-        })
-    }
-
     #[test]
-    fn defaults_and_compaction_are_listed_where_they_are_edited() {
-        let mut state = loaded(defaults_snapshot());
-        state.set_view(View::Routes);
-        let keys: Vec<_> = state.entries().iter().map(|entry| entry.key).collect();
-        assert_eq!(keys, ["routes", "defaults", "defaults"]);
-        state.set_view(View::Rewrites);
-        let keys: Vec<_> = state.entries().iter().map(|entry| entry.key).collect();
-        assert_eq!(keys, ["compaction"]);
+    fn a_failed_refresh_keeps_the_last_snapshot_readable() {
+        let mut state = loaded(World::AT_REST);
+        assert!(state.begin_refresh());
+        assert!(!state.begin_refresh(), "one refresh at a time");
+        state.receive(Reply::Command(
+            Command::snapshot("routing-snapshot"),
+            Err("down".to_owned()),
+        ));
+        assert!(state.error().is_some_and(|error| error.contains("down")));
+        assert_eq!(state.entry_count(Tab::Rewrites), 14 + 3);
+        assert!(state.begin_refresh(), "refresh can resume once it settled");
     }
 
     #[test]
     fn a_default_is_replaced_and_removed_by_its_scope() {
-        let mut state = loaded(defaults_snapshot());
-        state.set_view(View::Routes);
-        state.move_selection(2);
+        let mut state = loaded(World::FULL);
+        state.set_tab(Tab::Defaults);
+        // Unprefixed messages, messages, chat, unprefixed chat, responses.
+        state.move_selection(3);
         press(&mut state, KeyCode::Char('e'));
-        let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
-        let command = state.key(ctrl_enter).expect("replace command");
-        let operation = &command.body.expect("body")["edit"]["operations"][0];
+        let command = state.key(CTRL_ENTER).expect("replace command");
+        let operation = first_operation(command);
         assert_eq!(operation["kind"], "replace_default");
         assert_eq!(operation["scope"]["profile"], "unprefixed");
-        assert_eq!(operation["default"]["target"]["route_id"], "route-a");
+        assert_eq!(
+            operation["default"]["target"]["route_id"],
+            "openrouter-chat"
+        );
         state.receive(reply("save", 200, serde_json::json!({})));
 
         press(&mut state, KeyCode::Char('d'));
-        let command = press(&mut state, KeyCode::Char('y')).expect("confirmed");
-        let operation = &command.body.expect("body")["edit"]["operations"][0];
+        let operation = first_operation(press(&mut state, KeyCode::Char('y')).expect("confirmed"));
         assert_eq!(operation["kind"], "remove_default");
         assert_eq!(operation["scope"]["profile"], "unprefixed");
     }
 
     #[test]
-    fn compaction_is_replaced_and_removed_without_an_id() {
-        let mut state = loaded(defaults_snapshot());
-        state.set_view(View::Rewrites);
+    fn a_protocol_with_no_default_has_none_to_edit_or_remove() {
+        let mut state = loaded(World::AT_REST);
+        state.set_tab(Tab::Defaults);
+        state.move_selection(2);
+        press(&mut state, KeyCode::Char('e'));
         press(&mut state, KeyCode::Char('d'));
-        let command = press(&mut state, KeyCode::Char('y')).expect("confirmed");
-        let operation = &command.body.expect("body")["edit"]["operations"][0];
+        assert!(!state.modal().active());
+    }
+
+    #[test]
+    fn compaction_is_replaced_and_removed_without_an_id() {
+        let mut state = on(Tab::Models);
+        state.move_selection(5);
+        assert_eq!(state.models().focus, Panel::Compaction);
+        press(&mut state, KeyCode::Char('d'));
+        let operation = first_operation(press(&mut state, KeyCode::Char('y')).expect("confirmed"));
         assert_eq!(operation["kind"], "remove_compaction");
         state.receive(reply("save", 200, serde_json::json!({})));
         press(&mut state, KeyCode::Char('e'));
-        let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
-        let command = state.key(ctrl_enter).expect("replace command");
-        let operation = &command.body.expect("body")["edit"]["operations"][0];
+        let operation = first_operation(state.key(CTRL_ENTER).expect("replace command"));
         assert_eq!(operation["kind"], "replace_compaction");
-        assert_eq!(operation["compaction"]["target"]["route_id"], "route-a");
+        assert_eq!(operation["compaction"]["target"]["kind"], "substitution");
     }
 
     /// The terminal builds default and compaction edits by hand as well; the
@@ -1641,23 +2009,21 @@ mod tests {
         assert_eq!(edit.operations.len(), 4);
     }
 
-    const CTRL_ENTER: KeyEvent = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
-
     #[test]
     fn adding_a_presentation_sends_the_typed_addition_against_the_live_revision() {
-        let mut state = loaded(full_snapshot());
+        let mut state = loaded(World::AT_REST);
         assert!(press(&mut state, KeyCode::Char('n')).is_none());
         assert_eq!(
             form_purpose(&state),
             record_form("presentations", true),
-            "a one-kind view opens the template directly"
+            "a one-kind tab opens the template directly"
         );
         assert_eq!(form_value(&state)["id"], "new-presentation");
         let command = state.key(CTRL_ENTER).expect("add command");
         assert_eq!(command.name, "save");
         assert_eq!(command.method, Method::POST);
         let body = command.body.expect("body");
-        assert_eq!(body["expected_revision_id"], 3);
+        assert_eq!(body["expected_revision_id"], 9);
         let operation = &body["edit"]["operations"][0];
         assert_eq!(operation["kind"], "add_presentation");
         assert_eq!(operation["presentation"]["id"], "new-presentation");
@@ -1669,21 +2035,21 @@ mod tests {
 
     #[test]
     fn an_added_record_is_what_was_typed_into_the_form() {
-        let mut state = loaded(full_snapshot());
+        let mut state = loaded(World::AT_REST);
         press(&mut state, KeyCode::Char('n'));
         for _ in 0.."new-presentation".len() {
             press(&mut state, KeyCode::Backspace);
         }
         typed(&mut state, "mine");
         let command = state.key(CTRL_ENTER).expect("add command");
-        let operation = &command.body.expect("body")["edit"]["operations"][0];
+        let operation = first_operation(command);
         assert_eq!(operation["presentation"]["id"], "mine");
         assert_eq!(operation["presentation"]["slug"], "new-model");
     }
 
     #[test]
     fn a_blank_id_stays_open_and_sends_nothing() {
-        let mut state = loaded(full_snapshot());
+        let mut state = loaded(World::AT_REST);
         press(&mut state, KeyCode::Char('n'));
         for _ in 0.."new-presentation".len() {
             press(&mut state, KeyCode::Backspace);
@@ -1700,10 +2066,8 @@ mod tests {
 
     #[test]
     fn adding_a_record_whose_id_exists_shows_the_daemons_refusal_in_the_form() {
-        let mut state = loaded(full_snapshot());
-        state.set_view(View::Routes);
+        let mut state = on(Tab::Routes);
         press(&mut state, KeyCode::Char('n'));
-        press(&mut state, KeyCode::Char('1'));
         assert!(state.key(CTRL_ENTER).is_some());
         // The refusal text is the daemon's own: the template's route added
         // to a policy that already holds a route of that id.
@@ -1739,10 +2103,9 @@ mod tests {
     }
 
     #[test]
-    fn a_view_with_several_kinds_asks_which_to_add() {
-        let mut state = loaded(defaults_snapshot());
-        state.set_view(View::Routes);
-        // The cursor is on a route, so a route is the preselected kind.
+    fn the_models_tab_asks_which_kind_to_add_by_the_panel_it_is_in() {
+        let mut state = on(Tab::Models);
+        // The focus is in upgrades: an upgrade is the preselected kind.
         press(&mut state, KeyCode::Char('n'));
         assert!(matches!(
             state.modal(),
@@ -1751,75 +2114,68 @@ mod tests {
         assert!(press(&mut state, KeyCode::Char('x')).is_none());
         assert!(matches!(state.modal(), Modal::NewKind { .. }));
         press(&mut state, KeyCode::Enter);
-        assert_eq!(
-            form_purpose(&state),
-            record_form("routes", true),
-            "Enter picks the preselected kind"
-        );
+        assert_eq!(form_purpose(&state), record_form("upgrades", true));
         press(&mut state, KeyCode::Esc);
 
-        // With the cursor on a default, a default is the preselected kind.
-        state.move_selection(1);
+        // In the compaction line, the compaction is.
+        state.move_selection(5);
         press(&mut state, KeyCode::Char('n'));
         assert!(matches!(
             state.modal(),
             Modal::NewKind { preselected: 1, .. }
         ));
-        press(&mut state, KeyCode::Esc);
-        assert!(!state.modal().active());
-
-        // A number picks a kind whatever the cursor is on.
-        press(&mut state, KeyCode::Char('n'));
+        // A number picks a kind whatever the focus is on.
         press(&mut state, KeyCode::Char('9'));
         assert!(matches!(state.modal(), Modal::NewKind { .. }));
-        press(&mut state, KeyCode::Char('2'));
-        assert_eq!(form_purpose(&state), record_form("defaults", true));
+        press(&mut state, KeyCode::Char('1'));
+        assert_eq!(form_purpose(&state), record_form("upgrades", true));
     }
 
     #[test]
-    fn every_kind_in_the_rewrites_view_can_be_added() {
-        let mut state = loaded(defaults_snapshot());
-        state.set_view(View::Rewrites);
-        for (digit, kind, operation) in [
-            ('1', "rewrites", "add_rewrite"),
-            ('2', "classifiers", "add_classifier"),
-            ('3', "upgrades", "add_upgrade"),
-            ('4', "compaction", "add_compaction"),
+    fn every_kind_of_record_can_be_added_from_the_tab_that_shows_it() {
+        for (tab, digits, kind, operation) in [
+            (Tab::Presentations, "", "presentations", "add_presentation"),
+            (Tab::Rewrites, "", "rewrites", "add_rewrite"),
+            (Tab::Defaults, "", "defaults", "add_default"),
+            (Tab::Routes, "", "routes", "add_route"),
+            (Tab::Models, "1", "upgrades", "add_upgrade"),
+            (Tab::Models, "2", "compaction", "add_compaction"),
         ] {
+            let mut state = on(tab);
             press(&mut state, KeyCode::Char('n'));
-            press(&mut state, KeyCode::Char(digit));
-            assert_eq!(form_purpose(&state), record_form(kind, true));
-            let command = state.key(CTRL_ENTER).expect("add command");
-            assert_eq!(
-                command.body.expect("body")["edit"]["operations"][0]["kind"],
-                operation
-            );
-            state.receive(reply("save", 200, serde_json::json!({})));
+            for digit in digits.chars() {
+                press(&mut state, KeyCode::Char(digit));
+            }
+            assert_eq!(form_purpose(&state), record_form(kind, true), "{tab:?}");
+            let operation_sent = first_operation(state.key(CTRL_ENTER).expect("add command"));
+            assert_eq!(operation_sent["kind"], operation, "{tab:?}");
         }
+        // A family is added with the focus in families.
+        let mut state = on(Tab::Models);
+        state.move_selection(-1);
+        press(&mut state, KeyCode::Char('n'));
+        assert_eq!(form_purpose(&state), record_form("classifiers", true));
     }
 
     #[test]
     fn a_new_default_starts_from_the_first_route_and_adds_by_scope() {
-        let mut state = loaded(defaults_snapshot());
-        state.set_view(View::Routes);
+        let mut state = on(Tab::Defaults);
         press(&mut state, KeyCode::Char('n'));
-        press(&mut state, KeyCode::Char('2'));
         let template = form_value(&state);
-        assert_eq!(template["target"]["route_id"], "route-a");
+        assert_eq!(template["target"]["route_id"], "claude-sub");
         let command = state.key(CTRL_ENTER).expect("add command");
-        let operation = &command.body.expect("body")["edit"]["operations"][0];
+        let operation = first_operation(command);
         assert_eq!(operation["kind"], "add_default");
         assert_eq!(operation["default"], template);
     }
 
     #[test]
-    fn adding_is_not_offered_in_the_status_view_or_while_busy() {
-        let mut state = loaded(full_snapshot());
-        state.set_view(View::Status);
+    fn adding_is_not_offered_in_history_or_while_busy() {
+        let mut state = on(Tab::History);
         assert!(press(&mut state, KeyCode::Char('n')).is_none());
         assert!(!state.modal().active());
         assert!(state.error().is_some());
-        state.set_view(View::Presentations);
+        state.set_tab(Tab::Presentations);
         press(&mut state, KeyCode::Char('d'));
         press(&mut state, KeyCode::Char('y'));
         assert!(state.in_flight());

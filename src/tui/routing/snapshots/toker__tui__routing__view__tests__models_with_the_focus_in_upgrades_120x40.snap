@@ -1,0 +1,44 @@
+---
+source: src/tui/routing/view.rs
+expression: "frame(&state, 120, 40)"
+---
+ ?   dashboard   routing   config   accounts   ‹ 2 rewrites → 3 defaults → 4 routes · 5 models 11 · 6 history rev 9 live
+┌FAMILIES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ family           matches                         example                       reads as                              │
+│ claude-opus      claude-opus-*                   claude-opus-4-7               opus · 4.7                            │
+│ claude-sonnet    claude-sonnet-*                 claude-sonnet-4-5             sonnet · 4.5                          │
+│ claude-haiku     claude-haiku-*                  claude-haiku-4-5              haiku · 4.5                           │
+│ gpt              gpt-*                           openai/gpt-5.6-sol            sol · 5.6                             │
+│ qwen             qwen/qwen*                      qwen/qwen3.5-max              max · 3.5                             │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌UPGRADES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ newest  5 upgrades                                                                 evidence bar                      │
+│ claude-sub            claude-opus-4-7              → claude-opus-5                 scaled: 3 of 4 active days        │
+│ claude-api            claude-sonnet-4-5            → claude-sonnet-5               scaled: 3 of 4 active days        │
+│ openrouter-messages   anthropic/claude-sonnet-4-5  → anthropic/claude-sonnet-5     scaled: 3 of 4 active days        │
+│ openrouter-responses  openai/gpt-5.5-sol           → openai/gpt-5.6-sol            scaled: 2 of 3 active days        │
+│ codex                 gpt-5.5-terra                → gpt-5.6-terra                 scaled: 2 of 3 active days        │
+│ [e] edit   [n] new   [d] delete   [p] promote                                                                        │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌COMPACTION────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ cold compactions      → sonnet                     on anthropic_sub · anthropic_api  cache allowed when cold         │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌OFFERS────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ openrouter.openrouter_chat_completions  440 offers                                                                   │
+│ … 180 above                                                                                                          │
+│ openai/gpt-4-turbo-preview                     128k   2024-01                                                        │
+│ openai/gpt-4.1                                   1M   2025-04                                                        │
+│ openai/gpt-4.1-mini                              1M   2025-04                                                        │
+│ openai/gpt-4.1-nano                              1M   2025-04                                                        │
+│ openai/gpt-4o                                  128k   2024-05                                                        │
+│ openai/gpt-4o-2024-05-13                       128k   2024-05                                                        │
+│ openai/gpt-4o-2024-08-06                       128k   2024-08                                                        │
+│ openai/gpt-4o-2024-11-20                       128k   2024-11                                                        │
+│ openai/gpt-4o-audio-preview                    128k   2024-10                                                        │
+│ openai/gpt-4o-mini                             128k   2024-07                                                        │
+│ openai/gpt-4o-mini-2024-07-18                  128k   2024-07                                                        │
+│ openai/gpt-4o-mini-search-preview              128k   2025-03                                                        │
+│ openai/gpt-4o-search-preview                   128k   2025-03                                                        │
+│ openai/gpt-4o:extended                         128k   2024-05                                                        │
+│ … 246 more                                                                                                           │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

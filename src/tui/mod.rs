@@ -480,6 +480,13 @@ pub fn run(
                 }
                 crossterm::event::KeyCode::Char('?') => toggle_legend(&mut ui),
                 crossterm::event::KeyCode::Esc if ui.legend => ui.legend = false,
+                // A route opened whole closes to its table first; the next
+                // Esc leaves the page.
+                crossterm::event::KeyCode::Esc
+                    if page == Page::Routing && routing.captures_esc() =>
+                {
+                    routing.key(key);
+                }
                 crossterm::event::KeyCode::Esc
                     if matches!(page, Page::Routing | Page::Config | Page::Accounts) =>
                 {
@@ -553,6 +560,12 @@ pub fn run(
                 }
                 crossterm::event::KeyCode::Char('4') if page == Page::Routing => {
                     routing.set_view(3)
+                }
+                crossterm::event::KeyCode::Char('5') if page == Page::Routing => {
+                    routing.set_view(4)
+                }
+                crossterm::event::KeyCode::Char('6') if page == Page::Routing => {
+                    routing.set_view(5)
                 }
                 crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k')
                     if page == Page::Routing =>

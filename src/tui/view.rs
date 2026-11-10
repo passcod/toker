@@ -1873,7 +1873,7 @@ fn scrolled(list: Vec<Line<'static>>, window: &ListWindow) -> Vec<Line<'static>>
 
 /// Short tokens: round thousands and millions
 /// abbreviate; anything else is under a thousand, so ungrouped.
-fn short_tokens(tokens: u64) -> String {
+pub(super) fn short_tokens(tokens: u64) -> String {
     // Human-rounded, deliberately not exact: the CONTEXT panel carries
     // the precise figure (occupancy bar + exact counts), so the table's
     // cell answers "which league is this window in". ≥1M rounds to the
