@@ -45,17 +45,23 @@ const NOUN: Noun = Noun {
 };
 
 pub(super) fn render(frame: &mut Frame, state: &State, overlay: bool) -> Drawn {
-    // A refusal or a failed read is said over the page, which stays
-    // usable read-only on the snapshot it last loaded.
-    let (header, body) = chrome::page(frame, crate::tui::Page::Routing, state.error());
     let labels = View::ALL.map(|view| chrome::Tab::new(view.tab()));
     let current = View::ALL
         .iter()
         .position(|view| *view == state.view())
         .unwrap_or(0);
-    let tabs_min = chrome::tabs_min_width(&labels, current);
-    let tabs_area = chrome::status(frame, header.rest, tabs_min, &status_text(state));
-    let tabs = chrome::tabs(frame, tabs_area, &labels, current);
+    // A refusal or a failed read is said over the page, which stays
+    // usable read-only on the snapshot it last loaded.
+    let chrome::Laid { header, tabs, body } = chrome::page(
+        frame,
+        crate::tui::Page::Routing,
+        state.error(),
+        &chrome::Strip {
+            tabs: &labels,
+            current,
+            status: &status_text(state),
+        },
+    );
 
     let entries = state.entries();
     let list: Vec<Vec<Line<'static>>> = if entries.is_empty() {

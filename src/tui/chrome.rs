@@ -258,10 +258,13 @@ fn spans_width(spans: &Spans) -> usize {
 
 /// The tab strip's spans, from widest to narrowest: every tab in full;
 /// the other tabs without their counts; a window of tabs around the
-/// current one, as many as fit and at least two, marked where tabs are
+/// current one, as many as fit and at least three, marked where tabs are
 /// hidden; every tab as its number but the current; and the current tab
 /// alone, clipped to what is left. The current tab keeps its count
 /// throughout.
+///
+/// A window of two reads as a pair rather than a place in a sequence, so
+/// the numbers, which show every tab, are preferred to it.
 fn tab_spans(tabs: &[Tab], current: usize, width: usize) -> Spans {
     let last = tabs.len().saturating_sub(1);
     for others in [Others::Counted, Others::Named] {
@@ -288,7 +291,7 @@ fn tab_spans(tabs: &[Tab], current: usize, width: usize) -> Spans {
             break;
         }
     }
-    if lo < hi {
+    if hi - lo + 1 >= tabs.len().min(3) {
         return strip(tabs, current, lo, hi, Others::Named);
     }
     let numbers = strip(tabs, current, 0, last, Others::Numbered);
@@ -363,10 +366,33 @@ pub(super) fn status(frame: &mut Frame, area: Rect, tabs_min: u16, text: &str) -
     }
 }
 
-/// Lay out a page other than the dashboard: the header row, then the
-/// page's message under it for as many rows as it takes, then the body.
-/// The chips are left to [`chips`], drawn once the body is down.
-pub(super) fn page(frame: &mut Frame, current: Page, message: Option<&str>) -> (Header, Rect) {
+/// What a page puts in its header row after the page buttons: its tabs,
+/// which tab is current, and a status at the right. A page with neither
+/// leaves the default.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct Strip<'a> {
+    pub(super) tabs: &'a [Tab<'a>],
+    pub(super) current: usize,
+    pub(super) status: &'a str,
+}
+
+/// A page laid out: where its header's buttons and tabs are, and the body
+/// under them.
+#[derive(Debug, Clone)]
+pub(super) struct Laid {
+    pub(super) header: Header,
+    /// Each tab's rectangle, indexed like `Strip::tabs`; empty for one
+    /// scrolled out of the strip.
+    pub(super) tabs: Vec<Rect>,
+    pub(super) body: Rect,
+}
+
+/// Lay out a page other than the dashboard: the header row with its
+/// buttons, tabs and status, then the page's message under it for as many
+/// rows as it takes, then the body. Every such page goes through here, so
+/// they share one header. The buttons are left to [`chips`], drawn once the
+/// body is down.
+pub(super) fn page(frame: &mut Frame, current: Page, message: Option<&str>, strip: &Strip) -> Laid {
     let area = frame.area();
     let header = header(
         Rect {
@@ -375,6 +401,9 @@ pub(super) fn page(frame: &mut Frame, current: Page, message: Option<&str>) -> (
         },
         current,
     );
+    let tabs_min = tabs_min_width(strip.tabs, strip.current);
+    let tabs_area = status(frame, header.rest, tabs_min, strip.status);
+    let tabs = tabs(frame, tabs_area, strip.tabs, strip.current);
     let below = area.height - header.keys.height;
     let lines = message_lines(message, area.width.saturating_sub(2));
     // The body keeps a row: a message never takes the whole page.
@@ -395,7 +424,7 @@ pub(super) fn page(frame: &mut Frame, current: Page, message: Option<&str>) -> (
         height: below - rows,
         ..area
     };
-    (header, body)
+    Laid { header, tabs, body }
 }
 
 /// A page's message: what went wrong with the last thing it tried,
@@ -850,6 +879,101 @@ mod tests {
         assert_eq!(strip_text(&tabs, 0, 21), " 1 presentations 15 ›");
         assert_eq!(tabs_min_width(&tabs, 1), 18);
         assert_eq!(strip_text(&tabs, 1, 12), " ‹ 2 rewr… ›");
+    }
+
+    /// The header of the routing page as the mockups draw it, at `width`
+    /// columns, as text rows, with the buffer for styles.
+    fn header_frame(
+        width: u16,
+        current: Page,
+        strip: &Strip,
+    ) -> (String, ratatui::buffer::Buffer, Laid) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 2)).expect("terminal");
+        let mut laid = None;
+        terminal
+            .draw(|frame| {
+                let drawn = page(frame, current, None, strip);
+                chips(frame, &drawn.header);
+                laid = Some(drawn);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let text = (0..width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_owned();
+        (text, buffer, laid.expect("drawn"))
+    }
+
+    fn routing_strip<'a>(tabs: &'a [Tab<'a>], current: usize) -> Strip<'a> {
+        Strip {
+            tabs,
+            current,
+            status: "rev 9 live",
+        }
+    }
+
+    // The header at the three widths the design draws it at: whole at
+    // 120, scrolled to a window of the tabs at 100, and the current tab
+    // alone at 80, with the buttons whole throughout.
+    #[test]
+    fn the_header_at_120_columns() {
+        let tabs = lookup_tabs();
+        let (text, ..) = header_frame(120, Page::Routing, &routing_strip(&tabs, 1));
+        insta::assert_snapshot!("header_120", text);
+    }
+
+    #[test]
+    fn the_header_at_100_columns() {
+        let tabs = lookup_tabs();
+        let (text, ..) = header_frame(100, Page::Routing, &routing_strip(&tabs, 3));
+        insta::assert_snapshot!("header_100", text);
+    }
+
+    #[test]
+    fn the_header_at_80_columns() {
+        let tabs = lookup_tabs();
+        let (text, ..) = header_frame(80, Page::Routing, &routing_strip(&tabs, 1));
+        insta::assert_snapshot!("header_80", text);
+    }
+
+    #[test]
+    fn a_page_with_no_tabs_has_the_buttons_alone() {
+        let (text, _, laid) = header_frame(80, Page::Accounts, &Strip::default());
+        insta::assert_snapshot!("header_accounts_80", text);
+        assert!(laid.tabs.is_empty());
+    }
+
+    #[test]
+    fn the_current_button_is_bold_blue_and_the_others_dark_grey() {
+        let tabs = lookup_tabs();
+        let (_, buffer, laid) = header_frame(100, Page::Config, &routing_strip(&tabs, 0));
+        let style_at = |button: Rect| {
+            let cell = &buffer[(button.x + 1, button.y)];
+            (cell.fg, cell.modifier.contains(Modifier::BOLD))
+        };
+        for (button, page) in laid.header.pages.iter().zip(Page::ALL) {
+            let (fg, bold) = style_at(*button);
+            if page == Page::Config {
+                assert_eq!((fg, bold), (Color::Blue, true), "{page:?}");
+            } else {
+                assert_eq!((fg, bold), (Color::DarkGray, false), "{page:?}");
+            }
+        }
+        // A cell between two buttons is bare.
+        assert_eq!(buffer[(laid.header.pages[0].right(), 0)].symbol(), " ");
+    }
+
+    #[test]
+    fn a_window_of_two_gives_way_to_the_numbers() {
+        let tabs = lookup_tabs();
+        // The first two tabs would fit, but the numbers show all six.
+        assert_eq!(
+            strip_text(&tabs, 1, 35),
+            " 1 → 2 rewrites 14 → 3 → 4 · 5 · 6"
+        );
     }
 
     #[test]

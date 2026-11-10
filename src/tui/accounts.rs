@@ -198,7 +198,12 @@ impl Page {
     pub(super) fn render(&self, frame: &mut Frame, now_ms: i64, overlay: bool) -> chrome::Header {
         // A failed read or write says so over the last list read, which
         // stays standing: an empty page would read as "no accounts".
-        let (header, body) = chrome::page(frame, super::Page::Accounts, self.error.as_deref());
+        let chrome::Laid { header, body, .. } = chrome::page(
+            frame,
+            super::Page::Accounts,
+            self.error.as_deref(),
+            &chrome::Strip::default(),
+        );
         let width = usize::from(body.width.saturating_sub(2));
         let entries: Vec<Vec<Line<'static>>> = if self.entries.is_empty() {
             vec![vec![Line::styled(

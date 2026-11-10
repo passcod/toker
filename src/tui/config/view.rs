@@ -38,7 +38,6 @@ const KEYS: [(&str, &str); 8] = [
 pub(super) fn render(frame: &mut Frame, state: &State, overlay: bool) -> Drawn {
     // A refused value is reported on the page, under the header, for as
     // many rows as it takes (spec: UTUI#the-configuration-pages).
-    let (header, body) = chrome::page(frame, crate::tui::Page::Config, state.error());
     let current = match state.view() {
         View::Providers => 0,
         View::Settings => 1,
@@ -52,7 +51,16 @@ pub(super) fn render(frame: &mut Frame, state: &State, overlay: bool) -> Drawn {
         },
         chrome::Tab::new(TABS[1]),
     ];
-    let tabs = chrome::tabs(frame, header.rest, &strip, current);
+    let chrome::Laid { header, tabs, body } = chrome::page(
+        frame,
+        crate::tui::Page::Config,
+        state.error(),
+        &chrome::Strip {
+            tabs: &strip,
+            current,
+            status: "",
+        },
+    );
 
     let rows = if !state.reachable() {
         // The service is the only writer, so a form the operator can
