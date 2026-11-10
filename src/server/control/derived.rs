@@ -534,7 +534,6 @@ fn presentations_body<L: LearningView>(
     policy: &CompiledPolicy,
     inputs: &Inputs<'_, L>,
 ) -> Vec<Value> {
-    let active = inputs.active;
     let mut rows = Vec::new();
     for (scope, slug, presentation) in policy.all_presentations() {
         let protocol = protocol_of(&scope);
@@ -558,14 +557,7 @@ fn presentations_body<L: LearningView>(
             "adapter": adapter,
             "desired": desired,
             "reason": reason,
-            "applied": active.and_then(|active| applied_state(
-                active,
-                inputs,
-                profile,
-                protocol,
-                slug,
-                adapter,
-            )),
+            "applied": applied_state(inputs, desired, slug, adapter),
         }));
     }
     rows
@@ -615,39 +607,17 @@ fn listing_slugs(listing: &Value) -> impl Iterator<Item = &str> {
 
 /// Whether the active revision's publication holds the slug right now. The
 /// chat and responses lists are rendered from the active revision on every
-/// request, so they hold exactly what it lists. The claude picker is a
+/// request, so they hold exactly what it desires. The claude picker is a
 /// settings file, so it holds what the last applied sync wrote; `None` when
 /// no sync has recorded its rows.
 fn applied_state<L: LearningView>(
-    active: &CompiledPolicy,
     inputs: &Inputs<'_, L>,
-    profile: Option<&crate::policy::ProfileId>,
-    protocol: FrontendProtocol,
+    desired: &str,
     slug: &str,
     adapter: &str,
 ) -> Option<bool> {
     if adapter != CLAUDE_ADAPTER {
-        let presentation = match profile {
-            Some(profile) => active.presentation(
-                &FrontendScope::Profile {
-                    profile: profile.clone(),
-                    protocol,
-                },
-                slug,
-            ),
-            None => active.presentation(&FrontendScope::Protocol { protocol }, slug),
-        }?;
-        return Some(
-            desired_state(
-                active,
-                inputs.inventory,
-                profile,
-                protocol,
-                slug,
-                presentation,
-            )
-            .0 == "listed",
-        );
+        return Some(desired == "listed");
     }
     inputs
         .publications
