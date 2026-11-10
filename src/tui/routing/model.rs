@@ -1444,6 +1444,16 @@ impl State {
                         .collect(),
                 );
             }
+            context.parameters = array(policy, "routes")
+                .iter()
+                .filter_map(|route| {
+                    let declared = array(route, "parameters")
+                        .iter()
+                        .filter_map(|name| name.as_str().map(str::to_owned))
+                        .collect();
+                    Some((text(route, "id")?, declared))
+                })
+                .collect();
             // What tells a classifier or an upgrade policy apart from the
             // others in a field's list.
             let about = |collection: &'static str, say: fn(&Value) -> String| {
@@ -2904,6 +2914,11 @@ mod tests {
         let mut state = on(Tab::Defaults);
         press(&mut state, KeyCode::Char('n'));
         assert_eq!(form_value(&state)["target"]["route_id"], "claude-sub");
+        // The route takes the requested model, which is passed through.
+        assert_eq!(
+            form_value(&state)["target"]["parameters"],
+            serde_json::json!({"requested_model": {"kind": "requested_model"}})
+        );
     }
 
     /// A duplicate is the add form filled from the selected rewrite, with an

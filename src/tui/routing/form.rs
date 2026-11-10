@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{Map, Value, json};
 
+use crate::policy::REQUESTED_MODEL_PARAMETER;
+
 /// What a field holds and how it is edited.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Node {
@@ -618,6 +620,8 @@ pub(super) struct Context {
     /// the records a field can name apart in its list, and what a field
     /// naming a route says beside itself once it is accepted.
     pub(super) about: BTreeMap<&'static str, BTreeMap<String, String>>,
+    /// The parameters each route declares, by its id.
+    pub(super) parameters: BTreeMap<String, Vec<String>>,
 }
 
 /// One step into a value.
@@ -776,8 +780,62 @@ impl Form {
             note: None,
             findings: Vec::new(),
         };
+        for (path, _) in form.route_choices() {
+            form.fill_arguments(&path);
+        }
         form.focus_first();
         form
+    }
+
+    /// Each field naming the route a reference sends to, by its path, with
+    /// the route it names.
+    fn route_choices(&self) -> Vec<(Vec<Seg>, String)> {
+        self.rows()
+            .into_iter()
+            .filter(|row| {
+                matches!(row.op, Op::Input(Input::Ref { kind: "routes", .. }))
+                    && row.path.last() == Some(&key("route_id"))
+            })
+            .map(|row| {
+                let route = get(&self.value, &row.path).as_str().unwrap_or("");
+                (row.path.clone(), route.to_owned())
+            })
+            .collect()
+    }
+
+    /// Give the reference whose route field is at `path` one argument for
+    /// each parameter its route declares and no other, leaving only the
+    /// values to choose (spec: UTUI#editing). An argument the route still
+    /// declares keeps its value. A route the policy does not hold, as while
+    /// its name is being typed, leaves the arguments as they are. What a
+    /// reference must supply is RDOC's (spec: RDOC#routes-and-candidates).
+    fn fill_arguments(&mut self, path: &[Seg]) {
+        let route = get(&self.value, path).as_str().unwrap_or("");
+        let Some(declared) = self.context.parameters.get(route).cloned() else {
+            return;
+        };
+        let mut owner = path[..path.len() - 1].to_vec();
+        owner.push(key("parameters"));
+        let current = get(&self.value, &owner);
+        let old = current.as_object().cloned().unwrap_or_default();
+        let same =
+            old.len() == declared.len() && declared.iter().all(|name| old.contains_key(name));
+        // A reference that leaves the map out supplies none, which is
+        // what a route declaring none wants.
+        if same || (declared.is_empty() && current.is_null()) {
+            return;
+        }
+        let arguments: Map<String, Value> = declared
+            .into_iter()
+            .map(|name| {
+                let argument = old
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(|| argument_for(&name));
+                (name, argument)
+            })
+            .collect();
+        *get_mut(&mut self.value, &owner) = Value::Object(arguments);
     }
 
     pub(super) fn purpose(&self) -> Purpose {
@@ -1436,6 +1494,17 @@ impl Form {
     }
 
     pub(super) fn key(&mut self, event: KeyEvent) -> Outcome {
+        let before = self.route_choices();
+        let outcome = self.handle(event);
+        for (path, route) in self.route_choices() {
+            if !before.contains(&(path.clone(), route)) {
+                self.fill_arguments(&path);
+            }
+        }
+        outcome
+    }
+
+    fn handle(&mut self, event: KeyEvent) -> Outcome {
         self.note = None;
         let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
         let alt = event.modifiers.contains(KeyModifiers::ALT);
@@ -2003,6 +2072,16 @@ fn default_for(node: &Node, present: bool) -> Value {
             "first": object_of(CANDIDATE),
             "steps": [],
         }),
+    }
+}
+
+/// The argument a parameter starts with: the model the client asked for,
+/// for the parameter reserved for it, and otherwise a value to fill in.
+fn argument_for(parameter: &str) -> Value {
+    if parameter == REQUESTED_MODEL_PARAMETER {
+        json!({ "kind": "requested_model" })
+    } else {
+        json!({ "kind": "literal", "value": "" })
     }
 }
 
@@ -2845,6 +2924,151 @@ mod tests {
         let list = listed(&form);
         assert_eq!(list.len(), 1);
         assert!(list[0].text.contains("no route to name yet"), "{list:?}");
+    }
+
+    /// Three routes: one taking the requested model and a tier, one taking
+    /// only a tier, and one taking nothing.
+    fn routes_with_parameters() -> Context {
+        let mut context = Context::default();
+        let routes = [
+            ("fast", &["requested_model", "tier"][..]),
+            ("slow", &["tier"]),
+            ("bare", &[]),
+        ];
+        context.ids.insert(
+            "routes",
+            routes.iter().map(|(id, _)| (*id).to_owned()).collect(),
+        );
+        context.parameters = routes
+            .iter()
+            .map(|(id, declared)| {
+                let declared = declared.iter().map(|name| (*name).to_owned()).collect();
+                ((*id).to_owned(), declared)
+            })
+            .collect();
+        context
+    }
+
+    /// Choose the `nth` route of a reference's list.
+    fn choose(form: &mut Form, nth: usize) {
+        focus_label(form, "route");
+        for _ in 0..=nth {
+            press(form, KeyCode::Down);
+        }
+        press(form, KeyCode::Enter);
+    }
+
+    /// A form that opens on a route has an argument for each of its
+    /// parameters, the requested model passed through and the rest to fill.
+    #[test]
+    fn a_reference_opens_with_an_argument_per_parameter_of_its_route() {
+        let form = a_default(routes_with_parameters());
+        assert_eq!(
+            form.value()["target"]["parameters"],
+            json!({
+                "requested_model": {"kind": "requested_model"},
+                "tier": {"kind": "literal", "value": ""},
+            })
+        );
+    }
+
+    /// Choosing another route keeps the arguments it shares with the last
+    /// one and drops those it does not declare.
+    #[test]
+    fn choosing_a_route_fills_its_arguments_and_keeps_the_shared_ones() {
+        let mut form = a_default(routes_with_parameters());
+        form.value["target"]["parameters"]["tier"]["value"] = Value::from("gold");
+        choose(&mut form, 1);
+        assert_eq!(form.value()["target"]["route_id"], "slow");
+        assert_eq!(
+            form.value()["target"]["parameters"],
+            json!({"tier": {"kind": "literal", "value": "gold"}})
+        );
+        choose(&mut form, 2);
+        assert_eq!(form.value()["target"]["parameters"], json!({}));
+        choose(&mut form, 0);
+        assert_eq!(
+            form.value()["target"]["parameters"],
+            json!({
+                "requested_model": {"kind": "requested_model"},
+                "tier": {"kind": "literal", "value": ""},
+            })
+        );
+    }
+
+    /// A route being typed is not one yet: its arguments stay until it
+    /// names one, and an argument added by hand stays while the route is
+    /// the same.
+    #[test]
+    fn arguments_change_only_when_the_route_does() {
+        let mut form = a_default(routes_with_parameters());
+        focus_label(&mut form, "route");
+        for _ in 0.."fast".len() {
+            press(&mut form, KeyCode::Backspace);
+        }
+        type_text(&mut form, "slo");
+        assert_eq!(
+            form.value()["target"]["parameters"]["requested_model"]["kind"],
+            "requested_model"
+        );
+        type_text(&mut form, "w");
+        assert_eq!(
+            form.value()["target"]["parameters"],
+            json!({"tier": {"kind": "literal", "value": ""}})
+        );
+        focus_label(&mut form, "argument");
+        press(&mut form, KeyCode::Enter);
+        assert_eq!(
+            form.value()["target"]["parameters"]
+                .as_object()
+                .map(Map::len),
+            Some(2),
+            "an argument added by hand is kept"
+        );
+    }
+
+    /// A rewrite and a presentation's route fill their arguments the same.
+    #[test]
+    fn every_reference_fills_its_arguments() {
+        let rewrite = Form::new(
+            Purpose::Record {
+                kind: "rewrites",
+                adding: true,
+            },
+            template("rewrites", Some("slow")),
+            routes_with_parameters(),
+        );
+        assert_eq!(
+            rewrite.value()["target"]["parameters"],
+            json!({"tier": {"kind": "literal", "value": ""}})
+        );
+        let mut presentation = Form::new(
+            Purpose::Record {
+                kind: "presentations",
+                adding: true,
+            },
+            template("presentations", None),
+            routes_with_parameters(),
+        );
+        let rows = presentation.rows();
+        let kind = rows
+            .iter()
+            .position(|row| matches!(&row.op, Op::Tag { .. }) && row.path == vec![key("source")])
+            .expect("a source kind row");
+        presentation.set_focus(kind);
+        press(&mut presentation, KeyCode::Left);
+        assert_eq!(presentation.value()["source"]["kind"], "virtual");
+        choose(&mut presentation, 2);
+        assert_eq!(presentation.value()["source"]["target"]["route_id"], "bare");
+        assert_eq!(
+            presentation.value()["source"]["target"]["parameters"],
+            json!({})
+        );
+        choose(&mut presentation, 0);
+        assert_eq!(
+            presentation.value()["source"]["target"]["parameters"]["requested_model"],
+            json!({"kind": "requested_model"})
+        );
     }
 
     #[test]
