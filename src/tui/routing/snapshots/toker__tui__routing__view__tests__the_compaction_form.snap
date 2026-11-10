@@ -1,31 +1,31 @@
 ---
 source: src/tui/routing/view.rs
-expression: "frame(&adding(super::View::Rewrites, '4'))"
+expression: "frame(&adding(Tab::Models, Some('2')), 120, 32)"
 ---
- ?   dashboard   routing   config   accounts   1  2  3 rewrites, families, upgrades & compaction  4           revision 3
-┌REWR┌ADD COMPACTION──────────────────────────────────────────────────────────────────────────────────────────────┐────┐
-│r-so│  ROUTE                                                                                                     │    │
-│gpt-│>   route: mixed▏                                                                                           │    │
-│newe│    Tab: mixed                                                                                              │    │
-│    │    ARGUMENTS                                                                                               │    │
-│    │      + add argument                                                                                        │    │
-│    │  lane transition: < move_when_cold >                                                                       │    │
-│    │  cache transition: < allow_when_cold >                                                                     │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
+ ?   dashboard   routing   config   accounts   ‹ 2 rewrites → 3 defaults → 4 routes · 5 models 11 · 6 history rev 9 live
+┌FAMI┌ADD COMPACTION──────────────────────────────────────────────────────────────────────────────────────────────┐────┐
+│ fam│  ROUTE                                                                                                     │    │
+│ cla│>   route: claude-sub▏                                                                                      │    │
+│ cla│    Tab: claude-sub                                                                                         │    │
+│ cla│    ARGUMENTS                                                                                               │    │
+│ gpt│      + add argument                                                                                        │    │
+│ qwe│  lane transition: < move_when_cold >                                                                       │    │
+└────│  cache transition: < allow_when_cold >                                                                     │────┘
+┌UPGR│                                                                                                            │────┐
+│ new│                                                                                                            │    │
+│ cla│                                                                                                            │    │
+│ cla│                                                                                                            │    │
+│ ope│                                                                                                            │    │
+│ ope│                                                                                                            │    │
+│ cod│                                                                                                            │    │
+│ [e]│                                                                                                            │    │
+└────│                                                                                                            │────┘
+┌COMP│                                                                                                            │────┐
+│ col│                                                                                                            │    │
+└────│                                                                                                            │────┘
+┌OFFE│                                                                                                            │────┐
+│ ant│                                                                                                            │    │
+│ cla│                                                                                                            │    │
 │    │                                                                                                            │    │
 │    │                                                                                                            │    │
 │    │                                                                                                            │    │
@@ -33,4 +33,4 @@ expression: "frame(&adding(super::View::Rewrites, '4'))"
 │    │↑/↓ field · ←/→ change · tab complete · ctrl+s save · esc cancel                                            │    │
 │    │                                                                                                            │    │
 │    └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
-└────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

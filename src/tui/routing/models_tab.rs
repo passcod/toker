@@ -346,7 +346,7 @@ fn offer_lines(state: &State) -> (String, Vec<Line<'static>>) {
                 .and_then(Value::as_i64)
                 .map_or_else(String::new, month);
             Cells::new()
-                .cell(vec![Span::raw(text(offer, "model_id").to_owned())], 45)
+                .cell(vec![Span::raw(text(offer, "model_id").to_owned())], 43)
                 .right(vec![Span::raw(window)], 6)
                 .cell(Vec::new(), 3)
                 .raw(vec![Span::raw(since)])

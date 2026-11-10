@@ -1,31 +1,31 @@
 ---
 source: src/tui/routing/view.rs
-expression: "frame(&adding(super::View::Rewrites, '3'))"
+expression: "frame(&adding(Tab::Models, Some('1')), 120, 32)"
 ---
- ?   dashboard   routing   config   accounts   1  2  3 rewrites, families, upgrades & compaction  4           revision 3
-┌REWR┌ADD UPGRADE─────────────────────────────────────────────────────────────────────────────────────────────────┐────┐
-│r-so│> id: new-upgrade▏                                                                                          │    │
-│gpt-│  classifier: new-classifier  (not offered)                                                                 │    │
-│newe│  [x] enabled                                                                                               │    │
-│    │  MINIMUM LEARNING                                                                                          │    │
-│    │    kind: < explicit_promotion >                                                                            │    │
-│    │  [x] allow manual promotion                                                                                │    │
-│    │  INVENTORY SOURCES                                                                                         │    │
-│    │    [x] catalogue                                                                                           │    │
-│    │    [x] served                                                                                              │    │
-│    │    [x] learned                                                                                             │    │
-│    │  lane transition: < move_when_cold >                                                                       │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
+ ?   dashboard   routing   config   accounts   ‹ 2 rewrites → 3 defaults → 4 routes · 5 models 11 · 6 history rev 9 live
+┌FAMI┌ADD UPGRADE─────────────────────────────────────────────────────────────────────────────────────────────────┐────┐
+│ fam│> id: new-upgrade▏                                                                                          │    │
+│ cla│  classifier: new-classifier  (not offered)                                                                 │    │
+│ cla│  [x] enabled                                                                                               │    │
+│ cla│  MINIMUM LEARNING                                                                                          │    │
+│ gpt│    kind: < explicit_promotion >                                                                            │    │
+│ qwe│  [x] allow manual promotion                                                                                │    │
+└────│  INVENTORY SOURCES                                                                                         │────┘
+┌UPGR│    [x] catalogue                                                                                           │────┐
+│ new│    [x] served                                                                                              │    │
+│ cla│    [x] learned                                                                                             │    │
+│ cla│  lane transition: < move_when_cold >                                                                       │    │
+│ ope│                                                                                                            │    │
+│ ope│                                                                                                            │    │
+│ cod│                                                                                                            │    │
+│ [e]│                                                                                                            │    │
+└────│                                                                                                            │────┘
+┌COMP│                                                                                                            │────┐
+│ col│                                                                                                            │    │
+└────│                                                                                                            │────┘
+┌OFFE│                                                                                                            │────┐
+│ ant│                                                                                                            │    │
+│ cla│                                                                                                            │    │
 │    │                                                                                                            │    │
 │    │                                                                                                            │    │
 │    │                                                                                                            │    │
@@ -33,4 +33,4 @@ expression: "frame(&adding(super::View::Rewrites, '3'))"
 │    │↑/↓ field · ←/→ change · tab complete · ctrl+s save · esc cancel                                            │    │
 │    │                                                                                                            │    │
 │    └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
-└────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

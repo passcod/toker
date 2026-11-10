@@ -26,19 +26,19 @@ expression: "frame(&state, 120, 40)"
 ┌OFFERS────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ openrouter.openrouter_chat_completions  440 offers                                                                   │
 │ … 180 above                                                                                                          │
-│ openai/gpt-4-turbo-preview                     128k   2024-01                                                        │
-│ openai/gpt-4.1                                   1M   2025-04                                                        │
-│ openai/gpt-4.1-mini                              1M   2025-04                                                        │
-│ openai/gpt-4.1-nano                              1M   2025-04                                                        │
-│ openai/gpt-4o                                  128k   2024-05                                                        │
-│ openai/gpt-4o-2024-05-13                       128k   2024-05                                                        │
-│ openai/gpt-4o-2024-08-06                       128k   2024-08                                                        │
-│ openai/gpt-4o-2024-11-20                       128k   2024-11                                                        │
-│ openai/gpt-4o-audio-preview                    128k   2024-10                                                        │
-│ openai/gpt-4o-mini                             128k   2024-07                                                        │
-│ openai/gpt-4o-mini-2024-07-18                  128k   2024-07                                                        │
-│ openai/gpt-4o-mini-search-preview              128k   2025-03                                                        │
-│ openai/gpt-4o-search-preview                   128k   2025-03                                                        │
-│ openai/gpt-4o:extended                         128k   2024-05                                                        │
+│ openai/gpt-4-turbo-preview                   128k   2024-01                                                          │
+│ openai/gpt-4.1                                 1M   2025-04                                                          │
+│ openai/gpt-4.1-mini                            1M   2025-04                                                          │
+│ openai/gpt-4.1-nano                            1M   2025-04                                                          │
+│ openai/gpt-4o                                128k   2024-05                                                          │
+│ openai/gpt-4o-2024-05-13                     128k   2024-05                                                          │
+│ openai/gpt-4o-2024-08-06                     128k   2024-08                                                          │
+│ openai/gpt-4o-2024-11-20                     128k   2024-11                                                          │
+│ openai/gpt-4o-audio-preview                  128k   2024-10                                                          │
+│ openai/gpt-4o-mini                           128k   2024-07                                                          │
+│ openai/gpt-4o-mini-2024-07-18                128k   2024-07                                                          │
+│ openai/gpt-4o-mini-search-preview            128k   2025-03                                                          │
+│ openai/gpt-4o-search-preview                 128k   2025-03                                                          │
+│ openai/gpt-4o:extended                       128k   2024-05                                                          │
 │ … 246 more                                                                                                           │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

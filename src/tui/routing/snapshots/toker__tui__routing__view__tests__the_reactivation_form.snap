@@ -1,36 +1,26 @@
 ---
 source: src/tui/routing/view.rs
-expression: frame(&state)
+expression: "frame(&state, 120, 32)"
 ---
- ?   dashboard   routing   config   accounts   1  2  3  4 preview, revisions & activation                     revision 3
-┌PREVIEW, REVISIONS & ACTIVATION─────────────────┐┌DETAIL──────────────────────────────────────────────────────────────┐
-│3  {"revision_id":3,"policy":{"description":"ex…││revision 3 is live                                                  │
-│2  {"revision_id":2}                            ││{                                                                   │
-│dynamic_responses_models  {"adapter":"dynamic_r…││  "revision_id": 2                                                  │
-│codex_sub.codex_responses  {"binding_id":"codex…││}                                                                   │
-│openrouter.openrouter_responses  {"binding_id":…││                                                                    │
-│lane_impacts  {"total":4,"unpinned":1,"warm":2,…││                                                                    │
-│                                                ││                                                                    │
-│                                                ││                                                                    │
-│                                                ││                                                                    │
-│                                                ││                                                                    │
-│                              ┌REACTIVATE REVISION────────────────────────────────────┐                               │
-│                              │Create a forward revision from revision 2?             │                               │
-│                              │The active pointer never moves backwards.              │                               │
-│                              │lanes: 4 total, 1 unpinned, 2 warm, 1 cold, 0 unknown  │                               │
-│                              │publication dynamic_responses_models: applied          │                               │
-│                              │y/enter confirm · n/esc cancel                         │                               │
-│                              └───────────────────────────────────────────────────────┘                               │
-│                                                ││                                                                    │
-│                                                ││                                                                    │
-│                                                ││                                                                    │
-│                                                ││                                                                    │
-│                                                ││                                                                    │
-│                                                ││                                                                    │
-│                                                ││                                                                    │
-│                                                ││                                                                    │
-│                                                ││                                                                    │
-│                                                ││                                                                    │
-│                                                ││                                                                    │
-│                                                ││                                                                    │
-└────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘
+ ?   dashboard   routing   config   accounts   ‹ 6 history 10            rev 10 live · 2 lanes on rev 9 · claude pending
+ reactivate: stale_revision (HTTP 409): revision 11 is now live; reload, then save again
+┌HISTORY───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│   revision      from            lanes pinned          description                                                    │
+│   rev 10 live   edit            8 cold                revision 10                                                    │
+│   rev 9         edit            2 warm                revision 9                                                     │
+│   rev 8         edit            none                  revision 8                                                     │
+│   rev 7         edit            none                  revision 7                                                     │
+│   rev 6         edit            none                  revision 6                                                     │
+│   rev 5         edit            none                  revision 5                                                     │
+│   rev 4         edit            none                  revision 4                                                     │
+│   rev 3    ┌REACTIVATE REVISION────────────────────────────────────────────────────────────────────────┐             │
+│   rev 2    │Create a forward revision from revision 9?                                                 │             │
+│   rev 1    │The active pointer never moves backwards.                                                  │             │
+└────────────│lanes: 10 total, 0 unpinned, 2 warm, 8 cold, 0 unknown                                     │─────────────┘
+┌REVISION────│publication claude_settings: pending                                                       │─────────────┐
+│ rev 9      │publication dynamic_chat_models: applied                                                   │             │
+│ from       │publication dynamic_responses_models: applied                                              │             │
+│ made from  │y/enter confirm · n/esc cancel                                                             │             │
+│ lanes pinne│! reactivate: stale_revision (HTTP 409): revision 11 is now live; reload, then save again  │             │
+│ [a] reactiv└───────────────────────────────────────────────────────────────────────────────────────────┘             │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

@@ -1,36 +1,36 @@
 ---
 source: src/tui/routing/view.rs
-expression: frame(&state)
+expression: "frame(&state, 120, 32)"
 ---
- ?   dashboard   routing   config   accounts   1  2  3  4 preview, revisions & activation                     revision 3
-PREVI┌ROUTING PREVIEW─────────────────────────────────────────────────────────────────────────────────────────────┐────
- 3  {│> protocol: < anthropic_messages >                                                                          │
- dyna│  profile: (none)                                                                                           │
- code│  model: (none)                                                                                             │
- open│  lane key: (none)                                                                                          │
- lane│  prompt bound: 0                                                                                           │
-     │  message count: (none)                                                                                     │
-     │  tool count: 0                                                                                             │
-     │  [ ] asks for server safeguards                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │content-free request facts only · space toggle · enter preview · esc cancel                                 │
-     │                                                                                                            │
-     └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                                                             "first": {
+ ?   dashboard   routing   config   accounts   ‹ 2 rewrites → 3 defaults → 4 routes · 5 models 11 · 6 history rev 9 live
+┌FAMI┌ROUTING PREVIEW─────────────────────────────────────────────────────────────────────────────────────────────┐────┐
+│ fam│> protocol: < anthropic_messages >                                                                          │    │
+│ cla│  profile: (none)                                                                                           │    │
+│ cla│  model: (none)                                                                                             │    │
+│ cla│  lane key: (none)                                                                                          │    │
+│ gpt│  prompt bound: 0                                                                                           │    │
+│ qwe│  message count: (none)                                                                                     │    │
+└────│  tool count: 0                                                                                             │────┘
+┌UPGR│  [ ] asks for server safeguards                                                                            │────┐
+│ new│                                                                                                            │    │
+│ cla│                                                                                                            │    │
+│ cla│                                                                                                            │    │
+│ ope│                                                                                                            │    │
+│ ope│                                                                                                            │    │
+│ cod│                                                                                                            │    │
+│ [e]│                                                                                                            │    │
+└────│                                                                                                            │────┘
+┌COMP│                                                                                                            │────┐
+│ col│                                                                                                            │    │
+└────│                                                                                                            │────┘
+┌OFFE│                                                                                                            │────┐
+│ ant│                                                                                                            │    │
+│ cla│                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │content-free request facts only · space toggle · enter preview · esc cancel                                 │    │
+│    │                                                                                                            │    │
+│    └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

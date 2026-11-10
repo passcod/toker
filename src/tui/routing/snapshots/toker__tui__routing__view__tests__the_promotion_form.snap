@@ -1,36 +1,36 @@
 ---
 source: src/tui/routing/view.rs
-expression: frame(&state)
+expression: "frame(&state, 120, 32)"
 ---
- ?   dashboard   routing   config   accounts   1  2  3  4 preview, revisions & activation                     revision 3
-PREVI┌PROMOTE LEARNED MODEL───────────────────────────────────────────────────────────────────────────────────────┐────
- 3  {│> binding: ▏                                                                                                │
- dyna│    Tab: anthropic_sub.anthropic_messages | anthropic_api.anthropic_messages | openai_api.openai_chat_comple│
- code│  model:                                                                                                    │
- open│                                                                                                            │
- lane│                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │                                                                                                            │
-     │tab complete from a daemon offer · enter record · esc cancel                                                │
-     │                                                                                                            │
-     └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                                                             "first": {
+ ?   dashboard   routing   config   accounts   ‹ 2 rewrites → 3 defaults → 4 routes · 5 models 11 · 6 history rev 9 live
+┌FAMI┌PROMOTE LEARNED MODEL───────────────────────────────────────────────────────────────────────────────────────┐────┐
+│ fam│> binding: ▏                                                                                                │    │
+│ cla│    Tab: anthropic_sub.anthropic_messages | anthropic_api.anthropic_messages | openai_api.openai_chat_comple│    │
+│ cla│  model:                                                                                                    │    │
+│ cla│                                                                                                            │    │
+│ gpt│                                                                                                            │    │
+│ qwe│                                                                                                            │    │
+└────│                                                                                                            │────┘
+┌UPGR│                                                                                                            │────┐
+│ new│                                                                                                            │    │
+│ cla│                                                                                                            │    │
+│ cla│                                                                                                            │    │
+│ ope│                                                                                                            │    │
+│ ope│                                                                                                            │    │
+│ cod│                                                                                                            │    │
+│ [e]│                                                                                                            │    │
+└────│                                                                                                            │────┘
+┌COMP│                                                                                                            │────┐
+│ col│                                                                                                            │    │
+└────│                                                                                                            │────┘
+┌OFFE│                                                                                                            │────┐
+│ ant│                                                                                                            │    │
+│ cla│                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │tab complete from a daemon offer · enter record · esc cancel                                                │    │
+│    │                                                                                                            │    │
+│    └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

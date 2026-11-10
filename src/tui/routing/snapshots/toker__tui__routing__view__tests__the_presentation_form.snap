@@ -1,36 +1,35 @@
 ---
 source: src/tui/routing/view.rs
-expression: "frame(&adding(super::View::Presentations, '1'))"
+expression: "frame(&adding(Tab::Presentations, None), 120, 32)"
 ---
- ?   dashboard   routing   config   accounts   1 presentations  2  3  4                                       revision 3
+ ?   dashboard   routing   config   accounts   1 presentations 15 → 2 rewrites → 3 defaults → 4 routes ›      rev 9 live
 ┌PRES┌ADD PRESENTATION────────────────────────────────────────────────────────────────────────────────────────────┐────┐
-│mixe│> id: new-presentation▏                                                                                     │    │
-│    │  SCOPE                                                                                                     │    │
-│    │    kind: < protocol >                                                                                      │    │
-│    │    protocol: < anthropic_messages >                                                                        │    │
-│    │  slug: new-model                                                                                           │    │
-│    │  label: New model                                                                                          │    │
-│    │  description: (none)                                                                                       │    │
-│    │  [x] enabled                                                                                               │    │
-│    │  [ ] shadows a native model                                                                                │    │
-│    │  SOURCE                                                                                                    │    │
-│    │    kind: < exact_offer >                                                                                   │    │
-│    │    binding: anthropic_sub.anthropic_messages                                                               │    │
-│    │    model: model-id                                                                                         │    │
-│    │  [ ] adapter metadata                                                                                      │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │↑/↓ field · ←/→ change · tab complete · ctrl+s save · esc cancel                                            │    │
-│    │                                                                                                            │    │
-│    └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
-└────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘
+│    │> id: new-presentation▏                                                                                     │    │
+│ ┌─ │  SCOPE                                                                                                     │─── │
+│ │  │    kind: < protocol >                                                                                      │    │
+│ │  │    protocol: < anthropic_messages >                                                                        │    │
+│ │  │  slug: new-model                                                                                           │    │
+│ │  │  label: New model                                                                                          │    │
+│ │  │  description: (none)                                                                                       │    │
+│ │  │  [x] enabled                                                                                               │    │
+│ │  │  [ ] shadows a native model                                                                                │    │
+│ │  │  SOURCE                                                                                                    │    │
+│ │  │    kind: < exact_offer >                                                                                   │    │
+│ │ 1│    binding: anthropic_sub.anthropic_messages                                                               │    │
+│ │ 1│    model: model-id  (not offered)                                                                          │    │
+│ │ 1│  [ ] adapter metadata                                                                                      │    │
+│ │ 1│                                                                                                            │    │
+│ │ 1│                                                                                                            │    │
+│ │ 1│                                                                                                            │    │
+│ └─ │                                                                                                            │    │
+└────│                                                                                                            │────┘
+┌PRES│                                                                                                            │────┐
+│ ope│                                                                                                            │    │
+│ inc│                                                                                                            │    │
+│ exc│                                                                                                            │    │
+│ lis│                                                                                                            │    │
+│ as │                                                                                                            │    │
+│ ove│                                                                                                            │    │
+│ pub│↑/↓ field · ←/→ change · tab complete · ctrl+s save · esc cancel                                            │    │
+│ [e]│                                                                                                            │    │
+└────└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘────┘

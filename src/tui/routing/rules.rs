@@ -845,7 +845,10 @@ pub(super) fn presentations_table(active: &Value, width: usize) -> Table {
                     span("else", dim()),
                     Span::raw("  "),
                 ])
-                .cell(vec![Span::raw("no slug equals it")], GUTTER + cols.0 - 7)
+                .cell(
+                    vec![Span::raw("no slug equals it")],
+                    (GUTTER + cols.0).saturating_sub(7),
+                )
                 .raw(vec![span("→ rewrites", dim())])
                 .line(),
         ));

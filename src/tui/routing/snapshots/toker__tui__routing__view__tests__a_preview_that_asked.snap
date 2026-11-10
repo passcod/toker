@@ -1,27 +1,27 @@
 ---
 source: src/tui/routing/view.rs
-expression: frame(&asked)
+expression: "frame(&asked, 120, 32)"
 ---
- ?   dashboard   routing   co┌ROUTING PREVIEW────────────────────────────────────────────┐                    revision 3
-PREVIEW, REVISIONS & ACTIVATI│any key close                                              │─────────────────────────────
- 3  {"revision_id":3,"policy"│{                                                          │
- dynamic_responses_models  {"│  "toker": "routing-preview",                              │
- codex_sub.codex_responses  {│  "ok": true,                                              │
- openrouter.openrouter_respon│  "result": {                                              │
- lane_impacts  {"total":4,"un│    "outcome": "selected",                                 │
-                             │    "route_id": "mixed",                                   │
-                             │    "server_safeguards": {                                 │
-                             │      "asked": true,                                       │
-                             │      "effective": "supported",                            │
-                             │      "marked": true,                                      │
-                             │      "skipped_candidate": true,                           │
-                             │      "walked_again": false                                │
-                             │    },                                                     │"
-                             │    "trace": [                                             │
-                             │      {                                                    │
-                             │        "kind": "candidate",                               │
-                             │        "candidate_id": "sub",                             │
-                             │        "binding_id": "codex_sub.codex_responses",         │
+ ?   dashboard   routing   co┌ROUTING PREVIEW────────────────────────────────────────────┐dels · 6 history 9  rev 9 live
+┌HISTORY─────────────────────│any key close                                              │─────────────────────────────┐
+│   revision      from       │{                                                          │                             │
+│   rev 9 live    edit       │  "toker": "routing-preview",                              │                             │
+│   rev 8         edit       │  "ok": true,                                              │                             │
+│   rev 7         edit       │  "result": {                                              │                             │
+│   rev 6         edit       │    "outcome": "selected",                                 │                             │
+│   rev 5         edit       │    "route_id": "claude-sub",                              │                             │
+│   rev 4         edit       │    "server_safeguards": {                                 │                             │
+│   rev 3         edit       │      "asked": true,                                       │                             │
+│   rev 2         edit       │      "effective": "supported",                            │                             │
+│   rev 1         setup      │      "marked": true,                                      │                             │
+└────────────────────────────│      "skipped_candidate": true,                           │─────────────────────────────┘
+┌REVISION────────────────────│      "walked_again": false                                │─────────────────────────────┐
+│ rev 9 · live               │    },                                                     │                             │
+│ from          edit         │    "trace": [                                             │                             │
+│ made from     rev 8        │      {                                                    │                             │
+│ lanes pinned  2 warm · 8 co│        "kind": "candidate",                               │                             │
+│ [a] reactivate             │        "candidate_id": "sub",                             │                             │
+└────────────────────────────│        "binding_id": "codex_sub.codex_responses",         │─────────────────────────────┘
                              │        "server_safeguards": "unsupported",                │
                              │        "result": {                                        │
                              │          "Err": "LacksServerSafeguards"                   │
@@ -30,7 +30,7 @@ PREVIEW, REVISIONS & ACTIVATI│any key close                                   
                              │      {                                                    │
                              │        "kind": "candidate",                               │
                              │        "candidate_id": "api",                             │
-                             │        "binding_id": "anthropic_api.anthropic_messages",  │hen billed",
-                             │        "server_safeguards": "supported",                  │old",
+                             │        "binding_id": "anthropic_api.anthropic_messages",  │
+                             │        "server_safeguards": "supported",                  │
                              │        "result": {                                        │
                              └───────────────────────────────────────────────────────────┘

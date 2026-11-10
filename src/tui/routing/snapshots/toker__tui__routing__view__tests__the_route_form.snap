@@ -1,36 +1,35 @@
 ---
 source: src/tui/routing/view.rs
-expression: frame(&state)
+expression: "frame(&state, 120, 32)"
 ---
- ?   dashboard   routing   config   accounts   1  2 routes, candidates & defaults  3  4                       revision 3
+ ?   dashboard   routing   config   accounts   ‹ 2 rewrites → 3 defaults → 4 routes 7 · 5 models · 6 history  rev 9 live
 ┌ROUT┌EDIT ROUTE──────────────────────────────────────────────────────────────────────────────────────────────────┐────┐
-│mixe│> id: mixed▏  (fixed)                                                                                       │    │
-│defa│  name: Subscription then billed                                                                            │    │
-│    │  description: (none)                                                                                       │    │
-│    │  PARAMETERS                                                                                                │    │
-│    │    + add parameter                                                                                         │    │
-│    │  CANDIDATES                                                                                                │    │
-│    │    candidate 1 sub                                                                                         │    │
-│    │      id: sub                                                                                               │    │
-│    │      binding: codex_sub.codex_responses                                                                    │    │
-│    │      MODEL                                                                                                 │    │
-│    │        kind: < exact >                                                                                     │s   │
-│    │        model: gpt-example                                                                                  │    │
-│    │      upgrade policy: (none)                                                                                │    │
-│    │      [ ] alias rules                                                                                       │    │
-│    │      REQUIRED CAPABILITIES                                                                                 │    │
-│    │        [ ] sampling                                                                                        │    │
-│    │        [ ] system in messages                                                                              │    │
-│    │        [ ] thinking replay                                                                                 │    │
-│    │        [ ] images                                                                                          │    │
-│    │        [ ] tools                                                                                           │    │
-│    │        [ ] tool choice none                                                                                │    │
-│    │        [ ] tool choice named                                                                               │    │
-│    │        [ ] tool choice unnamed                                                                             │    │
-│    │        [ ] tool choice other                                                                               │    │
-│    │      [x] enabled                                                                                           │    │
-│    │      HEALTH CIRCUITS                                                                                       │    │
-│    │↑/↓ field · ←/→ change · tab complete · ctrl+s save · esc cancel                                            │    │
-│    │                                                                                                            │    │
-│    └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
-└────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘
+│ rou│> id: claude-sub▏  (fixed)                                                                                  │    │
+│ cla│  name: claude-sub                                                                                          │    │
+│ cla│  description: (none)                                                                                       │    │
+│ ope│  PARAMETERS                                                                                                │    │
+│ ope│    parameter 1: requested_model                                                                            │    │
+│ ope│    + add parameter                                                                                         │    │
+│ ope│  CANDIDATES                                                                                                │    │
+│ cod│    candidate 1 sub                                                                                         │    │
+└────│      id: sub                                                                                               │────┘
+┌ROUT│      binding: anthropic_sub.anthropic_messages                                                             │────┐
+│ cla│      MODEL                                                                                                 │    │
+│ 1  │        kind: < requested_model >                                                                           │    │
+│    │      upgrade policy: (none)                                                                                │rm  │
+│ 2  │      [ ] alias rules                                                                                       │    │
+│ [e]│      REQUIRED CAPABILITIES                                                                                 │    │
+└────│        [ ] sampling                                                                                        │────┘
+     │        [ ] system in messages                                                                              │
+     │        [ ] thinking replay                                                                                 │
+     │        [ ] images                                                                                          │
+     │        [ ] tools                                                                                           │
+     │        [ ] tool choice none                                                                                │
+     │        [ ] tool choice named                                                                               │
+     │        [ ] tool choice unnamed                                                                             │
+     │        [ ] tool choice other                                                                               │
+     │      [x] enabled                                                                                           │
+     │      HEALTH CIRCUITS                                                                                       │
+     │↑/↓ field · ←/→ change · tab complete · ctrl+s save · esc cancel                                            │
+     │                                                                                                            │
+     └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

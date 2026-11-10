@@ -1,36 +1,35 @@
 ---
 source: src/tui/routing/view.rs
-expression: "frame(&adding(super::View::Routes, '2'))"
+expression: "frame(&adding(Tab::Defaults, None), 120, 32)"
 ---
- ?   dashboard   routing   config   accounts   1  2 routes, candidates & defaults  3  4                       revision 3
-┌ROUT┌ADD DEFAULT─────────────────────────────────────────────────────────────────────────────────────────────────┐────┐
-│mixe│  SCOPE                                                                                                     │    │
-│defa│>   kind: < protocol >                                                                                      │    │
-│    │    protocol: < openai_chat >                                                                               │    │
-│    │  ROUTE                                                                                                     │    │
-│    │    route: mixed                                                                                            │    │
-│    │    ARGUMENTS                                                                                               │    │
-│    │      + add argument                                                                                        │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │s   │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │↑/↓ field · ←/→ change · tab complete · ctrl+s save · esc cancel                                            │    │
-│    │                                                                                                            │    │
-│    └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
-└────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘
+ ?   dashboard   routing   config   accounts   1 presentations → 2 rewrites → 3 defaults 2 → 4 routes ›       rev 9 live
+┌DEFA┌ADD DEFAULT─────────────────────────────────────────────────────────────────────────────────────────────────┐────┐
+│   d│  SCOPE                                                                                                     │24h │
+│   a│>   kind: < protocol >                                                                                      │ ≥3 │
+│   o│    protocol: < openai_chat >                                                                               │  - │
+│   o│  ROUTE                                                                                                     │  - │
+└────│    route: claude-sub                                                                                       │────┘
+┌DEFA│    ARGUMENTS                                                                                               │────┐
+│ ant│      + add argument                                                                                        │    │
+│ sen│                                                                                                            │    │
+│ rea│                                                                                                            │    │
+│ rec│                                                                                                            │    │
+│ [e]│                                                                                                            │    │
+└────│                                                                                                            │────┘
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │↑/↓ field · ←/→ change · tab complete · ctrl+s save · esc cancel                                            │
+     │                                                                                                            │
+     └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
