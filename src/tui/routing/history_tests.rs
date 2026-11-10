@@ -259,6 +259,49 @@ fn a_confirmation_is_for_the_revision_it_named_not_one_that_went_live_since() {
     );
 }
 
+/// The prompt after `m`, with `lanes` at risk on the earlier revision.
+fn prompt_naming(lanes: Value) -> String {
+    let mut snapshot = testing::snapshot(World::SAVED);
+    snapshot["derived"]["revisions"] = json!([
+        {"revision_id": 9, "warm": 2, "cold": 0, "unknown": 0, "total": 2, "at_risk": lanes},
+        {"revision_id": 10, "warm": 0, "cold": 1, "unknown": 0, "total": 1, "at_risk": []},
+    ]);
+    let mut state = State::default();
+    reply(&mut state, "snapshot", 200, snapshot);
+    reply(
+        &mut state,
+        "revisions",
+        200,
+        testing::revisions(World::SAVED),
+    );
+    state.set_tab(Tab::History);
+    key(&mut state, 'm');
+    frame(&state, 160, 40)
+}
+
+#[test]
+fn long_lane_names_are_cut_in_the_middle_so_their_ends_still_tell_them_apart() {
+    let text = prompt_naming(json!([
+        "session-with-a-long-prefix-one",
+        "session-with-a-long-prefix-two"
+    ]));
+    assert!(text.contains("session…ix-one, session…ix-two"), "{text}");
+}
+
+#[test]
+fn lanes_that_would_read_the_same_once_cut_are_named_in_full() {
+    let text = prompt_naming(json!([
+        "session-aaaaaaaaaa-with-a-shared-tail",
+        "session-bbbbbbbbbb-with-a-shared-tail"
+    ]));
+    assert!(
+        text.contains(
+            "session-aaaaaaaaaa-with-a-shared-tail, session-bbbbbbbbbb-with-a-shared-tail"
+        ),
+        "{text}"
+    );
+}
+
 #[test]
 fn esc_or_any_other_key_cancels_the_arming_and_sends_nothing() {
     let mut state = after_a_save();

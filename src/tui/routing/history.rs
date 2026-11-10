@@ -7,6 +7,7 @@ use ratatui::{
     text::{Line, Span},
 };
 use serde_json::Value;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::data::{array, count, text};
 use super::table::{BodyLine, Cells, Table, heading, span, widest};
@@ -130,7 +131,7 @@ impl Armed {
     }
 
     fn sentence(&self) -> String {
-        let names: Vec<String> = self.lanes.iter().map(|lane| short(lane)).collect();
+        let names = shortened(&self.lanes);
         let named = if names.is_empty() {
             String::new()
         } else if (names.len() as u64) < self.count {
@@ -152,12 +153,48 @@ impl Armed {
     }
 }
 
+/// The lane names as the prompt says them. A long name is cut in its
+/// middle, keeping the end that tells lanes apart; where two cut names would
+/// still read the same, the names are given whole, since the prompt exists
+/// to say which caches are about to be lost.
+fn shortened(lanes: &[String]) -> Vec<String> {
+    let cut: Vec<String> = lanes.iter().map(|lane| short(lane)).collect();
+    let clash = cut
+        .iter()
+        .enumerate()
+        .any(|(at, name)| (0..at).any(|before| cut[before] == *name && lanes[before] != lanes[at]));
+    if clash { lanes.to_vec() } else { cut }
+}
+
 fn short(name: &str) -> String {
-    if name.chars().count() <= LANE_NAME {
-        name.to_owned()
-    } else {
-        format!("{}…", name.chars().take(LANE_NAME - 1).collect::<String>())
+    if name.width() <= LANE_NAME {
+        return name.to_owned();
     }
+    // The head and the tail share what is left after the ellipsis.
+    let tail_room = (LANE_NAME - 1) / 2;
+    let head_room = LANE_NAME - 1 - tail_room;
+    let mut head = String::new();
+    let mut used = 0;
+    for glyph in name.chars() {
+        let wide = glyph.width().unwrap_or(0);
+        if used + wide > head_room {
+            break;
+        }
+        head.push(glyph);
+        used += wide;
+    }
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 0;
+    for glyph in name.chars().rev() {
+        let wide = glyph.width().unwrap_or(0);
+        if used + wide > tail_room {
+            break;
+        }
+        tail.push(glyph);
+        used += wide;
+    }
+    tail.reverse();
+    format!("{head}…{}", tail.into_iter().collect::<String>())
 }
 
 /// The lanes whose cache moving the running lanes onto revision `live` would
