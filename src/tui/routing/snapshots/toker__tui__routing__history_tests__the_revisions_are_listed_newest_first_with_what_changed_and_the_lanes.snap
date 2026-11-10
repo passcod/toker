@@ -1,0 +1,25 @@
+---
+source: src/tui/routing/history_tests.rs
+expression: "frame(&state, 120, 40)"
+---
+ ?   dashboard   routing   config   accounts   ‹ 6 history 10            rev 10 live · 2 lanes on rev 9 · claude pending
+┌HISTORY───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rev      when              what changed                                                                       lanes  │
+│  10 live Tue 10 Nov 14:41  add rewrite claude-* → openrouter-messages                                         8 cold │
+│   9      Tue 10 Nov 14:18  add a fallback to claude-sub                                                       2 warm │
+│   8      Tue 10 Nov 13:07  move anthropic_sub/${model} above anthropic_api/${model} in anthropic_messages     none   │
+│   7      Tue 10 Nov 11:21  turn on compaction                                                                 none   │
+│   6      Tue 10 Nov 10:48  add upgrade newest on claude-sub                                                   none   │
+│   5      Tue 10 Nov 09:03  add family qwen                                                                    none   │
+│   4      Mon 09 Nov 15:20  retry openrouter-chat on 5xx                                                       none   │
+│   3      Mon 09 Nov 10:41  add presentation anthropic/claude-sonnet-*                                         none   │
+│   2      Mon 09 Nov 10:29  add rewrite anthropic_api/${model} to anthropic_messages                           none   │
+│   1      Sat 07 Nov 16:05  setup: 7 routes, 4 defaults, 13 rewrites, 14 presentations, 4 families, 4 upgrades none   │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌REVISION──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ rev 10  Tue 10 Nov 14:41 · from rev 9                                                                                │
+│ + rewrite anthropic_messages 6  claude-* → openrouter-messages  as asked                                             │
+│                                                                                                                      │
+│ lanes  8 cold on rev 10 · 2 warm still on rev 9                                                                      │
+│ [a] already live   [m] move running lanes   [c] trace a request                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

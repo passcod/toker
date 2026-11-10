@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use super::data::{self, array, text};
 use super::editing::{Editing, What};
 use super::form::{Context, Form, Outcome, Purpose};
+use super::history::{self, Armed};
 use super::trace::{Picking, Subject, Trace};
 use super::{models_tab, routes, rules, template};
 use crate::tui::control::{Command, Reply, Response};
@@ -144,9 +145,6 @@ pub(super) enum Modal {
     #[default]
     None,
     Form(Box<Form>),
-    Reactivate {
-        revision_id: i64,
-    },
     /// Which request to trace.
     Trace(Box<Picking>),
 }
@@ -160,7 +158,6 @@ impl Modal {
         match self {
             Self::None => String::new(),
             Self::Form(form) => form.title().to_uppercase(),
-            Self::Reactivate { .. } => "REACTIVATE REVISION".to_owned(),
             Self::Trace(_) => "TRACE A REQUEST".to_owned(),
         }
     }
@@ -203,6 +200,9 @@ pub(super) struct State {
     trace: Option<Trace>,
     /// The revision the invented request being filled in is traced under.
     tracing_under: Option<i64>,
+    /// A move of the running lanes that has asked once and waits for the
+    /// second confirmation.
+    armed: Option<Armed>,
 }
 
 impl Default for State {
@@ -228,6 +228,7 @@ impl Default for State {
             refresh_wanted: false,
             trace: None,
             tracing_under: None,
+            armed: None,
         }
     }
 }
@@ -285,39 +286,6 @@ impl State {
         self.error.as_deref()
     }
 
-    /// What a reactivation would do, from the snapshot the daemon last sent:
-    /// the lane impact and where each publication stands. Shown before the
-    /// user confirms.
-    pub(super) fn activation_summary(&self) -> Vec<String> {
-        let Some(snapshot) = &self.snapshot else {
-            return vec!["no daemon snapshot loaded".to_owned()];
-        };
-        let mut lines = Vec::new();
-        match snapshot.get("lane_impacts") {
-            Some(impacts) => {
-                let count = |key: &str| impacts.get(key).and_then(Value::as_u64).unwrap_or(0);
-                lines.push(format!(
-                    "lanes: {} total, {} unpinned, {} warm, {} cold, {} unknown",
-                    count("total"),
-                    count("unpinned"),
-                    count("warm"),
-                    count("cold"),
-                    count("unknown"),
-                ));
-            }
-            None => lines.push("lanes: impact not reported".to_owned()),
-        }
-        for publication in array(snapshot, "publications") {
-            let text = |key: &str| publication.get(key).and_then(Value::as_str).unwrap_or("-");
-            lines.push(format!(
-                "publication {}: {}",
-                text("adapter"),
-                text("state")
-            ));
-        }
-        lines
-    }
-
     pub(super) fn settings_note(&self) -> Option<&str> {
         self.settings_note.as_deref()
     }
@@ -362,6 +330,11 @@ impl State {
         } else {
             None
         }
+    }
+
+    /// The move of the running lanes that waits to be confirmed.
+    pub(super) fn armed(&self) -> Option<&Armed> {
+        self.armed.as_ref()
     }
 
     /// The trace on show.
@@ -428,6 +401,7 @@ impl State {
     }
 
     pub(super) fn set_tab(&mut self, tab: Tab) {
+        self.armed = None;
         self.tab = tab;
         self.mode = Mode::Table;
     }
@@ -435,6 +409,7 @@ impl State {
     /// Up or down within the tab; in the models tab, on into the next panel
     /// past a panel's edge.
     pub(super) fn move_selection(&mut self, delta: isize) {
+        self.armed = None;
         match (self.tab, self.mode) {
             (Tab::Routes, Mode::Route) => {
                 let count = self.route_candidates();
@@ -873,6 +848,31 @@ impl State {
             self.moved(&response.body);
             return;
         }
+        let code = response.body.get("error").and_then(Value::as_str);
+        if matches!(command.name, "reactivate" | "widen") && response.status == 409 {
+            match code {
+                // The live revision moved under the operation: read what is
+                // live now, and let the operator ask again.
+                Some("stale_revision") => {
+                    self.refresh_wanted = true;
+                    self.error = Some(control_error(&command, &response));
+                }
+                // The daemon asks for the consent the page did not know to
+                // ask for, as unpinned lanes may hold caches too.
+                Some("forced_cache_transition_required") => {
+                    let impacts = response.body.get("lane_impacts").unwrap_or(&Value::Null);
+                    let live = self.active_revision_id.unwrap_or_default();
+                    let count = data::count(impacts, "warm") + data::count(impacts, "unknown");
+                    self.armed = Some(Armed::new(Vec::new(), count, live));
+                    self.error = None;
+                }
+                Some("not_a_widening") => {
+                    self.notice = Some("the live revision already moves running lanes".to_owned());
+                }
+                _ => self.error = Some(control_error(&command, &response)),
+            }
+            return;
+        }
         if response.status / 100 != 2 {
             self.error = Some(control_error(&command, &response));
             return;
@@ -885,8 +885,26 @@ impl State {
                 self.saved = true;
             }
             "reactivate" => {
+                let copied = command.body.as_ref().map_or(0, |body| {
+                    body.get("revision_id")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default()
+                });
                 self.merge_activation(response.body);
-                self.modal = Modal::None;
+                self.notice = Some(format!(
+                    "reactivated rev {copied} as rev {}",
+                    self.active_revision_id.unwrap_or_default()
+                ));
+                self.saved = true;
+            }
+            "widen" => {
+                self.notice = Some(format!(
+                    "moved running lanes onto rev {}",
+                    self.active_revision_id.unwrap_or_default()
+                ));
+                self.error = None;
+                // Where the lanes are now is the snapshot's to say.
+                self.refresh_wanted = true;
             }
             "promote" => {
                 self.notice = Some(format!(
@@ -1077,6 +1095,7 @@ impl State {
             return self.modal_key(key);
         }
         self.notice = None;
+        let armed = self.armed.take();
         match key.code {
             KeyCode::Char('e') => {
                 self.open_edit();
@@ -1090,14 +1109,21 @@ impl State {
                 self.open_remove();
                 None
             }
+            KeyCode::Char('m') if self.tab == Tab::History => self.move_lanes(armed),
             KeyCode::Char('m') => {
                 self.open_move();
                 None
             }
-            KeyCode::Char('a') if self.tab == Tab::History => {
-                self.open_reactivate();
-                None
+            KeyCode::Char('a') if self.tab == Tab::History => self.reactivate_selected(),
+            KeyCode::Char('c') if self.tab == Tab::History => {
+                let under = self
+                    .selected_revision()
+                    .filter(|revision| Some(*revision) != self.active_revision_id);
+                self.open_trace(under)
             }
+            // Only the key that armed a move can confirm it; esc is the
+            // cancel, and stops there.
+            KeyCode::Esc if armed.is_some() => None,
             KeyCode::Char('p') => {
                 self.open_promote();
                 None
@@ -1644,17 +1670,69 @@ impl State {
         Some(command)
     }
 
-    fn open_reactivate(&mut self) {
-        let revision_id = self
-            .revisions
+    /// The revision the history tab has selected.
+    fn selected_revision(&self) -> Option<i64> {
+        self.revisions
             .get(self.selected_in(Tab::History))
             .and_then(|revision| revision.get("revision_id"))
-            .and_then(Value::as_i64);
-        if let Some(revision_id) = revision_id {
-            self.modal = Modal::Reactivate { revision_id };
-        } else {
+            .and_then(Value::as_i64)
+    }
+
+    /// Make the selected revision live again, as a new revision, for new
+    /// and cold lanes as a save is (spec: RREV#history-and-reactivation).
+    fn reactivate_selected(&mut self) -> Option<Command> {
+        let Some(revision_id) = self.selected_revision() else {
             self.error = Some("refresh revisions, then choose a revision to reactivate".to_owned());
+            return None;
+        };
+        if Some(revision_id) == self.active_revision_id {
+            self.notice = Some(format!("rev {revision_id} is already live"));
+            return None;
         }
+        self.reactivate(revision_id)
+    }
+
+    /// Move the running lanes onto the live revision. A move that would lose
+    /// a warm cache asks once, naming the lanes, and goes on a second `m`;
+    /// one that loses nothing goes at once.
+    fn move_lanes(&mut self, armed: Option<Armed>) -> Option<Command> {
+        let live = self.active_revision_id?;
+        if armed.is_some() {
+            return self.widen(live, true);
+        }
+        let snapshot = self.snapshot.as_ref()?;
+        let activation = snapshot.get("activation").unwrap_or(&Value::Null);
+        if text(activation, "scope") == "immediate" {
+            self.notice = Some(format!(
+                "rev {live} already moves running lanes at their next request"
+            ));
+            return None;
+        }
+        if history::on_earlier(snapshot, live) == 0 {
+            self.notice = Some(format!("no lane is on an earlier revision than rev {live}"));
+            return None;
+        }
+        let (names, count) = history::at_risk(snapshot, live);
+        if count == 0 {
+            return self.widen(live, false);
+        }
+        self.armed = Some(Armed::new(names, count, live));
+        None
+    }
+
+    fn widen(&mut self, live: i64, force: bool) -> Option<Command> {
+        self.in_flight = true;
+        Some(command(
+            "widen",
+            Method::POST,
+            "widen",
+            "routing-widen",
+            json!({
+                "expected_revision_id": live,
+                "scope": "immediate",
+                "force_cache_transition": force,
+            }),
+        ))
     }
 
     /// Promote a learned model. With an upgrade selected, the form starts
@@ -1711,20 +1789,11 @@ impl State {
                 KeyCode::Esc => return None,
                 _ => (Modal::Trace(picking), ModalAction::None),
             },
-            Modal::Reactivate { revision_id } => match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => (
-                    Modal::Reactivate { revision_id },
-                    ModalAction::Reactivate { revision_id },
-                ),
-                KeyCode::Esc | KeyCode::Char('n') => return None,
-                _ => (Modal::Reactivate { revision_id }, ModalAction::None),
-            },
         };
         self.modal = modal;
         match action {
             ModalAction::None => None,
             ModalAction::Edit(edits) => self.edit(edits),
-            ModalAction::Reactivate { revision_id } => self.reactivate(revision_id),
             ModalAction::Promote { binding, model } => self.promote(&binding, &model),
             ModalAction::Trace(subject, under) => {
                 // The form that asked for it is done with.
@@ -1801,9 +1870,6 @@ fn candidate_ids(route: &Value) -> Vec<String> {
 enum ModalAction {
     None,
     Edit(Vec<Value>),
-    Reactivate {
-        revision_id: i64,
-    },
     Promote {
         binding: String,
         model: String,
@@ -3177,49 +3243,6 @@ mod tests {
         ));
         assert!(!state.in_flight());
         assert_eq!(state.active_revision_id(), Some(4));
-    }
-
-    #[test]
-    fn the_summary_names_lane_impact_and_publications() {
-        let state = loaded(World::AT_REST);
-        let summary = state.activation_summary().join("\n");
-        assert!(
-            summary.contains("lanes: 10 total, 0 unpinned, 2 warm, 8 cold, 0 unknown"),
-            "{summary}"
-        );
-        assert!(
-            summary.contains("publication claude_settings: applied"),
-            "{summary}"
-        );
-        assert_eq!(
-            State::default().activation_summary(),
-            ["no daemon snapshot loaded"]
-        );
-    }
-
-    #[test]
-    fn reactivation_confirms_the_selected_revision() {
-        let mut state = on(Tab::History);
-        // Newest first, whatever order the daemon sent them in.
-        state.receive(reply(
-            "revisions",
-            200,
-            serde_json::json!({"revisions": [
-                {"revision_id": 4}, {"revision_id": 9}, {"revision_id": 7},
-            ]}),
-        ));
-        state.move_selection(2);
-        assert!(press(&mut state, KeyCode::Char('a')).is_none());
-        assert!(matches!(
-            state.modal(),
-            Modal::Reactivate { revision_id: 4 }
-        ));
-        let command = press(&mut state, KeyCode::Char('y')).expect("confirmed");
-        let body = command.body.expect("body");
-        assert_eq!(command.name, "reactivate");
-        assert_eq!(body["revision_id"], 4);
-        assert_eq!(body["expected_revision_id"], 9);
-        assert!(body.get("scope").is_none(), "a reactivation names no scope");
     }
 
     #[test]

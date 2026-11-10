@@ -110,7 +110,7 @@ The README's routing paragraph describes the draft, validate and activate flow, 
 - [x] Add, remove and `m` to move a rewrite within its scope; add, remove and reorder a route's candidates (`converged-02` add-fallback).
 - [x] Edit preview under the table: changed requests from the last 24 hours, now and with the change, and the unreplayable count.
 - [x] Header status: live revision, lanes on earlier revisions, publication pending, failed or unsupported with its detail (`converged-01` after-save).
-- [ ] History tab (`converged-04`): revisions newest first with a summary and pinned lanes; detail as the diff in words; `a` reactivates, `c` traces under the selected revision, `m` widens to move running lanes, arming first and naming the lanes whose warm cache it would lose.
+- [x] History tab (`converged-04`): revisions newest first with a summary and pinned lanes; detail as the diff in words; `a` reactivates, `c` traces under the selected revision, `m` widens to move running lanes, arming first and naming the lanes whose warm cache it would lose.
 - [ ] Empty policy (`converged-07` empty): every protocol group drawn with its refused `else` row, and the add control pointing at routes first.
 - [ ] Keys overlay (`converged-07` keys): grouped by where each key applies; every mark the page draws is explained.
 - [ ] Shedding at 100×24 and 80×24 (`converged-06`): uniform columns into the group head, tabs give way, panels lose framing first.

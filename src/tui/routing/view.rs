@@ -416,6 +416,7 @@ fn history_tab(frame: &mut Frame, body: Rect, snapshot: &Value, state: &State, d
         snapshot,
         &revisions[selected.min(revisions.len() - 1)],
         live,
+        state.armed(),
     );
     let mut detail_title = "REVISION";
     if let Some(trace) = state.trace() {
@@ -440,7 +441,7 @@ fn history_tab(frame: &mut Frame, body: Rect, snapshot: &Value, state: &State, d
 }
 
 /// The page's keys, in its `?` overlay.
-const KEYS: [(&str, &str); 15] = [
+const KEYS: [(&str, &str); 16] = [
     ("↑/↓ j/k", "select a record, or a candidate on a route"),
     ("←/→ h/l 1–6", "switch tab; ←/→ also step between routes"),
     ("enter", "open the route a record sends to"),
@@ -448,9 +449,13 @@ const KEYS: [(&str, &str); 15] = [
     ("pgup/pgdn", "move a page of records"),
     ("n", "add a record to the table, or a fallback to a route"),
     ("e", "edit the selected record in place"),
-    ("m", "move a rewrite within its scope, or a candidate"),
+    (
+        "m",
+        "move a rewrite within its scope, or a candidate; in history, the running lanes onto the live revision",
+    ),
     ("d", "remove the selected record, or candidate"),
     ("a", "reactivate the selected revision"),
+    ("c", "trace a request under the selected revision"),
     ("p", "promote"),
     ("t", "trace a request, invented or a recent one"),
     ("r", "refresh"),
@@ -571,12 +576,6 @@ fn render_form(frame: &mut Frame, state: &State, form: &Form) -> FormHit {
 fn modal_text(state: &State) -> Vec<String> {
     let modal = state.modal();
     let mut lines = modal_lines(modal);
-    if matches!(modal, Modal::Reactivate { .. }) {
-        // Before the closing "confirms" line, so the prompt stays last.
-        let confirm = lines.pop();
-        lines.extend(state.activation_summary());
-        lines.extend(confirm);
-    }
     if let Some(error) = state.error() {
         lines.push(format!("! {error}"));
     }
@@ -597,24 +596,14 @@ fn modal_lines(modal: &Modal) -> Vec<String> {
             ]));
             lines
         }
-        Modal::Reactivate { revision_id } => vec![
-            format!("Create a forward revision from revision {revision_id}?"),
-            "The active pointer never moves backwards.".to_owned(),
-            confirm_hint(),
-        ],
     }
-}
-
-/// The prompt every confirmation closes on.
-fn confirm_hint() -> String {
-    chrome::hints(&[("y/enter", "confirm"), ("n/esc", "cancel")])
 }
 
 #[cfg(test)]
 mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
-    use super::{Drawn, State, Tab, modal_text, render};
+    use super::{Drawn, State, Tab, render};
     use crate::tui::control::{Command, Reply, Response};
     use crate::tui::routing::testing::{self, World};
 
@@ -737,12 +726,6 @@ mod tests {
         insta::assert_snapshot!(frame(&state, 120, 40));
     }
 
-    #[test]
-    fn history_120x40() {
-        let state = page(World::SAVED, Tab::History);
-        insta::assert_snapshot!(frame(&state, 120, 40));
-    }
-
     fn press(state: &mut State, code: crossterm::event::KeyCode) {
         state.key(crossterm::event::KeyEvent::new(
             code,
@@ -787,7 +770,9 @@ mod tests {
                 .iter()
                 .any(|(keys, _)| keys.split([' ', '/']).any(|token| token == key))
         };
-        for key in ['e', 'n', 'd', 'v', 'a', 'p', 'r', 'h', 'j', 'k', 'l'] {
+        for key in [
+            'e', 'n', 'd', 'v', 'a', 'p', 'r', 'h', 'j', 'k', 'l', 't', 'c',
+        ] {
             assert!(
                 !super::super::owns_key(KeyCode::Char(key)) || named(&key.to_string()),
                 "{key} is taken but not named"
@@ -806,38 +791,6 @@ mod tests {
         for heading in ["KEYS", "IN A FORM", "? or esc close"] {
             assert!(text.contains(heading), "{heading}: {text}");
         }
-    }
-
-    #[test]
-    fn the_reactivation_form_shows_its_impact_and_the_last_refusal() {
-        let mut state = page(World::SAVED, Tab::History);
-        state.move_selection(1);
-        press(&mut state, crossterm::event::KeyCode::Char('a'));
-        let mut command = Command::snapshot("routing-snapshot");
-        command.name = "reactivate";
-        state.receive(Reply::Command(
-            command,
-            Ok(Response {
-                status: 409,
-                body: serde_json::json!({"error": "stale_revision", "live_revision_id": 11}),
-            }),
-        ));
-        let text = modal_text(&state).join("\n");
-        assert!(text.contains("revision 9"), "{text}");
-        assert!(text.contains("2 warm"), "{text}");
-        assert!(
-            text.contains("publication claude_settings: pending"),
-            "{text}"
-        );
-        assert!(text.contains("revision 11 is now live"), "{text}");
-        assert!(
-            text.lines()
-                .rev()
-                .nth(1)
-                .is_some_and(|line| line.contains("y/enter confirm · n/esc cancel")),
-            "the confirmation prompt stays above the refusal: {text}"
-        );
-        insta::assert_snapshot!("the_reactivation_form", frame(&state, 120, 32));
     }
 
     /// The tabs scroll around the current one before the strip clips, and

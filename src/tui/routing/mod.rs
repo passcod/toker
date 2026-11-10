@@ -5,6 +5,8 @@ mod edit_view;
 mod editing;
 mod form;
 mod history;
+#[cfg(test)]
+mod history_tests;
 mod model;
 mod models_tab;
 mod reconcile;
@@ -55,7 +57,7 @@ fn activated(reply: &Reply) -> bool {
 pub(super) fn owns_key(code: crossterm::event::KeyCode) -> bool {
     matches!(
         code,
-        crossterm::event::KeyCode::Char('e' | 'n' | 'd' | 'm' | 'a' | 'p' | 't')
+        crossterm::event::KeyCode::Char('e' | 'n' | 'd' | 'm' | 'a' | 'p' | 't' | 'c')
             | crossterm::event::KeyCode::Enter
             | crossterm::event::KeyCode::PageUp
             | crossterm::event::KeyCode::PageDown
@@ -128,7 +130,9 @@ impl Page {
     /// Whether `esc` has something of the page's own to close before it
     /// leaves the page: a route opened whole.
     pub(super) fn captures_esc(&self) -> bool {
-        self.state.mode() == model::Mode::Route || self.state.trace().is_some()
+        self.state.mode() == model::Mode::Route
+            || self.state.trace().is_some()
+            || self.state.armed().is_some()
     }
 
     /// Handle a key owned by the routing page.  Only this page owns its form
@@ -246,7 +250,7 @@ mod tests {
 
     #[test]
     fn every_key_the_legend_documents_reaches_the_page() {
-        for key in ['e', 'n', 'd', 'm', 'a', 'p', 't'] {
+        for key in ['e', 'n', 'd', 'm', 'a', 'p', 't', 'c'] {
             assert!(owns_key(KeyCode::Char(key)), "{key}");
         }
         for key in [KeyCode::PageUp, KeyCode::PageDown] {

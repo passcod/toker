@@ -1148,11 +1148,13 @@ pub(super) fn snapshot(world: World) -> Value {
             "circuits": [],
             "revisions": if world.saved {
                 json!([
-                    {"revision_id": 9, "warm": 2, "cold": 0, "unknown": 0, "total": 2},
+                    {"revision_id": 9, "warm": 2, "cold": 0, "unknown": 0, "total": 2,
+                     "at_risk": ["ses-hot", "ses-crow"]},
                     {"revision_id": 10, "warm": 0, "cold": 8, "unknown": 0, "total": 8},
                 ])
             } else {
-                json!([{"revision_id": 9, "warm": 2, "cold": 8, "unknown": 0, "total": 10}])
+                json!([{"revision_id": 9, "warm": 2, "cold": 8, "unknown": 0, "total": 10,
+                    "at_risk": ["ses-hot", "ses-crow"]}])
             },
             "active": {
                 "routes": routes,
@@ -1174,14 +1176,108 @@ pub(super) fn snapshot(world: World) -> Value {
 /// The revision history the page reads beside the snapshot, newest first.
 pub(super) fn revisions(world: World) -> Value {
     let newest = if world.saved { 10 } else { 9 };
+    // The design's history: when each was made, what it changed and the
+    // record it touched, as the daemon words them.
+    let moment = |day: i8, hour: i8, minute: i8| {
+        jiff::civil::date(2026, 11, day)
+            .at(hour, minute, 0, 0)
+            .in_tz("UTC")
+            .expect("a moment")
+            .timestamp()
+            .as_millisecond()
+    };
+    let history = |id: i64| -> (i64, &str, &str, &str, &str) {
+        match id {
+            10 => (
+                moment(10, 14, 41),
+                "add rewrite claude-* → openrouter-messages",
+                "added",
+                "rewrite",
+                "rewrite anthropic_messages 6  claude-* → openrouter-messages  as asked",
+            ),
+            9 => (
+                moment(10, 14, 18),
+                "add a fallback to claude-sub",
+                "added",
+                "candidate",
+                "candidate openrouter on route claude-sub  openrouter.openrouter_messages",
+            ),
+            8 => (
+                moment(10, 13, 7),
+                "move anthropic_sub/${model} above anthropic_api/${model} in anthropic_messages",
+                "moved",
+                "rewrite",
+                "rewrite anthropic_messages 2  anthropic_sub/${model} → claude-sub above anthropic_api/${model}",
+            ),
+            7 => (
+                moment(10, 11, 21),
+                "turn on compaction",
+                "added",
+                "compaction",
+                "compaction",
+            ),
+            6 => (
+                moment(10, 10, 48),
+                "add upgrade newest on claude-sub",
+                "added",
+                "upgrade",
+                "upgrade newest  on family claude-opus",
+            ),
+            5 => (
+                moment(10, 9, 3),
+                "add family qwen",
+                "added",
+                "family",
+                "family qwen  on openrouter.openrouter_messages",
+            ),
+            4 => (
+                moment(9, 15, 20),
+                "retry openrouter-chat on 5xx",
+                "changed",
+                "route",
+                "route openrouter-chat, the edge into fallback: post_send",
+            ),
+            3 => (
+                moment(9, 10, 41),
+                "add presentation anthropic/claude-sonnet-*",
+                "added",
+                "presentation",
+                "presentation claude/anthropic_messages  anthropic/claude-sonnet-*",
+            ),
+            2 => (
+                moment(9, 10, 29),
+                "add rewrite anthropic_api/${model} to anthropic_messages",
+                "added",
+                "rewrite",
+                "rewrite anthropic_messages 3  anthropic_api/${model} → claude-api  ${model}",
+            ),
+            _ => (moment(7, 16, 5), "", "", "", ""),
+        }
+    };
     json!({
         "toker": "routing-revisions",
         "ok": true,
-        "revisions": (1..=newest).rev().map(|id| json!({
-            "revision_id": id,
-            "description": format!("revision {id}"),
-            "source": if id == 1 { "setup" } else { "edit" },
-            "parent_revision_id": if id == 1 { Value::Null } else { json!(id - 1) },
-        })).collect::<Vec<_>>(),
+        "revisions": (1..=newest).rev().map(|id| {
+            let (at, summary, change, kind, said) = history(id);
+            let first = id == 1;
+            json!({
+                "revision_id": id,
+                "created_ms": at,
+                "activated_ms": at,
+                "description": null,
+                "source": if first { "legacy" } else { "save" },
+                "parent_revision_id": if first { Value::Null } else { json!(id - 1) },
+                "summary": if first {
+                    "setup: 7 routes, 4 defaults, 13 rewrites, 14 presentations, 4 families, 4 upgrades"
+                } else {
+                    summary
+                },
+                "changes": if first {
+                    json!([])
+                } else {
+                    json!([{"change": change, "kind": kind, "id": null, "summary": summary, "text": said}])
+                },
+            })
+        }).collect::<Vec<_>>(),
     })
 }

@@ -1,15 +1,22 @@
-//! The history tab: the revisions, newest first, each with what it was made
-//! from and the lanes pinned to it (spec: UTUI#history).
-//!
-//! The diff in words, and the controls that act on a revision, belong to the
-//! tab's editing; this is the list they hang off.
+//! The history tab: the revisions, newest first, each with what it changed
+//! from the one before it and the lanes pinned to it; the selected one as
+//! the diff in words (spec: UTUI#history).
 
-use ratatui::text::{Line, Span};
+use ratatui::{
+    style::{Modifier, Style},
+    text::{Line, Span},
+};
 use serde_json::Value;
 
 use super::data::{array, count, text};
-use super::table::{BodyLine, Cells, Table, controls, field, heading, span};
-use super::words::{bold, dim, lanes_phrase};
+use super::table::{BodyLine, Cells, Table, heading, span, widest};
+use super::words::{bold, dim, lanes_phrase, when};
+
+/// The most changes the detail lists before it counts the rest.
+const CHANGES_SHOWN: usize = 8;
+
+/// The longest a lane's name is drawn.
+const LANE_NAME: usize = 14;
 
 fn id(revision: &Value) -> i64 {
     revision
@@ -18,8 +25,8 @@ fn id(revision: &Value) -> i64 {
         .unwrap_or(0)
 }
 
-/// The lanes pinned to revision `id`, from the derived facts.
-fn lanes(snapshot: &Value, id: i64) -> Option<&Value> {
+/// The derived facts about the lanes pinned to revision `id`.
+fn pinned(snapshot: &Value, id: i64) -> Option<&Value> {
     snapshot
         .get("derived")
         .map(|derived| array(derived, "revisions"))
@@ -29,8 +36,28 @@ fn lanes(snapshot: &Value, id: i64) -> Option<&Value> {
         .filter(|lanes| count(lanes, "total") > 0)
 }
 
-fn source(revision: &Value) -> String {
-    text(revision, "source").replace('_', " ")
+fn lanes_of(snapshot: &Value, id: i64) -> String {
+    pinned(snapshot, id).map_or_else(|| "none".to_owned(), lanes_phrase)
+}
+
+/// When the revision became live, or was made.
+fn moment(revision: &Value) -> String {
+    let at = revision
+        .get("activated_ms")
+        .and_then(Value::as_i64)
+        .or_else(|| revision.get("created_ms").and_then(Value::as_i64));
+    at.map_or_else(|| "-".to_owned(), when)
+}
+
+/// What the revision changed, in a line: the daemon's own summary, or, from
+/// a daemon that does not send one, what its author wrote.
+fn summary(revision: &Value) -> String {
+    ["summary", "description"]
+        .iter()
+        .map(|key| text(revision, key))
+        .find(|said| !said.is_empty())
+        .unwrap_or("-")
+        .to_owned()
 }
 
 /// The revisions as a table.
@@ -40,39 +67,39 @@ pub(super) fn table(
     live: Option<i64>,
     width: usize,
 ) -> Table {
+    const REV: usize = 9;
+    const WHEN: usize = 18;
+    let lanes: Vec<String> = revisions
+        .iter()
+        .map(|revision| lanes_of(snapshot, id(revision)))
+        .collect();
+    let lanes_width = widest(lanes.iter().map(String::as_str).chain(["lanes"]));
+    let said = width.saturating_sub(REV + WHEN + lanes_width + 1);
     let header = Cells::new()
-        .cell(Vec::new(), 2)
-        .cell(heading("revision"), 14)
-        .cell(heading("from"), 16)
-        .cell(heading("lanes pinned"), 22)
-        .raw(heading("description"))
+        .cell(heading("rev"), REV)
+        .cell(heading("when"), WHEN)
+        .cell(heading("what changed"), said + 1)
+        .cell(heading("lanes"), lanes_width)
         .line();
     let body = revisions
         .iter()
+        .zip(&lanes)
         .enumerate()
-        .map(|(entry, revision)| {
+        .map(|(entry, (revision, here))| {
             let at = id(revision);
-            let here = lanes(snapshot, at).map_or_else(|| "none".to_owned(), lanes_phrase);
-            let name = if Some(at) == live {
-                format!("rev {at} live")
-            } else {
-                format!("rev {at}")
-            };
+            let name = format!("{at:>3}{}", if Some(at) == live { " live" } else { "" });
             let line = Cells::new()
-                .cell(Vec::new(), 2)
-                .cell(vec![Span::raw(name)], 14)
-                .cell(vec![Span::raw(source(revision))], 16)
+                .cell(vec![Span::raw(name)], REV)
+                .cell(vec![Span::raw(moment(revision))], WHEN)
+                .cell(vec![Span::raw(summary(revision))], said)
+                .raw(vec![Span::raw(" ")])
                 .cell(
                     vec![if here == "none" {
-                        span(here, dim())
+                        span(here.clone(), dim())
                     } else {
-                        Span::raw(here)
+                        Span::raw(here.clone())
                     }],
-                    22,
-                )
-                .cell(
-                    vec![Span::raw(text(revision, "description").to_owned())],
-                    width.saturating_sub(54),
+                    lanes_width,
                 )
                 .line();
             BodyLine::of(line, entry)
@@ -81,32 +108,204 @@ pub(super) fn table(
     Table { header, body }
 }
 
-/// The selected revision's detail.
-pub(super) fn detail(snapshot: &Value, revision: &Value, live: Option<i64>) -> Vec<Line<'static>> {
-    let at = id(revision);
-    let mut lines = vec![Line::from(span(
-        if Some(at) == live {
-            format!("rev {at} · live")
-        } else {
-            format!("rev {at}")
-        },
-        bold(),
-    ))];
-    lines.push(field("from", 14, vec![Span::raw(source(revision))]));
-    if let Some(parent) = revision.get("parent_revision_id").and_then(Value::as_i64) {
-        lines.push(field(
-            "made from",
-            14,
-            vec![Span::raw(format!("rev {parent}"))],
-        ));
+/// A move of the running lanes onto the live revision, asked for once and
+/// waiting for the second confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Armed {
+    /// The lanes whose cache it would lose, as far as they are named.
+    pub(super) lanes: Vec<String>,
+    /// How many lanes would lose it, named or not.
+    pub(super) count: u64,
+    /// The revision they would move to.
+    pub(super) revision: i64,
+}
+
+impl Armed {
+    pub(super) fn new(lanes: Vec<String>, count: u64, revision: i64) -> Armed {
+        Armed {
+            lanes,
+            count,
+            revision,
+        }
     }
-    lines.push(field(
-        "lanes pinned",
-        14,
-        vec![Span::raw(
-            lanes(snapshot, at).map_or_else(|| "none".to_owned(), lanes_phrase),
-        )],
-    ));
-    lines.push(controls(&[("a", "reactivate")]));
+
+    fn sentence(&self) -> String {
+        let names: Vec<String> = self.lanes.iter().map(|lane| short(lane)).collect();
+        let named = if names.is_empty() {
+            String::new()
+        } else if (names.len() as u64) < self.count {
+            format!(
+                ": {} and {} more",
+                names.join(", "),
+                self.count - names.len() as u64
+            )
+        } else {
+            format!(": {}", names.join(", "))
+        };
+        let lanes = if self.count == 1 { "lane" } else { "lanes" };
+        let verb = if self.count == 1 { "loses" } else { "lose" };
+        format!(
+            "{} {lanes} {verb} {} cache{named}",
+            self.count,
+            if self.count == 1 { "its" } else { "their" },
+        )
+    }
+}
+
+fn short(name: &str) -> String {
+    if name.chars().count() <= LANE_NAME {
+        name.to_owned()
+    } else {
+        format!("{}…", name.chars().take(LANE_NAME - 1).collect::<String>())
+    }
+}
+
+/// The lanes whose cache moving the running lanes onto revision `live` would
+/// lose, and how many of them there are: those on an earlier revision that
+/// are warm or not provably cold.
+pub(super) fn at_risk(snapshot: &Value, live: i64) -> (Vec<String>, u64) {
+    let earlier = || {
+        snapshot
+            .get("derived")
+            .map(|derived| array(derived, "revisions"))
+            .unwrap_or(&[])
+            .iter()
+            .filter(move |lanes| lanes.get("revision_id").and_then(Value::as_i64) != Some(live))
+    };
+    let names = earlier()
+        .flat_map(|lanes| array(lanes, "at_risk"))
+        .filter_map(|name| name.as_str().map(str::to_owned))
+        .collect();
+    let total = earlier()
+        .map(|lanes| count(lanes, "warm") + count(lanes, "unknown"))
+        .sum();
+    (names, total)
+}
+
+/// How many lanes are pinned to a revision other than `live`.
+pub(super) fn on_earlier(snapshot: &Value, live: i64) -> u64 {
+    snapshot
+        .get("derived")
+        .map(|derived| array(derived, "revisions"))
+        .unwrap_or(&[])
+        .iter()
+        .filter(|lanes| lanes.get("revision_id").and_then(Value::as_i64) != Some(live))
+        .map(|lanes| count(lanes, "total"))
+        .sum()
+}
+
+/// Where the lanes stand: on this revision and, where it is the live one,
+/// still on earlier ones.
+fn lanes_line(snapshot: &Value, at: i64, live: Option<i64>) -> Line<'static> {
+    let here = lanes_of(snapshot, at);
+    let mut said = if here == "none" {
+        format!("none pinned to rev {at}")
+    } else {
+        format!("{here} on rev {at}")
+    };
+    if Some(at) == live {
+        let earlier = snapshot
+            .get("derived")
+            .map(|derived| array(derived, "revisions"))
+            .unwrap_or(&[])
+            .iter()
+            .filter(|lanes| lanes.get("revision_id").and_then(Value::as_i64) != Some(at))
+            .filter(|lanes| count(lanes, "total") > 0);
+        for lanes in earlier {
+            said.push_str(&format!(
+                " · {} still on rev {}",
+                lanes_phrase(lanes),
+                count(lanes, "revision_id")
+            ));
+        }
+    }
+    Line::from(vec![span("lanes  ", dim()), Span::raw(said)])
+}
+
+/// The sign a change is listed under.
+fn sign(change: &str) -> &'static str {
+    match change {
+        "added" => "+",
+        "removed" => "-",
+        "moved" => "↕",
+        _ => "~",
+    }
+}
+
+/// The detail's controls, `[m]` reversed while a move is armed.
+fn controls_line(at: i64, live: Option<i64>, armed: bool) -> Line<'static> {
+    let mut spans = vec![Span::raw(format!(
+        "[a] {}   ",
+        if Some(at) == live {
+            "already live"
+        } else {
+            "reactivate"
+        }
+    ))];
+    let mover = "[m] move running lanes";
+    spans.push(if armed {
+        Span::styled(mover, Style::new().add_modifier(Modifier::REVERSED))
+    } else {
+        Span::raw(mover)
+    });
+    spans.push(Span::raw("   [c] trace a request"));
+    Line::from(spans)
+}
+
+/// The selected revision's detail: what it changed, where its lanes stand
+/// and what can be done with it.
+pub(super) fn detail(
+    snapshot: &Value,
+    revision: &Value,
+    live: Option<i64>,
+    armed: Option<&Armed>,
+) -> Vec<Line<'static>> {
+    let at = id(revision);
+    let mut head = vec![
+        span(format!("rev {at}"), bold()),
+        Span::raw(format!("  {}", moment(revision))),
+    ];
+    match (
+        text(revision, "source"),
+        revision.get("parent_revision_id").and_then(Value::as_i64),
+    ) {
+        ("reactivation", Some(parent)) => {
+            head.push(span(format!(" · a copy of rev {parent}"), dim()));
+        }
+        (_, Some(parent)) => head.push(span(format!(" · from rev {parent}"), dim())),
+        (_, None) => head.push(span(" · the first revision".to_owned(), dim())),
+    }
+    let mut lines = vec![Line::from(head)];
+    let changes = array(revision, "changes");
+    if changes.is_empty() {
+        lines.push(Line::from(span(summary(revision), dim())));
+    }
+    for change in changes.iter().take(CHANGES_SHOWN) {
+        lines.push(Line::from(vec![
+            span(format!("{} ", sign(text(change, "change"))), bold()),
+            Span::raw(text(change, "text").to_owned()),
+        ]));
+    }
+    if changes.len() > CHANGES_SHOWN {
+        lines.push(Line::from(span(
+            format!("… and {} more", changes.len() - CHANGES_SHOWN),
+            dim(),
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines.push(lanes_line(snapshot, at, live));
+    lines.push(controls_line(at, live, armed.is_some()));
+    if let Some(armed) = armed {
+        lines.push(Line::from(vec![
+            Span::raw(armed.sentence()),
+            span(
+                format!(
+                    " · [m] again to move them to rev {} · [esc] cancel",
+                    armed.revision
+                ),
+                dim(),
+            ),
+        ]));
+    }
     lines
 }
