@@ -74,6 +74,14 @@ impl ReadyAttempt {
         &self.binding_id
     }
 
+    pub(crate) fn in_flight(&self) -> Option<&InFlightGuard> {
+        self.in_flight.as_ref()
+    }
+
+    pub(crate) fn provider(&self) -> &str {
+        self.backend.id()
+    }
+
     pub(crate) fn effective_model(&self) -> &str {
         &self.effective_model
     }
@@ -91,6 +99,7 @@ impl ReadyAttempt {
         let cancellation = super::cancel::PrecommitCancellationGuard::responses(
             record.as_ref(),
             "openai_responses",
+            in_flight.as_ref(),
         );
         let upstream = match send_upstream_to(
             server,
@@ -133,6 +142,9 @@ impl ReadyAttempt {
         let response_status = upstream.response.status();
         match super::attempt::precommit_responses(upstream.response).await {
             Ok(super::attempt::PrecommitOutcome::Accepted { response, .. }) => {
+                if let Some(guard) = &in_flight {
+                    guard.streaming();
+                }
                 ReadyOutcome::Accepted {
                     upstream: response,
                     record,

@@ -61,7 +61,7 @@ pub struct InFlightRequest {
     pub attempt_group_id: Option<AttemptGroupId>,
     pub session_id: Option<String>,
     pub lineage: Option<SessionLineage>,
-    pub frontend: Option<String>,
+    pub profile: Option<String>,
     pub requested_model: Option<String>,
     pub req_messages: Option<i64>,
     pub stage: InFlightStage,
@@ -71,10 +71,10 @@ pub struct InFlightRequest {
     pub effective_model: Option<String>,
 }
 
-pub(super) fn begin(conn: &Connection, started_ms: i64, frontend: Option<&str>) -> Result<i64> {
+pub(super) fn begin(conn: &Connection, started_ms: i64, profile: Option<&str>) -> Result<i64> {
     conn.execute(
-        "INSERT INTO in_flight (started_ms, frontend, stage) VALUES (?1, ?2, 'held')",
-        rusqlite::params![started_ms, frontend],
+        "INSERT INTO in_flight (started_ms, profile, stage) VALUES (?1, ?2, 'held')",
+        rusqlite::params![started_ms, profile],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -132,7 +132,7 @@ pub(super) fn clear(conn: &Connection) -> Result<u64> {
 pub(super) fn rows(conn: &Connection) -> Result<Vec<InFlightRequest>> {
     rows_of(
         conn,
-        "SELECT id, started_ms, attempt_group_id, session_id, parent_session_id, frontend,
+        "SELECT id, started_ms, attempt_group_id, session_id, parent_session_id, profile,
                 requested_model, req_messages, stage, attempt_index, provider, binding_id,
                 effective_model
          FROM in_flight ORDER BY started_ms ASC, id ASC",
@@ -166,7 +166,7 @@ fn read_row(row: &rusqlite::Row<'_>) -> Result<InFlightRequest> {
         )?,
         session_id,
         lineage,
-        frontend: row.get("frontend")?,
+        profile: row.get("profile")?,
         requested_model: row.get("requested_model")?,
         req_messages: row.get("req_messages")?,
         stage,

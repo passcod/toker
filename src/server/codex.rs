@@ -91,10 +91,10 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
             );
         }
     };
-    let in_flight = Some(server.begin_in_flight());
+    let frontend = super::frontend_of(&parts.extensions).map(str::to_owned);
+    let in_flight = Some(server.begin_in_flight(true, frontend.as_deref()));
     let header_session = session_id(&server.config().session_header_names, &parts.headers);
     let ping = lanes::is_ping(&parts.headers, &server.config().ping_header_name);
-    let frontend = super::frontend_of(&parts.extensions).map(str::to_owned);
     let thread_id = parts
         .headers
         .get("thread-id")
@@ -157,6 +157,17 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
                 .map(|input| input.len() as u64),
         )
     });
+    if let Some(guard) = &in_flight {
+        guard.identify(&crate::store::InFlightIdentity {
+            session_id: request_session.as_deref(),
+            lineage: lineage.as_ref(),
+            requested_model: Some(&requested_model),
+            req_messages: shape
+                .as_ref()
+                .and_then(|shape| shape.req_messages)
+                .and_then(|count| i64::try_from(count).ok()),
+        });
+    }
     let lane_reference = shape.as_ref().and_then(|shape| {
         lanes::lane_key(request_session.as_deref(), Some(shape.tools_hash.as_str()))
     });
@@ -410,6 +421,14 @@ impl ReadyAttempt {
         &self.binding_id
     }
 
+    pub(crate) fn in_flight(&self) -> Option<&InFlightGuard> {
+        self.in_flight.as_ref()
+    }
+
+    pub(crate) fn provider(&self) -> &str {
+        self.backend.id()
+    }
+
     pub(crate) fn effective_model(&self) -> &str {
         &self.effective_model
     }
@@ -425,6 +444,7 @@ impl ReadyAttempt {
         let cancellation = super::cancel::PrecommitCancellationGuard::responses(
             self.record.as_ref(),
             self.frontend_wire.protocol(),
+            self.in_flight.as_ref(),
         );
         let url = self.backend.endpoint("/responses");
         let upstream = match server
@@ -467,6 +487,9 @@ impl ReadyAttempt {
         let response_status = upstream.status();
         match super::attempt::precommit_responses(upstream).await {
             Ok(super::attempt::PrecommitOutcome::Accepted { response, .. }) => {
+                if let Some(guard) = &self.in_flight {
+                    guard.streaming();
+                }
                 ReadyOutcome::Accepted {
                     ready: self,
                     upstream: response,

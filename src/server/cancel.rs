@@ -7,6 +7,7 @@
 
 use axum::http::StatusCode;
 
+use super::InFlightGuard;
 use super::record::{RecordCtx, record_error};
 use super::record_anthropic::{AnthropicRecordCtx, record_anthropic_error, record_codex_error};
 
@@ -21,30 +22,40 @@ enum CancellationRecord {
 
 pub(crate) struct PrecommitCancellationGuard {
     record: Option<CancellationRecord>,
+    /// The request's in-flight hold, moved into the row's write so that
+    /// the request is not removed from in flight before its row lands.
+    in_flight: Option<InFlightGuard>,
 }
 
 impl PrecommitCancellationGuard {
-    pub(crate) fn chat(record: Option<&RecordCtx>) -> Self {
+    pub(crate) fn chat(record: Option<&RecordCtx>, in_flight: Option<&InFlightGuard>) -> Self {
         Self {
             record: record.cloned().map(CancellationRecord::Chat),
+            in_flight: in_flight.cloned(),
         }
     }
 
-    pub(crate) fn anthropic(record: Option<&AnthropicRecordCtx>) -> Self {
+    pub(crate) fn anthropic(
+        record: Option<&AnthropicRecordCtx>,
+        in_flight: Option<&InFlightGuard>,
+    ) -> Self {
         Self {
             record: record.cloned().map(CancellationRecord::Anthropic),
+            in_flight: in_flight.cloned(),
         }
     }
 
     pub(crate) fn responses(
         record: Option<&AnthropicRecordCtx>,
         frontend_protocol: &'static str,
+        in_flight: Option<&InFlightGuard>,
     ) -> Self {
         Self {
             record: record.cloned().map(|ctx| CancellationRecord::Responses {
                 ctx,
                 frontend_protocol,
             }),
+            in_flight: in_flight.cloned(),
         }
     }
 
@@ -59,6 +70,7 @@ impl PrecommitCancellationGuard {
 
 impl Drop for PrecommitCancellationGuard {
     fn drop(&mut self) {
+        let in_flight = self.in_flight.take();
         let Some(record) = self.record.take() else {
             return;
         };
@@ -66,32 +78,36 @@ impl Drop for PrecommitCancellationGuard {
             tracing::error!("precommit cancellation row lost outside a Tokio runtime");
             return;
         };
-        handle.spawn_blocking(move || match record {
-            CancellationRecord::Chat(ctx) => record_error(
-                &ctx,
-                StatusCode::BAD_GATEWAY.as_u16(),
-                Some("client_cancelled".to_owned()),
-                None,
-            ),
-            CancellationRecord::Anthropic(ctx) => record_anthropic_error(
-                &ctx,
-                StatusCode::BAD_GATEWAY.as_u16(),
-                Some("client_cancelled".to_owned()),
-                None,
-                None,
-                None,
-            ),
-            CancellationRecord::Responses {
-                ctx,
-                frontend_protocol,
-            } => record_codex_error(
-                &ctx,
-                StatusCode::BAD_GATEWAY.as_u16(),
-                "client_cancelled",
-                "client disconnected before response commitment",
-                None,
-                frontend_protocol,
-            ),
+        handle.spawn_blocking(move || {
+            match record {
+                CancellationRecord::Chat(ctx) => record_error(
+                    &ctx,
+                    StatusCode::BAD_GATEWAY.as_u16(),
+                    Some("client_cancelled".to_owned()),
+                    None,
+                ),
+                CancellationRecord::Anthropic(ctx) => record_anthropic_error(
+                    &ctx,
+                    StatusCode::BAD_GATEWAY.as_u16(),
+                    Some("client_cancelled".to_owned()),
+                    None,
+                    None,
+                    None,
+                ),
+                CancellationRecord::Responses {
+                    ctx,
+                    frontend_protocol,
+                } => record_codex_error(
+                    &ctx,
+                    StatusCode::BAD_GATEWAY.as_u16(),
+                    "client_cancelled",
+                    "client disconnected before response commitment",
+                    None,
+                    frontend_protocol,
+                ),
+            }
+            // Only now may the request leave in flight.
+            drop(in_flight);
         });
     }
 }
@@ -165,7 +181,7 @@ mod tests {
     async fn an_armed_guard_records_cancellation_off_the_dropping_task() {
         let (store, ctx) = chat_record("cancel-guard-", None, None);
 
-        drop(PrecommitCancellationGuard::chat(Some(&ctx)));
+        drop(PrecommitCancellationGuard::chat(Some(&ctx), None));
         for _ in 0..200 {
             let rows = store.requests_since(0, 10).expect("rows");
             if let Some(row) = rows.first() {
@@ -211,7 +227,7 @@ mod tests {
             Some(pin_transition),
         );
 
-        drop(PrecommitCancellationGuard::chat(Some(&ctx)));
+        drop(PrecommitCancellationGuard::chat(Some(&ctx), None));
         for _ in 0..200 {
             if !store.requests_since(0, 10).expect("rows").is_empty() {
                 assert!(

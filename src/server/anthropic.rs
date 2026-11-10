@@ -280,7 +280,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // guard's Drop is the decrement, so no early return — a blocked
     // answer, a cold notice, a 502 — can leak the count; for a streamed
     // response it rides the body stream.
-    let in_flight = (path == "/v1/messages" && !ping).then(|| server.begin_in_flight());
+    let in_flight =
+        (path == "/v1/messages").then(|| server.begin_in_flight(!ping, frontend.as_deref()));
 
     // Parse and route before applying the Messages middleware.
     let mut forward = original.clone();
@@ -335,6 +336,16 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             || ir.anthropic().wants_json_response(),
             |request| request.stream != Some(true),
         );
+        if let Some(guard) = &in_flight {
+            guard.identify(&crate::store::InFlightIdentity {
+                session_id: session_id.as_deref(),
+                lineage: None,
+                requested_model: client_model.as_deref(),
+                req_messages: ingress_canonical
+                    .as_ref()
+                    .map(|request| request.messages.len() as i64),
+            });
+        }
         // Inference routing reads the canonical model; administrative
         // bodies retain their typed model view and lexical mapper.
         let model = client_model.clone();
@@ -929,6 +940,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             );
             record_quota_blocked(QuotaBlockedRecord {
                 frontend: frontend.as_deref(),
+                requested_model: client_model.as_deref(),
+                effective_model: served_model.as_deref(),
                 server: &server,
                 started,
                 path,
@@ -1055,6 +1068,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             cold::ColdDecision::Recap { idle_ms, prompt } => {
                 record_anthropic_cold_recap(ColdRecord {
                     frontend: frontend.as_deref(),
+                    requested_model: client_model.as_deref(),
+                    effective_model: served_model.as_deref(),
                     server: &server,
                     started,
                     path,
@@ -1096,6 +1111,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             } => {
                 record_anthropic_cold_quiet(ColdRecord {
                     frontend: frontend.as_deref(),
+                    requested_model: client_model.as_deref(),
+                    effective_model: served_model.as_deref(),
                     server: &server,
                     started,
                     path,
@@ -1128,6 +1145,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 if writes_free {
                     record_anthropic_cold_quiet(ColdRecord {
                         frontend: frontend.as_deref(),
+                        requested_model: client_model.as_deref(),
+                        effective_model: served_model.as_deref(),
                         server: &server,
                         started,
                         path,
@@ -1194,6 +1213,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     }
                     record_anthropic_cold(ColdRecord {
                         frontend: frontend.as_deref(),
+                        requested_model: client_model.as_deref(),
+                        effective_model: served_model.as_deref(),
                         server: &server,
                         started,
                         path,
@@ -1593,6 +1614,7 @@ pub(crate) async fn retry_thinking_off(
     sent: Bytes,
     upstream: reqwest::Response,
     record: &mut Option<AnthropicRecordCtx>,
+    in_flight: Option<&super::InFlightGuard>,
     cancellation: &mut super::cancel::PrecommitCancellationGuard,
 ) -> Result<ThinkingRetry, Box<ThinkingRetryFailure>> {
     if upstream.status() != StatusCode::BAD_REQUEST {
@@ -1677,7 +1699,13 @@ pub(crate) async fn retry_thinking_off(
             ctx.safeguards.support = Some(crate::routing::CapabilityEvidence::Unsupported);
         }
         cancellation.update_anthropic(Some(ctx));
-        server.note_binding_sent(&ctx.binding_id, ctx.effective_model.as_deref());
+        server.note_attempt_sent(
+            in_flight,
+            ctx.attempt.as_ref(),
+            ctx.backend.id(),
+            &ctx.binding_id,
+            ctx.effective_model.as_deref(),
+        );
     }
     let retry_parts;
     let parts = if wants_safeguards {

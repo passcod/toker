@@ -773,13 +773,22 @@ impl Server {
         self.store.record_request(&row)
     }
 
-    pub(crate) fn note_binding_sent(
+    /// An attempt is about to be sent: the binding's learning notes the
+    /// effective target, and the request's in-flight record moves to the
+    /// attempt, so every send, a fallback's included, shows as it begins.
+    pub(crate) fn note_attempt_sent(
         &self,
+        in_flight: Option<&InFlightGuard>,
+        attempt: Option<&crate::store::AttemptProvenance>,
+        provider: &str,
         binding_id: &crate::policy::BindingId,
         effective_model: Option<&str>,
     ) {
         self.binding_learning
             .note_sent(binding_id, effective_model, now_ms());
+        if let (Some(guard), Some(attempt)) = (in_flight, attempt) {
+            guard.sent(attempt, provider, binding_id, effective_model);
+        }
     }
 
     /// Merge a completed provider-reported observation. Store errors are
@@ -1703,23 +1712,45 @@ impl Server {
         }
     }
 
-    /// A usage-path request is now in flight:
-    /// a lane's `updated_ms` moves only when a
-    /// response finishes, and one long turn can outlast a 5-minute tier,
-    /// so a request being served holds the machine awake, pings aside.
-    pub(crate) fn begin_in_flight(&self) -> InFlightGuard {
-        self.in_flight.fetch_add(1, Ordering::SeqCst);
-        self.evaluate_awake();
-        InFlightGuard {
-            server: self.clone(),
+    /// A request is now in flight. It is recorded in the store from here, so
+    /// the dashboard shows it before any of its rows exists. A `counted`
+    /// request also holds the sleep lock: a lane's `updated_ms` moves only
+    /// when a response finishes, and one long turn can outlast a 5-minute
+    /// tier, so a request being served holds the machine awake, pings aside.
+    pub(crate) fn begin_in_flight(&self, counted: bool, frontend: Option<&str>) -> InFlightGuard {
+        let record = match self.store.begin_in_flight(now_ms(), frontend) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                tracing::error!(%error, "in-flight record failed");
+                None
+            }
+        };
+        if counted {
+            self.in_flight.fetch_add(1, Ordering::SeqCst);
+            self.evaluate_awake();
         }
+        InFlightGuard(Arc::new(InFlightHold {
+            server: self.clone(),
+            counted,
+            record,
+        }))
     }
 
     /// The other half of the guard's Drop (the close event fires
     /// however the exchange ends — completion, error, hangup).
-    fn end_in_flight(&self) {
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        self.evaluate_awake();
+    fn end_in_flight(&self, counted: bool, record: Option<i64>) {
+        // The record goes first, and only now: the request's last row is
+        // written before its guard drops, so a reader never sees the
+        // request neither in flight nor recorded.
+        if let Some(id) = record
+            && let Err(error) = self.store.end_in_flight(id)
+        {
+            tracing::error!(%error, "in-flight record removal failed");
+        }
+        if counted {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            self.evaluate_awake();
+        }
     }
 
     /// The full route table, behind the frontend-prefix strip: a request
@@ -1814,6 +1845,11 @@ impl Server {
         };
         let address = listener.local_addr()?;
         tracing::info!("toker listening on http://{address}");
+        // No request outlives the process handling it, so a record left by
+        // a crash describes nothing.
+        if let Err(error) = self.store.clear_in_flight() {
+            tracing::error!(%error, "clearing in-flight records failed");
+        }
         self.spawn_state_prune();
         self.spawn_awake_timer();
         self.spawn_catalog_refresh();
@@ -2902,13 +2938,70 @@ pub(crate) fn mark_not_configured(
 /// streamed response the guard rides the body stream (it drops when axum
 /// drops the body — client hangup or natural completion); for everything
 /// else it drops when the handler's work is done.
-pub(crate) struct InFlightGuard {
+///
+/// A clone shares the one hold, which ends when the last clone drops: a
+/// cancelled attempt's row is written on the blocking pool, and the hold
+/// has to outlast it so the request never reads as neither in flight nor
+/// recorded.
+#[derive(Clone)]
+pub(crate) struct InFlightGuard(Arc<InFlightHold>);
+
+struct InFlightHold {
     server: Server,
+    /// Whether the request holds the sleep lock's count. A ping is
+    /// recorded as in flight all the same.
+    counted: bool,
+    /// The request's record in the store, `None` where writing it failed.
+    record: Option<i64>,
 }
 
-impl Drop for InFlightGuard {
+impl InFlightGuard {
+    /// Say what the request turned out to be, once it has been read.
+    pub(crate) fn identify(&self, identity: &crate::store::InFlightIdentity<'_>) {
+        if let Some(id) = self.0.record
+            && let Err(error) = self.0.server.store.identify_in_flight(id, identity)
+        {
+            tracing::error!(%error, "in-flight record update failed");
+        }
+    }
+
+    /// An attempt is about to be sent, a fallback's included.
+    pub(crate) fn sent(
+        &self,
+        attempt: &crate::store::AttemptProvenance,
+        provider: &str,
+        binding_id: &crate::policy::BindingId,
+        effective_model: Option<&str>,
+    ) {
+        if let Some(id) = self.0.record
+            && let Err(error) = self.0.server.store.in_flight_sent(
+                id,
+                &crate::store::InFlightAttempt {
+                    group_id: &attempt.attempt_group_id,
+                    index: attempt.attempt_index,
+                    provider,
+                    binding_id: Some(binding_id.as_str()),
+                    effective_model,
+                },
+            )
+        {
+            tracing::error!(%error, "in-flight record update failed");
+        }
+    }
+
+    /// The current attempt has begun to answer.
+    pub(crate) fn streaming(&self) {
+        if let Some(id) = self.0.record
+            && let Err(error) = self.0.server.store.in_flight_streaming(id)
+        {
+            tracing::error!(%error, "in-flight record update failed");
+        }
+    }
+}
+
+impl Drop for InFlightHold {
     fn drop(&mut self) {
-        self.server.end_in_flight();
+        self.server.end_in_flight(self.counted, self.record);
     }
 }
 

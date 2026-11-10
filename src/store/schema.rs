@@ -1403,7 +1403,7 @@ pub(super) const MIGRATIONS: &[&str] = &[
         attempt_group_id TEXT,
         session_id TEXT,
         parent_session_id TEXT,
-        frontend TEXT,
+        profile TEXT,
         requested_model TEXT,
         req_messages INTEGER,
         stage TEXT NOT NULL CHECK (stage IN ('held', 'waiting', 'streaming')),

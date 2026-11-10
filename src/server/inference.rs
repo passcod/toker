@@ -276,6 +276,14 @@ impl ReadyMessagesAttempt {
         &self.binding_id
     }
 
+    fn in_flight(&self) -> Option<&InFlightGuard> {
+        self.in_flight.as_ref()
+    }
+
+    fn provider(&self) -> &str {
+        self.backend.id()
+    }
+
     fn effective_model(&self) -> &str {
         &self.effective_model
     }
@@ -288,8 +296,10 @@ impl ReadyMessagesAttempt {
         if let Some(ctx) = self.record.as_mut() {
             ctx.attempt = Some(provenance.clone());
         }
-        let mut cancellation =
-            super::cancel::PrecommitCancellationGuard::anthropic(self.record.as_ref());
+        let mut cancellation = super::cancel::PrecommitCancellationGuard::anthropic(
+            self.record.as_ref(),
+            self.in_flight.as_ref(),
+        );
         let sent = self.body.clone();
         let upstream = match super::proxy::send_upstream(
             server,
@@ -355,6 +365,7 @@ impl ReadyMessagesAttempt {
             sent,
             upstream.response,
             &mut self.record,
+            self.in_flight.as_ref(),
             &mut cancellation,
         )
         .await
@@ -427,6 +438,9 @@ impl ReadyMessagesAttempt {
             .unwrap_or(provenance);
         match outcome {
             Ok(super::attempt::PrecommitOutcome::Accepted { response, .. }) => {
+                if let Some(guard) = &self.in_flight {
+                    guard.streaming();
+                }
                 ReadyMessagesOutcome::Accepted {
                     upstream: response,
                     record: self.record,
@@ -876,6 +890,14 @@ impl ReadyChatAttempt {
         &self.binding_id
     }
 
+    fn in_flight(&self) -> Option<&InFlightGuard> {
+        self.in_flight.as_ref()
+    }
+
+    fn provider(&self) -> &str {
+        self.backend.id()
+    }
+
     fn effective_model(&self) -> &str {
         &self.effective_model
     }
@@ -890,7 +912,8 @@ impl ReadyChatAttempt {
         }
         let record = self.record.take();
         let in_flight = self.in_flight.take();
-        let cancellation = super::cancel::PrecommitCancellationGuard::chat(record.as_ref());
+        let cancellation =
+            super::cancel::PrecommitCancellationGuard::chat(record.as_ref(), in_flight.as_ref());
         let upstream = match super::proxy::send_upstream(
             server,
             self.backend.as_ref(),
@@ -934,6 +957,9 @@ impl ReadyChatAttempt {
         let response_status = upstream.response.status();
         match super::attempt::precommit_openai_chat(upstream.response).await {
             Ok(super::attempt::PrecommitOutcome::Accepted { response, .. }) => {
+                if let Some(guard) = &in_flight {
+                    guard.streaming();
+                }
                 ReadyChatOutcome::Accepted {
                     upstream: response,
                     record,
@@ -1052,6 +1078,24 @@ impl ReadyBackendAttempt {
             Self::OpenRouter(ready) => ready.binding_id(),
             Self::Codex(ready) => ready.binding_id(),
         }
+    }
+
+    /// The attempt is about to be sent.
+    fn note_sent(&self, server: &Server, provenance: &crate::store::AttemptProvenance) {
+        let (in_flight, provider) = match self {
+            Self::Messages(ready) => (ready.in_flight(), ready.provider()),
+            Self::Chat(ready) => (ready.in_flight(), ready.provider()),
+            Self::Anthropic(ready) => (ready.in_flight(), ready.provider()),
+            Self::OpenRouter(ready) => (ready.in_flight(), ready.provider()),
+            Self::Codex(ready) => (ready.in_flight(), ready.provider()),
+        };
+        server.note_attempt_sent(
+            in_flight,
+            Some(provenance),
+            provider,
+            self.binding_id(),
+            Some(self.effective_model()),
+        );
     }
 
     fn effective_model(&self) -> &str {
@@ -1465,7 +1509,7 @@ async fn coordinate_policy_messages(
     client_wants_json: bool,
 ) -> Response {
     loop {
-        server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
+        ready.note_sent(&server, &provenance);
         let mut failed =
             match execute_policy_messages_precommit(&server, ready, provenance.clone()).await {
                 Ok(response) => return response,
@@ -1829,7 +1873,7 @@ async fn coordinate_policy_chat(
     record_template: Option<RecordCtx>,
 ) -> Response {
     loop {
-        server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
+        ready.note_sent(&server, &provenance);
         let failed = match execute_policy_chat_precommit(&server, ready, provenance.clone()).await {
             Ok(response) => return response,
             Err(failed) => failed,
@@ -2303,7 +2347,7 @@ async fn coordinate_policy_responses(
     client_wants_json: bool,
 ) -> Response {
     loop {
-        server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
+        ready.note_sent(&server, &provenance);
         let mut failed =
             match execute_policy_responses_precommit(&server, ready, provenance.clone()).await {
                 Ok(response) => return response,

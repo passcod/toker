@@ -444,8 +444,8 @@ impl Store {
 
     /// Record a request as in flight, held, from `started_ms`; returns the
     /// record's id for the calls below.
-    pub fn begin_in_flight(&self, started_ms: i64, frontend: Option<&str>) -> Result<i64> {
-        in_flight::begin(&*self.conn()?, started_ms, frontend)
+    pub fn begin_in_flight(&self, started_ms: i64, profile: Option<&str>) -> Result<i64> {
+        in_flight::begin(&*self.conn()?, started_ms, profile)
     }
 
     /// Fill in what the server learned of an in-flight request once it
@@ -1811,9 +1811,7 @@ mod tests {
     #[test]
     fn in_flight_round_trips_through_its_stages() {
         let store = mem_store();
-        let id = store
-            .begin_in_flight(1_000, Some("anthropic"))
-            .expect("begin");
+        let id = store.begin_in_flight(1_000, Some("claude")).expect("begin");
         let held = store.in_flight_rows().expect("rows");
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].stage, InFlightStage::Held);

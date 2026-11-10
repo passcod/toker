@@ -794,6 +794,11 @@ pub(crate) struct QuotaBlockedRecord<'a> {
     pub(crate) stale_meters: Option<&'a Value>,
     /// The frontend's prefix name, for `extra.frontend`.
     pub(crate) frontend: Option<&'a str>,
+    /// The model the request asked for.
+    pub(crate) requested_model: Option<&'a str>,
+    /// The model the request was routed to, where it had been when the row
+    /// was written.
+    pub(crate) effective_model: Option<&'a str>,
 }
 
 /// Record the quota-block row (the `kind: "blocked"` row).
@@ -822,6 +827,8 @@ pub(crate) fn record_quota_blocked(record: QuotaBlockedRecord<'_>) {
         context_tokens,
         stale_meters,
         frontend,
+        requested_model,
+        effective_model,
     } = record;
     let row = RequestRow {
         safeguards: Default::default(),
@@ -838,8 +845,8 @@ pub(crate) fn record_quota_blocked(record: QuotaBlockedRecord<'_>) {
         account_number: credential.account_number,
         model: None,
         raw_model: None,
-        requested_model: None,
-        effective_model: None,
+        requested_model: requested_model.map(str::to_owned),
+        effective_model: effective_model.map(str::to_owned),
         input: None,
         cache_read: None,
         cache_write_total: None,
@@ -958,6 +965,8 @@ fn write_cold_row(record: ColdRecord<'_>, kind: RowKind, verb: &str) {
         writes_free: _,
         gate_on,
         frontend,
+        requested_model,
+        effective_model,
     } = record;
     let outlook = outlook.cloned();
     let row = RequestRow {
@@ -975,8 +984,8 @@ fn write_cold_row(record: ColdRecord<'_>, kind: RowKind, verb: &str) {
         account_number: None,
         model: None,
         raw_model: None,
-        requested_model: None,
-        effective_model: None,
+        requested_model: requested_model.map(str::to_owned),
+        effective_model: effective_model.map(str::to_owned),
         input: None,
         cache_read: None,
         cache_write_total: None,
@@ -1088,6 +1097,11 @@ pub(crate) struct ColdRecord<'a> {
     pub(crate) gate_on: bool,
     /// The frontend's prefix name, for `extra.frontend`.
     pub(crate) frontend: Option<&'a str>,
+    /// The model the request asked for.
+    pub(crate) requested_model: Option<&'a str>,
+    /// The model the request was routed to, where it had been when the row
+    /// was written.
+    pub(crate) effective_model: Option<&'a str>,
 }
 
 /// The withheld-notice row (the `kind: "cold-quiet"` row).
@@ -1121,6 +1135,8 @@ pub(crate) fn record_anthropic_cold_quiet(record: ColdRecord<'_>) {
         writes_free,
         gate_on,
         frontend,
+        requested_model,
+        effective_model,
         ..
     } = record;
     let outlook = outlook.cloned();
@@ -1139,8 +1155,8 @@ pub(crate) fn record_anthropic_cold_quiet(record: ColdRecord<'_>) {
         account_number: None,
         model: None,
         raw_model: None,
-        requested_model: None,
-        effective_model: None,
+        requested_model: requested_model.map(str::to_owned),
+        effective_model: effective_model.map(str::to_owned),
         input: None,
         cache_read: None,
         cache_write_total: None,
