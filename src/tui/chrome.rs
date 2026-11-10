@@ -940,8 +940,9 @@ mod tests {
         assert_eq!(strip_text(&tabs, 1, 12), " ‹ 2 rewr… ›");
     }
 
-    /// The header of the routing page as the mockups draw it, at `width`
-    /// columns, as text rows, with the buffer for styles.
+    /// The routing page's header at `width` columns: the page buttons and
+    /// tab strip on the first row, the status on the right, as text rows,
+    /// with the buffer for styles.
     fn header_frame(
         width: u16,
         current: Page,
