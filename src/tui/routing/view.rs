@@ -9,6 +9,7 @@ use ratatui::{
     widgets::{Block, Clear, Paragraph, Wrap},
 };
 use serde_json::Value;
+use unicode_width::UnicodeWidthStr;
 
 use super::data::array;
 use super::edit_view;
@@ -498,7 +499,7 @@ fn render_modal(frame: &mut Frame, state: &State) -> Option<FormHit> {
         .collect();
     let width = lines
         .iter()
-        .map(|line| line.chars().count())
+        .map(|line| line.width())
         .max()
         .unwrap_or(20)
         .min(100) as u16

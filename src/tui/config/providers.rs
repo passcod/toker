@@ -11,6 +11,7 @@ use ratatui::{
     layout::Rect,
     text::{Line, Span},
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::form;
 use super::model::{Dependents, Provider, Row, Safeguards, Snapshot, State, Target};
@@ -120,7 +121,7 @@ fn layout(snapshot: &Snapshot, state: &State, width: usize) -> Layout {
                 .iter()
                 .map(|piece| piece.content.to_string())
                 .collect();
-            text.chars().count()
+            text.width()
         })
         .max()
         .unwrap_or(0)

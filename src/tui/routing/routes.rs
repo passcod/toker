@@ -398,7 +398,7 @@ pub(super) fn route_top(
     let id = text(route, "id");
     let mut lines = Vec::new();
     let place = format!("{} of {total}", place + 1);
-    let gap = width.saturating_sub(id.chars().count() + place.chars().count());
+    let gap = width.saturating_sub(id.width() + place.width());
     lines.push(Line::from(vec![
         span(id.to_owned(), bold()),
         Span::raw(" ".repeat(gap)),
@@ -635,4 +635,21 @@ pub(super) fn compaction_text(block: &Value) -> String {
         "{target} · cache {}",
         cache_words(text(block, "cache_transition"))
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::routing::testing::{World, snapshot};
+
+    /// A route id is the operator's to choose, so its width is in cells: the
+    /// place that follows it stays against the right edge.
+    #[test]
+    fn a_wide_route_id_leaves_its_place_against_the_edge() {
+        let snapshot = snapshot(World::AT_REST);
+        let mut route = snapshot["derived"]["active"]["routes"][0].clone();
+        route["id"] = serde_json::json!("路由路由路由");
+        let lines = route_top(&snapshot, &route, 0, 7, 40);
+        assert_eq!(lines[0].width(), 40);
+    }
 }

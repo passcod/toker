@@ -13,6 +13,7 @@ use ratatui::{
     widgets::Paragraph,
 };
 use serde_json::Value;
+use unicode_width::UnicodeWidthStr;
 
 use super::data::{array, count, counted, text};
 use super::model::{Panel, State};
@@ -312,10 +313,7 @@ fn compaction_line(active: &Value, focused: bool) -> Lines {
                 )],
                 29,
             )
-            .cell(
-                vec![Span::raw(on.clone())],
-                (on.chars().count() + 2).max(32),
-            )
+            .cell(vec![Span::raw(on.clone())], (on.width() + 2).max(32))
             .raw(vec![Span::raw(format!("cache {cache}"))])
             .line(),
         focused,
