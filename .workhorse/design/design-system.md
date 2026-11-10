@@ -60,7 +60,7 @@ A meter under 80%. A cache hit rate over 95%. Freshness under 30 seconds. A nati
 A meter between 80% and 95%. A hit rate between 80% and 95%. Freshness between 30 seconds and five minutes. A known context ceiling that is not the native million. A session released past the armed gate (`$`) or to the end of the plan (`%`). A forecast that reaches the armed gate's threshold rather than true exhaustion (`stops ~T`), the `gated ·` prefix, and overage in use. The `burn` control, inverted to `Black` on `Yellow` once armed.
 
 **Red — exhausted, failed, or about to be.**
-A meter over 95%, or one whose verdict is `spent` or `out ~T`. A hit rate under 80%. Freshness beyond five minutes, and `no data` on an empty ledger. Errors, failed requests and drift in the requests line, and the sparkline bucket holding an error. A context occupancy over 80% on a live session, with its `← compacts soon` marker. A session whose newest decision was a gate stopping it (`!`). `overage IN USE`. A popup's error message.
+A meter over 95%, or one whose verdict is `spent` or `out ~T`. A hit rate under 80%. Freshness beyond five minutes, and `no data` on an empty ledger. Errors, failed requests and drift in the requests line, and the sparkline bucket holding an error. A context occupancy over 80% on a live session, with its `← compacts soon` marker. A session whose newest decision was a gate stopping it (`!`), and one whose newest finished request failed (`✗`). `overage IN USE`. A popup's error message.
 
 **Cyan — identity rather than judgement.**
 A session's working directory in its label, and the context occupancy bar at a share that is not yet a concern. Cyan never means good or bad; it distinguishes.
@@ -93,7 +93,7 @@ It marks the best case (a native 1M ceiling), the most urgent case (a stopped se
 
 **`DIM` means absent, inactive or subordinate.**
 It renders at half the foreground's opacity, so it keeps the colour underneath rather than flattening to grey — which matters, because a dim green `↑` is still a green `↑`.
-It marks an idle session and its bar, a `?` for an unknown ceiling, a proportion bar in TOKENS, a reset clock beside a verdict, the `estimating` and `window rolled over` verdicts, a rule in ruled chrome, an unavailable control in a popup, a tab that is not the current one, a count of the entries a list left out, and the key prompt under a text entry.
+It marks an idle session and its bar, a model and ceiling no response has yet confirmed (`~`), a `?` for an unknown ceiling, a proportion bar in TOKENS, a reset clock beside a verdict, the `estimating` and `window rolled over` verdicts, a rule in ruled chrome, an unavailable control in a popup, a tab that is not the current one, a count of the entries a list left out, and the key prompt under a text entry.
 
 **`REVERSED` means a handle to press or a row in focus.**
 The header chips, and the selected row in a list.
@@ -118,6 +118,8 @@ The contract is that agreement and not the length of the list: a screen that gai
 | `$` | released past the armed quota gate for this window |
 | `%` | released to the end of the plan, stopping before overage |
 | `!` | stopped: the last thing this session got was a gate notice |
+| `✗` | failed: this session's newest finished request ended in failure |
+| `~` | routed to this model, none served yet |
 | `↺` | compactions so far; - for none |
 | `-` | not reported, which is not zero |
 | `?` | unknown: model, context ceiling, or token count |
@@ -135,6 +137,8 @@ The contract is that agreement and not the length of the list: a screen that gai
 | `last req` | green under 30s, yellow under 5m, red beyond |
 | `ctx` | green: native 1M; yellow: another known ceiling |
 | `idle` | dim once a session has been quiet 3m |
+| `held` `sent` `recv` | in flight: not yet sent, awaiting a reply, or streaming; timed from arrival |
+| `+N` | N more requests in flight in that session |
 
 ### Structural glyphs
 
