@@ -1,9 +1,8 @@
 ---
 source: src/tui/routing/view.rs
-assertion_line: 925
 expression: frame(&state)
 ---
- ? ⇄ 1  2 routes, candidates & defaults  3  4                                                                    draft 4
+ ? ⇄ 1  2 routes, candidates & defaults  3  4                                                                 revision 3
 ┌ROUT┌EDIT ROUTE──────────────────────────────────────────────────────────────────────────────────────────────────┐────┐
 │mixe│> id: mixed▏  (fixed)                                                                                       │    │
 │defa│  name: Subscription then billed                                                                            │    │

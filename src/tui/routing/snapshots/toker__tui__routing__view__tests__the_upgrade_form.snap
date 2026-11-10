@@ -1,9 +1,8 @@
 ---
 source: src/tui/routing/view.rs
-assertion_line: 960
 expression: "frame(&adding(super::View::Rewrites, '3'))"
 ---
- ? ⇄ 1  2  3 rewrites, families, upgrades & compaction  4                                                        draft 4
+ ? ⇄ 1  2  3 rewrites, families, upgrades & compaction  4                                                     revision 3
 ┌REWR┌ADD UPGRADE─────────────────────────────────────────────────────────────────────────────────────────────────┐────┐
 │r-so│> id: new-upgrade▏                                                                                          │    │
 │gpt-│  classifier: new-classifier  (not offered)                                                                 │    │

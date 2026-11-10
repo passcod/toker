@@ -1,8 +1,7 @@
-//! Routing policy page with draft-led controls.
+//! Routing policy page.
 
 mod detail;
 mod form;
-mod import;
 mod model;
 mod reconcile;
 mod template;
@@ -30,7 +29,7 @@ fn revisions() -> Command {
 fn activated(reply: &Reply) -> bool {
     match reply {
         Reply::Command(command, Ok(response)) => {
-            matches!(command.name, "activate" | "reactivate") && response.status / 100 == 2
+            matches!(command.name, "save" | "reactivate") && response.status / 100 == 2
         }
         Reply::Command(_, Err(_)) => false,
     }
@@ -42,7 +41,7 @@ fn activated(reply: &Reply) -> bool {
 pub(super) fn owns_key(code: crossterm::event::KeyCode) -> bool {
     matches!(
         code,
-        crossterm::event::KeyCode::Char('e' | 'n' | 'd' | 'v' | 'V' | 'a' | 'x' | 'p' | 'i')
+        crossterm::event::KeyCode::Char('e' | 'n' | 'd' | 'v' | 'x' | 'p')
             | crossterm::event::KeyCode::PageUp
             | crossterm::event::KeyCode::PageDown
     )
@@ -83,8 +82,14 @@ impl Page {
         while let Some(reply) = self.client.poll() {
             let activated = activated(&reply);
             self.state.receive(reply);
-            if activated && let Some(note) = self.reconciler.start() {
-                self.state.set_settings_note(note);
+            if activated {
+                // The reply carries the activation; the derived facts and the
+                // history behind it are read again.
+                self.refresh();
+                self.send(revisions());
+                if let Some(note) = self.reconciler.start() {
+                    self.state.set_settings_note(note);
+                }
             }
         }
         while let Some(note) = self.reconciler.poll() {
@@ -204,10 +209,10 @@ mod tests {
 
     #[test]
     fn only_a_successful_activation_triggers_the_settings_sync() {
-        assert!(activated(&reply("activate", 200)));
+        assert!(activated(&reply("save", 200)));
         assert!(activated(&reply("reactivate", 200)));
-        assert!(!activated(&reply("activate", 409)));
-        assert!(!activated(&reply("draft-edit", 200)));
+        assert!(!activated(&reply("save", 409)));
+        assert!(!activated(&reply("preview", 200)));
         assert!(!activated(&Reply::Command(
             Command::snapshot("routing-snapshot"),
             Err("down".to_owned())
@@ -216,7 +221,7 @@ mod tests {
 
     #[test]
     fn every_key_the_legend_documents_reaches_the_page() {
-        for key in ['e', 'n', 'd', 'v', 'V', 'a', 'x', 'p', 'i'] {
+        for key in ['e', 'n', 'd', 'v', 'x', 'p'] {
             assert!(owns_key(KeyCode::Char(key)), "{key}");
         }
         for key in [KeyCode::PageUp, KeyCode::PageDown] {

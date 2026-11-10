@@ -1,9 +1,8 @@
 ---
 source: src/tui/routing/view.rs
-assertion_line: 945
 expression: "frame(&adding(super::View::Routes, '2'))"
 ---
- ? ⇄ 1  2 routes, candidates & defaults  3  4                                                                    draft 4
+ ? ⇄ 1  2 routes, candidates & defaults  3  4                                                                 revision 3
 ┌ROUT┌ADD DEFAULT─────────────────────────────────────────────────────────────────────────────────────────────────┐────┐
 │mixe│  SCOPE                                                                                                     │    │
 │defa│>   kind: < protocol >                                                                                      │    │

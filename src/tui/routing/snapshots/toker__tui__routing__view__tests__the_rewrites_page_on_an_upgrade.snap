@@ -1,11 +1,10 @@
 ---
 source: src/tui/routing/view.rs
-assertion_line: 840
 expression: frame(&state)
 ---
- ? ⇄ 1  2  3 rewrites, families, upgrades & compaction  4                                                        draft 4
+ ? ⇄ 1  2  3 rewrites, families, upgrades & compaction  4                                                     revision 3
 ┌REWRITES, FAMILIES, UPGRADES & COMPACTION───────┐┌DETAIL──────────────────────────────────────────────────────────────┐
-│r-sonnet  {"id":"r-sonnet","scope":{"kind":"pro…││draft generation 4                                                  │
+│r-sonnet  {"id":"r-sonnet","scope":{"kind":"pro…││revision 3 is live                                                  │
 │gpt-family  {"id":"gpt-family","binding_id":"co…││newest  classifier gpt-family                                       │
 │newest  {"id":"newest","classifier_id":"gpt-fam…││lane transition: move_when_cold                                     │
 │                                                ││                                                                    │

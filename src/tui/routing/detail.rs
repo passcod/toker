@@ -10,7 +10,7 @@ use super::model::{Entry, scope_label};
 
 /// The lines for `entry`, from the snapshot the daemon last sent.
 pub(super) fn lines(snapshot: &Value, entry: &Entry<'_>) -> Vec<String> {
-    let mut lines = match entry.key {
+    match entry.key {
         "presentations" => presentation(snapshot, entry.value),
         "routes" => route(snapshot, entry.value),
         "defaults" => default(snapshot, entry.value),
@@ -20,27 +20,7 @@ pub(super) fn lines(snapshot: &Value, entry: &Entry<'_>) -> Vec<String> {
         "availability" => availability(snapshot, entry.value),
         "publications" => publication(entry.value),
         _ => json(entry.value),
-    };
-    if let Some(id) = entry.value.get("id").and_then(Value::as_str) {
-        let diagnostics: Vec<String> = array(snapshot, "draft_diagnostics")
-            .iter()
-            .filter(|diagnostic| text(diagnostic, "record_id") == id)
-            .map(|diagnostic| {
-                format!(
-                    "  {} {} at {}",
-                    text(diagnostic, "severity"),
-                    text(diagnostic, "code"),
-                    text(diagnostic, "path")
-                )
-            })
-            .collect();
-        if !diagnostics.is_empty() {
-            lines.push(String::new());
-            lines.push("DIAGNOSTICS".to_owned());
-            lines.extend(diagnostics);
-        }
     }
-    lines
 }
 
 /// What a preview that asked for server safeguards says about them: each
@@ -118,23 +98,16 @@ fn json(value: &Value) -> Vec<String> {
         .collect()
 }
 
-/// The derived content that matches what the list shows: the draft's when
-/// there is one, else the active revision's. A draft that does not compile
-/// has none, and the page says so rather than show the active revision's
-/// facts against records it does not describe.
+/// The derived content for the active revision, which is what the list
+/// shows.
 fn derived(snapshot: &Value) -> Result<&Value, &'static str> {
     let derived = snapshot
         .get("derived")
         .ok_or("derived facts not reported")?;
-    let key = if snapshot.get("draft").is_some_and(|draft| !draft.is_null()) {
-        "draft"
-    } else {
-        "active"
-    };
     derived
-        .get(key)
+        .get("active")
         .filter(|value| !value.is_null())
-        .ok_or("no derived facts: the draft does not compile")
+        .ok_or("no derived facts: the active revision does not compile")
 }
 
 fn derived_note(snapshot: &Value, lines: &mut Vec<String>) {
@@ -429,9 +402,7 @@ fn default(snapshot: &Value, record: &Value) -> Vec<String> {
         format!("route: {target}"),
     ];
     let route = snapshot
-        .get("draft")
-        .filter(|draft| !draft.is_null())
-        .or_else(|| snapshot.get("active_revision"))
+        .get("active_revision")
         .map(|revision| revision.get("policy").unwrap_or(revision))
         .and_then(|policy| find(array(policy, "routes"), "id", target));
     if let Some(route) = route {
@@ -648,10 +619,7 @@ mod tests {
 
     fn snapshot() -> serde_json::Value {
         json!({
-            "draft": {"policy": {}},
-            "draft_diagnostics": [
-                {"code": "binding-unconfigured", "severity": "info", "record_id": "mixed", "path": "/routes/0"},
-            ],
+            "active_revision": {"revision_id": 3, "policy": {}},
             "publications": [
                 {"adapter": "dynamic_responses_models", "state": "applied",
                  "applied_revision_id": 2, "desired_revision_id": 3,
@@ -665,7 +633,7 @@ mod tests {
                     "capabilities": {}, "cost_class": "subscription",
                 }],
                 "circuits": [],
-                "draft": {
+                "active": {
                     "routes": [{
                         "id": "mixed",
                         "pinned_lanes": {"warm": 2, "cold": 1, "unknown": 0},
@@ -686,7 +654,6 @@ mod tests {
                         "desired": "left_out", "reason": "no_codex_record", "applied": null,
                     }],
                 },
-                "active": null,
             },
         })
     }
@@ -708,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn a_route_shows_its_cost_boundary_pinned_lanes_and_diagnostics() {
+    fn a_route_shows_its_cost_boundary_and_pinned_lanes() {
         let snapshot = snapshot();
         let record = route();
         let text = lines(
@@ -733,10 +700,6 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("now: available; catalogue fresh"), "{text}");
-        assert!(
-            text.contains("info binding-unconfigured at /routes/0"),
-            "{text}"
-        );
     }
 
     #[test]
@@ -822,9 +785,9 @@ mod tests {
     }
 
     #[test]
-    fn a_draft_that_does_not_compile_has_no_derived_facts_to_show() {
+    fn a_revision_that_does_not_compile_has_no_derived_facts_to_show() {
         let mut snapshot = snapshot();
-        snapshot["derived"]["draft"] = serde_json::Value::Null;
+        snapshot["derived"]["active"] = serde_json::Value::Null;
         let record = route();
         let text = lines(
             &snapshot,
@@ -836,7 +799,7 @@ mod tests {
         .join("\n");
 
         assert!(
-            text.contains("no derived facts: the draft does not compile"),
+            text.contains("no derived facts: the active revision does not compile"),
             "{text}"
         );
         assert!(!text.contains("COST BOUNDARY"), "{text}");

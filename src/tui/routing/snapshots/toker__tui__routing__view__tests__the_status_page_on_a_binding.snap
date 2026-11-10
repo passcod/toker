@@ -1,17 +1,16 @@
 ---
 source: src/tui/routing/view.rs
-assertion_line: 848
 expression: frame(&state)
 ---
- ? ⇄ 1  2  3  4 preview, revisions & activation                                                                  draft 4
+ ? ⇄ 1  2  3  4 preview, revisions & activation                                                               revision 3
 ┌PREVIEW, REVISIONS & ACTIVATION─────────────────┐┌DETAIL──────────────────────────────────────────────────────────────┐
-│3  {"revision_id":3,"policy":{}}                ││draft generation 4                                                  │
-│draft  {"policy":{"description":"example draft"…││codex_sub.codex_responses  codex_sub                                │
-│dynamic_responses_models  {"adapter":"dynamic_r…││cost class: subscription                                            │
-│codex_sub.codex_responses  {"binding_id":"codex…││configured: yes (configured)                                        │
-│openrouter.openrouter_responses  {"binding_id":…││enabled: yes (enabled)                                              │
-│lane_impacts  {"total":4,"unpinned":1,"warm":2,…││credential: unknown                                                 │
-│diagnostic  {"code":"virtual-presentation-unlis…││catalogue: fresh                                                    │
+│3  {"revision_id":3,"policy":{"description":"ex…││revision 3 is live                                                  │
+│dynamic_responses_models  {"adapter":"dynamic_r…││codex_sub.codex_responses  codex_sub                                │
+│codex_sub.codex_responses  {"binding_id":"codex…││cost class: subscription                                            │
+│openrouter.openrouter_responses  {"binding_id":…││configured: yes (configured)                                        │
+│lane_impacts  {"total":4,"unpinned":1,"warm":2,…││enabled: yes (enabled)                                              │
+│                                                ││credential: unknown                                                 │
+│                                                ││catalogue: fresh                                                    │
 │                                                ││                                                                    │
 │                                                ││CAPABILITIES                                                        │
 │                                                ││  sampling: supported                                               │

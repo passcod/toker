@@ -166,8 +166,8 @@ fn wrapped_rows(lines: &[Line], width: u16) -> usize {
 /// What the page is in the middle of, at the right of its header.
 fn status_text(state: &State) -> String {
     let mut parts = Vec::new();
-    if let Some(generation) = state.generation() {
-        parts.push(format!("draft {generation}"));
+    if let Some(revision) = state.active_revision_id() {
+        parts.push(format!("revision {revision}"));
     }
     if state.in_flight() {
         parts.push("working".to_owned());
@@ -179,7 +179,7 @@ fn status_text(state: &State) -> String {
 }
 
 /// The page's keys, in its `?` overlay.
-const KEYS: [(&str, &str); 18] = [
+const KEYS: [(&str, &str); 15] = [
     ("↑/↓ j/k", "select a record"),
     ("←/→ h/l 1–4", "switch view"),
     ("pgup/pgdn", "scroll the detail"),
@@ -190,14 +190,8 @@ const KEYS: [(&str, &str); 18] = [
     ("e", "edit the selected record in a form"),
     ("d", "remove the selected record"),
     ("v", "preview a request"),
-    ("V", "validate the draft"),
-    ("a", "activate the draft"),
     ("x", "reactivate the selected revision"),
     ("p", "promote"),
-    (
-        "i",
-        "import toker.toml's routing into the draft, from the status view",
-    ),
     ("r", "refresh"),
     ("click", "select a record, or focus a form field"),
     ("wheel", "scroll what is under the pointer"),
@@ -265,13 +259,10 @@ fn detail_lines(state: &State, selected: Option<&Entry<'_>>) -> Vec<Line<'static
         None if state.loading() => vec![Line::raw("loading routing snapshot…")],
         None => vec![Line::raw("routing snapshot has no entries for this view")],
     };
-    if let Some(generation) = state.generation() {
+    if let Some(revision) = state.active_revision_id() {
         lines.insert(
             0,
-            Line::styled(
-                format!("draft generation {generation}"),
-                Style::new().bold(),
-            ),
+            Line::styled(format!("revision {revision} is live"), Style::new().bold()),
         );
     }
     lines
@@ -382,7 +373,7 @@ fn modal_text(state: &State) -> Vec<String> {
         let summary = super::detail::preview_safeguards(result);
         lines.splice(1..1, summary);
     }
-    if matches!(modal, Modal::Activate { .. } | Modal::Reactivate { .. }) {
+    if matches!(modal, Modal::Reactivate { .. }) {
         // Before the closing "confirms" line, so the prompt stays last.
         let confirm = lines.pop();
         lines.extend(state.activation_summary());
@@ -410,50 +401,17 @@ fn modal_lines(modal: &Modal) -> Vec<String> {
             lines
         }
         Modal::Remove { key, value } => vec![
-            format!("Remove this {key} record? This changes only the draft."),
+            format!("Remove this {key} record? Saving it makes a new revision live."),
             short(value),
             confirm_hint(),
         ],
         Modal::PreviewResult(result) => {
             vec![chrome::hints(&[("any key", "close")]), pretty(result)]
         }
-        Modal::Activate {
-            scope,
-            force_cache_transition,
-        } => activation_lines("Activate this draft?", *scope, *force_cache_transition),
-        Modal::Reactivate {
-            revision_id,
-            scope,
-            force_cache_transition,
-        } => {
-            let mut lines = activation_lines(
-                &format!("Create a forward revision from revision {revision_id}?"),
-                *scope,
-                *force_cache_transition,
-            );
-            lines.insert(1, "The active pointer never moves backwards.".to_owned());
-            lines
-        }
-        Modal::Import => vec![
-            "Replace the current draft with the routing in toker.toml?".to_owned(),
-            "The active revision does not change until the draft is activated.".to_owned(),
+        Modal::Reactivate { revision_id } => vec![
+            format!("Create a forward revision from revision {revision_id}?"),
+            "The active pointer never moves backwards.".to_owned(),
             confirm_hint(),
-        ],
-        Modal::Conflict {
-            daemon_generation,
-            daemon_draft,
-        } => vec![
-            "The daemon draft changed while this terminal was editing.".to_owned(),
-            format!(
-                "daemon generation: {}",
-                daemon_generation.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
-            ),
-            chrome::hints(&[
-                ("r", "reload, discarding local typed edits"),
-                ("a", "reapply them to this daemon copy"),
-                ("esc", "close"),
-            ]),
-            pretty(daemon_draft),
         ],
     }
 }
@@ -461,20 +419,6 @@ fn modal_lines(modal: &Modal) -> Vec<String> {
 /// The prompt every confirmation closes on.
 fn confirm_hint() -> String {
     chrome::hints(&[("y/enter", "confirm"), ("n/esc", "cancel")])
-}
-
-fn activation_lines(prompt: &str, scope: usize, force_cache_transition: bool) -> Vec<String> {
-    let scope = ["new lanes", "new and cold lanes", "immediate"][scope.min(2)];
-    vec![
-        prompt.to_owned(),
-        format!("scope: {scope} · {}", chrome::hints(&[("h/l", "change")])),
-        format!(
-            "forced warm-cache transition: {} · {}",
-            if force_cache_transition { "YES" } else { "no" },
-            chrome::hints(&[("f", "toggle")])
-        ),
-        confirm_hint(),
-    ]
 }
 
 #[cfg(test)]
@@ -492,9 +436,7 @@ mod tests {
             Ok(Response {
                 status: 200,
                 body: serde_json::json!({
-                    "draft_generation": 2,
-                    "draft": {"policy": {"presentations": [{"slug": "friendly"}]}},
-                    "active_revision": {"policy": {"presentations": []}}
+                    "active_revision": {"revision_id": 2, "policy": {"presentations": [{"slug": "friendly"}]}}
                 }),
             }),
         ));
@@ -527,67 +469,52 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(text.contains("edit the selected record"), "{text}");
-        assert!(text.contains("activate the draft"), "{text}");
+        assert!(text.contains("reactivate the selected revision"), "{text}");
     }
 
     #[test]
-    fn the_activation_form_shows_its_impact_and_the_last_refusal() {
+    fn the_reactivation_form_shows_its_impact_and_the_last_refusal() {
         let mut state = State::default();
         state.receive(Reply::Command(
             Command::snapshot("routing-snapshot"),
             Ok(Response {
                 status: 200,
                 body: serde_json::json!({
-                    "draft_generation": 2,
-                    "draft": {"policy": {"routes": [{"id": "new-route"}]}},
-                    "active_revision": {"policy": {"routes": []}},
+                    "active_revision": {"revision_id": 3, "policy": {"routes": []}},
                     "lane_impacts": {"total": 4, "unpinned": 1, "warm": 2, "cold": 1, "unknown": 0},
                     "publications": [{"adapter": "claude", "state": "failed"}],
-                    "derived": {
-                        "active": {"routes": [
-                            {"id": "kept", "edges": [{"from": "a", "to": "b", "crosses_cost_boundary": true, "billed_boundary": "deny", "from_cost": "subscription", "to_cost": "billed"}]},
-                            {"id": "gone", "edges": [{"from": "a", "to": "b", "crosses_cost_boundary": true, "billed_boundary": "allow"}]},
-                        ]},
-                        "draft": {"routes": [
-                            {"id": "kept", "edges": [{"from": "a", "to": "b", "crosses_cost_boundary": true, "billed_boundary": "allow", "from_cost": "subscription", "to_cost": "billed"}]},
-                            {"id": "new-route", "edges": [{"from": "a", "to": "b", "crosses_cost_boundary": true, "billed_boundary": "allow", "from_cost": "subscription", "to_cost": "unknown"}]},
-                        ]},
-                    },
                 }),
             }),
         ));
+        let mut revisions = Command::snapshot("routing-revisions");
+        revisions.name = "revisions";
+        state.receive(Reply::Command(
+            revisions,
+            Ok(Response {
+                status: 200,
+                body: serde_json::json!({"revisions": [{"revision_id": 2}]}),
+            }),
+        ));
+        state.set_view(super::View::Status);
+        state.move_selection(1);
         state.key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyCode::Char('x'),
             crossterm::event::KeyModifiers::NONE,
         ));
         let mut command = Command::snapshot("routing-snapshot");
-        command.name = "activate";
+        command.name = "reactivate";
         state.receive(Reply::Command(
             command,
             Ok(Response {
                 status: 409,
-                body: serde_json::json!({"error": "forced_cache_transition_required"}),
+                body: serde_json::json!({"error": "stale_revision", "live_revision_id": 4}),
             }),
         ));
         let text = modal_text(&state).join("\n");
-        assert!(text.contains("+route new-route"), "{text}");
+        assert!(text.contains("revision 2"), "{text}");
         assert!(text.contains("2 warm"), "{text}");
-        assert!(
-            text.contains("cost boundary: kept: a -> b consent allow (was deny)"),
-            "{text}"
-        );
-        assert!(
-            text.contains(
-                "cost boundary: new-route: a -> b now crosses subscription to unknown (consent allow)"
-            ),
-            "{text}"
-        );
-        assert!(
-            text.contains("cost boundary: gone: a -> b removed"),
-            "{text}"
-        );
         assert!(text.contains("publication claude: failed"), "{text}");
-        assert!(text.contains("forced_cache_transition_required"), "{text}");
+        assert!(text.contains("revision 4 is now live"), "{text}");
         assert!(
             text.lines()
                 .rev()
@@ -607,9 +534,7 @@ mod tests {
                 .iter()
                 .any(|(keys, _)| keys.split([' ', '/']).any(|token| token == key))
         };
-        for key in [
-            'e', 'n', 'd', 'v', 'V', 'a', 'x', 'p', 'i', 'r', 'h', 'j', 'k', 'l',
-        ] {
+        for key in ['e', 'n', 'd', 'v', 'x', 'p', 'r', 'h', 'j', 'k', 'l'] {
             assert!(
                 !super::super::owns_key(KeyCode::Char(key)) || named(&key.to_string()),
                 "{key} is taken but not named"
@@ -651,8 +576,7 @@ mod tests {
             Ok(Response {
                 status: 200,
                 body: serde_json::json!({
-                    "draft_generation": 2,
-                    "draft": {"policy": {"routes": []}},
+                    "active_revision": {"revision_id": 2, "policy": {"routes": []}},
                 }),
             }),
         ));
@@ -685,7 +609,7 @@ mod tests {
             },
         });
         let policy = serde_json::json!({
-            "description": "example draft",
+            "description": "example policy",
             "presentations": [
                 {"id": "p-mixed", "slug": "mixed", "label": "Mixed",
                  "scope": {"kind": "protocol", "protocol": "openai_responses"},
@@ -728,13 +652,7 @@ mod tests {
                                "desired": "left_out", "reason": "no_codex_record", "applied": null}],
         });
         serde_json::json!({
-            "draft_generation": 4,
-            "draft": {"policy": policy},
-            "active_revision": {"revision_id": 3, "policy": {}},
-            "draft_diagnostics": [
-                {"code": "virtual-presentation-unlisted-in-responses", "severity": "info",
-                 "record_id": "p-mixed", "path": "/presentations/0/metadata"},
-            ],
+            "active_revision": {"revision_id": 3, "policy": policy},
             "lane_impacts": {"total": 4, "unpinned": 1, "warm": 2, "cold": 1, "unknown": 0},
             "publications": [{"adapter": "dynamic_responses_models", "state": "applied",
                               "scope": {"kind": "protocol", "protocol": "openai_responses"},
@@ -756,8 +674,7 @@ mod tests {
                     "catalogue": {"state": "absent"}, "capabilities": {}, "cost_class": "billed",
                 }],
                 "circuits": [],
-                "draft": derived_policy,
-                "active": null,
+                "active": derived_policy,
             },
         })
     }
@@ -886,16 +803,26 @@ mod tests {
     #[test]
     fn the_status_page_on_a_binding() {
         let mut state = page_in(super::View::Status);
-        // active revision, draft, publication, then the bindings
-        state.move_selection(3);
+        // active revision, publication, then the bindings
+        state.move_selection(2);
         insta::assert_snapshot!(frame(&state));
     }
 
     #[test]
-    fn the_activation_form() {
-        let mut state = page_in(super::View::Routes);
+    fn the_reactivation_form() {
+        let mut state = page_in(super::View::Status);
+        let mut revisions = Command::snapshot("routing-revisions");
+        revisions.name = "revisions";
+        state.receive(Reply::Command(
+            revisions,
+            Ok(Response {
+                status: 200,
+                body: serde_json::json!({"revisions": [{"revision_id": 2}]}),
+            }),
+        ));
+        state.move_selection(1);
         state.key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyCode::Char('x'),
             crossterm::event::KeyModifiers::NONE,
         ));
         insta::assert_snapshot!(frame(&state));
@@ -1069,7 +996,7 @@ mod tests {
             press_in(&mut state, crossterm::event::KeyCode::Char(character));
         }
         let mut command = Command::snapshot("routing-snapshot");
-        command.name = "draft-edit";
+        command.name = "save";
         state.receive(Reply::Command(
             command,
             Ok(Response {
@@ -1124,26 +1051,26 @@ mod tests {
         assert_eq!(state.selected(), 2);
         // A short list keeps the selection in view, and a click on a row
         // names the entry drawn there rather than one counted from the top.
-        let mut terminal = Terminal::new(TestBackend::new(120, 8)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(120, 6)).expect("terminal");
         let mut drawn = super::Drawn::default();
-        state.select(5);
+        state.select(4);
         terminal
             .draw(|frame| drawn = render(frame, &state, false))
             .expect("draw");
         let selected = drawn
             .rows
             .iter()
-            .find(|hit| hit.entry == 5)
-            .expect("row 5 is drawn in an 8-line terminal");
+            .find(|hit| hit.entry == 4)
+            .expect("row 4 is drawn in a 6-line terminal");
         assert!(
             drawn.rows[0].entry > 0,
-            "the list scrolled to reach row 5: {:?}",
+            "the list scrolled to reach row 4: {:?}",
             drawn.rows
         );
         state.select(0);
         assert_eq!(
             crate::tui::chrome::entry_at(&drawn.rows, selected.area.as_position()),
-            Some(5)
+            Some(4)
         );
     }
 }

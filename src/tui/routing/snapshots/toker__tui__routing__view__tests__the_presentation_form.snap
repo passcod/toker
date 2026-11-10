@@ -1,9 +1,8 @@
 ---
 source: src/tui/routing/view.rs
-assertion_line: 940
 expression: "frame(&adding(super::View::Presentations, '1'))"
 ---
- ? ⇄ 1 presentations  2  3  4                                                                                    draft 4
+ ? ⇄ 1 presentations  2  3  4                                                                                 revision 3
 ┌PRES┌ADD PRESENTATION────────────────────────────────────────────────────────────────────────────────────────────┐────┐
 │mixe│> id: new-presentation▏                                                                                     │    │
 │    │  SCOPE                                                                                                     │    │

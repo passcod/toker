@@ -28,7 +28,7 @@ pub(super) enum Node {
     Binding,
     /// A backend model id, completed from the offers of the nearest binding.
     Model,
-    /// The id of another record in the draft, completed from those ids.
+    /// The id of another record in the policy, completed from those ids.
     Ref {
         kind: &'static str,
         optional: bool,
@@ -500,7 +500,7 @@ impl Purpose {
                 (_, false) => "EDIT POLICY RECORD",
                 (_, true) => "ADD POLICY RECORD",
             },
-            Purpose::Description => "EDIT DRAFT DESCRIPTION",
+            Purpose::Description => "EDIT DESCRIPTION",
             Purpose::Promote => "PROMOTE LEARNED MODEL",
             Purpose::Preview => "ROUTING PREVIEW",
         }
@@ -551,7 +551,7 @@ pub(super) struct Context {
     pub(super) bindings: Vec<String>,
     /// (binding, model) pairs the catalogues offer.
     pub(super) offers: Vec<(String, String)>,
-    /// Record ids in the draft, by collection.
+    /// Record ids in the policy, by collection.
     pub(super) ids: BTreeMap<&'static str, Vec<String>>,
     /// Draft diagnostics against the record being edited, as (path inside
     /// the record, code).

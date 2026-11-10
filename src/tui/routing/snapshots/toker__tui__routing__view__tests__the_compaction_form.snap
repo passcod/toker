@@ -1,9 +1,8 @@
 ---
 source: src/tui/routing/view.rs
-assertion_line: 965
 expression: "frame(&adding(super::View::Rewrites, '4'))"
 ---
- ? ⇄ 1  2  3 rewrites, families, upgrades & compaction  4                                                        draft 4
+ ? ⇄ 1  2  3 rewrites, families, upgrades & compaction  4                                                     revision 3
 ┌REWR┌ADD COMPACTION──────────────────────────────────────────────────────────────────────────────────────────────┐────┐
 │r-so│  ROUTE                                                                                                     │    │
 │gpt-│>   route: mixed▏                                                                                           │    │

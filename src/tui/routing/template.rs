@@ -36,7 +36,7 @@ pub(super) fn singular(kind: &str) -> &'static str {
 }
 
 /// The template for a new record of `kind`. A new default points at
-/// `route_id`, which is the draft's first route when it has one.
+/// `route_id`, which is the first route of the live policy when it has one.
 pub(super) fn template(kind: &str, route_id: Option<&str>) -> Value {
     let route_id = route_id.unwrap_or("route-id");
     match kind {

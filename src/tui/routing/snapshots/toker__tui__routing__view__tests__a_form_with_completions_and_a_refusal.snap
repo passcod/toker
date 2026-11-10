@@ -1,10 +1,9 @@
 ---
 source: src/tui/routing/view.rs
-assertion_line: 1000
 expression: frame(&state)
 ---
- ? ⇄ 1  2  3 rewrites, families, upgrades & compaction  4                                                        draft 4
- draf┌ADD CLASSIFIER──────────────────────────────────────────────────────────────────────────────────────────────┐
+ ? ⇄ 1  2  3 rewrites, families, upgrades & compaction  4                                                     revision 3
+ save┌ADD CLASSIFIER──────────────────────────────────────────────────────────────────────────────────────────────┐
 ┌REWR│  id: new-classifier                                                                                        │────┐
 │r-so│> binding: codex▏                                                                                           │    │
 │gpt-│    Tab: codex_sub.codex_responses                                                                          │    │
@@ -32,6 +31,6 @@ expression: frame(&state)
 │    │                                                                                                            │    │
 │    │                                                                                                            │    │
 │    │↑/↓ field · ←/→ change · tab complete · ctrl+s save · esc cancel                                            │    │
-│    │! draft-edit: invalid_policy_edit (HTTP 422): id already exists                                             │    │
+│    │! save: invalid_policy_edit (HTTP 422): id already exists                                                   │    │
 │    └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
 └────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘

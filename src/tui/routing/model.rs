@@ -1,4 +1,4 @@
-//! Content-free routing snapshot, draft editing, and navigation state.
+//! Content-free routing snapshot, editing, and navigation state.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use reqwest::Method;
@@ -59,7 +59,7 @@ impl View {
 pub(super) enum Modal {
     #[default]
     None,
-    /// A typed form: a record's fields, the draft description, a promotion
+    /// A typed form: a record's fields, the policy description, a promotion
     /// or a preview's request facts.
     Form(Box<Form>),
     /// Which kind of record to add, in a view that lists several.
@@ -72,20 +72,8 @@ pub(super) enum Modal {
         value: Value,
     },
     PreviewResult(Value),
-    Activate {
-        scope: usize,
-        force_cache_transition: bool,
-    },
     Reactivate {
         revision_id: i64,
-        scope: usize,
-        force_cache_transition: bool,
-    },
-    /// Replace the draft with the compiled legacy `toker.toml` routing.
-    Import,
-    Conflict {
-        daemon_generation: Option<u64>,
-        daemon_draft: Value,
     },
 }
 
@@ -101,10 +89,7 @@ impl Modal {
             Self::NewKind { .. } => "ADD POLICY RECORD",
             Self::Remove { .. } => "REMOVE POLICY RECORD",
             Self::PreviewResult(_) => "ROUTING PREVIEW",
-            Self::Activate { .. } => "ACTIVATE DRAFT",
             Self::Reactivate { .. } => "REACTIVATE REVISION",
-            Self::Import => "IMPORT LEGACY CONFIG",
-            Self::Conflict { .. } => "DRAFT CHANGED BY DAEMON",
         }
     }
 }
@@ -115,7 +100,9 @@ pub(super) struct State {
     view: View,
     snapshot: Option<Value>,
     revisions: Vec<Value>,
-    generation: Option<u64>,
+    /// The revision the last snapshot said is live: what an edit is made
+    /// against.
+    active_revision_id: Option<i64>,
     selected: usize,
     error: Option<String>,
     /// The outcome of the last post-activation Claude settings sync.
@@ -130,12 +117,6 @@ pub(super) struct State {
     /// owns the second because only it knows the pane's height and wrapping.
     detail_scroll: u16,
     detail_furthest: std::cell::Cell<u16>,
-    /// The exact typed edit batch that received a 409.  It remains intact until
-    /// the user explicitly reloads or reapplies it against the daemon copy.
-    conflicted_edits: Vec<Value>,
-    /// Compiles the legacy config into a policy document; replaceable so the
-    /// page's tests need no config file.
-    legacy_policy: fn(&std::path::Path) -> anyhow::Result<Value>,
 }
 
 impl Default for State {
@@ -144,7 +125,7 @@ impl Default for State {
             view: View::Presentations,
             snapshot: None,
             revisions: Vec::new(),
-            generation: None,
+            active_revision_id: None,
             selected: 0,
             error: None,
             settings_note: None,
@@ -154,8 +135,6 @@ impl Default for State {
             preview_asked: false,
             detail_scroll: 0,
             detail_furthest: std::cell::Cell::new(0),
-            conflicted_edits: Vec::new(),
-            legacy_policy: super::import::legacy_policy,
         }
     }
 }
@@ -165,8 +144,9 @@ impl State {
         self.view
     }
 
-    pub(super) fn generation(&self) -> Option<u64> {
-        self.generation
+    /// The revision the daemon last reported live.
+    pub(super) fn active_revision_id(&self) -> Option<i64> {
+        self.active_revision_id
     }
 
     /// What the daemon last sent, for the detail pane to lay out.
@@ -197,21 +177,14 @@ impl State {
         self.error.as_deref()
     }
 
-    /// What an activation would do, from the snapshot the daemon last sent:
-    /// the records the draft changes, the lane impact, any draft diagnostics,
-    /// and where each publication stands. Shown before the user confirms.
+    /// What a reactivation would do, from the snapshot the daemon last sent:
+    /// the lane impact and where each publication stands. Shown before the
+    /// user confirms.
     pub(super) fn activation_summary(&self) -> Vec<String> {
         let Some(snapshot) = &self.snapshot else {
             return vec!["no daemon snapshot loaded".to_owned()];
         };
         let mut lines = Vec::new();
-        let changes = changed_records(snapshot);
-        if changes.is_empty() {
-            lines.push("changed records: none".to_owned());
-        } else {
-            lines.push(format!("changed records: {}", changes.join(", ")));
-        }
-        lines.extend(cost_boundary_changes(snapshot));
         match snapshot.get("lane_impacts") {
             Some(impacts) => {
                 let count = |key: &str| impacts.get(key).and_then(Value::as_u64).unwrap_or(0);
@@ -225,10 +198,6 @@ impl State {
                 ));
             }
             None => lines.push("lanes: impact not reported".to_owned()),
-        }
-        let diagnostics = array(snapshot, "draft_diagnostics");
-        if !diagnostics.is_empty() {
-            lines.push(format!("draft diagnostics: {}", diagnostics.len()));
         }
         for publication in array(snapshot, "publications") {
             let text = |key: &str| publication.get(key).and_then(Value::as_str).unwrap_or("-");
@@ -316,7 +285,7 @@ impl State {
         let Some(snapshot) = &self.snapshot else {
             return Vec::new();
         };
-        let policy = draft_policy(snapshot).or_else(|| active_policy(snapshot));
+        let policy = active_policy(snapshot);
         match self.view {
             View::Presentations => policy
                 .into_iter()
@@ -365,10 +334,6 @@ impl State {
                         key: "active_revision",
                         value,
                     });
-                let draft = snapshot.get("draft").into_iter().map(|value| Entry {
-                    key: "draft",
-                    value,
-                });
                 let revisions = self.revisions.iter().map(|value| Entry {
                     key: "revision",
                     value,
@@ -390,23 +355,15 @@ impl State {
                     key: "lane_impacts",
                     value,
                 });
-                let diagnostics = array(snapshot, "draft_diagnostics")
-                    .iter()
-                    .map(|value| Entry {
-                        key: "diagnostic",
-                        value,
-                    });
                 let offers = array(snapshot, "offers").iter().map(|value| Entry {
                     key: "offer",
                     value,
                 });
                 active
-                    .chain(draft)
                     .chain(revisions)
                     .chain(publications)
                     .chain(availability)
                     .chain(lane_impacts)
-                    .chain(diagnostics)
                     .chain(offers)
                     .collect()
             }
@@ -465,56 +422,21 @@ impl State {
             self.error = None;
             return;
         }
-        if response.status == 409
-            && response.body.get("error").and_then(Value::as_str) == Some("stale_draft")
-        {
-            let daemon_draft = response.body.get("draft").cloned().unwrap_or(Value::Null);
-            let daemon_generation = response.body.get("generation").and_then(Value::as_u64);
-            self.set_daemon_draft(daemon_generation, daemon_draft.clone());
-            self.modal = Modal::Conflict {
-                daemon_generation,
-                daemon_draft,
-            };
-            self.error = None;
-            return;
-        }
         if response.status / 100 != 2 {
-            // A refused edit is not a conflicted one: a later, unrelated
-            // stale-draft refusal must not offer to reapply it.
-            if command.name == "draft-edit" {
-                self.conflicted_edits.clear();
-            }
             self.error = Some(control_error(&command, &response));
             return;
         }
         match command.name {
-            "draft-edit" | "draft-replace" | "validate" => {
-                let validation = if command.name == "validate" {
-                    Some(json!({
-                        "kind": "validation",
-                        "valid": response.body.get("valid"),
-                        "diagnostics": response.body.get("diagnostics"),
-                    }))
-                } else {
-                    None
-                };
-                self.receive_draft_reply(response.body);
-                if let Some(validation) = validation {
-                    self.modal = Modal::PreviewResult(validation);
-                } else {
-                    self.conflicted_edits.clear();
-                    self.modal = Modal::None;
-                }
-            }
             "preview" => {
                 self.preview_asked = command.body.as_ref().is_some_and(|body| {
-                    body.get("asks_server_safeguards") == Some(&Value::Bool(true))
+                    body.get("request")
+                        .and_then(|request| request.get("asks_server_safeguards"))
+                        == Some(&Value::Bool(true))
                 });
                 self.modal = Modal::PreviewResult(response.body);
             }
-            "activate" | "reactivate" => {
+            "save" | "reactivate" => {
                 self.merge_activation(response.body);
-                self.conflicted_edits.clear();
                 self.modal = Modal::None;
             }
             "promote" => self.modal = Modal::PreviewResult(response.body),
@@ -523,52 +445,27 @@ impl State {
     }
 
     fn receive_snapshot(&mut self, snapshot: Value) {
-        self.generation = generation(&snapshot);
+        self.active_revision_id = active_revision_id(&snapshot);
         self.snapshot = Some(snapshot);
-        self.error = None;
-        self.clamp_selection();
-    }
-
-    fn receive_draft_reply(&mut self, body: Value) {
-        let generation = body.get("generation").and_then(Value::as_u64);
-        let draft = body.get("draft").cloned();
-        if let Some(draft) = draft {
-            self.set_daemon_draft(generation, draft);
-        } else {
-            self.generation = generation.or(self.generation);
-        }
         self.error = None;
         self.clamp_selection();
     }
 
     fn merge_activation(&mut self, body: Value) {
         if let Some(snapshot) = &mut self.snapshot {
-            for key in ["active_revision", "draft", "lane_impacts", "publications"] {
+            for key in [
+                "active_revision",
+                "activation",
+                "lane_impacts",
+                "publications",
+            ] {
                 if let Some(value) = body.get(key) {
                     snapshot[key] = value.clone();
                 }
             }
-            self.generation = body
-                .get("generation")
-                .and_then(Value::as_u64)
-                .or(self.generation);
+            self.active_revision_id = active_revision_id(snapshot);
         }
         self.error = None;
-    }
-
-    fn set_daemon_draft(&mut self, generation: Option<u64>, draft: Value) {
-        self.generation = generation.or(self.generation);
-        if let Some(snapshot) = &mut self.snapshot {
-            snapshot["draft"] = draft;
-            if let Some(generation) = self.generation {
-                snapshot["draft_generation"] = Value::from(generation);
-            }
-        } else {
-            self.snapshot = Some(json!({
-                "draft_generation": self.generation,
-                "draft": draft,
-            }));
-        }
         self.clamp_selection();
     }
 
@@ -606,21 +503,12 @@ impl State {
                 self.open_preview();
                 None
             }
-            KeyCode::Char('V') => self.validate(),
-            KeyCode::Char('a') => {
-                self.open_activate();
-                None
-            }
             KeyCode::Char('x') if self.view == View::Status => {
                 self.open_reactivate();
                 None
             }
             KeyCode::Char('p') => {
                 self.open_promote();
-                None
-            }
-            KeyCode::Char('i') if self.view == View::Status => {
-                self.modal = Modal::Import;
                 None
             }
             KeyCode::PageDown => {
@@ -636,12 +524,12 @@ impl State {
     }
 
     fn open_edit(&mut self) {
-        let on_draft = self
+        let on_policy = self
             .entries()
             .get(self.selected)
-            .is_some_and(|entry| entry.key == "draft");
-        if on_draft {
-            let description = draft_policy(self.snapshot.as_ref().unwrap_or(&Value::Null))
+            .is_some_and(|entry| entry.key == "active_revision");
+        if on_policy {
+            let description = active_policy(self.snapshot.as_ref().unwrap_or(&Value::Null))
                 .and_then(|policy| policy.get("description"))
                 .cloned()
                 .unwrap_or(Value::Null);
@@ -659,7 +547,7 @@ impl State {
         if let Some((record_key, value)) = selected {
             match record_kind(&record_key) {
                 Some(kind) => {
-                    let context = self.form_context(kind, value.get("id").and_then(Value::as_str));
+                    let context = self.form_context();
                     self.modal = Modal::Form(Box::new(Form::new(
                         Purpose::Record {
                             kind,
@@ -669,15 +557,15 @@ impl State {
                         context,
                     )));
                 }
-                None => self.error = Some("this item is not a draft policy record".to_owned()),
+                None => self.error = Some("this item is not a policy record".to_owned()),
             }
         }
     }
 
     /// What a form completes from: the bindings toker implements, what the
-    /// catalogues offer, the draft's record ids, and the daemon's findings on
+    /// catalogues offer, the policy's record ids, and the daemon's findings on
     /// the record being edited, keyed by their path inside it.
-    fn form_context(&self, kind: &'static str, record_id: Option<&str>) -> Context {
+    fn form_context(&self) -> Context {
         let mut context = Context {
             bindings: crate::routing::BACKEND_BINDINGS
                 .iter()
@@ -694,7 +582,7 @@ impl State {
             .iter()
             .filter_map(|offer| Some((text(offer, "binding_id")?, text(offer, "model_id")?)))
             .collect();
-        if let Some(policy) = draft_policy(snapshot) {
+        if let Some(policy) = active_policy(snapshot) {
             for collection in ["routes", "classifiers", "upgrades"] {
                 context.ids.insert(
                     collection,
@@ -704,20 +592,6 @@ impl State {
                         .collect(),
                 );
             }
-        }
-        if let Some(record_id) = record_id {
-            // "/routes/7/chain/first/binding_id" is "chain/first/binding_id"
-            // inside the record.
-            let prefix = format!("/{kind}/");
-            context.diagnostics = array(snapshot, "draft_diagnostics")
-                .iter()
-                .filter(|diagnostic| text(diagnostic, "record_id").as_deref() == Some(record_id))
-                .filter_map(|diagnostic| {
-                    let path = text(diagnostic, "path")?;
-                    let inside = path.strip_prefix(&prefix)?.split_once('/')?.1.to_owned();
-                    Some((inside, text(diagnostic, "code")?))
-                })
-                .collect();
         }
         context
     }
@@ -747,11 +621,11 @@ impl State {
         let route_id = self
             .snapshot
             .as_ref()
-            .and_then(draft_policy)
+            .and_then(active_policy)
             .and_then(|policy| array(policy, "routes").first())
             .and_then(|route| route.get("id"))
             .and_then(Value::as_str);
-        let context = self.form_context(kind, None);
+        let context = self.form_context();
         self.modal = Modal::Form(Box::new(Form::new(
             Purpose::Record { kind, adding: true },
             super::template::template(kind, route_id),
@@ -780,13 +654,6 @@ impl State {
         )));
     }
 
-    fn open_activate(&mut self) {
-        self.modal = Modal::Activate {
-            scope: 0,
-            force_cache_transition: false,
-        };
-    }
-
     fn open_reactivate(&mut self) {
         let revision_id = self
             .entries()
@@ -800,18 +667,14 @@ impl State {
                     .and_then(Value::as_i64)
             });
         if let Some(revision_id) = revision_id {
-            self.modal = Modal::Reactivate {
-                revision_id,
-                scope: 0,
-                force_cache_transition: false,
-            };
+            self.modal = Modal::Reactivate { revision_id };
         } else {
             self.error = Some("refresh revisions, then choose a revision to reactivate".to_owned());
         }
     }
 
     fn open_promote(&mut self) {
-        let context = self.form_context("promote", None);
+        let context = self.form_context();
         self.modal = Modal::Form(Box::new(Form::new(
             Purpose::Promote,
             json!({ "binding_id": "", "model_id": "" }),
@@ -871,102 +734,13 @@ impl State {
                 ),
             },
             Modal::PreviewResult(_) => (Modal::None, ModalAction::None),
-            Modal::Activate {
-                mut scope,
-                mut force_cache_transition,
-            } => {
-                let action = match key.code {
-                    KeyCode::Left | KeyCode::Char('h') => {
-                        scope = scope.saturating_sub(1);
-                        ModalAction::None
-                    }
-                    KeyCode::Right | KeyCode::Char('l') => {
-                        scope = (scope + 1).min(2);
-                        ModalAction::None
-                    }
-                    KeyCode::Char('f') => {
-                        force_cache_transition = !force_cache_transition;
-                        ModalAction::None
-                    }
-                    KeyCode::Char('y') | KeyCode::Enter => ModalAction::Activate {
-                        scope,
-                        force: force_cache_transition,
-                    },
-                    KeyCode::Esc | KeyCode::Char('n') => return None,
-                    _ => ModalAction::None,
-                };
-                (
-                    Modal::Activate {
-                        scope,
-                        force_cache_transition,
-                    },
-                    action,
-                )
-            }
-            Modal::Reactivate {
-                revision_id,
-                mut scope,
-                mut force_cache_transition,
-            } => {
-                let action = match key.code {
-                    KeyCode::Left | KeyCode::Char('h') => {
-                        scope = scope.saturating_sub(1);
-                        ModalAction::None
-                    }
-                    KeyCode::Right | KeyCode::Char('l') => {
-                        scope = (scope + 1).min(2);
-                        ModalAction::None
-                    }
-                    KeyCode::Char('f') => {
-                        force_cache_transition = !force_cache_transition;
-                        ModalAction::None
-                    }
-                    KeyCode::Char('y') | KeyCode::Enter => ModalAction::Reactivate {
-                        revision_id,
-                        scope,
-                        force: force_cache_transition,
-                    },
-                    KeyCode::Esc | KeyCode::Char('n') => return None,
-                    _ => ModalAction::None,
-                };
-                (
-                    Modal::Reactivate {
-                        revision_id,
-                        scope,
-                        force_cache_transition,
-                    },
-                    action,
-                )
-            }
-            Modal::Import => match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => (Modal::Import, ModalAction::Import),
+            Modal::Reactivate { revision_id } => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => (
+                    Modal::Reactivate { revision_id },
+                    ModalAction::Reactivate { revision_id },
+                ),
                 KeyCode::Esc | KeyCode::Char('n') => return None,
-                _ => (Modal::Import, ModalAction::None),
-            },
-            Modal::Conflict {
-                daemon_generation,
-                daemon_draft,
-            } => match key.code {
-                KeyCode::Char('r') => {
-                    self.conflicted_edits.clear();
-                    self.modal = Modal::None;
-                    return Some(Command::snapshot("routing-snapshot"));
-                }
-                KeyCode::Char('a') => (
-                    Modal::Conflict {
-                        daemon_generation,
-                        daemon_draft,
-                    },
-                    ModalAction::Reapply,
-                ),
-                KeyCode::Esc => return None,
-                _ => (
-                    Modal::Conflict {
-                        daemon_generation,
-                        daemon_draft,
-                    },
-                    ModalAction::None,
-                ),
+                _ => (Modal::Reactivate { revision_id }, ModalAction::None),
             },
         };
         self.modal = modal;
@@ -974,94 +748,31 @@ impl State {
             ModalAction::None => None,
             ModalAction::Edit(edits) => self.edit(edits),
             ModalAction::Preview(facts) => self.preview(&facts),
-            ModalAction::Activate { scope, force } => self.activate(scope, force),
-            ModalAction::Reactivate {
-                revision_id,
-                scope,
-                force,
-            } => self.reactivate(revision_id, scope, force),
+            ModalAction::Reactivate { revision_id } => self.reactivate(revision_id),
             ModalAction::Promote { binding, model } => self.promote(&binding, &model),
-            ModalAction::Import => self.import(),
-            ModalAction::Reapply => self.reapply_conflict(),
         }
     }
 
-    /// Replace the draft with the compiled legacy config. A config that does
-    /// not load or compile is reported and leaves the draft alone.
-    fn import(&mut self) -> Option<Command> {
-        let generation = self.generation?;
-        let path = match crate::config::config_path() {
-            Ok(path) => path,
-            Err(error) => {
-                self.modal = Modal::None;
-                self.error = Some(format!("import: {error:#}"));
-                return None;
-            }
-        };
-        match (self.legacy_policy)(&path) {
-            Ok(policy) => {
-                self.in_flight = true;
-                Some(command(
-                    "draft-replace",
-                    Method::PUT,
-                    "draft",
-                    "routing-draft-replace",
-                    json!({ "expected_generation": generation, "policy": policy }),
-                ))
-            }
-            Err(error) => {
-                self.modal = Modal::None;
-                self.error = Some(format!("import: {error:#}"));
-                None
-            }
-        }
-    }
-
+    /// Save the typed edits against the revision the page last saw live. The
+    /// daemon refuses a save made against a revision that has since moved, and
+    /// the form stays open as entered.
     fn edit(&mut self, edits: Vec<Value>) -> Option<Command> {
-        let generation = self.generation?;
-        self.conflicted_edits = edits.clone();
+        let revision = self.active_revision_id?;
         self.in_flight = true;
         Some(command(
-            "draft-edit",
-            Method::PATCH,
-            "draft",
-            "routing-draft-edit",
-            json!({ "expected_generation": generation, "edit": { "operations": edits } }),
-        ))
-    }
-
-    fn reapply_conflict(&mut self) -> Option<Command> {
-        if self.conflicted_edits.is_empty() {
-            self.error = Some("there is no local edit to reapply".to_owned());
-            return None;
-        }
-        let generation = self.generation?;
-        self.in_flight = true;
-        Some(command(
-            "draft-edit",
-            Method::PATCH,
-            "draft",
-            "routing-draft-edit",
-            json!({ "expected_generation": generation, "edit": { "operations": self.conflicted_edits } }),
-        ))
-    }
-
-    fn validate(&mut self) -> Option<Command> {
-        self.in_flight = true;
-        Some(command(
-            "validate",
+            "save",
             Method::POST,
-            "validate",
-            "routing-validate",
-            json!({ "expected_generation": self.generation }),
+            "save",
+            "routing-save",
+            json!({ "expected_revision_id": revision, "edit": { "operations": edits } }),
         ))
     }
 
     /// The preview request from the form's facts: only what was filled in.
     fn preview(&mut self, facts: &Value) -> Option<Command> {
         self.in_flight = true;
-        let mut body = json!({
-            "expected_generation": self.generation,
+        let mut request = json!({
+            "kind": "invented",
             "protocol": facts.get("protocol").cloned().unwrap_or(Value::Null),
         });
         for key in ["profile", "model", "lane_key"] {
@@ -1070,17 +781,22 @@ impl State {
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty())
             {
-                body[key] = Value::String(text.to_owned());
+                request[key] = Value::String(text.to_owned());
             }
         }
         for key in ["prompt_bound", "message_count", "tool_count"] {
             if let Some(number) = facts.get(key).and_then(Value::as_u64) {
-                body[key] = Value::from(number);
+                request[key] = Value::from(number);
             }
         }
         if facts.get("asks_server_safeguards") == Some(&Value::Bool(true)) {
-            body["asks_server_safeguards"] = Value::Bool(true);
+            request["asks_server_safeguards"] = Value::Bool(true);
         }
+        let body = json!({
+            "mode": "resolve",
+            "expected_revision_id": self.active_revision_id,
+            "request": request,
+        });
         Some(command(
             "preview",
             Method::POST,
@@ -1090,36 +806,15 @@ impl State {
         ))
     }
 
-    fn activate(&mut self, scope: usize, force: bool) -> Option<Command> {
-        let generation = self.generation?;
-        self.in_flight = true;
-        Some(command(
-            "activate",
-            Method::POST,
-            "activate",
-            "routing-activate",
-            json!({
-                "expected_generation": generation,
-                "scope": activation_scope(scope),
-                "force_cache_transition": force,
-            }),
-        ))
-    }
-
-    fn reactivate(&mut self, revision_id: i64, scope: usize, force: bool) -> Option<Command> {
-        let generation = self.generation?;
+    fn reactivate(&mut self, revision_id: i64) -> Option<Command> {
+        let revision = self.active_revision_id?;
         self.in_flight = true;
         Some(command(
             "reactivate",
             Method::POST,
             "reactivate",
             "routing-reactivate",
-            json!({
-                "expected_generation": generation,
-                "revision_id": revision_id,
-                "scope": activation_scope(scope),
-                "force_cache_transition": force,
-            }),
+            json!({ "expected_revision_id": revision, "revision_id": revision_id }),
         ))
     }
 
@@ -1144,21 +839,8 @@ enum ModalAction {
     None,
     Edit(Vec<Value>),
     Preview(Value),
-    Activate {
-        scope: usize,
-        force: bool,
-    },
-    Reactivate {
-        revision_id: i64,
-        scope: usize,
-        force: bool,
-    },
-    Promote {
-        binding: String,
-        model: String,
-    },
-    Import,
-    Reapply,
+    Reactivate { revision_id: i64 },
+    Promote { binding: String, model: String },
 }
 
 /// One content-free item supplied by the snapshot.
@@ -1198,25 +880,14 @@ fn active_policy(snapshot: &Value) -> Option<&Value> {
         .and_then(|revision| revision.get("policy"))
 }
 
-fn draft_policy(snapshot: &Value) -> Option<&Value> {
-    let draft = snapshot.get("draft")?;
-    Some(draft.get("policy").unwrap_or(draft))
-}
-
-fn generation(snapshot: &Value) -> Option<u64> {
+fn active_revision_id(snapshot: &Value) -> Option<i64> {
     snapshot
-        .get("draft_generation")
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            snapshot
-                .get("draft")
-                .and_then(|draft| draft.get("generation"))
-                .and_then(Value::as_u64)
-        })
-        .or_else(|| snapshot.get("generation").and_then(Value::as_u64))
+        .get("active_revision")
+        .and_then(|revision| revision.get("revision_id"))
+        .and_then(Value::as_i64)
 }
 
-/// The collection a list entry belongs to, if it is a draft policy record.
+/// The collection a list entry belongs to, if it is a policy record.
 fn record_kind(key: &str) -> Option<&'static str> {
     [
         "presentations",
@@ -1300,140 +971,6 @@ pub(super) fn scope_label(record: &Value) -> String {
     }
 }
 
-/// The route edges whose crossing from subscription to billed spend, or the
-/// consent that allows it, differ between the draft and the active revision.
-/// Spend is the one thing an activation can change that the changed-record
-/// list does not make plain.
-fn cost_boundary_changes(snapshot: &Value) -> Vec<String> {
-    let Some(derived) = snapshot.get("derived") else {
-        return Vec::new();
-    };
-    let edges = |key: &str| -> Vec<(String, &Value)> {
-        derived
-            .get(key)
-            .map(|policy| array(policy, "routes"))
-            .unwrap_or_default()
-            .iter()
-            .flat_map(|route| {
-                let route_id = route.get("id").and_then(Value::as_str).unwrap_or("?");
-                array(route, "edges").iter().map(move |edge| {
-                    let text = |name: &str| edge.get(name).and_then(Value::as_str).unwrap_or("?");
-                    (
-                        format!("{route_id}: {} -> {}", text("from"), text("to")),
-                        edge,
-                    )
-                })
-            })
-            .collect()
-    };
-    let (active, draft) = (edges("active"), edges("draft"));
-    let crosses = |edge: &Value| edge.get("crosses_cost_boundary") == Some(&Value::Bool(true));
-    let consent = |edge: &Value| {
-        edge.get("billed_boundary")
-            .and_then(Value::as_str)
-            .unwrap_or("?")
-            .to_owned()
-    };
-    let mut lines = Vec::new();
-    for (name, edge) in &draft {
-        let before = active
-            .iter()
-            .find(|(active_name, _)| active_name == name)
-            .map(|(_, edge)| *edge);
-        match (before.is_some_and(crosses), crosses(edge)) {
-            (false, true) => lines.push(format!(
-                "cost boundary: {name} now crosses {} to {} (consent {})",
-                edge["from_cost"].as_str().unwrap_or("?"),
-                edge["to_cost"].as_str().unwrap_or("?"),
-                consent(edge),
-            )),
-            (true, true) if before.map(consent) != Some(consent(edge)) => {
-                lines.push(format!(
-                    "cost boundary: {name} consent {} (was {})",
-                    consent(edge),
-                    before.map(consent).unwrap_or_default(),
-                ));
-            }
-            (true, false) => lines.push(format!("cost boundary: {name} no longer crosses")),
-            _ => {}
-        }
-    }
-    for (name, edge) in &active {
-        if crosses(edge) && !draft.iter().any(|(draft_name, _)| draft_name == name) {
-            lines.push(format!("cost boundary: {name} removed"));
-        }
-    }
-    lines
-}
-
-/// The records the draft adds (`+`), removes (`-`) or changes (`~`) relative
-/// to the active revision, by kind and id.
-fn changed_records(snapshot: &Value) -> Vec<String> {
-    let (Some(draft), active) = (draft_policy(snapshot), active_policy(snapshot)) else {
-        return Vec::new();
-    };
-    let mut changes = Vec::new();
-    for key in [
-        "presentations",
-        "routes",
-        "defaults",
-        "rewrites",
-        "classifiers",
-        "upgrades",
-        "compaction",
-    ] {
-        let by_id = |document: Option<&Value>| -> Vec<(String, Value)> {
-            // Compaction is one optional record, so it has no id to match by.
-            if key == "compaction" {
-                return document
-                    .and_then(|document| document.get("compaction"))
-                    .filter(|record| !record.is_null())
-                    .map(|record| (String::new(), record.clone()))
-                    .into_iter()
-                    .collect();
-            }
-            document
-                .map(|document| array(document, key))
-                .unwrap_or(&[])
-                .iter()
-                .map(|record| {
-                    if key == "defaults" {
-                        return (scope_label(record), record.clone());
-                    }
-                    let id = record
-                        .get("id")
-                        .or_else(|| record.get("slug"))
-                        .map(|id| id.as_str().map_or_else(|| id.to_string(), str::to_owned))
-                        .unwrap_or_default();
-                    (id, record.clone())
-                })
-                .collect()
-        };
-        let before = by_id(active);
-        let after = by_id(Some(draft));
-        let kind = if key == "compaction" {
-            key
-        } else {
-            key.trim_end_matches('s')
-        };
-        for (id, record) in &after {
-            match before.iter().find(|(prior, _)| prior == id) {
-                None => changes.push(format!("+{kind} {id}").trim_end().to_owned()),
-                Some((_, prior)) if prior != record => {
-                    changes.push(format!("~{kind} {id}").trim_end().to_owned())
-                }
-                Some(_) => {}
-            }
-        }
-        for (id, _) in &before {
-            if !after.iter().any(|(next, _)| next == id) {
-                changes.push(format!("-{kind} {id}").trim_end().to_owned());
-            }
-        }
-    }
-    changes
-}
-
 /// The edit a submitted form sends, or what it asks for.
 fn form_action(form: &Form) -> ModalAction {
     let value = form.value();
@@ -1484,10 +1021,6 @@ fn text_of(value: &Value, key: &str) -> String {
         .to_owned()
 }
 
-fn activation_scope(index: usize) -> &'static str {
-    ["new_lanes", "new_and_cold_lanes", "immediate"][index.min(2)]
-}
-
 fn control_error(command: &Command, response: &Response) -> String {
     let code = response
         .body
@@ -1503,6 +1036,16 @@ fn control_error(command: &Command, response: &Response) -> String {
         })
         .collect::<Vec<_>>();
     let mut message = format!("{}: {code} (HTTP {})", command.name, response.status);
+    if code == "stale_revision"
+        && let Some(live) = response
+            .body
+            .get("live_revision_id")
+            .and_then(Value::as_i64)
+    {
+        message.push_str(&format!(
+            ": revision {live} is now live; reload, then save again"
+        ));
+    }
     if let Some(detail) = response.body.get("detail").and_then(Value::as_str) {
         message.push_str(&format!(": {detail}"));
     }
@@ -1521,18 +1064,16 @@ mod tests {
 
     fn snapshot() -> serde_json::Value {
         serde_json::json!({
-            "draft_generation": 7,
-            "draft": {"policy": {"description": "draft", "routes": [{
+            "active_revision": {"revision_id": 7, "policy": {"description": "live", "routes": [{
                 "id": "route", "chain": {"first": {"id": "one"}, "steps": [
                     {"edge": {"preflight": "enabled"}, "candidate": {"id": "two"}}
                 ]}
             }]}},
-            "active_revision": {"policy": {"routes": []}}
         })
     }
 
     #[test]
-    fn draft_entries_and_generation_win_over_the_active_revision() {
+    fn the_live_revision_and_its_policy_are_what_the_page_lists() {
         let mut state = State::default();
         state.receive(Reply::Command(
             Command::snapshot("routing-snapshot"),
@@ -1542,40 +1083,8 @@ mod tests {
             }),
         ));
         state.set_view(View::Routes);
-        assert_eq!(state.generation(), Some(7));
+        assert_eq!(state.active_revision_id(), Some(7));
         assert_eq!(state.entries()[0].value["id"], "route");
-    }
-
-    #[test]
-    fn conflict_preserves_edits_and_offers_reapply() {
-        let mut state = State::default();
-        state.receive(Reply::Command(
-            Command::snapshot("routing-snapshot"),
-            Ok(Response {
-                status: 200,
-                body: snapshot(),
-            }),
-        ));
-        let command = state.key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('V'),
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        assert_eq!(command.expect("validation command").name, "validate");
-        state.conflicted_edits =
-            vec![serde_json::json!({"kind": "set_description", "description": "mine"})];
-        state.receive(reply(
-            "draft-edit",
-            409,
-            serde_json::json!({"error": "stale_draft", "generation": 8, "draft": {"policy": {"description": "theirs"}}}),
-        ));
-        assert!(matches!(state.modal(), Modal::Conflict { .. }));
-        let command = state.key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        let body = command.expect("reapply command").body.expect("body");
-        assert_eq!(body["expected_generation"], 8);
-        assert_eq!(body["edit"]["operations"][0]["description"], "mine");
     }
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1626,17 +1135,11 @@ mod tests {
 
     fn full_snapshot() -> serde_json::Value {
         serde_json::json!({
-            "draft_generation": 3,
-            "draft": {"policy": {
-                "description": "draft",
+            "active_revision": {"revision_id": 3, "policy": {
+                "description": "live",
                 "presentations": [{"id": "kept", "slug": "k"}, {"id": "added", "slug": "a"}],
                 "routes": [{"id": "changed", "chain": {"first": {"id": "b"}, "steps": []}}],
             }},
-            "active_revision": {"policy": {
-                "presentations": [{"id": "kept", "slug": "k"}, {"id": "gone", "slug": "g"}],
-                "routes": [{"id": "changed", "chain": {"first": {"id": "a"}, "steps": []}}],
-            }},
-            "draft_diagnostics": [{"code": "unused_binding", "severity": "warning", "path": "/routes/0"}],
             "lane_impacts": {"total": 5, "unpinned": 1, "warm": 2, "cold": 1, "unknown": 1},
             "offers": [
                 {"binding_id": "openrouter.chat", "model_id": "vendor/one"},
@@ -1677,7 +1180,7 @@ mod tests {
     }
 
     #[test]
-    fn status_view_lists_diagnostics_lane_impact_and_offers() {
+    fn status_view_lists_lane_impact_and_offers() {
         let mut state = loaded(full_snapshot());
         state.set_view(View::Status);
         let keys: Vec<_> = state.entries().iter().map(|entry| entry.key).collect();
@@ -1685,10 +1188,8 @@ mod tests {
             keys,
             [
                 "active_revision",
-                "draft",
                 "publications",
                 "lane_impacts",
-                "diagnostic",
                 "offer",
                 "offer"
             ]
@@ -1696,93 +1197,9 @@ mod tests {
     }
 
     #[test]
-    fn activation_waits_for_confirmation_and_carries_scope_and_force() {
-        let mut state = loaded(full_snapshot());
-        assert!(press(&mut state, KeyCode::Char('a')).is_none());
-        assert!(matches!(state.modal(), Modal::Activate { .. }));
-        press(&mut state, KeyCode::Char('l'));
-        press(&mut state, KeyCode::Char('f'));
-        let command = press(&mut state, KeyCode::Char('y')).expect("confirmed");
-        assert_eq!(
-            (command.name, command.control),
-            ("activate", "routing-activate")
-        );
-        let body = command.body.expect("body");
-        assert_eq!(body["expected_generation"], 3);
-        assert_eq!(body["scope"], "new_and_cold_lanes");
-        assert_eq!(body["force_cache_transition"], true);
-        assert!(state.in_flight());
-    }
-
-    #[test]
-    fn import_waits_for_confirmation_then_replaces_the_draft_at_the_loaded_generation() {
-        let mut state = loaded(full_snapshot());
-        state.legacy_policy = |_| Ok(serde_json::json!({"format_version": 3, "marker": "legacy"}));
-        state.set_view(View::Status);
-        assert!(press(&mut state, KeyCode::Char('i')).is_none());
-        assert!(matches!(state.modal(), Modal::Import));
-        let command = press(&mut state, KeyCode::Char('y')).expect("confirmed");
-        assert_eq!(
-            (command.name, command.control),
-            ("draft-replace", "routing-draft-replace")
-        );
-        assert_eq!(command.method, Method::PUT);
-        let body = command.body.expect("body");
-        assert_eq!(body["expected_generation"], 3);
-        assert_eq!(body["policy"]["marker"], "legacy");
-        assert!(state.in_flight());
-    }
-
-    #[test]
-    fn import_is_offered_only_in_the_status_view_and_cancels_cleanly() {
-        let mut state = loaded(full_snapshot());
-        press(&mut state, KeyCode::Char('i'));
-        assert!(!state.modal().active(), "not in the presentations view");
-        state.set_view(View::Status);
-        press(&mut state, KeyCode::Char('i'));
-        assert!(press(&mut state, KeyCode::Esc).is_none());
-        assert!(!state.modal().active());
-    }
-
-    #[test]
-    fn a_config_that_cannot_be_imported_leaves_the_draft_alone() {
-        let mut state = loaded(full_snapshot());
-        state.legacy_policy = |_| Err(anyhow::anyhow!("the named file does not load"));
-        state.set_view(View::Status);
-        press(&mut state, KeyCode::Char('i'));
-        assert!(press(&mut state, KeyCode::Char('y')).is_none());
-        assert!(!state.modal().active());
-        assert!(!state.in_flight());
-        assert!(
-            state
-                .error()
-                .is_some_and(|error| error.contains("the named file does not load")),
-            "{:?}",
-            state.error()
-        );
-        assert_eq!(state.generation(), Some(3));
-    }
-
-    #[test]
-    fn an_import_against_a_stale_draft_takes_the_conflict_path() {
-        let mut state = loaded(full_snapshot());
-        state.legacy_policy = |_| Ok(serde_json::json!({}));
-        state.set_view(View::Status);
-        press(&mut state, KeyCode::Char('i'));
-        press(&mut state, KeyCode::Char('y'));
-        state.receive(reply(
-            "draft-replace",
-            409,
-            serde_json::json!({"error": "stale_draft", "generation": 4, "draft": {"policy": {"description": "theirs"}}}),
-        ));
-        assert!(matches!(state.modal(), Modal::Conflict { .. }));
-        assert_eq!(state.generation(), Some(4), "the daemon draft is kept");
-    }
-
-    #[test]
     fn escape_cancels_every_confirmation_without_a_command() {
         let mut state = loaded(full_snapshot());
-        for key in ['a', 'd', 'p', 'v'] {
+        for key in ['d', 'p', 'v'] {
             press(&mut state, KeyCode::Char(key));
             assert!(state.modal().active(), "{key} opens a form");
             assert!(press(&mut state, KeyCode::Esc).is_none());
@@ -1793,8 +1210,7 @@ mod tests {
         press(&mut state, KeyCode::Esc);
         assert!(!state.modal().active());
         state.set_view(View::Status);
-        // Entry 0 is the active revision; the draft follows it.
-        state.move_selection(1);
+        // Entry 0 is the live revision, whose description is edited.
         press(&mut state, KeyCode::Char('e'));
         assert_eq!(form_purpose(&state), Some(Purpose::Description));
         press(&mut state, KeyCode::Esc);
@@ -1832,7 +1248,7 @@ mod tests {
         press(&mut state, KeyCode::Down);
         typed(&mut state, "named");
         let command = state.key(CTRL_ENTER).expect("edit command");
-        assert_eq!(command.method, reqwest::Method::PATCH);
+        assert_eq!(command.method, reqwest::Method::POST);
         let operation = &command.body.expect("body")["edit"]["operations"][0];
         assert_eq!(operation["kind"], "replace_route");
         assert_eq!(operation["id"], "changed");
@@ -1841,61 +1257,31 @@ mod tests {
         assert_eq!(operation["route"]["chain"]["first"]["id"], "b");
     }
 
-    /// Daemon diagnostics against the record being edited mark its fields.
-    #[test]
-    fn a_form_marks_the_fields_the_daemon_flagged() {
-        let mut body = full_snapshot();
-        body["draft_diagnostics"] = serde_json::json!([
-            {"code": "binding-unconfigured", "severity": "info", "record_id": "changed",
-             "path": "/routes/0/chain/first/binding_id"},
-            {"code": "other", "severity": "info", "record_id": "someone-else",
-             "path": "/routes/3/chain/first/binding_id"},
-        ]);
-        let mut state = loaded(body);
-        state.set_view(View::Routes);
-        press(&mut state, KeyCode::Char('e'));
-        let Modal::Form(form) = state.modal() else {
-            panic!("a form");
-        };
-        let marked = form
-            .lines()
-            .into_iter()
-            .filter(|line| line.text.contains("! binding-unconfigured"))
-            .count();
-        assert_eq!(marked, 1);
-        assert!(
-            !form
-                .lines()
-                .iter()
-                .any(|line| line.text.contains("! other"))
-        );
-    }
-
     #[test]
     fn keys_are_ignored_while_a_command_is_in_flight() {
         let mut state = loaded(full_snapshot());
-        press(&mut state, KeyCode::Char('a'));
+        press(&mut state, KeyCode::Char('d'));
         press(&mut state, KeyCode::Char('y'));
         assert!(state.in_flight());
         assert!(press(&mut state, KeyCode::Char('y')).is_none());
-        assert!(press(&mut state, KeyCode::Char('V')).is_none());
-        state.receive(reply("activate", 200, serde_json::json!({"generation": 4})));
+        assert!(press(&mut state, KeyCode::Char('n')).is_none());
+        state.receive(reply(
+            "save",
+            200,
+            serde_json::json!({"active_revision": {"revision_id": 4}}),
+        ));
         assert!(!state.in_flight());
+        assert_eq!(state.active_revision_id(), Some(4));
     }
 
     #[test]
-    fn activation_summary_names_changes_lane_impact_and_publications() {
+    fn the_summary_names_lane_impact_and_publications() {
         let state = loaded(full_snapshot());
         let summary = state.activation_summary().join("\n");
-        assert!(summary.contains("+presentation added"), "{summary}");
-        assert!(summary.contains("-presentation gone"), "{summary}");
-        assert!(summary.contains("~route changed"), "{summary}");
-        assert!(!summary.contains("kept"), "{summary}");
         assert!(
             summary.contains("lanes: 5 total, 1 unpinned, 2 warm, 1 cold, 1 unknown"),
             "{summary}"
         );
-        assert!(summary.contains("draft diagnostics: 1"), "{summary}");
         assert!(summary.contains("publication claude: applied"), "{summary}");
         assert_eq!(
             State::default().activation_summary(),
@@ -1904,34 +1290,29 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_activation_keeps_the_form_open_with_the_reason() {
+    fn a_save_moved_past_names_the_live_revision_and_keeps_the_form() {
         let mut state = loaded(full_snapshot());
-        press(&mut state, KeyCode::Char('a'));
-        press(&mut state, KeyCode::Char('y'));
+        press(&mut state, KeyCode::Char('n'));
+        let command = state.key(CTRL_ENTER).expect("add command");
+        assert_eq!(command.body.expect("body")["expected_revision_id"], 3);
         state.receive(reply(
-            "activate",
+            "save",
             409,
-            serde_json::json!({"error": "forced_cache_transition_required"}),
+            serde_json::json!({"error": "stale_revision", "live_revision_id": 9}),
         ));
-        assert!(matches!(state.modal(), Modal::Activate { .. }));
-        assert!(
-            state
-                .error()
-                .is_some_and(|error| error.contains("forced_cache_transition_required"))
-        );
-        // Toggling the force and confirming again resubmits.
-        press(&mut state, KeyCode::Char('f'));
-        let command = press(&mut state, KeyCode::Char('y')).expect("resubmitted");
-        assert_eq!(command.body.expect("body")["force_cache_transition"], true);
+        assert_eq!(form_purpose(&state), record_form("presentations", true));
+        assert!(!state.in_flight());
+        let error = state.error().expect("the refusal is shown");
+        assert!(error.contains("revision 9 is now live"), "{error}");
     }
 
     #[test]
-    fn an_invalid_activation_names_its_diagnostics() {
+    fn an_invalid_save_names_its_diagnostics() {
         let mut state = loaded(full_snapshot());
-        press(&mut state, KeyCode::Char('a'));
+        press(&mut state, KeyCode::Char('d'));
         press(&mut state, KeyCode::Char('y'));
         state.receive(reply(
-            "activate",
+            "save",
             422,
             serde_json::json!({"error": "invalid_policy", "diagnostics": [
                 {"code": "unknown_binding", "path": "/routes/0/chain/first"}
@@ -1953,18 +1334,19 @@ mod tests {
             serde_json::json!({"revisions": [{"revision_id": 9}, {"revision_id": 4}]}),
         ));
         state.set_view(View::Status);
-        // Entries: active, draft, then the revisions.
-        state.move_selection(3);
+        // Entries: the live revision, then the revisions.
+        state.move_selection(2);
         assert!(press(&mut state, KeyCode::Char('x')).is_none());
         assert!(matches!(
             state.modal(),
-            Modal::Reactivate { revision_id: 4, .. }
+            Modal::Reactivate { revision_id: 4 }
         ));
         let command = press(&mut state, KeyCode::Char('y')).expect("confirmed");
         let body = command.body.expect("body");
         assert_eq!(command.name, "reactivate");
         assert_eq!(body["revision_id"], 4);
-        assert_eq!(body["force_cache_transition"], false);
+        assert_eq!(body["expected_revision_id"], 3);
+        assert!(body.get("scope").is_none(), "a reactivation names no scope");
     }
 
     #[test]
@@ -2009,11 +1391,13 @@ mod tests {
         let command = press(&mut state, KeyCode::Enter).expect("preview");
         let body = command.body.expect("body");
         assert_eq!(command.name, "preview");
-        assert_eq!(body["protocol"], "openai_chat");
-        assert_eq!(body["profile"], "work");
-        assert_eq!(body["prompt_bound"], 5000);
-        assert!(body.get("model").is_none());
-        assert!(body.get("message_count").is_none());
+        assert_eq!(body["mode"], "resolve");
+        assert_eq!(body["request"]["kind"], "invented");
+        assert_eq!(body["request"]["protocol"], "openai_chat");
+        assert_eq!(body["request"]["profile"], "work");
+        assert_eq!(body["request"]["prompt_bound"], 5000);
+        assert!(body["request"].get("model").is_none());
+        assert!(body["request"].get("message_count").is_none());
     }
 
     #[test]
@@ -2029,7 +1413,7 @@ mod tests {
         assert_eq!(form_value(&state)["asks_server_safeguards"], true);
         let command = state.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         let body = command.expect("preview").body.expect("body");
-        assert_eq!(body["asks_server_safeguards"], true);
+        assert_eq!(body["request"]["asks_server_safeguards"], true);
         assert!(
             !state.preview_asked(),
             "only a reply settles what was shown"
@@ -2059,7 +1443,7 @@ mod tests {
             .expect("preview")
             .body
             .expect("body");
-        assert!(body.get("asks_server_safeguards").is_none());
+        assert!(body["request"].get("asks_server_safeguards").is_none());
     }
 
     #[test]
@@ -2086,11 +1470,7 @@ mod tests {
         assert_eq!(operations[1]["kind"], "set_route_server_safeguards");
         assert_eq!(operations[1]["route_id"], "changed");
         assert_eq!(operations[1]["honours"], true);
-        state.receive(reply(
-            "draft-edit",
-            200,
-            serde_json::json!({"generation": 4}),
-        ));
+        state.receive(reply("save", 200, serde_json::json!({})));
 
         // Left off, the same save clears it.
         press(&mut state, KeyCode::Char('e'));
@@ -2106,24 +1486,6 @@ mod tests {
         let command = state.key(CTRL_ENTER).expect("edit command");
         let operations = command.body.expect("body")["edit"]["operations"].clone();
         assert_eq!(operations.as_array().expect("operations").len(), 1);
-    }
-
-    #[test]
-    fn a_conflict_can_reload_and_discards_the_local_batch() {
-        let mut state = loaded(full_snapshot());
-        state.conflicted_edits =
-            vec![serde_json::json!({"kind": "set_description", "description": "mine"})];
-        state.receive(reply(
-            "draft-edit",
-            409,
-            serde_json::json!({"error": "stale_draft", "generation": 4,
-                "draft": {"policy": {"description": "theirs"}}}),
-        ));
-        assert_eq!(state.generation(), Some(4), "the daemon copy is shown");
-        let command = press(&mut state, KeyCode::Char('r')).expect("reload");
-        assert_eq!(command.name, "snapshot");
-        assert!(state.conflicted_edits.is_empty());
-        assert!(!state.modal().active());
     }
 
     /// The terminal builds its edits by hand; the daemon's typed vocabulary is
@@ -2152,7 +1514,7 @@ mod tests {
     #[test]
     fn a_read_reply_does_not_release_a_pending_edit() {
         let mut state = loaded(full_snapshot());
-        press(&mut state, KeyCode::Char('a'));
+        press(&mut state, KeyCode::Char('d'));
         press(&mut state, KeyCode::Char('y'));
         assert!(state.in_flight());
         // The page's earlier snapshot and revisions reads land first.
@@ -2164,7 +1526,11 @@ mod tests {
         state.receive(reply("snapshot", 200, full_snapshot()));
         assert!(state.in_flight());
         assert!(press(&mut state, KeyCode::Char('y')).is_none());
-        state.receive(reply("activate", 200, serde_json::json!({"generation": 4})));
+        state.receive(reply(
+            "save",
+            200,
+            serde_json::json!({"active_revision": {"revision_id": 4}}),
+        ));
         assert!(!state.in_flight());
     }
 
@@ -2174,17 +1540,16 @@ mod tests {
         assert!(state.begin_refresh());
         state.refresh_refused();
         assert!(state.begin_refresh(), "a refused refresh can be retried");
-        press(&mut state, KeyCode::Char('a'));
+        press(&mut state, KeyCode::Char('d'));
         press(&mut state, KeyCode::Char('y'));
-        state.command_refused("activate");
+        state.command_refused("save");
         assert!(!state.in_flight());
         assert!(state.error().is_some_and(|error| error.contains("busy")));
     }
 
     fn defaults_snapshot() -> serde_json::Value {
         serde_json::json!({
-            "draft_generation": 5,
-            "draft": {"policy": {
+            "active_revision": {"revision_id": 5, "policy": {
                 "routes": [{"id": "route-a"}],
                 "defaults": [
                     {"scope": {"kind": "protocol", "protocol": "openai_chat"},
@@ -2198,12 +1563,6 @@ mod tests {
                     "cache_transition": "allow_when_cold",
                 },
             }},
-            "active_revision": {"policy": {"routes": [{"id": "route-a"}], "defaults": [
-                {"scope": {"kind": "protocol", "protocol": "openai_chat"},
-                 "target": {"route_id": "route-b"}},
-                {"scope": {"kind": "protocol", "protocol": "openai_responses"},
-                 "target": {"route_id": "route-b"}},
-            ]}},
         })
     }
 
@@ -2230,11 +1589,7 @@ mod tests {
         assert_eq!(operation["kind"], "replace_default");
         assert_eq!(operation["scope"]["profile"], "unprefixed");
         assert_eq!(operation["default"]["target"]["route_id"], "route-a");
-        state.receive(reply(
-            "draft-edit",
-            200,
-            serde_json::json!({"generation": 6}),
-        ));
+        state.receive(reply("save", 200, serde_json::json!({})));
 
         press(&mut state, KeyCode::Char('d'));
         let command = press(&mut state, KeyCode::Char('y')).expect("confirmed");
@@ -2251,30 +1606,13 @@ mod tests {
         let command = press(&mut state, KeyCode::Char('y')).expect("confirmed");
         let operation = &command.body.expect("body")["edit"]["operations"][0];
         assert_eq!(operation["kind"], "remove_compaction");
-        state.receive(reply(
-            "draft-edit",
-            200,
-            serde_json::json!({"generation": 6}),
-        ));
+        state.receive(reply("save", 200, serde_json::json!({})));
         press(&mut state, KeyCode::Char('e'));
         let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
         let command = state.key(ctrl_enter).expect("replace command");
         let operation = &command.body.expect("body")["edit"]["operations"][0];
         assert_eq!(operation["kind"], "replace_compaction");
         assert_eq!(operation["compaction"]["target"]["route_id"], "route-a");
-    }
-
-    #[test]
-    fn the_activation_summary_counts_default_and_compaction_changes() {
-        let state = loaded(defaults_snapshot());
-        let summary = state.activation_summary().join("\n");
-        assert!(summary.contains("~default openai_chat"), "{summary}");
-        assert!(
-            summary.contains("+default unprefixed/openai_chat"),
-            "{summary}"
-        );
-        assert!(summary.contains("-default openai_responses"), "{summary}");
-        assert!(summary.contains("+compaction"), "{summary}");
     }
 
     /// The terminal builds default and compaction edits by hand as well; the
@@ -2306,7 +1644,7 @@ mod tests {
     const CTRL_ENTER: KeyEvent = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
 
     #[test]
-    fn adding_a_presentation_sends_the_typed_addition_at_the_loaded_generation() {
+    fn adding_a_presentation_sends_the_typed_addition_against_the_live_revision() {
         let mut state = loaded(full_snapshot());
         assert!(press(&mut state, KeyCode::Char('n')).is_none());
         assert_eq!(
@@ -2316,20 +1654,16 @@ mod tests {
         );
         assert_eq!(form_value(&state)["id"], "new-presentation");
         let command = state.key(CTRL_ENTER).expect("add command");
-        assert_eq!(command.name, "draft-edit");
-        assert_eq!(command.method, Method::PATCH);
+        assert_eq!(command.name, "save");
+        assert_eq!(command.method, Method::POST);
         let body = command.body.expect("body");
-        assert_eq!(body["expected_generation"], 3);
+        assert_eq!(body["expected_revision_id"], 3);
         let operation = &body["edit"]["operations"][0];
         assert_eq!(operation["kind"], "add_presentation");
         assert_eq!(operation["presentation"]["id"], "new-presentation");
         assert!(state.in_flight());
-        // The draft the daemon answers with closes the form.
-        state.receive(reply(
-            "draft-edit",
-            200,
-            serde_json::json!({"generation": 4}),
-        ));
+        // The activation the daemon answers with closes the form.
+        state.receive(reply("save", 200, serde_json::json!({})));
         assert!(!state.modal().active());
     }
 
@@ -2372,9 +1706,9 @@ mod tests {
         press(&mut state, KeyCode::Char('1'));
         assert!(state.key(CTRL_ENTER).is_some());
         // The refusal text is the daemon's own: the template's route added
-        // to a draft that already holds a route of that id.
+        // to a policy that already holds a route of that id.
         let record = crate::tui::routing::template::template("routes", None);
-        let draft: crate::policy::PolicyDocument = serde_json::from_value(serde_json::json!({
+        let live: crate::policy::PolicyDocument = serde_json::from_value(serde_json::json!({
             "format_version": 3, "routes": [record.clone()],
         }))
         .expect("document");
@@ -2382,9 +1716,9 @@ mod tests {
             serde_json::json!({ "operations": [super::add_edit("routes", record)] }),
         )
         .expect("edit");
-        let refusal = duplicate.apply(&draft).expect_err("the id is taken");
+        let refusal = duplicate.apply(&live).expect_err("the id is taken");
         state.receive(reply(
-            "draft-edit",
+            "save",
             422,
             serde_json::json!({
                 "error": "invalid_policy_edit",
@@ -2400,30 +1734,8 @@ mod tests {
         let error = state.error().expect("the refusal is shown");
         assert!(error.contains("invalid_policy_edit"), "{error}");
         assert!(error.contains("already exists"), "{error}");
-        assert!(
-            state.conflicted_edits.is_empty(),
-            "a refused edit is not offered for reapply"
-        );
         // Fixing the id and saving again is an ordinary second attempt.
         assert!(state.key(CTRL_ENTER).is_some());
-    }
-
-    #[test]
-    fn a_conflict_on_an_add_reapplies_the_addition_to_the_daemon_copy() {
-        let mut state = loaded(full_snapshot());
-        press(&mut state, KeyCode::Char('n'));
-        state.key(CTRL_ENTER).expect("add command");
-        state.receive(reply(
-            "draft-edit",
-            409,
-            serde_json::json!({"error": "stale_draft", "generation": 9,
-                "draft": {"policy": {"description": "theirs"}}}),
-        ));
-        assert!(matches!(state.modal(), Modal::Conflict { .. }));
-        let command = press(&mut state, KeyCode::Char('a')).expect("reapply command");
-        let body = command.body.expect("body");
-        assert_eq!(body["expected_generation"], 9);
-        assert_eq!(body["edit"]["operations"][0]["kind"], "add_presentation");
     }
 
     #[test]
@@ -2482,16 +1794,12 @@ mod tests {
                 command.body.expect("body")["edit"]["operations"][0]["kind"],
                 operation
             );
-            state.receive(reply(
-                "draft-edit",
-                200,
-                serde_json::json!({"generation": 6}),
-            ));
+            state.receive(reply("save", 200, serde_json::json!({})));
         }
     }
 
     #[test]
-    fn a_new_default_starts_from_the_drafts_first_route_and_adds_by_scope() {
+    fn a_new_default_starts_from_the_first_route_and_adds_by_scope() {
         let mut state = loaded(defaults_snapshot());
         state.set_view(View::Routes);
         press(&mut state, KeyCode::Char('n'));
@@ -2512,7 +1820,7 @@ mod tests {
         assert!(!state.modal().active());
         assert!(state.error().is_some());
         state.set_view(View::Presentations);
-        press(&mut state, KeyCode::Char('a'));
+        press(&mut state, KeyCode::Char('d'));
         press(&mut state, KeyCode::Char('y'));
         assert!(state.in_flight());
         press(&mut state, KeyCode::Char('n'));

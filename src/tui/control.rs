@@ -23,7 +23,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A named control operation, kept with its reply so state can distinguish an
-/// old snapshot from a draft edit or confirmation action.
+/// old snapshot from a save or confirmation action.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Command {
     pub(crate) name: &'static str,

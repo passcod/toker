@@ -1,11 +1,10 @@
 ---
 source: src/tui/routing/view.rs
-assertion_line: 821
 expression: "frame(&page_in(super::View::Presentations))"
 ---
- ? ⇄ 1 presentations  2  3  4                                                                                    draft 4
+ ? ⇄ 1 presentations  2  3  4                                                                                 revision 3
 ┌PRESENTATIONS───────────────────────────────────┐┌DETAIL──────────────────────────────────────────────────────────────┐
-│mixed  {"id":"p-mixed","slug":"mixed","label":"…││draft generation 4                                                  │
+│mixed  {"id":"p-mixed","slug":"mixed","label":"…││revision 3 is live                                                  │
 │                                                ││mixed  Mixed                                                        │
 │                                                ││scope: openai_responses                                             │
 │                                                ││source: virtual, routes through mixed                               │
@@ -16,9 +15,9 @@ expression: "frame(&page_in(super::View::Presentations))"
 │                                                ││applied unknown                                                     │
 │                                                ││    state applied; revision 3 applied, 3 desired                    │
 │                                                ││                                                                    │
-│                                                ││DIAGNOSTICS                                                         │
-│                                                ││  info virtual-presentation-unlisted-in-responses at                │
-│                                                ││/presentations/0/metadata                                           │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
 │                                                ││                                                                    │
 │                                                ││                                                                    │
 │                                                ││                                                                    │

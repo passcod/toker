@@ -1,0 +1,36 @@
+---
+source: src/tui/routing/view.rs
+expression: frame(&state)
+---
+ ? ⇄ 1  2  3  4 preview, revisions & activation                                                               revision 3
+┌PREVIEW, REVISIONS & ACTIVATION─────────────────┐┌DETAIL──────────────────────────────────────────────────────────────┐
+│3  {"revision_id":3,"policy":{"description":"ex…││revision 3 is live                                                  │
+│2  {"revision_id":2}                            ││{                                                                   │
+│dynamic_responses_models  {"adapter":"dynamic_r…││  "revision_id": 2                                                  │
+│codex_sub.codex_responses  {"binding_id":"codex…││}                                                                   │
+│openrouter.openrouter_responses  {"binding_id":…││                                                                    │
+│lane_impacts  {"total":4,"unpinned":1,"warm":2,…││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                              ┌REACTIVATE REVISION────────────────────────────────────┐                               │
+│                              │Create a forward revision from revision 2?             │                               │
+│                              │The active pointer never moves backwards.              │                               │
+│                              │lanes: 4 total, 1 unpinned, 2 warm, 1 cold, 0 unknown  │                               │
+│                              │publication dynamic_responses_models: applied          │                               │
+│                              │y/enter confirm · n/esc cancel                         │                               │
+│                              └───────────────────────────────────────────────────────┘                               │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+└────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘

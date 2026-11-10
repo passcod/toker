@@ -1,11 +1,10 @@
 ---
 source: src/tui/routing/view.rs
-assertion_line: 826
 expression: "frame(&page_in(super::View::Routes))"
 ---
- ? ⇄ 1  2 routes, candidates & defaults  3  4                                                                    draft 4
+ ? ⇄ 1  2 routes, candidates & defaults  3  4                                                                 revision 3
 ┌ROUTES, CANDIDATES & DEFAULTS───────────────────┐┌DETAIL──────────────────────────────────────────────────────────────┐
-│mixed  {"id":"mixed","display_name":"Subscripti…││draft generation 4                                                  │
+│mixed  {"id":"mixed","display_name":"Subscripti…││revision 3 is live                                                  │
 │default openai_responses  {"scope":{"kind":"pro…││mixed  Subscription then billed                                     │
 │                                                ││lane transition: move_when_cold                                     │
 │                                                ││pinned lanes: 2 warm, 1 cold, 0 unknown                             │

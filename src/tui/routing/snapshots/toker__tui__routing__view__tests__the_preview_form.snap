@@ -2,35 +2,35 @@
 source: src/tui/routing/view.rs
 expression: frame(&state)
 ---
- ? ⇄ 1  2  3  4 preview, revisions & activation                                                                  draft 4
-┌PREV┌ROUTING PREVIEW─────────────────────────────────────────────────────────────────────────────────────────────┐────┐
-│3  {│> protocol: < anthropic_messages >                                                                          │    │
-│draf│  profile: (none)                                                                                           │    │
-│dyna│  model: (none)                                                                                             │    │
-│code│  lane key: (none)                                                                                          │    │
-│open│  prompt bound: 0                                                                                           │    │
-│lane│  message count: (none)                                                                                     │    │
-│diag│  tool count: 0                                                                                             │    │
-│    │  [ ] asks for server safeguards                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │content-free request facts only · space toggle · enter preview · esc cancel                                 │    │
-│    │                                                                                                            │    │
-│    └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
-└────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘
+ ? ⇄ 1  2  3  4 preview, revisions & activation                                                               revision 3
+PREVI┌ROUTING PREVIEW─────────────────────────────────────────────────────────────────────────────────────────────┐────
+ 3  {│> protocol: < anthropic_messages >                                                                          │
+ dyna│  profile: (none)                                                                                           │
+ code│  model: (none)                                                                                             │
+ open│  lane key: (none)                                                                                          │
+ lane│  prompt bound: 0                                                                                           │
+     │  message count: (none)                                                                                     │
+     │  tool count: 0                                                                                             │
+     │  [ ] asks for server safeguards                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │                                                                                                            │
+     │content-free request facts only · space toggle · enter preview · esc cancel                                 │
+     │                                                                                                            │
+     └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                             "first": {
