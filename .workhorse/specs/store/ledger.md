@@ -59,6 +59,12 @@ A row MUST carry the [requested model](../routing/models.md#requested-model), th
 A response naming no model MUST leave the served model absent.
 Nothing MUST fill it from the effective model.
 
+A row about a request MUST carry its requested model, whatever its kind.
+A row about a request that was routed MUST carry the effective model it was routed to, a gate's row and a failed attempt's row included.
+
+> [!NOTE]
+> A gate stops a request after it has been routed, so its row knows the provider and the model as well as an attempt's does.
+
 ## Fields that need care
 
 A record of an upgrade MUST be written on every request the upgrade moved, not only the first.

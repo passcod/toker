@@ -14,3 +14,6 @@
 - Session rows today come only from measurement rows (`is_api_measurement` gates the per-session pass in `tui/model.rs`).
   Gated, failed and in-flight-only sessions need the session map seeded from every row naming a session, not only measurements.
 - The glyphs for the stages, the failure mark and a not-yet-served model are design decisions to record in the design system alongside the existing marks, and each needs a legend entry.
+- The quota gate's row (`record_quota_blocked` in `server/record_anthropic.rs`) writes no requested or effective model, though it already knows the provider and account.
+  It needs both from the recording context, as error rows already take them.
+  Older gate rows lack them, so a gated-only session from before the change still reads `?`.

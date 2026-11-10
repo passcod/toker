@@ -97,12 +97,12 @@ A session grouped with its children MUST follow [SLIN](../store/lineage.md#linea
 A session's request count MUST count its logical requests as [SATT](../store/attempts.md#reading-the-rows) counts them, whether they completed, failed or are still in flight.
 
 A session's row MUST take its model and the context ceiling derived from it from the [served model](../routing/models.md#served-model) of the latest row that named one.
-Where no row of the session named one, the row MUST take them from the model a request in flight was sent on, and MUST mark them as not yet served.
+Where no row of the session named one, the row MUST take them from the newest [effective model](../routing/models.md#effective-model) the session was routed to, whether on a request in flight, a gate's row or a failed attempt's, and MUST mark them as not yet served.
 A session's row MUST NOT take them from the requested model.
 
 > [!NOTE]
 > A context window belongs to the model that served, not to the one that was asked for.
-> The model an attempt was sent on is the nearest thing to it before any response names one.
+> The model a request was routed to is the nearest thing to it before any response names one.
 
 A session detail MUST show the requested, effective and served models separately.
 A session detail MUST show the served one as absent where the response named no model.

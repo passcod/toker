@@ -113,16 +113,16 @@
 </head>
 <body>
 <h1>Requests in flight &mdash; 120&times;40</h1>
-<p class="note">Seven sessions. ses-free has two requests in flight, ses-new a first turn with nothing served yet, ses-hot a turn streaming back. ses-gate was only stopped by a gate and ses-fail only failed; both now have rows to open and act on.</p>
+<p class="note">Seven sessions. ses-free has two requests in flight, ses-new a first turn with nothing served yet, ses-hot a turn streaming back. ses-gate was only stopped by a gate and ses-fail only failed; both now have rows to open and act on, showing the model each was routed to.</p>
 <pre class="frame"><span class="gray r"> ? </span> <span class="blue b r"> dashboard </span> <span class="gray r"> routing </span> <span class="gray r"> config </span> <span class="gray r"> accounts </span> last 30m · 7 sessions · 2 idle · 19 requests       last req <span class="green">now</span> · 12:34:56
 ┌SESSIONS──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │session                                             ctx model         reqs prompt now    peak msgs ↺   out        idle│
 │ses-free                                             <span class="green b">1M</span> sonnet-5 <span class="yellow">$</span>       5      2,500   2,500    <span class="d">-</span> <span class="d">-</span>    60 recv 22s +1│
 │ses-new                                              <span class="green b d">1M</span> <span class="d">~opus-5</span>          1          ?       ?    4 <span class="d">-</span>     ?    sent 14s│
 │ses-hot                                              <span class="green b">1M</span> opus-5 <span class="green b">↑</span>         4    470,893 472,000   79 1 2,304     recv 1m│
-│ses-gate                                              <span class="d">?</span> <span class="d">?</span> <span class="red b">!</span>              1          ?       ?    <span class="d">-</span> <span class="d">-</span>     ?          2m│
+│ses-gate                                             <span class="green b d">1M</span> <span class="d">~opus-5</span> <span class="red b">!</span>        1          ?       ?    <span class="d">-</span> <span class="d">-</span>     ?          2m│
 │ses-myst                                              <span class="d">?</span> gpt-5.6-terra    3      3,132   3,132    <span class="d">-</span> <span class="d">-</span>    40          2m│
-│ses-fail                                              <span class="d">?</span> <span class="d">?</span> <span class="red">✗</span>              2          ?       ?    <span class="d">-</span> <span class="d">-</span>     ?          <span class="d">4m</span>│
+│ses-fail                                             <span class="green b d">1M</span> <span class="d">~sonnet-5</span> <span class="red">✗</span>      2          ?       ?    <span class="d">-</span> <span class="d">-</span>     ?          <span class="d">4m</span>│
 │ses-crow                                           <span class="yellow">200k</span> haiku-4-5        3    170,000 170,000    <span class="d">-</span> <span class="d">-</span>   100         <span class="d">10m</span>│
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -156,7 +156,7 @@
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</pre>
 <h2>Proposed legend entries</h2>
 <p class="note"><strong>held / sent / recv T</strong> in the idle column: a request in flight, received but not yet sent, sent with no reply begun, or streaming back. T counts from arrival. <strong>+N</strong>: N more in flight.</p>
-<p class="note"><strong><span class="d">~</span>model</strong>, dim with its ceiling: the model a request was sent on, none served yet.</p>
+<p class="note"><strong><span class="d">~</span>model</strong>, dim with its ceiling: the model the session was routed to, none served yet.</p>
 <p class="note"><strong><span class="red">&#10007;</span></strong>: failed. The newest request to finish ended in failure. Red like the other failures, and the glyph carries it without colour.</p>
 <p class="note">The idle column widens to fit the longest stage cell; the name column gives up the room, as it does for every other column.</p>
 <h2>Session detail with two requests in flight</h2>
