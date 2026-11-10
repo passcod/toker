@@ -36,6 +36,39 @@ Where the resolver or the lane's transition rules refuse a fall, the failed resp
 
 A gate notice is decided once for the whole request, and MUST NOT be decided again for a later attempt.
 
+## While a request is in flight
+
+Toker MUST record a logical request in the store as in flight from when it begins handling it, so that a reader can see it before any of its rows is written.
+
+The in-flight record MUST carry when Toker began handling the request, its group, session, lineage, profile, requested model and message count.
+It MUST carry no prompt or completion content, as [SEC](../security.md#no-prompt-or-completion-content-is-recorded) requires.
+
+The record MUST carry the request's stage, being one of:
+
+| stage | what it means |
+| --- | --- |
+| held | received, and not yet sent to any provider |
+| waiting | an attempt was sent, and no response to it has begun |
+| streaming | a response to the current attempt is under way |
+
+When an attempt is sent, the record MUST take that attempt's index, provider, binding and the model it was sent on, and its stage MUST become waiting.
+A fallback therefore moves the record to the next attempt as that attempt is sent.
+
+The record MUST be removed when Toker stops handling the request, and MUST NOT be removed before the request's last row is written.
+
+> [!NOTE]
+> Removing it first would leave a moment in which a reader sees the request neither in flight nor recorded, and the session's row would blink out.
+
+A reader MUST treat a group with an in-flight record as in flight, whatever rows of it are already written.
+
+> [!NOTE]
+> A failed attempt's row is written before a fallback is decided, so a group still in flight can already hold a failure the client will never see.
+
+Toker MUST remove every in-flight record when the service starts.
+
+> [!NOTE]
+> No request outlives the process handling it, so a record left behind by a crash describes nothing.
+
 ## Accounting is per attempt
 
 Every attempt MUST be recorded as it ends, attached to the provider that received it.

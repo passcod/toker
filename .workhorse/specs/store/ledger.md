@@ -59,6 +59,12 @@ A row MUST carry the [requested model](../routing/models.md#requested-model), th
 A response naming no model MUST leave the served model absent.
 Nothing MUST fill it from the effective model.
 
+A row about a request MUST carry its requested model, whatever its kind.
+A row about a request that was routed MUST carry the effective model it was routed to, a gate's row and a failed attempt's row included.
+
+> [!NOTE]
+> A gate stops a request after it has been routed, so its row knows the provider and the model as well as an attempt's does.
+
 ## Fields that need care
 
 A record of an upgrade MUST be written on every request the upgrade moved, not only the first.
@@ -72,6 +78,11 @@ A record of a compaction's model move and a record of its body transform MUST st
 > A compaction already on the target model is rewritten without being moved.
 
 Both MUST be taken from the attempt plan rather than from the body transform.
+
+A row about a request MUST carry when Toker began handling that request, as well as when the row was written.
+
+> [!NOTE]
+> A row is written as its attempt ends, so a long stream would otherwise place a request at the minute it finished rather than the one it was sent in.
 
 A row MUST record whether each gate was armed for that request.
 

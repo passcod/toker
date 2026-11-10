@@ -1461,6 +1461,14 @@ async fn the_openrouter_prefix_without_its_block_is_answered_locally() {
     );
     let rows = wait_for_rows(&store, 1).await;
     assert_eq!(rows[0].kind, Some(RowKind::RouteUnavailable));
+    // Nothing was routed, so there is no model it was routed to; and the
+    // request is no longer in flight once its row is there.
+    assert_eq!(
+        rows[0].requested_model.as_deref(),
+        Some("openrouter/moonshotai/kimi-k3")
+    );
+    assert_eq!(rows[0].effective_model, None);
+    assert!(store.in_flight_rows().expect("in flight").is_empty());
 }
 
 #[tokio::test]
@@ -2757,6 +2765,11 @@ async fn a_spent_meter_blocks_with_a_synthetic_200_and_never_reaches_upstream() 
     assert_eq!(row.session_id.as_deref(), Some("ccses-42"));
     assert_eq!(row.gate_on, Some(true));
     assert!(row.duration_ms.is_some());
+    // The request was routed before the gate stopped it, so its row says
+    // which model it asked for and which it was routed to.
+    assert_eq!(row.requested_model.as_deref(), Some("claude-opus-5"));
+    assert_eq!(row.effective_model.as_deref(), Some("claude-opus-5"));
+    assert!(row.started_ms.is_some_and(|started| started <= row.ts_ms));
     // Parity: the stale snapshot the block was decided on.
     assert_eq!(row.rate_limits, Some(snapshot));
     assert_eq!(
@@ -2776,12 +2789,8 @@ async fn a_spent_meter_blocks_with_a_synthetic_200_and_never_reaches_upstream() 
             .is_some_and(|extra| extra.get("context_tokens") == Some(&Value::Null)),
         "not recorded yet — never printed as a zero"
     );
-    // A proxy-written row: no usage, no model, never priced (the
-    // predecessor's blocked
-    // row carries no model either).
+    // A proxy-written row: no usage, no served model, never priced.
     assert_eq!(row.model, None);
-    assert_eq!(row.requested_model, None);
-    assert_eq!(row.effective_model, None);
     assert_eq!(row.input, None);
     assert_eq!(row.usage_presence, None);
     assert_eq!(row.cost_usd, None);

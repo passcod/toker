@@ -765,6 +765,7 @@ fn map_row(row: &CtpRow, cost_kind: CostKind) -> Result<RequestRow, String> {
         attempt: None,
         policy_routing: None,
         lineage: None,
+        started_ms: None,
     })
 }
 

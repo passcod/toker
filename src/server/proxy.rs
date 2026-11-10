@@ -124,7 +124,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     // lane note below is what excludes it. The guard's Drop is the
     // decrement, so no early return — a cold notice, a 502 — can leak
     // it; for a streamed response it rides the body stream.
-    let in_flight = Some(server.begin_in_flight());
+    let in_flight = Some(server.begin_in_flight(true, frontend.as_deref()));
 
     // 2.-5. Parse and route. Every supported Chat backend renders from
     // canonical IR, including the same-protocol OpenRouter binding.
@@ -176,6 +176,14 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     let Some(model) = canonical.model.clone().filter(|model| !model.is_empty()) else {
         return compatibility_error("model is missing, empty, or not a string", stream_asked);
     };
+    if let Some(guard) = &in_flight {
+        guard.identify(&crate::store::InFlightIdentity {
+            session_id: session_id.as_deref(),
+            lineage: None,
+            requested_model: Some(&model),
+            req_messages: Some(canonical.messages.len() as i64),
+        });
+    }
     let mut inference = super::inference::InferenceRequest::new(model.clone(), canonical);
     let canonical = inference.canonical();
     let shape = Shape::from_canonical(&canonical, original.len() as u64);
@@ -361,6 +369,8 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             context_tokens: block.context_tokens,
             stale_meters: block.stale_meters.as_ref(),
             frontend: frontend.as_deref(),
+            requested_model: Some(model.as_str()),
+            effective_model: gate_model.as_deref(),
         });
         let mut headers = HeaderMap::new();
         headers.insert(

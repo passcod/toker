@@ -440,6 +440,7 @@ fn bare_row(ts_ms: i64) -> RequestRow {
         attempt: None,
         policy_routing: None,
         lineage: None,
+        started_ms: None,
     }
 }
 
@@ -602,6 +603,9 @@ async fn a_cold_lane_gets_the_notice_a_cold_row_and_no_upstream_then_the_resend_
     assert_eq!(row.kind, Some(RowKind::Cold));
     assert_eq!(row.session_id.as_deref(), Some("ccses-42"));
     assert_eq!(row.provider.as_deref(), Some("anthropic_sub"));
+    // Stopped after it was routed: the row says to what.
+    assert_eq!(row.requested_model.as_deref(), Some("claude-opus-5"));
+    assert_eq!(row.effective_model.as_deref(), Some("claude-opus-5"));
     assert_eq!(row.cold_on, Some(true));
     assert_eq!(row.gate_on, Some(true));
     // NO rate_limits: nothing reached upstream, so the only meters
@@ -761,6 +765,8 @@ async fn a_recap_on_a_cold_lane_is_held_without_spending_the_notice() {
     assert!(mock.captured().is_empty(), "the gate answered, not the API");
     let rows = wait_for_rows(&store, 1).await;
     assert_eq!(rows[0].kind, Some(RowKind::ColdRecap));
+    assert_eq!(rows[0].requested_model.as_deref(), Some("claude-opus-5"));
+    assert_eq!(rows[0].effective_model.as_deref(), Some("claude-opus-5"));
     assert_eq!(extra_of(&rows[0])["lastPrompt"], json!(200_000));
     let lane = store
         .load_lane(&lane_key_of(&prompt))
@@ -833,6 +839,8 @@ async fn an_on_track_outlook_withholds_the_notice_and_records_cold_quiet() {
         .find(|row| row.kind == Some(RowKind::ColdQuiet))
         .expect("a withheld notice is recorded");
     assert_eq!(quiet.session_id.as_deref(), Some("ccses-42"));
+    assert_eq!(quiet.requested_model.as_deref(), Some("claude-opus-5"));
+    assert_eq!(quiet.effective_model.as_deref(), Some("claude-opus-5"));
     assert_eq!(quiet.rate_limits, None, "no stale meters on a proxy row");
     assert_eq!(quiet.cold_on, Some(true));
     let extra = extra_of(quiet);

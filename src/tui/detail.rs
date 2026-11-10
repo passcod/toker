@@ -24,7 +24,7 @@ use crate::catalog::windows::ContextWindow;
 use crate::ir::Release;
 use crate::middleware::quota::{Meters, grant_ahead};
 use crate::release::GATED_BACKEND;
-use crate::store::{Allowance, RequestRow, SessionSummary, Store};
+use crate::store::{Allowance, InFlightStage, RequestRow, SessionSummary, Store};
 
 /// One session's detail, as of its last read.
 #[derive(Debug, Clone, PartialEq)]
@@ -207,6 +207,32 @@ pub(crate) fn availability(
     }
 }
 
+/// The stage a request in flight is at, as the idle column says it.
+fn stage_name(stage: InFlightStage) -> &'static str {
+    match stage {
+        InFlightStage::Held => "held",
+        InFlightStage::Waiting => "sent",
+        InFlightStage::Streaming => "recv",
+    }
+}
+
+/// `first`, `second`, and on, for a zero-based attempt index.
+fn ordinal(index: i64) -> String {
+    const NAMES: [&str; 5] = ["first", "second", "third", "fourth", "fifth"];
+    usize::try_from(index)
+        .ok()
+        .and_then(|index| NAMES.get(index))
+        .map_or_else(|| format!("#{}", index + 1), |name| (*name).to_owned())
+}
+
+/// Whether the binding bills per token, as against a subscription.
+fn bills(binding_id: &str) -> bool {
+    crate::routing::BACKEND_BINDINGS
+        .iter()
+        .find(|binding| binding.id_str() == binding_id)
+        .is_some_and(|binding| binding.cost_class() == crate::policy::CostClass::Billed)
+}
+
 /// The popup's content above the controls: who the session is, which
 /// models it asked for and got, its context, its activity, and its gate.
 /// Anything the store does not know is said to be unknown, never zero.
@@ -384,6 +410,43 @@ pub(crate) fn lines(
         }
         Some(_) => out.push(field("session", vec![Span::styled("no measurements", dim)])),
         None => out.push(field("session", vec![Span::styled("unknown", dim)])),
+    }
+
+    // Each request in flight: how far it has got and for how long, then
+    // where its current attempt went.
+    if let Some(agg) = &detail.agg {
+        let live: Vec<[String; 2]> = agg
+            .in_flight
+            .iter()
+            .map(|request| {
+                [
+                    format!(
+                        "{} {}",
+                        stage_name(request.stage),
+                        super::view::in_flight_age(now_ms - request.started_ms)
+                    ),
+                    request.provider.clone().unwrap_or_default(),
+                ]
+            })
+            .collect();
+        let widths = [0, 1].map(|i| live.iter().map(|cells| cells[i].len()).max().unwrap_or(0));
+        for (index, (request, cells)) in agg.in_flight.iter().zip(&live).enumerate() {
+            let mut spans = vec![Span::raw(format!("{:<w$}", cells[0], w = widths[0]))];
+            if request.provider.is_some() {
+                spans.push(Span::raw(format!("  {:<w$}", cells[1], w = widths[1])));
+            }
+            if let Some(model) = &request.effective_model {
+                spans.push(Span::raw(format!("  {model}")));
+            }
+            if let Some(attempt) = request.attempt_index {
+                let mut said = format!("  {} attempt", ordinal(attempt.get()));
+                if request.binding_id.as_deref().is_some_and(bills) {
+                    said.push_str(", billed");
+                }
+                spans.push(Span::styled(said, dim));
+            }
+            out.push(field(if index == 0 { "live" } else { "" }, spans));
+        }
     }
 
     // The gate: armed or not, the meters it reads, and what this
@@ -919,5 +982,134 @@ mod tests {
             );
         })
         .expect("draw");
+    }
+
+    /// A detail with two requests in flight on the session: the first
+    /// streaming on the subscription, the second a fallback sent to a
+    /// billed provider.
+    fn two_in_flight() -> Detail {
+        use crate::store::{AttemptGroupId, AttemptIndex, InFlightRequest, InFlightStage};
+        let (_, mut detail) = fixture(Some(meters(0.40)));
+        let request =
+            |secs: i64, stage, index: i64, provider: &str, binding: &str| InFlightRequest {
+                id: index + 1,
+                started_ms: NOW - secs * 1_000,
+                attempt_group_id: Some(
+                    AttemptGroupId::new(format!("{index:x}").repeat(32)).unwrap(),
+                ),
+                session_id: Some("ses-detail-0001".to_owned()),
+                lineage: None,
+                profile: None,
+                requested_model: Some("claude-opus-5".to_owned()),
+                req_messages: Some(12),
+                stage,
+                attempt_index: Some(AttemptIndex::try_from(index).unwrap()),
+                provider: Some(provider.to_owned()),
+                binding_id: Some(binding.to_owned()),
+                effective_model: Some("claude-opus-5-5".to_owned()),
+            };
+        let agg = detail.agg.as_mut().expect("the fixture has a row");
+        agg.in_flight = vec![
+            request(
+                60,
+                InFlightStage::Streaming,
+                0,
+                "anthropic_sub",
+                "anthropic_sub.anthropic_messages",
+            ),
+            request(
+                8,
+                InFlightStage::Waiting,
+                1,
+                "anthropic_api",
+                "anthropic_api.anthropic_messages",
+            ),
+        ];
+        detail
+    }
+
+    fn text_of(detail: &Detail) -> Vec<String> {
+        lines(detail, true, NOW, &utc(), &Fmt::fixed())
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn each_request_in_flight_is_a_line_with_its_stage_and_attempt() {
+        let text = text_of(&two_in_flight());
+        let live: Vec<&String> = text
+            .iter()
+            .skip_while(|line| !line.starts_with("live"))
+            .take(2)
+            .collect();
+        assert_eq!(
+            live[0],
+            "live    recv 1m  anthropic_sub  claude-opus-5-5  first attempt"
+        );
+        assert_eq!(
+            live[1],
+            "        sent 8s  anthropic_api  claude-opus-5-5  second attempt, billed"
+        );
+    }
+
+    #[test]
+    fn a_request_still_held_has_a_stage_and_nothing_else() {
+        use crate::store::InFlightStage;
+        let mut detail = two_in_flight();
+        let agg = detail.agg.as_mut().expect("row");
+        agg.in_flight.truncate(1);
+        let held = &mut agg.in_flight[0];
+        held.stage = InFlightStage::Held;
+        held.provider = None;
+        held.binding_id = None;
+        held.effective_model = None;
+        held.attempt_index = None;
+        held.attempt_group_id = None;
+        let text = text_of(&detail);
+        assert!(
+            text.iter().any(|line| line == "live    held 1m"),
+            "{text:#?}"
+        );
+    }
+
+    #[test]
+    fn a_session_with_nothing_in_flight_has_no_live_line() {
+        let (_, detail) = fixture(Some(meters(0.40)));
+        assert!(!text_of(&detail).iter().any(|line| line.starts_with("live")),);
+    }
+
+    #[test]
+    fn the_popup_lists_the_requests_in_flight() {
+        let detail = two_in_flight();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &detail,
+                    true,
+                    false,
+                    None,
+                    NOW,
+                    &utc(),
+                    &Fmt::fixed(),
+                );
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        insta::assert_snapshot!("session_popup_in_flight_100x30", text);
     }
 }

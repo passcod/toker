@@ -287,6 +287,7 @@ fn gate_row(
         attempt: None,
         policy_routing: None,
         lineage: None,
+        started_ms: None,
     }
 }
 

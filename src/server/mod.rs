@@ -761,13 +761,34 @@ impl Server {
         }
     }
 
-    pub(crate) fn note_binding_sent(
+    /// Write one ledger row. A row that carries its duration also says when
+    /// its request began handling, which is where it was written less how
+    /// long it took, so a long stream is placed where it was sent and not
+    /// where it finished.
+    pub(crate) fn record_row(&self, row: &crate::store::RequestRow) -> crate::store::Result<()> {
+        let mut row = row.clone();
+        if row.started_ms.is_none() {
+            row.started_ms = row.duration_ms.map(|duration| row.ts_ms - duration);
+        }
+        self.store.record_request(&row)
+    }
+
+    /// An attempt is about to be sent: the binding's learning notes the
+    /// effective target, and the request's in-flight record moves to the
+    /// attempt, so every send, a fallback's included, shows as it begins.
+    pub(crate) fn note_attempt_sent(
         &self,
+        in_flight: Option<&InFlightGuard>,
+        attempt: Option<&crate::store::AttemptProvenance>,
+        provider: &str,
         binding_id: &crate::policy::BindingId,
         effective_model: Option<&str>,
     ) {
         self.binding_learning
             .note_sent(binding_id, effective_model, now_ms());
+        if let (Some(guard), Some(attempt)) = (in_flight, attempt) {
+            guard.sent(attempt, provider, binding_id, effective_model);
+        }
     }
 
     /// Merge a completed provider-reported observation. Store errors are
@@ -1691,23 +1712,45 @@ impl Server {
         }
     }
 
-    /// A usage-path request is now in flight:
-    /// a lane's `updated_ms` moves only when a
-    /// response finishes, and one long turn can outlast a 5-minute tier,
-    /// so a request being served holds the machine awake, pings aside.
-    pub(crate) fn begin_in_flight(&self) -> InFlightGuard {
-        self.in_flight.fetch_add(1, Ordering::SeqCst);
-        self.evaluate_awake();
-        InFlightGuard {
-            server: self.clone(),
+    /// A request is now in flight (spec: SATT#while-a-request-is-in-flight). It is recorded in the store from here, so
+    /// the dashboard shows it before any of its rows exists. A `counted`
+    /// request also holds the sleep lock: a lane's `updated_ms` moves only
+    /// when a response finishes, and one long turn can outlast a 5-minute
+    /// tier, so a request being served holds the machine awake, pings aside.
+    pub(crate) fn begin_in_flight(&self, counted: bool, frontend: Option<&str>) -> InFlightGuard {
+        let record = match self.store.begin_in_flight(now_ms(), frontend) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                tracing::error!(%error, "in-flight record failed");
+                None
+            }
+        };
+        if counted {
+            self.in_flight.fetch_add(1, Ordering::SeqCst);
+            self.evaluate_awake();
         }
+        InFlightGuard(Arc::new(InFlightHold {
+            server: self.clone(),
+            counted,
+            record,
+        }))
     }
 
     /// The other half of the guard's Drop (the close event fires
     /// however the exchange ends — completion, error, hangup).
-    fn end_in_flight(&self) {
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        self.evaluate_awake();
+    fn end_in_flight(&self, counted: bool, record: Option<i64>) {
+        // The record goes first, and only now: the request's last row is
+        // written before its guard drops, so a reader never sees the
+        // request neither in flight nor recorded.
+        if let Some(id) = record
+            && let Err(error) = self.store.end_in_flight(id)
+        {
+            tracing::error!(%error, "in-flight record removal failed");
+        }
+        if counted {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            self.evaluate_awake();
+        }
     }
 
     /// The full route table, behind the frontend-prefix strip: a request
@@ -1830,6 +1873,11 @@ impl Server {
     /// The background tasks [`Server::serve`] spawns are not stopped here:
     /// they end with the runtime, when the process exits.
     pub async fn serve_listener(self, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
+        // No request outlives the process handling it, so a record left by
+        // a crash describes nothing. Nothing is accepted until it is gone.
+        if let Err(error) = self.store.clear_in_flight() {
+            tracing::error!(%error, "clearing in-flight records failed");
+        }
         let shutdown = self.shutdown.clone();
         let serving = axum::serve(listener, self.router())
             .with_graceful_shutdown(async move { shutdown.notified().await });
@@ -2890,13 +2938,70 @@ pub(crate) fn mark_not_configured(
 /// streamed response the guard rides the body stream (it drops when axum
 /// drops the body — client hangup or natural completion); for everything
 /// else it drops when the handler's work is done.
-pub(crate) struct InFlightGuard {
+///
+/// A clone shares the one hold, which ends when the last clone drops: a
+/// cancelled attempt's row is written on the blocking pool, and the hold
+/// has to outlast it so the request never reads as neither in flight nor
+/// recorded.
+#[derive(Clone)]
+pub(crate) struct InFlightGuard(Arc<InFlightHold>);
+
+struct InFlightHold {
     server: Server,
+    /// Whether the request holds the sleep lock's count. A ping is
+    /// recorded as in flight all the same.
+    counted: bool,
+    /// The request's record in the store, `None` where writing it failed.
+    record: Option<i64>,
 }
 
-impl Drop for InFlightGuard {
+impl InFlightGuard {
+    /// Say what the request turned out to be, once it has been read.
+    pub(crate) fn identify(&self, identity: &crate::store::InFlightIdentity<'_>) {
+        if let Some(id) = self.0.record
+            && let Err(error) = self.0.server.store.identify_in_flight(id, identity)
+        {
+            tracing::error!(%error, "in-flight record update failed");
+        }
+    }
+
+    /// An attempt is about to be sent, a fallback's included.
+    pub(crate) fn sent(
+        &self,
+        attempt: &crate::store::AttemptProvenance,
+        provider: &str,
+        binding_id: &crate::policy::BindingId,
+        effective_model: Option<&str>,
+    ) {
+        if let Some(id) = self.0.record
+            && let Err(error) = self.0.server.store.in_flight_sent(
+                id,
+                &crate::store::InFlightAttempt {
+                    group_id: &attempt.attempt_group_id,
+                    index: attempt.attempt_index,
+                    provider,
+                    binding_id: Some(binding_id.as_str()),
+                    effective_model,
+                },
+            )
+        {
+            tracing::error!(%error, "in-flight record update failed");
+        }
+    }
+
+    /// The current attempt has begun to answer.
+    pub(crate) fn streaming(&self) {
+        if let Some(id) = self.0.record
+            && let Err(error) = self.0.server.store.in_flight_streaming(id)
+        {
+            tracing::error!(%error, "in-flight record update failed");
+        }
+    }
+}
+
+impl Drop for InFlightHold {
     fn drop(&mut self) {
-        self.server.end_in_flight();
+        self.server.end_in_flight(self.counted, self.record);
     }
 }
 
@@ -5395,5 +5500,72 @@ api_key = "ak-literal-test"
                 .is_some(),
             "a learned model reaches the snapshot the resolver reads"
         );
+    }
+
+    #[tokio::test]
+    async fn a_fallback_moves_the_in_flight_record_to_the_next_attempt() {
+        use crate::policy::BindingId;
+        use crate::store::{AttemptGroupId, AttemptIndex, AttemptProvenance, AttemptReason};
+
+        let dir =
+            std::env::temp_dir().join(format!("toker-in-flight-fallback-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = server(&dir);
+        let guard = server.begin_in_flight(true, Some("claude"));
+        let first = AttemptProvenance {
+            attempt_group_id: AttemptGroupId::fresh(),
+            attempt_index: AttemptIndex::zero(),
+            reason: AttemptReason::Initial,
+        };
+        let sub = BindingId::new("anthropic_sub.anthropic_messages").unwrap();
+        server.note_attempt_sent(
+            Some(&guard),
+            Some(&first),
+            "anthropic_sub",
+            &sub,
+            Some("opus"),
+        );
+        guard.streaming();
+        let now = server.store.in_flight_rows().unwrap().remove(0);
+        assert_eq!(now.stage, crate::store::InFlightStage::Streaming);
+
+        // The first attempt failed before commitment and the next is sent:
+        // the record takes it, and is waiting again.
+        let second = AttemptProvenance {
+            attempt_group_id: first.attempt_group_id.clone(),
+            attempt_index: first.attempt_index.next().unwrap(),
+            reason: AttemptReason::Overload,
+        };
+        let api = BindingId::new("anthropic_api.anthropic_messages").unwrap();
+        server.note_attempt_sent(
+            Some(&guard),
+            Some(&second),
+            "anthropic_api",
+            &api,
+            Some("opus-5"),
+        );
+        let moved = server.store.in_flight_rows().unwrap().remove(0);
+        assert_eq!(moved.stage, crate::store::InFlightStage::Waiting);
+        assert_eq!(moved.attempt_index.map(AttemptIndex::get), Some(1));
+        assert_eq!(
+            moved.attempt_group_id.as_ref(),
+            Some(&first.attempt_group_id)
+        );
+        assert_eq!(moved.provider.as_deref(), Some("anthropic_api"));
+        assert_eq!(
+            moved.binding_id.as_deref(),
+            Some("anthropic_api.anthropic_messages")
+        );
+        assert_eq!(moved.effective_model.as_deref(), Some("opus-5"));
+
+        // A clone of the guard, as a cancelled attempt's row carries, keeps
+        // the record until the last of them drops.
+        let held = guard.clone();
+        drop(guard);
+        assert_eq!(server.store.in_flight_rows().unwrap().len(), 1);
+        drop(held);
+        assert!(server.store.in_flight_rows().unwrap().is_empty());
+        assert_eq!(server.in_flight.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -27,6 +27,7 @@
 
 mod accounts;
 mod config;
+mod in_flight;
 mod ledger;
 mod schema;
 mod state;
@@ -35,6 +36,7 @@ pub use accounts::{
     Account, AccountIdentity, AccountNameSource, CredentialAccount, CredentialDigest, MixedHistory,
 };
 pub use config::{Configuration, ProviderConfigRow, SettingsConfigRow};
+pub use in_flight::{InFlightAttempt, InFlightIdentity, InFlightRequest, InFlightStage};
 pub use ledger::{
     AttemptGroupId, AttemptIndex, AttemptProvenance, AttemptReason, ChildRole, CostKind,
     DisplayRow, JSON_TEXT_COLUMNS, KindFilter, LaneSystemRow, LocalisationRow, LookupKind,
@@ -432,11 +434,50 @@ impl Store {
         ledger::count_logical_requests(&*self.conn()?)
     }
 
-    /// The newest ledger row's timestamp, of any kind; `None` when the
-    /// ledger is empty. The TUI header's freshness reads this rather
-    /// than the display window, so a dead proxy still shows its age.
-    pub fn latest_ts_ms(&self) -> Result<Option<i64>> {
-        ledger::latest_ts_ms(&*self.conn()?)
+    /// When the newest request began being handled, in flight or
+    /// recorded; `None` when there is neither. The TUI header's freshness
+    /// reads this rather than the display window, so a dead proxy still
+    /// shows its age.
+    pub fn latest_started_ms(&self) -> Result<Option<i64>> {
+        ledger::latest_started_ms(&*self.conn()?)
+    }
+
+    /// Record a request as in flight, held, from `started_ms`; returns the
+    /// record's id for the calls below.
+    pub fn begin_in_flight(&self, started_ms: i64, profile: Option<&str>) -> Result<i64> {
+        in_flight::begin(&*self.conn()?, started_ms, profile)
+    }
+
+    /// Fill in what the server learned of an in-flight request once it
+    /// had read it.
+    pub fn identify_in_flight(&self, id: i64, identity: &InFlightIdentity<'_>) -> Result<()> {
+        in_flight::identify(&*self.conn()?, id, identity)
+    }
+
+    /// Move an in-flight request to the attempt just sent.
+    pub fn in_flight_sent(&self, id: i64, attempt: &InFlightAttempt<'_>) -> Result<()> {
+        in_flight::sent(&*self.conn()?, id, attempt)
+    }
+
+    /// An in-flight request's current attempt has begun to answer.
+    pub fn in_flight_streaming(&self, id: i64) -> Result<()> {
+        in_flight::streaming(&*self.conn()?, id)
+    }
+
+    /// Remove an in-flight record, once the request's last row is written.
+    pub fn end_in_flight(&self, id: i64) -> Result<()> {
+        in_flight::end(&*self.conn()?, id)
+    }
+
+    /// Remove every in-flight record. No request outlives the process
+    /// handling it, so the service clears them as it starts.
+    pub fn clear_in_flight(&self) -> Result<u64> {
+        in_flight::clear(&*self.conn()?)
+    }
+
+    /// Every request in flight, oldest first.
+    pub fn in_flight_rows(&self) -> Result<Vec<InFlightRequest>> {
+        in_flight::rows(&*self.conn()?)
     }
 
     /// SQLite's `PRAGMA data_version` on this store's one connection: a
@@ -1035,14 +1076,14 @@ mod tests {
     use super::{
         AccountIdentity, AccountNameSource, ActivatePolicyRevision, Allowance, AttemptGroupId,
         AttemptIndex, AttemptProvenance, AttemptReason, BindingLearningUpdate, CostKind,
-        CredentialDigest, DisplayRow, Error, InitialPublication, Lane, LanePin, LanePinCasResult,
-        MAX_ROUTING_TRACE_EVENTS, MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction,
-        PingRecord, PolicyRevision, PolicyRevisionSource, PolicyRouteProvenance,
-        PolicyRoutingOutcome, PublicationAdapter, PublicationCasResult, PublicationKey,
-        PublicationResultUpdate, PublicationState, RequestLookupProvenance, RequestRow,
-        ResolvedRoute, RevisionOneActivation, RowKind, SessionCostGroup, SessionLineage, Store,
-        StoredCandidateState, StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason,
-        WidenResult, is_api_measurement,
+        CredentialDigest, DisplayRow, Error, InFlightAttempt, InFlightIdentity, InFlightStage,
+        InitialPublication, Lane, LanePin, LanePinCasResult, MAX_ROUTING_TRACE_EVENTS,
+        MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction, PingRecord, PolicyRevision,
+        PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome, PublicationAdapter,
+        PublicationCasResult, PublicationKey, PublicationResultUpdate, PublicationState,
+        RequestLookupProvenance, RequestRow, ResolvedRoute, RevisionOneActivation, RowKind,
+        SessionCostGroup, SessionLineage, Store, StoredCandidateState, StoredRoutingTrace,
+        StoredRoutingTraceEvent, StoredSkipReason, WidenResult, is_api_measurement,
     };
     use crate::ir::Release;
     use crate::policy::{
@@ -1300,6 +1341,7 @@ mod tests {
             attempt: None,
             policy_routing: None,
             lineage: None,
+            started_ms: None,
         }
     }
 
@@ -1372,6 +1414,7 @@ mod tests {
             attempt: None,
             policy_routing: None,
             lineage: None,
+            started_ms: None,
         }
     }
 
@@ -1731,13 +1774,17 @@ mod tests {
         store
             .record_request(&bare_row(100))
             .expect("records after poison");
-        assert_eq!(store.latest_ts_ms().expect("latest"), Some(100));
+        assert_eq!(store.latest_started_ms().expect("latest"), Some(100));
     }
 
     #[test]
-    fn latest_ts_ms_is_the_newest_row_of_any_kind() {
+    fn latest_started_ms_is_the_newest_request_in_flight_or_recorded() {
         let store = mem_store();
-        assert_eq!(store.latest_ts_ms().expect("empty"), None, "empty ledger");
+        assert_eq!(
+            store.latest_started_ms().expect("empty"),
+            None,
+            "empty ledger"
+        );
         // Out of insertion order, and the newest row a proxy-written
         // kind: freshness counts every row, not only measurements.
         for ts in [100, 300, 200] {
@@ -1746,7 +1793,79 @@ mod tests {
         let mut error = bare_row(400);
         error.kind = Some(RowKind::Error);
         store.record_request(&error).expect("record");
-        assert_eq!(store.latest_ts_ms().expect("latest"), Some(400));
+        assert_eq!(store.latest_started_ms().expect("latest"), Some(400));
+
+        // A row reads by when its request began, where it says.
+        let mut late = bare_row(900);
+        late.started_ms = Some(500);
+        store.record_request(&late).expect("record");
+        assert_eq!(store.latest_started_ms().expect("started"), Some(500));
+
+        // A request in flight is the newest the moment it begins.
+        let id = store.begin_in_flight(950, None).expect("begin");
+        assert_eq!(store.latest_started_ms().expect("in flight"), Some(950));
+        store.end_in_flight(id).expect("end");
+        assert_eq!(store.latest_started_ms().expect("ended"), Some(500));
+    }
+
+    #[test]
+    fn in_flight_round_trips_through_its_stages() {
+        let store = mem_store();
+        let id = store.begin_in_flight(1_000, Some("claude")).expect("begin");
+        let held = store.in_flight_rows().expect("rows");
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].stage, InFlightStage::Held);
+        assert_eq!(held[0].started_ms, 1_000);
+        assert_eq!(held[0].session_id, None);
+        assert_eq!(held[0].attempt_group_id, None);
+
+        let lineage = SessionLineage::codex_guardian("guardian:parent");
+        store
+            .identify_in_flight(
+                id,
+                &InFlightIdentity {
+                    session_id: Some("child"),
+                    lineage: lineage.as_ref(),
+                    requested_model: Some("sonnet"),
+                    req_messages: Some(7),
+                },
+            )
+            .expect("identify");
+        let group = AttemptGroupId::fresh();
+        store
+            .in_flight_sent(
+                id,
+                &InFlightAttempt {
+                    group_id: &group,
+                    index: AttemptIndex::zero(),
+                    provider: "anthropic",
+                    binding_id: Some("b1"),
+                    effective_model: Some("sonnet-4"),
+                },
+            )
+            .expect("sent");
+        let sent = &store.in_flight_rows().expect("rows")[0];
+        assert_eq!(sent.stage, InFlightStage::Waiting);
+        assert_eq!(sent.session_id.as_deref(), Some("child"));
+        assert_eq!(sent.lineage, lineage);
+        assert_eq!(sent.requested_model.as_deref(), Some("sonnet"));
+        assert_eq!(sent.req_messages, Some(7));
+        assert_eq!(sent.attempt_group_id.as_ref(), Some(&group));
+        assert_eq!(sent.provider.as_deref(), Some("anthropic"));
+        assert_eq!(sent.effective_model.as_deref(), Some("sonnet-4"));
+
+        store.in_flight_streaming(id).expect("streaming");
+        assert_eq!(
+            store.in_flight_rows().expect("rows")[0].stage,
+            InFlightStage::Streaming
+        );
+
+        store.begin_in_flight(2_000, None).expect("second");
+        assert_eq!(store.in_flight_rows().expect("rows").len(), 2);
+        store.end_in_flight(id).expect("end");
+        assert_eq!(store.in_flight_rows().expect("rows").len(), 1);
+        assert_eq!(store.clear_in_flight().expect("clear"), 1);
+        assert!(store.in_flight_rows().expect("rows").is_empty());
     }
 
     /// A row carrying only a gate flag (the cold-notice/release shape:
@@ -2208,8 +2327,11 @@ mod tests {
                 req_messages: Some(42),
                 compact_generations: Some(1),
                 forced_to: Some("z-ai/glm-5.3".to_string()),
+                started_ms: None,
+                requested_model: Some("openrouter/z-ai/glm-5.3".to_string()),
+                effective_model: Some("z-ai/glm-5.3".to_string()),
             },
-            "the eighteen display columns round-trip; the rest never cross"
+            "the display columns round-trip; the rest never cross"
         );
 
         // A bare row's absence stays absence on every one of the ten.
@@ -2239,6 +2361,9 @@ mod tests {
                 req_messages: None,
                 compact_generations: None,
                 forced_to: None,
+                started_ms: None,
+                requested_model: None,
+                effective_model: None,
             }
         );
     }
@@ -4497,6 +4622,44 @@ mod tests {
             1,
         );
         assert!(matches!(write, Err(Error::Sqlite(_))));
+    }
+
+    #[test]
+    fn the_in_flight_migration_keeps_every_row_and_leaves_started_ms_absent() {
+        let dir = test_dir("in-flight-upgrade");
+        let db = dir.join("toker.db");
+        let last = schema::MIGRATIONS.len();
+        std::fs::create_dir_all(&dir).expect("create the db parent dir");
+        {
+            let conn = Connection::open(&db).expect("open raw db");
+            for script in &schema::MIGRATIONS[..last - 1] {
+                conn.execute_batch(script).expect("apply a migration");
+            }
+            conn.pragma_update(None, "user_version", last as i64 - 1)
+                .expect("stamp the version before");
+            for ts in [1_000, 2_000, 3_000] {
+                conn.execute(
+                    "INSERT INTO requests (ts_ms, session_id, duration_ms) VALUES (?1, 'ses-old', 500)",
+                    [ts],
+                )
+                .expect("insert a row from before");
+            }
+        }
+        let store = Store::open(&db).expect("the database migrates");
+        assert_eq!(user_version(&store), last as i64);
+        let rows = store.requests_since(0, 10).expect("rows");
+        assert_eq!(rows.len(), 3, "no row was lost");
+        assert!(
+            rows.iter().all(|row| row.started_ms.is_none()),
+            "earlier rows say nothing of when they began: absence, not zero"
+        );
+        assert!(store.in_flight_rows().expect("rows").is_empty());
+        // A row written now carries it.
+        let mut row = bare_row(4_000);
+        row.started_ms = Some(3_500);
+        store.record_request(&row).expect("record");
+        let newest = store.requests_since(4_000, 10).expect("rows");
+        assert_eq!(newest[0].started_ms, Some(3_500));
     }
 
     #[test]

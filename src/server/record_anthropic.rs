@@ -285,7 +285,7 @@ fn frontend_protocol_of(ctx: &AnthropicRecordCtx) -> &'static str {
 /// (spec: STORE#not-recorded-is-not-zero) — it is logged as the visible breakage it is.
 fn insert(ctx: &AnthropicRecordCtx, row: RequestRow) {
     let row = with_frontend(row, ctx.frontend.as_deref());
-    if let Err(error) = ctx.server.store.record_request(&row) {
+    if let Err(error) = ctx.server.record_row(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
 }
@@ -574,6 +574,7 @@ fn measurement_row(
         attempt: ctx.attempt.clone(),
         policy_routing: ctx.policy_routing.clone(),
         lineage: ctx.lineage.clone(),
+        started_ms: None,
     }
 }
 
@@ -703,6 +704,7 @@ fn error_row(
         attempt: ctx.attempt.clone(),
         policy_routing: ctx.policy_routing.clone(),
         lineage: ctx.lineage.clone(),
+        started_ms: None,
     }
 }
 
@@ -746,7 +748,7 @@ pub(crate) fn record_anthropic_released(
     row.frontend = Some(frontend_protocol.to_owned());
     row.route = Some(format!("{frontend_protocol}:{backend_id}"));
     let row = with_frontend(row, frontend);
-    if let Err(error) = server.store.record_request(&row) {
+    if let Err(error) = server.record_row(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
     tracing::info!(
@@ -792,6 +794,11 @@ pub(crate) struct QuotaBlockedRecord<'a> {
     pub(crate) stale_meters: Option<&'a Value>,
     /// The frontend's prefix name, for `extra.frontend`.
     pub(crate) frontend: Option<&'a str>,
+    /// The model the request asked for.
+    pub(crate) requested_model: Option<&'a str>,
+    /// The model the request was routed to, where it had been when the row
+    /// was written.
+    pub(crate) effective_model: Option<&'a str>,
 }
 
 /// Record the quota-block row (the `kind: "blocked"` row).
@@ -820,6 +827,8 @@ pub(crate) fn record_quota_blocked(record: QuotaBlockedRecord<'_>) {
         context_tokens,
         stale_meters,
         frontend,
+        requested_model,
+        effective_model,
     } = record;
     let row = RequestRow {
         safeguards: Default::default(),
@@ -836,8 +845,8 @@ pub(crate) fn record_quota_blocked(record: QuotaBlockedRecord<'_>) {
         account_number: credential.account_number,
         model: None,
         raw_model: None,
-        requested_model: None,
-        effective_model: None,
+        requested_model: requested_model.map(str::to_owned),
+        effective_model: effective_model.map(str::to_owned),
         input: None,
         cache_read: None,
         cache_write_total: None,
@@ -896,9 +905,10 @@ pub(crate) fn record_quota_blocked(record: QuotaBlockedRecord<'_>) {
         attempt: None,
         policy_routing: None,
         lineage: None,
+        started_ms: None,
     };
     let row = with_frontend(row, frontend);
-    if let Err(error) = server.store.record_request(&row) {
+    if let Err(error) = server.record_row(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
     tracing::info!(
@@ -955,6 +965,8 @@ fn write_cold_row(record: ColdRecord<'_>, kind: RowKind, verb: &str) {
         writes_free: _,
         gate_on,
         frontend,
+        requested_model,
+        effective_model,
     } = record;
     let outlook = outlook.cloned();
     let row = RequestRow {
@@ -972,8 +984,8 @@ fn write_cold_row(record: ColdRecord<'_>, kind: RowKind, verb: &str) {
         account_number: None,
         model: None,
         raw_model: None,
-        requested_model: None,
-        effective_model: None,
+        requested_model: requested_model.map(str::to_owned),
+        effective_model: effective_model.map(str::to_owned),
         input: None,
         cache_read: None,
         cache_write_total: None,
@@ -1034,9 +1046,10 @@ fn write_cold_row(record: ColdRecord<'_>, kind: RowKind, verb: &str) {
         attempt: None,
         policy_routing: None,
         lineage: None,
+        started_ms: None,
     };
     let row = with_frontend(row, frontend);
-    if let Err(error) = server.store.record_request(&row) {
+    if let Err(error) = server.record_row(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
     tracing::info!(
@@ -1084,6 +1097,11 @@ pub(crate) struct ColdRecord<'a> {
     pub(crate) gate_on: bool,
     /// The frontend's prefix name, for `extra.frontend`.
     pub(crate) frontend: Option<&'a str>,
+    /// The model the request asked for.
+    pub(crate) requested_model: Option<&'a str>,
+    /// The model the request was routed to, where it had been when the row
+    /// was written.
+    pub(crate) effective_model: Option<&'a str>,
 }
 
 /// The withheld-notice row (the `kind: "cold-quiet"` row).
@@ -1117,6 +1135,8 @@ pub(crate) fn record_anthropic_cold_quiet(record: ColdRecord<'_>) {
         writes_free,
         gate_on,
         frontend,
+        requested_model,
+        effective_model,
         ..
     } = record;
     let outlook = outlook.cloned();
@@ -1135,8 +1155,8 @@ pub(crate) fn record_anthropic_cold_quiet(record: ColdRecord<'_>) {
         account_number: None,
         model: None,
         raw_model: None,
-        requested_model: None,
-        effective_model: None,
+        requested_model: requested_model.map(str::to_owned),
+        effective_model: effective_model.map(str::to_owned),
         input: None,
         cache_read: None,
         cache_write_total: None,
@@ -1197,9 +1217,10 @@ pub(crate) fn record_anthropic_cold_quiet(record: ColdRecord<'_>) {
         attempt: None,
         policy_routing: None,
         lineage: None,
+        started_ms: None,
     };
     let row = with_frontend(row, frontend);
-    if let Err(error) = server.store.record_request(&row) {
+    if let Err(error) = server.record_row(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
     tracing::info!(
@@ -1390,6 +1411,7 @@ pub(crate) fn record_responses_measurement(
         attempt: ctx.attempt.clone(),
         policy_routing: ctx.policy_routing.clone(),
         lineage: ctx.lineage.clone(),
+        started_ms: None,
     };
     insert(ctx, row);
 
@@ -1544,6 +1566,7 @@ pub(crate) fn record_codex_error(
         attempt: ctx.attempt.clone(),
         policy_routing: ctx.policy_routing.clone(),
         lineage: ctx.lineage.clone(),
+        started_ms: None,
     };
     insert(ctx, row);
     tracing::info!(

@@ -60,6 +60,7 @@ use super::rebuilds::REBUILD_MIN;
 use crate::catalog::windows::ContextWindow;
 use crate::ir::Release;
 use crate::middleware::cold::Verdict;
+use crate::store::InFlightStage;
 
 /// The most lines SPEND claims beside CACHE REBUILDS: the total line,
 /// the never-dropped "no cost data" line, and a few breakdown lines;
@@ -470,7 +471,7 @@ pub(crate) fn render(
 }
 
 /// The legend's rows: a glyph or marker, and what it means.
-const LEGEND: [(&str, &str); 21] = [
+const LEGEND: [(&str, &str); 25] = [
     (
         "↑",
         "served on a newer model: bright on the latest turn, dim earlier",
@@ -484,6 +485,11 @@ const LEGEND: [(&str, &str); 21] = [
         "!",
         "stopped: the last thing this session got was a gate notice",
     ),
+    (
+        "✗",
+        "failed: this session's newest finished request ended in failure",
+    ),
+    ("~", "routed to this model, none served yet"),
     ("↺", "compactions so far; - for none"),
     ("-", "not reported, which is not zero"),
     ("?", "unknown: model, context ceiling, or token count"),
@@ -513,6 +519,11 @@ const LEGEND: [(&str, &str); 21] = [
     ("last req", "green under 30s, yellow under 5m, red beyond"),
     ("ctx", "green: native 1M; yellow: another known ceiling"),
     ("idle", "dim once a session has been quiet 3m"),
+    (
+        "held sent recv",
+        "in flight: not yet sent, awaiting a reply, or streaming; timed from arrival",
+    ),
+    ("+N", "N more requests in flight in that session"),
 ];
 
 /// The dashboard's keys, under its marks in the same overlay: with no
@@ -823,7 +834,7 @@ fn meter_keys(quota: &QuotaAgg) -> Vec<&'static str> {
 /// window" — absence, not "0 requests".
 ///
 /// The freshness is the age of the ledger's newest row of any kind
-/// ([`Snapshot::latest_row_ts_ms`]), and it renders whether or not the
+/// ([`Snapshot::latest_started_ms`]), and it renders whether or not the
 /// window holds rows: an empty window is exactly when it matters,
 /// because a dead proxy looks like a quiet one everywhere else.
 ///
@@ -896,7 +907,7 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &Snapshot, clock: &str) {
 /// is against the snapshot's `now_ms`, so it moves on the display tick
 /// like every other figure in the frame.
 fn freshness(snap: &Snapshot) -> (String, Style) {
-    let Some(latest) = snap.latest_row_ts_ms else {
+    let Some(latest) = snap.latest_started_ms else {
         return ("no data".to_owned(), Style::new().fg(Color::Red));
     };
     // Rounded to the nearest second, as the predecessor did; a row
@@ -1092,7 +1103,7 @@ fn session_cells(session: &SessionAgg, now_ms: i64, fmt: &Fmt) -> [Line<'static>
     let idle = now_ms - session.latest_ts_ms >= IDLE_SECS * 1_000;
     let last = rel_age(now_ms - session.latest_ts_ms);
     Col::ALL.map(|col| match col {
-        Col::Ctx => ctx_cell(session.ctx),
+        Col::Ctx => ctx_cell(session.ctx, session.model_unserved),
         Col::Model => model_cell(session),
         Col::Reqs => Line::raw(session.requests.to_string()),
         Col::PromptNow => Line::raw(unknown_or_grouped(fmt, session.input_now)),
@@ -1111,13 +1122,18 @@ fn session_cells(session: &SessionAgg, now_ms: i64, fmt: &Fmt) -> [Line<'static>
             None => Line::styled("-", Style::new().dim()),
         },
         Col::Out => Line::raw(unknown_or_grouped(fmt, session.output_total)),
-        Col::Idle => {
-            if idle {
-                Line::styled(last.clone(), Style::new().dim())
-            } else {
-                Line::raw(last.clone())
-            }
-        }
+        // A request in flight takes the place of the idle age: how far it
+        // has got and how long it has been going, the longest first, and
+        // how many more there are.
+        Col::Idle => match session.in_flight.first() {
+            Some(request) => Line::raw(in_flight_cell(
+                request.stage,
+                now_ms - request.started_ms,
+                session.in_flight.len() - 1,
+            )),
+            None if idle => Line::styled(last.clone(), Style::new().dim()),
+            None => Line::raw(last.clone()),
+        },
     })
 }
 
@@ -1178,11 +1194,39 @@ fn session_cell(session: &SessionAgg, width: u16) -> Cell<'static> {
     Cell::new(short_id(&session.session))
 }
 
+/// The idle column's cell for a session with a request in flight: `held`,
+/// `sent` or `recv` for how far the longest-running one has got, its age,
+/// and `+N` for the others.
+fn in_flight_cell(stage: InFlightStage, age_ms: i64, more: usize) -> String {
+    let stage = match stage {
+        InFlightStage::Held => "held",
+        InFlightStage::Waiting => "sent",
+        InFlightStage::Streaming => "recv",
+    };
+    let mut cell = format!("{stage} {}", in_flight_age(age_ms));
+    if more > 0 {
+        cell.push_str(&format!(" +{more}"));
+    }
+    cell
+}
+
+/// How long a request has been in flight: seconds up to a minute, where
+/// [`rel_age`] would say `now` for the first ten of them.
+pub(super) fn in_flight_age(age_ms: i64) -> String {
+    let secs = age_ms.max(0) / 1_000;
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        rel_age(age_ms)
+    }
+}
+
 /// The CTX cell: `1M`/`200k`/`872k` for a known ceiling, a dim `?` for
 /// none — green and bright for a native exact 1M, yellow otherwise
-/// (the reference's context colouring).
-fn ctx_cell(ctx: ContextWindow) -> Line<'static> {
-    match ctx {
+/// (the reference's context colouring). Dim throughout where the ceiling
+/// is of a model no response has yet confirmed.
+fn ctx_cell(ctx: ContextWindow, unserved: bool) -> Line<'static> {
+    let line = match ctx {
         ContextWindow::Unknown => Line::styled("?", Style::new().dim()),
         ContextWindow::Exact { tokens } if tokens >= 1_000_000 => Line::styled(
             short_tokens(tokens),
@@ -1191,16 +1235,22 @@ fn ctx_cell(ctx: ContextWindow) -> Line<'static> {
         ContextWindow::Exact { tokens } | ContextWindow::Declared { tokens } => {
             Line::styled(short_tokens(tokens), Style::new().fg(Color::Yellow))
         }
-    }
+    };
+    if unserved { line.dim() } else { line }
 }
 
-/// The MODEL cell with its `↑`/`$`/`%`/`!` markers, coloured per marker. The
-/// `claude-` prefix goes: every anthropic model carries it, so it
-/// distinguishes nothing and costs seven cells a row.
+/// The MODEL cell with its `↑`/`$`/`%`/`!`/`✗` markers, coloured per marker.
+/// The `claude-` prefix goes: every anthropic model carries it, so it
+/// distinguishes nothing and costs seven cells a row. A model no response
+/// has confirmed yet, only routed to, is dim with a `~` before it.
 fn model_cell(session: &SessionAgg) -> Line<'static> {
     let model = session.model.as_deref().unwrap_or("?");
-    let model = model.strip_prefix("claude-").unwrap_or(model).to_owned();
-    let mut line = vec![Span::raw(model)];
+    let model = model.strip_prefix("claude-").unwrap_or(model);
+    let mut line = vec![if session.model_unserved {
+        Span::styled(format!("~{model}"), Style::new().dim())
+    } else {
+        Span::raw(model.to_owned())
+    }];
     if session.forced_any {
         let style = if session.forced_latest {
             Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
@@ -1219,6 +1269,9 @@ fn model_cell(session: &SessionAgg) -> Line<'static> {
             " !",
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
+    }
+    if session.failed {
+        line.push(Span::styled(" ✗", Style::new().fg(Color::Red)));
     }
     Line::from(line)
 }
@@ -3270,7 +3323,7 @@ mod tests {
     }
 
     fn with_latest(mut snap: model::Snapshot, latest: Option<i64>) -> model::Snapshot {
-        snap.latest_row_ts_ms = latest;
+        snap.latest_started_ms = latest;
         snap
     }
 
@@ -5051,6 +5104,213 @@ mod tests {
                     super::render(frame, &snap, "12:34:56", &utc(), &plain());
                 })
                 .expect("draw");
+        }
+    }
+
+    // ── requests in flight, and sessions only a gate or a failure touched ──
+
+    /// Six sessions: two requests in flight in one, a first turn with
+    /// nothing served in another, a stream under way in a third, one that
+    /// only a gate stopped, one that only failed, and one gone quiet.
+    fn in_flight_snapshot() -> model::Snapshot {
+        use crate::store::{AttemptGroupId, AttemptIndex, InFlightRequest, InFlightStage, RowKind};
+
+        let served = |ts: i64, session: &str, model: &str, messages: i64| {
+            let mut row = display_bare(ts);
+            row.session_id = Some(session.into());
+            row.model = Some(model.into());
+            row.provider = Some("anthropic_sub".into());
+            row.input = Some(1_500);
+            row.cache_read = Some(449_393);
+            row.cache_write_1h = Some(20_000);
+            row.cache_write_5m = Some(0);
+            row.output = Some(768);
+            row.req_messages = Some(messages);
+            row
+        };
+        let live =
+            |session: &str, secs: i64, stage: InFlightStage, model: Option<&str>| InFlightRequest {
+                id: 1,
+                started_ms: NOW - secs * 1_000,
+                attempt_group_id: None,
+                session_id: Some(session.into()),
+                lineage: None,
+                profile: None,
+                requested_model: Some("opus".into()),
+                req_messages: Some(4),
+                stage,
+                attempt_index: model.map(|_| AttemptIndex::zero()),
+                provider: model.map(|_| "anthropic_sub".into()),
+                binding_id: None,
+                effective_model: model.map(str::to_owned),
+            };
+        let mut rows = vec![
+            served(NOW - 5 * MIN, "ses-free", "claude-sonnet-5", 60),
+            served(NOW - 2 * MIN, "ses-hot", "claude-opus-5", 79),
+            served(NOW - 10 * MIN, "ses-crow", "claude-haiku-4-5", 12),
+        ];
+        let mut gate = display_kind_row(NOW - 2 * MIN, RowKind::Blocked);
+        gate.session_id = Some("ses-gate".into());
+        gate.effective_model = Some("claude-opus-5".into());
+        gate.provider = Some("anthropic_sub".into());
+        rows.push(gate);
+        let mut failed = display_kind_row(NOW - 4 * MIN, RowKind::Error);
+        failed.session_id = Some("ses-fail".into());
+        failed.attempt_group_id = Some(AttemptGroupId::new("a".repeat(32)).unwrap());
+        failed.attempt_index = Some(AttemptIndex::zero());
+        failed.effective_model = Some("claude-sonnet-5".into());
+        failed.provider = Some("anthropic_sub".into());
+        rows.push(failed);
+        let in_flight = [
+            live(
+                "ses-hot",
+                60,
+                InFlightStage::Streaming,
+                Some("claude-opus-5"),
+            ),
+            live(
+                "ses-free",
+                22,
+                InFlightStage::Streaming,
+                Some("claude-sonnet-5"),
+            ),
+            live("ses-new", 14, InFlightStage::Waiting, Some("claude-opus-5")),
+            live("ses-free", 3, InFlightStage::Held, None),
+        ];
+        let mut snap = model::aggregate_in_flight(
+            &rows,
+            &in_flight,
+            None,
+            &Released::new(),
+            &no_labels(),
+            &FetchedCatalogs::default(),
+            None,
+            30,
+            NOW,
+            523,
+        );
+        // The newest request began three seconds ago, in flight.
+        snap.latest_started_ms = Some(NOW - 3_000);
+        snap
+    }
+
+    #[test]
+    fn the_idle_cell_shows_how_far_a_request_has_got() {
+        use crate::store::InFlightStage;
+        assert_eq!(
+            super::in_flight_cell(InFlightStage::Held, 3_000, 0),
+            "held 3s"
+        );
+        assert_eq!(
+            super::in_flight_cell(InFlightStage::Waiting, 14_000, 0),
+            "sent 14s"
+        );
+        assert_eq!(
+            super::in_flight_cell(InFlightStage::Streaming, 22_000, 1),
+            "recv 22s +1"
+        );
+        assert_eq!(
+            super::in_flight_cell(InFlightStage::Streaming, 61_000, 0),
+            "recv 1m"
+        );
+        assert_eq!(super::in_flight_age(-5), "0s", "a skewed clock reads zero");
+    }
+
+    #[test]
+    fn requests_in_flight_show_on_their_rows_at_every_width() {
+        let snap = in_flight_snapshot();
+        for (width, height) in [(80, 30), (100, 30), (120, 40)] {
+            let text = rendered(&snap, width, height);
+            frame_snapshot(&format!("sessions_in_flight_{width}x{height}"), &text);
+            for expected in ["recv 22s", "sent 14s", "recv 1m"] {
+                assert!(text.contains(expected), "{expected:?} at {width}:\n{text}");
+            }
+            for session in ["ses-free", "ses-new", "ses-hot", "ses-gate", "ses-fail"] {
+                assert!(text.contains(session), "{session} at {width}:\n{text}");
+            }
+        }
+        let wide = rendered(&snap, 120, 40);
+        // The longest-running of ses-free's two leads, with the other counted.
+        assert!(wide.contains("recv 22s +1"), "{wide}");
+        // Nothing served yet: the routed model, marked, and the marks that
+        // say why each of the other two has a row.
+        assert!(wide.contains("~opus-5"), "{wide}");
+        assert!(wide.contains("~sonnet-5 ✗"), "{wide}");
+        assert!(wide.contains("~opus-5 !"), "{wide}");
+    }
+
+    #[test]
+    fn a_quiet_dashboard_shows_none_of_the_in_flight_marks() {
+        let text = rendered(&full_snapshot(), 120, 40);
+        for absent in ["held ", "sent ", "recv ", "~", "✗", " +1"] {
+            assert!(!text.contains(absent), "{absent:?} in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn an_unserved_model_dims_with_its_ceiling() {
+        let snap = in_flight_snapshot();
+        let new = snap
+            .sessions
+            .iter()
+            .find(|session| session.session == "ses-new")
+            .expect("ses-new");
+        let ctx = super::ctx_cell(new.ctx, new.model_unserved);
+        assert!(ctx.style.add_modifier.contains(Modifier::DIM), "{ctx:?}");
+        let model = super::model_cell(new);
+        assert!(model.spans[0].content.starts_with('~'), "{model:?}");
+        assert!(model.spans[0].style.add_modifier.contains(Modifier::DIM));
+        let served = snap
+            .sessions
+            .iter()
+            .find(|session| session.session == "ses-hot")
+            .expect("ses-hot");
+        assert!(!super::model_cell(served).spans[0].content.starts_with('~'));
+        assert!(
+            !super::ctx_cell(served.ctx, served.model_unserved)
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+    }
+
+    #[test]
+    fn the_failure_mark_is_red_and_the_gate_mark_stays_bold() {
+        let snap = in_flight_snapshot();
+        let find = |name: &str| {
+            snap.sessions
+                .iter()
+                .find(|session| session.session == name)
+                .expect("session")
+        };
+        let failed = super::model_cell(find("ses-fail"));
+        let mark = failed.spans.last().expect("mark");
+        assert_eq!(mark.content, " ✗");
+        assert_eq!(mark.style.fg, Some(Color::Red));
+        let gated = super::model_cell(find("ses-gate"));
+        let mark = gated.spans.last().expect("mark");
+        assert_eq!(mark.content, " !");
+        assert!(mark.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn the_legend_teaches_the_in_flight_marks() {
+        let ui = super::Ui {
+            legend: true,
+            ..plain()
+        };
+        let text: String = buffer_with(&in_flight_snapshot(), 140, 60, &ui)
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        for expected in [
+            "failed: this session's newest finished request ended in failure",
+            "routed to this model, none served yet",
+            "in flight: not yet sent, awaiting a reply, or streaming",
+            "N more requests in flight in that session",
+        ] {
+            assert!(text.contains(expected), "{expected:?} in:\n{text}");
         }
     }
 }

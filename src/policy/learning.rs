@@ -510,6 +510,7 @@ mod tests {
             attempt: None,
             policy_routing: None,
             lineage: None,
+            started_ms: None,
         }
     }
 

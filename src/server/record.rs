@@ -350,7 +350,7 @@ fn record_route_unavailable(
     );
     row.policy_routing = Some(policy_routing);
     let row = with_frontend(row, frontend);
-    if let Err(error) = server.store.record_request(&row) {
+    if let Err(error) = server.record_row(&row) {
         tracing::error!(%error, "route-unavailable ledger insert failed");
     }
 }
@@ -433,6 +433,7 @@ fn unsent_row(
         attempt: None,
         policy_routing: None,
         lineage,
+        started_ms: None,
     }
 }
 
@@ -504,7 +505,7 @@ impl RefusalCtx {
             row.status = Some(i64::from(response.status().as_u16()));
             row.error_type = Some("local_preparation".to_owned());
             let row = with_frontend(row, self.frontend.as_deref());
-            if let Err(error) = server.store.record_request(&row) {
+            if let Err(error) = server.record_row(&row) {
                 tracing::error!(%error, "local-preparation ledger insert failed");
             }
         }
@@ -655,9 +656,10 @@ pub(crate) fn record_openai_cold(record: ColdOpenaiRecord<'_>) {
         attempt: None,
         policy_routing: None,
         lineage: None,
+        started_ms: None,
     };
     let row = with_frontend(row, frontend);
-    if let Err(error) = server.store.record_request(&row) {
+    if let Err(error) = server.record_row(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
     tracing::info!(
@@ -766,9 +768,10 @@ pub(crate) fn record_openai_cold_quiet(record: ColdOpenaiRecord<'_>) {
         attempt: None,
         policy_routing: None,
         lineage: None,
+        started_ms: None,
     };
     let row = with_frontend(row, frontend);
-    if let Err(error) = server.store.record_request(&row) {
+    if let Err(error) = server.record_row(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
     tracing::info!(
@@ -897,8 +900,9 @@ pub(crate) fn record_awake(server: &Server, transition: &awake::AwakeTransition,
         attempt: None,
         policy_routing: None,
         lineage: None,
+        started_ms: None,
     };
-    if let Err(error) = server.store.record_request(&row) {
+    if let Err(error) = server.record_row(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
     tracing::info!(
@@ -912,7 +916,7 @@ pub(crate) fn record_awake(server: &Server, transition: &awake::AwakeTransition,
 /// (spec: STORE#not-recorded-is-not-zero) — it is logged as the visible breakage it is.
 fn insert(ctx: &RecordCtx, row: RequestRow) {
     let row = with_frontend(row, ctx.frontend.as_deref());
-    if let Err(error) = ctx.server.store.record_request(&row) {
+    if let Err(error) = ctx.server.record_row(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
 }
@@ -1086,6 +1090,7 @@ fn measurement_row(
         attempt: ctx.attempt.clone(),
         policy_routing: ctx.policy_routing.clone(),
         lineage: None,
+        started_ms: None,
     }
 }
 
@@ -1169,6 +1174,7 @@ fn error_row(
         attempt: ctx.attempt.clone(),
         policy_routing: ctx.policy_routing.clone(),
         lineage: None,
+        started_ms: None,
     }
 }
 
