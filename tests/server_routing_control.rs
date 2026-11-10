@@ -453,7 +453,6 @@ async fn validation_reports_diagnostics_with_their_paths_and_changes_nothing() {
     assert_eq!(status, StatusCode::OK, "{valid}");
     assert_eq!(valid["active_revision_id"], 1);
     assert_eq!(valid["valid"], true, "{valid}");
-    assert_eq!(valid["refusal"], Value::Null);
     let diagnostics = valid["diagnostics"].as_array().unwrap();
     assert!(
         !diagnostics.is_empty()
@@ -502,7 +501,8 @@ async fn validation_reports_diagnostics_with_their_paths_and_changes_nothing() {
         "{invalid}"
     );
 
-    // An edit that cannot be applied has nothing to compile.
+    // An edit that cannot be applied has nothing to compile, and is refused
+    // in the shape `save` and `preview` refuse the same failure in.
     let (status, refused) = post(
         &app,
         "validate",
@@ -512,9 +512,10 @@ async fn validation_reports_diagnostics_with_their_paths_and_changes_nothing() {
         ]}}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{refused}");
-    assert_eq!(refused["valid"], false);
-    assert_eq!(refused["refusal"]["error"], "record_not_found");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+    assert_eq!(refused["error"], "record_not_found");
+    assert!(refused["detail"].is_string(), "{refused}");
+    assert_eq!(refused.get("valid"), None, "{refused}");
 
     let (status, stale) = post(
         &app,

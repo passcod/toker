@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::policy::{
     ActivationScope, AttemptPlan, BindingId, CapabilityFlags, FrontendProtocol, PolicyEdit,
-    PolicyEditError, ProfileId, RecordedFacts, RequestClass, RequestFacts, ResolveFailure,
+    ProfileId, RecordedFacts, RequestClass, RequestFacts, ResolveFailure,
 };
 use crate::server::record::now_ms;
 use crate::store::{
@@ -101,9 +101,6 @@ pub(crate) struct RoutingValidation {
     pub(crate) active_revision_id: i64,
     pub(crate) valid: bool,
     pub(crate) diagnostics: Vec<crate::policy::Diagnostic>,
-    /// Set where the edit could not be applied to the document at all, so
-    /// there was nothing to compile.
-    pub(crate) refusal: Option<PolicyEditError>,
 }
 
 /// How a replayed request routed under one document: where it went, and which
@@ -420,17 +417,10 @@ impl Server {
         let basis = self.control_basis_locked()?;
         Self::expect_active_revision(&basis, Some(expected_revision_id))?;
         let active_revision_id = basis.active_revision.revision_id;
-        let document = match edit.apply_validated(&basis.active_revision.document) {
-            Ok(document) => document,
-            Err(refusal) => {
-                return Ok(RoutingValidation {
-                    active_revision_id,
-                    valid: false,
-                    diagnostics: Vec::new(),
-                    refusal: Some(refusal),
-                });
-            }
-        };
+        // An edit that cannot be applied answers as it does from `save` and
+        // `preview`: the same failure had two wire shapes, and the terminal
+        // read both.
+        let document = edit.apply_validated(&basis.active_revision.document)?;
         let compilation = compile_control(&document, &self.registry, &basis.inventory);
         // Info and warning findings ride along with a policy that compiled,
         // so validation shows the notes (an unconfigured binding, an offer the
@@ -439,7 +429,6 @@ impl Server {
             active_revision_id,
             valid: compilation.policy().is_some(),
             diagnostics: compilation.diagnostics().to_vec(),
-            refusal: None,
         })
     }
 

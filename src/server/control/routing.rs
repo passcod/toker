@@ -219,7 +219,6 @@ pub(crate) async fn validate(State(server): State<Server>, request: Request) -> 
                 "active_revision_id": validation.active_revision_id,
                 "valid": validation.valid,
                 "diagnostics": diagnostics_body(validation.diagnostics),
-                "refusal": validation.refusal.map(|refusal| edit_refusal_body(&refusal)),
             })),
         )
             .into_response(),

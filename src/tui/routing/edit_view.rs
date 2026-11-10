@@ -154,7 +154,6 @@ pub(super) fn block(editing: &Editing, width: usize) -> Vec<BodyLine> {
         loose.push((finding.sentence, finding.fix));
     }
     if let Some(checked) = &editing.checked {
-        loose.extend(checked.refusal.iter().map(|text| (text.clone(), None)));
         loose.extend(checked.elsewhere.iter().map(|other| {
             (
                 format!("{}: {}", other.record, other.sentence),

@@ -50,8 +50,6 @@ pub(super) enum What {
 pub(super) struct Checked {
     pub(super) ops: Value,
     pub(super) valid: bool,
-    /// An edit that could not be applied at all, in the daemon's words.
-    pub(super) refusal: Option<String>,
     /// Refusals that belong to other records than the one being edited.
     pub(super) elsewhere: Vec<Elsewhere>,
 }
@@ -240,8 +238,7 @@ impl Editing {
         let (fields, loose) = self.form.refused();
         let checked = self.checked.as_ref().filter(|checked| checked.ops == ops);
         let elsewhere = checked.map_or(0, |checked| checked.elsewhere.len());
-        let refused = checked.is_some_and(|checked| checked.refusal.is_some());
-        let others = elsewhere + usize::from(refused) + usize::from(loose);
+        let others = elsewhere + usize::from(loose);
         match (fields.len(), others) {
             (0, 0) => match checked {
                 Some(checked) if checked.valid => "save".to_owned(),
@@ -504,21 +501,10 @@ impl Editing {
                 _ => {}
             }
         }
-        let refusal = body
-            .get("refusal")
-            .filter(|refusal| !refusal.is_null())
-            .map(|refusal| {
-                refusal
-                    .get("detail")
-                    .and_then(Value::as_str)
-                    .unwrap_or("the edit cannot be applied")
-                    .to_owned()
-            });
         self.form.set_findings(own);
         self.checked = Some(Checked {
             ops,
             valid: body.get("valid") == Some(&Value::Bool(true)),
-            refusal,
             elsewhere,
         });
         self.unchecked = None;

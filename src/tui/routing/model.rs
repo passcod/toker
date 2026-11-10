@@ -2063,7 +2063,7 @@ mod tests {
 
     /// What the daemon says of an edit it finds nothing wrong with.
     fn fine() -> serde_json::Value {
-        serde_json::json!({"valid": true, "diagnostics": [], "refusal": null})
+        serde_json::json!({"valid": true, "diagnostics": []})
     }
 
     /// Ask for the check the open edit is due, and have the daemon accept the
@@ -2310,7 +2310,7 @@ mod tests {
             check,
             200,
             serde_json::json!({
-                "valid": false, "refusal": null,
+                "valid": false,
                 "diagnostics": [{
                     "code": "missing-route", "severity": "error",
                     "record_id": "anthropic-messages-2",
@@ -2348,7 +2348,7 @@ mod tests {
             check,
             200,
             serde_json::json!({
-                "valid": false, "refusal": null,
+                "valid": false,
                 "diagnostics": [{
                     "code": "missing-route", "severity": "error",
                     "record_id": "anthropic-messages-1",
@@ -2382,7 +2382,7 @@ mod tests {
             check,
             200,
             serde_json::json!({
-                "valid": true, "refusal": null,
+                "valid": true,
                 "diagnostics": [
                     {"code": "binding-unconfigured", "severity": "warning",
                      "record_id": "claude-sub",
@@ -2414,17 +2414,21 @@ mod tests {
         let mut state = loaded(World::AT_REST);
         press(&mut state, KeyCode::Char('n'));
         let check = state.next_check().expect("check");
+        // The same shape `save` and `preview` refuse an unappliable edit in.
         answer(
             &mut state,
             check,
-            200,
+            422,
             serde_json::json!({
-                "valid": false, "diagnostics": [],
-                "refusal": {"error": "invalid_policy_edit", "detail": "presentation `new-presentation` already exists"},
+                "toker": "routing-validate", "ok": false,
+                "error": "invalid_policy_edit",
+                "detail": "presentation `new-presentation` already exists",
             }),
         );
         let editing = state.editing().expect("the form stays");
-        assert_eq!(editing.save_label(), "fix the refusal to save");
+        assert_eq!(editing.save_label(), "the check failed");
+        let said = editing.unchecked.as_deref().expect("the daemon's words");
+        assert!(said.contains("already exists"), "{said}");
         assert!(state.key(CTRL_S).is_none());
     }
 
@@ -3024,7 +3028,7 @@ mod tests {
             &mut state,
             check,
             200,
-            serde_json::json!({"valid": false, "refusal": null, "diagnostics": [{
+            serde_json::json!({"valid": false, "diagnostics": [{
                 "code": "model-not-offered", "severity": "error", "record_id": "claude-sub",
                 "path": format!("/routes/{index}/chain/steps/{step}/candidate/model/model_id"),
                 "sentence": "The provider does not offer the model.",
@@ -3042,7 +3046,7 @@ mod tests {
                 .is_empty()
         );
         // The same finding on another candidate is not this form's.
-        let other = serde_json::json!({"valid": false, "refusal": null, "diagnostics": [{
+        let other = serde_json::json!({"valid": false, "diagnostics": [{
             "code": "model-not-offered", "severity": "error", "record_id": "claude-sub",
             "path": format!("/routes/{index}/chain/first/model/model_id"),
             "sentence": "x", "fix": "y",

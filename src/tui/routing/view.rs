@@ -1010,7 +1010,7 @@ mod tests {
     }
 
     fn fine() -> serde_json::Value {
-        serde_json::json!({"valid": true, "diagnostics": [], "refusal": null})
+        serde_json::json!({"valid": true, "diagnostics": []})
     }
 
     /// What replaying the last 24 hours under the edit came to.
@@ -1071,7 +1071,7 @@ mod tests {
     fn a_refusal_is_said_in_red_beside_the_field_with_its_fix() {
         let index = 14;
         let mut state = adding_a_rewrite(serde_json::json!({
-            "valid": false, "refusal": null,
+            "valid": false,
             "diagnostics": [{
                 "code": "capture-binding-not-regex", "severity": "error",
                 "record_id": "new-rewrite", "path": format!("/rewrites/{index}/target"),
@@ -1113,7 +1113,7 @@ mod tests {
         };
         checked(
             &mut state,
-            serde_json::json!({"valid": true, "refusal": null, "diagnostics": [{
+            serde_json::json!({"valid": true, "diagnostics": [{
                 "code": "binding-unconfigured", "severity": "warning", "record_id": "claude-sub",
                 "path": format!("/routes/{index}/chain/steps/{steps}/candidate/binding_id"),
                 "sentence": "The provider is off: the candidate is skipped until it is on.",
@@ -1154,7 +1154,7 @@ mod tests {
         checked(
             &mut state,
             serde_json::json!({
-                "valid": false, "refusal": null,
+                "valid": false,
                 "diagnostics": [
                     {"code": "missing-route", "severity": "error", "record_id": "anthropic-messages-1",
                      "path": "/rewrites/0/target/route_id",
