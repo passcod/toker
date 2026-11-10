@@ -21,6 +21,8 @@ Several keys per provider is left for a card of its own.
 - [x] Setup completes whether or not it found a provider.
 - [x] The unit always lets the service write the codex login directory, existing or not, so codex can be turned on later without setup.
 - [x] Enabling a provider gives each protocol it serves a default route where it has none (DCONF).
+- [x] A stored ping schedule, off until turned on; Toker keeps a marker in the state dir while it is on and the Anthropic subscription is enabled (GPING#scope).
+- [x] Setup installs and enables the hold and ping timers unasked, their services conditioned on the marker, and only stages the wake timer; it never reaches the system manager. The dashboard switch, enabling the wake, and slot editing are #M2's.
 
 ## Routing form
 
