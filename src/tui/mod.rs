@@ -521,7 +521,15 @@ pub fn run(
                 {
                     config.key(key);
                 }
-                code if page == Page::Routing && routing::owns_key(code) => {
+                // The history tab's `c` is a plain key: Ctrl+C is still the
+                // quit below.
+                code if page == Page::Routing
+                    && routing::owns_key(code)
+                    && !(code == crossterm::event::KeyCode::Char('c')
+                        && key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)) =>
+                {
                     routing.key(key);
                 }
                 // RATE & QUOTA's accounts, sideways. Whole accounts, one
