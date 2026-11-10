@@ -89,6 +89,14 @@ pub enum Error {
     InvalidAccountState(String),
 }
 
+impl Error {
+    /// Whether this is [`Store::open_read_only`] or [`Store::open_existing`]
+    /// finding no store at the path.
+    pub fn is_missing_store(&self) -> bool {
+        matches!(self, Error::Io(error) if error.kind() == std::io::ErrorKind::NotFound)
+    }
+}
+
 /// Result type for all store operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -159,24 +167,35 @@ impl Store {
 
     /// Open an existing ledger for reading only: no file or directory is
     /// created, no migration runs, and nothing (not even
-    /// `meta.created_at`) is written. The readers that are not the
-    /// service (`toker export`, `toker watch-context-window`) use this,
-    /// so pointing one at the wrong path fails instead of leaving an
-    /// empty ledger behind, and an older binary never migrates the live
-    /// file under the service.
+    /// `meta.created_at`) is written. Every command that only reads uses
+    /// this (spec: STORE#opening-the-store), so pointing one at the wrong
+    /// path fails instead of leaving an empty ledger behind, and an older
+    /// binary never migrates the live file under the service.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Store> {
-        use rusqlite::OpenFlags;
-        let path = path.as_ref();
+        Self::open_without_creating(path.as_ref(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    }
+
+    /// Open an existing ledger to read and write it, without creating it
+    /// or migrating it. For the commands besides the service that write a
+    /// row of their own: one run with the store directory gone must fail
+    /// rather than leave an empty store where the service will look, and
+    /// one run by a newer binary must not migrate the file under the
+    /// service still running the old one.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Store> {
+        Self::open_without_creating(path.as_ref(), rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+    }
+
+    fn open_without_creating(path: &Path, access: rusqlite::OpenFlags) -> Result<Store> {
         if !path.exists() {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("no ledger at {}", path.display()),
             )));
         }
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        // No CREATE flag: a file removed since the check above is an error
+        // here too, not a new empty database.
+        let conn =
+            Connection::open_with_flags(path, access | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         let version = conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
@@ -4660,6 +4679,35 @@ mod tests {
         store.record_request(&row).expect("record");
         let newest = store.requests_since(4_000, 10).expect("rows");
         assert_eq!(newest[0].started_ms, Some(3_500));
+    }
+
+    #[test]
+    fn opening_without_creating_leaves_a_missing_store_missing() {
+        let dir = test_dir("open-missing");
+        let db = dir.join("state").join("toker.db");
+        for opened in [Store::open_read_only(&db), Store::open_existing(&db)] {
+            assert!(opened.err().is_some_and(|error| error.is_missing_store()));
+        }
+        assert!(!db.exists(), "no file was created");
+        assert!(!dir.join("state").exists(), "no directory was created");
+    }
+
+    #[test]
+    fn opening_an_existing_store_writes_without_migrating() {
+        let dir = test_dir("open-existing");
+        let db = dir.join("toker.db");
+        {
+            let conn = Connection::open(&db).expect("open raw v1 db");
+            conn.execute_batch(schema::MIGRATIONS[0])
+                .expect("apply the v1 migration alone");
+            conn.pragma_update(None, "user_version", 1)
+                .expect("stamp v1");
+        }
+        let store = Store::open_existing(&db).expect("opens");
+        assert_eq!(user_version(&store), 1, "left at its own schema");
+        assert!(!store.schema_is_current().unwrap());
+        store.set_meta("probe", "written").expect("writes");
+        assert_eq!(store.get_meta("probe").unwrap().as_deref(), Some("written"));
     }
 
     #[test]
