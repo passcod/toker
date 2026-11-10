@@ -33,11 +33,11 @@
 //! ([`patchers`]). A fully-wired machine re-run detects everything,
 //! changes nothing, and says so.
 //!
-//! Credentials (spec: SEC#a-credential-is-never-logged-or-displayed): a pasted key goes only into the OS keyring
-//! ([`SecretStore`] — tests inject a map) or, when there is none, the
-//! 0600 `toker.toml` — never into a prompt message, never into the
-//! wizard's output, never into a unit file. Tests pin the rule with a
-//! scripted key and an output scan.
+//! Credentials (spec: USETUP#writing): the wizard never asks for one. On
+//! a machine configured with no provider it enables codex_sub where the
+//! codex login is, and each provider with an entry in the OS keyring
+//! ([`SecretStore`] — tests inject a map), asking the keyring only
+//! whether the entry exists, never for its value.
 //!
 //! The wake/hold/ping timers are a
 //! real offer in the toggles step: a yes/no defaulting to what is
@@ -64,13 +64,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use crate::config::{
-    ANTHROPIC_BACKENDS, Config, DEFAULT_ANTHROPIC_API_KEY_ENV, DEFAULT_OPENAI_API_KEY_ENV,
-    DEFAULT_OPENROUTER_API_KEY_ENV, DEFAULT_PORT, OPENAI_CHAT_BACKENDS,
-};
+use crate::config::{ANTHROPIC_BACKENDS, Config, DEFAULT_PORT, OPENAI_CHAT_BACKENDS};
 use crate::import::{self, ImportOpts};
 use crate::routing::ProtocolId;
-use crate::secrets::SecretStore;
+use crate::secrets::{KEYRING_SERVICE, SecretStore};
 use crate::setup::atomic::atomic_write_bytes;
 use crate::setup::patchers::{self, Frontend};
 use crate::setup::plugin;
@@ -187,24 +184,13 @@ pub trait Prompt {
     /// preselected answer.
     fn select(&mut self, message: &str, options: &[&str], default: Option<usize>) -> Result<usize>;
 
-    /// Pick any of `options`; `defaults` are the indices offered
-    /// ticked. Returns the ticked indices, ascending.
-    fn multi_select(
-        &mut self,
-        message: &str,
-        options: &[&str],
-        defaults: &[usize],
-    ) -> Result<Vec<usize>>;
-
     /// A yes/no, with `default` as the suggested answer.
     fn confirm(&mut self, message: &str, default: bool) -> Result<bool>;
 
     /// A free-text answer. An empty answer means "take the default"
     /// when one is given (the wizard resolves empties itself, so the
-    /// real UI and the fake agree). `secret: true` is key entry: the
-    /// real UI renders a password prompt and never echoes the answer;
-    /// the wizard stores it but never prints it (spec: SEC#a-credential-is-never-logged-or-displayed).
-    fn text(&mut self, message: &str, default: Option<&str>, secret: bool) -> Result<String>;
+    /// real UI and the fake agree).
+    fn text(&mut self, message: &str, default: Option<&str>) -> Result<String>;
 }
 
 /// The real prompt UI: inquire.
@@ -223,33 +209,13 @@ impl Prompt for InquirePrompt {
             .expect("inquire returns one of the offered options"))
     }
 
-    fn multi_select(
-        &mut self,
-        message: &str,
-        options: &[&str],
-        defaults: &[usize],
-    ) -> Result<Vec<usize>> {
-        let answer = inquire::MultiSelect::new(message, options.to_vec())
-            .with_default(defaults)
-            .raw_prompt()?;
-        let mut ticked: Vec<usize> = answer.iter().map(|option| option.index).collect();
-        ticked.sort_unstable();
-        Ok(ticked)
-    }
-
     fn confirm(&mut self, message: &str, default: bool) -> Result<bool> {
         Ok(inquire::Confirm::new(message)
             .with_default(default)
             .prompt()?)
     }
 
-    fn text(&mut self, message: &str, default: Option<&str>, secret: bool) -> Result<String> {
-        if secret {
-            // A key is entered masked; inquire's Password takes no
-            // default (an echoed default would be the key-echo the
-            // rule forbids).
-            return Ok(inquire::Password::new(message).prompt()?);
-        }
+    fn text(&mut self, message: &str, default: Option<&str>) -> Result<String> {
         let mut question = inquire::Text::new(message);
         if let Some(default) = default {
             question = question.with_default(default);
@@ -1061,75 +1027,25 @@ struct FrontendDetected {
 
 // ── the wizard's config choices ────────────────────────────────────────
 
-/// How one api-key backend authenticates.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum KeyChoice {
-    /// Store nothing: the frontend sends its own key, which toker passes
-    /// through (pass-through-when-present).
-    Frontend,
-    /// A key given to toker, before it is placed: the keyring when there
-    /// is one, else the 0600 `toker.toml` ([`Wizard::place_keys`]).
-    Store(String),
-    /// "Give it to toker" with an empty answer over a key toker already
-    /// stores: keep it where it is.
-    KeepStored,
-    /// Placed in the keyring.
-    Keyring,
-    /// Placed in the 0600 `toker.toml`: no secret service was available.
-    Literal(String),
-    /// An env var, which must be in the systemd user manager's
-    /// environment (the service never sees the shell's).
-    Env(String),
-}
-
-/// The backends/defaults/toggles the wizard asked about (the plan's
-/// steps 1-2), applied to the config at [`Step::WriteConfig`].
+/// What step one settled, applied to the configuration at
+/// [`Step::WriteConfig`].
 #[derive(Debug, Clone)]
 struct Choices {
     port: u16,
-    /// The ticked backends, in [`BACKENDS`] order: exactly the set the
-    /// written config enables.
-    backends: Vec<&'static str>,
-    /// The anthropic protocol's default, among the ticked; `None` when
-    /// no anthropic backend is ticked, or when the database already owns
-    /// routing and the question is not asked.
-    anthropic_default: Option<&'static str>,
-    /// The openai_chat protocol's default, among the ticked; `None` when
-    /// no Chat-capable backend is ticked, or when the database already
-    /// owns routing.
-    openai_chat_default: Option<&'static str>,
-    /// Asked only when anthropic_api is ticked.
-    anthropic_api_key: Option<KeyChoice>,
-    /// Asked only when openrouter is ticked.
-    openrouter_key: Option<KeyChoice>,
-    /// Asked only when openai_api is ticked.
-    openai_api_key: Option<KeyChoice>,
-    awake: bool,
+    /// The providers found on a machine whose configuration names none,
+    /// in [`PROVIDERS`] order; `None` when it names any, and they are kept
+    /// as they are.
+    found: Option<Vec<&'static str>>,
 }
 
-/// Every backend the wizard offers, in the multi-select's order, with
-/// the line that says what it is.
-const BACKENDS: &[(&str, &str)] = &[
-    (
-        "anthropic_sub",
-        "anthropic_sub — the Claude subscription (Claude login or configured OAuth token)",
-    ),
-    (
-        "anthropic_api",
-        "anthropic_api — the Anthropic API, by API key",
-    ),
-    (
-        "codex_sub",
-        "codex_sub — the ChatGPT subscription, through the codex CLI's login",
-    ),
-    (
-        "openrouter",
-        "openrouter — the openai-chat protocol (opencode), by API key",
-    ),
-    (
-        "openai_api",
-        "openai_api — the direct OpenAI Chat Completions API, by API key",
-    ),
+/// Every provider, in the order setup looks for their credentials. The
+/// keyring account of each is its name.
+const PROVIDERS: &[&str] = &[
+    "anthropic_sub",
+    "anthropic_api",
+    "codex_sub",
+    "openrouter",
+    "openai_api",
 ];
 
 // ── the report ─────────────────────────────────────────────────────────
@@ -1220,7 +1136,8 @@ pub struct RunReport {
 pub struct Wizard<'a> {
     prompt: &'a mut dyn Prompt,
     runner: &'a dyn SystemRunner,
-    /// Where a key given to toker is kept ([`Wizard::place_keys`]).
+    /// The keyring, asked only whether a provider's entry exists
+    /// ([`Wizard::find_providers`]).
     secrets: &'a dyn SecretStore,
     paths: &'a Paths,
     out: &'a mut dyn Write,
@@ -1259,8 +1176,8 @@ impl<'a> Wizard<'a> {
         }
         let mut report = RunReport::default();
 
-        let choices = self.choose_backends(&detected)?;
-        let current = self.write_step(choices.as_ref(), &detected, &mut report)?;
+        let choices = self.providers_step(&detected)?;
+        let current = self.write_step(&choices, &detected, &mut report)?;
         report.port = current.port;
         // Before the units: the service refuses to start while the ledger
         // holds rows from before accounts were recorded.
@@ -1272,9 +1189,10 @@ impl<'a> Wizard<'a> {
         // would fail against the new port with the old listener still
         // serving. The wizard deliberately never restarts a live
         // socket (a restart drops every live session through it), so
-        // it says the one command that finishes the change instead.
-        if report.config_written
-            && detected.socket_active == Some(true)
+        // it says the one command that finishes the change instead. The
+        // port is not in the store, so a kept configuration can change it
+        // too.
+        if detected.socket_active == Some(true)
             && detected
                 .config
                 .as_ref()
@@ -1300,8 +1218,9 @@ impl<'a> Wizard<'a> {
                 .config
                 .as_ref()
                 .is_some_and(|old| old.port == current.port);
-        if self.units_step(&current, refresh_running, &mut report)? {
-            self.verify_step(&current, &detected, &mut report).await?;
+        if self.units_step(&current, refresh_running, &mut report)?
+            && self.verify_step(&current, &detected, &mut report).await?
+        {
             self.frontends_step(&detected, &current, &mut report)?;
             self.toggles_step(&detected, &current, &mut report)?;
             // Last, after the timers: it writes claude's settings, so it
@@ -1544,7 +1463,7 @@ impl<'a> Wizard<'a> {
             "  codex login : {} — {}",
             self.paths.codex_auth.display(),
             if detected.codex_auth {
-                "found (codex_sub is pre-ticked)"
+                "found"
             } else {
                 "not found"
             },
@@ -1650,353 +1569,86 @@ impl<'a> Wizard<'a> {
         Ok(())
     }
 
-    // ── step 1: choose backends ───────────────────────────────────
+    // ── step 1: providers and the port ────────────────────────────
 
-    /// [`Step::ChooseBackends`] — the plan's "backends → defaults →
-    /// toggles" questions: which backends toker serves (one
-    /// multi-select, pre-ticked from what the machine has), the auth of
-    /// each ticked key backend, the default per protocol among the
-    /// ticked ones (asked only when there is a choice), the awake toggle,
-    /// and the port. An existing config is offered keep-vs-reconfigure
-    /// first; `Ok(None)` means "keep" — the caller writes nothing. Every
-    /// existing value preselects its own answer, so a re-run can be
-    /// walked through with Enter.
-    fn choose_backends(&mut self, detected: &Detected) -> Result<Option<Choices>> {
-        self.step(Step::ChooseBackends)?;
+    /// [`Step::Providers`] — settle which providers serve, and ask the
+    /// port, the one question here (spec: USETUP#writing). A
+    /// configuration that names any provider keeps them as they are; one
+    /// that names none gets every provider whose credential setup finds.
+    /// Everything else about providers is edited on the dashboard.
+    fn providers_step(&mut self, detected: &Detected) -> Result<Choices> {
+        self.step(Step::Providers)?;
         let existing = detected.config.as_ref();
-        if existing.is_some() {
-            let options = ["keep it as is", "reconfigure"];
-            let found = if self.paths.config_toml.is_file() {
-                self.paths.config_toml.display().to_string()
-            } else {
-                format!("the configuration in {}", self.paths.db_path().display())
-            };
-            let keep = self.prompt.select(
-                &format!("Found {found} — what should the wizard do?"),
-                &options,
-                Some(0),
-            )? == 0;
-            if keep {
-                return Ok(None);
+        let found = match existing {
+            Some(config) if !config.enabled_backends().is_empty() => {
+                self.say(&format!(
+                    "  providers {} — kept as they are",
+                    backends_list(config)
+                ))?;
+                None
+            }
+            _ => Some(self.find_providers(detected)?),
+        };
+        self.say("  other providers are configured on the providers page of `toker tui`")?;
+        let port_default = existing.map(|config| config.port).unwrap_or(DEFAULT_PORT);
+        let port = self.ask_port(port_default)?;
+        Ok(Choices { port, found })
+    }
+
+    /// The providers whose credential is on this machine, each said with
+    /// where it was found: codex_sub where the codex CLI's login is, and
+    /// each provider with an entry in the keyring. The keyring is asked
+    /// whether an entry exists, never for its value (spec: USETUP#writing).
+    /// A keyring that cannot be asked enables nothing, and says why.
+    fn find_providers(&mut self, detected: &Detected) -> Result<Vec<&'static str>> {
+        let mut found = Vec::new();
+        let mut keyring_error = None;
+        for &provider in PROVIDERS {
+            if provider == "codex_sub" {
+                if detected.codex_auth {
+                    self.say(&format!(
+                        "  codex_sub: the codex login is at {}",
+                        self.paths.codex_auth.display()
+                    ))?;
+                    found.push(provider);
+                }
+                continue;
+            }
+            // One failure stands for the whole keyring: asking again
+            // per provider would only repeat it.
+            if keyring_error.is_some() {
+                continue;
+            }
+            match self.secrets.exists(provider) {
+                Ok(true) => {
+                    self.say(&format!(
+                        "  {provider}: found in the keyring ({KEYRING_SERVICE}/{provider})"
+                    ))?;
+                    found.push(provider);
+                }
+                Ok(false) => {}
+                Err(error) => keyring_error = Some(error),
             }
         }
-
-        let backends = self.ask_backends(detected)?;
-        let ticked = |name: &str| backends.contains(&name);
-
-        let anthropic_api_key = if ticked("anthropic_api") {
-            let api = existing.and_then(|config| config.anthropic_api.as_ref());
-            Some(self.ask_api_key(
-                "anthropic_api",
-                DEFAULT_ANTHROPIC_API_KEY_ENV,
-                api.map(|api| {
-                    (
-                        api.api_key_env.as_str(),
-                        api.api_key_keyring,
-                        api.api_key.is_some(),
-                    )
-                }),
-            )?)
-        } else {
-            None
-        };
-        if ticked("codex_sub") {
-            if !detected.codex_auth {
-                self.say(&format!(
-                    "  note: there is no codex login at {} yet — `codex login` creates it, \
-                     and codex_sub answers 401s until then",
-                    self.paths.codex_auth.display()
-                ))?;
-            }
+        if let Some(error) = keyring_error {
+            // The error names the entry, never a value.
+            self.say(&format!(
+                "  the keyring could not be checked ({error:#}), so nothing is enabled from it"
+            ))?;
+        }
+        if found.is_empty() {
+            self.say(
+                "  no provider credential found, so none is enabled; enable one on the \
+                 dashboard and run setup again to wire the frontends",
+            )?;
+        }
+        if found.contains(&"codex_sub") {
             self.say(
                 "  note: the model routing that makes the translated route useful \
                  is a deliberate operator edit in `toker tui` — the wizard writes none",
             )?;
         }
-        let openrouter_key = if ticked("openrouter") {
-            let openrouter = existing.and_then(|config| config.openrouter.as_ref());
-            Some(self.ask_api_key(
-                "openrouter",
-                DEFAULT_OPENROUTER_API_KEY_ENV,
-                openrouter.map(|openrouter| {
-                    (
-                        openrouter.api_key_env.as_str(),
-                        openrouter.api_key_keyring,
-                        openrouter.api_key.is_some(),
-                    )
-                }),
-            )?)
-        } else {
-            None
-        };
-        let openai_api_key = if ticked("openai_api") {
-            let api = existing.and_then(|config| config.openai_api.as_ref());
-            Some(self.ask_api_key(
-                "openai_api",
-                DEFAULT_OPENAI_API_KEY_ENV,
-                api.map(|api| {
-                    (
-                        api.api_key_env.as_str(),
-                        api.api_key_keyring,
-                        api.api_key.is_some(),
-                    )
-                }),
-            )?)
-        } else {
-            None
-        };
-
-        // Each protocol's default, among the ticked backends that bind it,
-        // is only asked while the config still decides routing: once the
-        // database owns it, the routing TUI is where defaults live.
-        let owned = detected.routing.is_some();
-        let candidates: Vec<&'static str> = ANTHROPIC_BACKENDS
-            .iter()
-            .copied()
-            .filter(|name| ticked(name))
-            .collect();
-        let anthropic_default = match candidates.as_slice() {
-            _ if owned => None,
-            [] => None,
-            [only] => Some(*only),
-            several => {
-                let current = existing
-                    .and_then(|config| config.default_backend_anthropic.as_deref())
-                    .unwrap_or(ANTHROPIC_BACKENDS[0]);
-                let default = several.iter().position(|name| *name == current);
-                Some(
-                    several[self.prompt.select(
-                        "Default backend for the anthropic protocol (claude and friends)? \
-                     (bare model names go here; a provider/ prefix picks another per request)",
-                        several,
-                        default.or(Some(0)),
-                    )?],
-                )
-            }
-        };
-
-        let candidates: Vec<&'static str> = OPENAI_CHAT_BACKENDS
-            .iter()
-            .copied()
-            .filter(|name| ticked(name))
-            .collect();
-        let openai_chat_default = match candidates.as_slice() {
-            _ if owned => None,
-            [] => None,
-            [only] => Some(*only),
-            several => {
-                let current = existing
-                    .and_then(|config| config.default_backend_openai_chat.as_deref())
-                    .unwrap_or(OPENAI_CHAT_BACKENDS[0]);
-                let default = several.iter().position(|name| *name == current);
-                Some(
-                    several[self.prompt.select(
-                        "Default backend for the openai_chat protocol (opencode and friends)? \
-                         (bare model names go here; a provider/ prefix picks another per request)",
-                        several,
-                        default.or(Some(0)),
-                    )?],
-                )
-            }
-        };
-
-        let awake_default = existing.map(|config| config.awake).unwrap_or(true);
-        let awake = self.prompt.confirm(
-            "Hold an idle-sleep lock while agent sessions are live (awake)?",
-            awake_default,
-        )?;
-        let port_default = existing.map(|config| config.port).unwrap_or(DEFAULT_PORT);
-        let port = self.ask_port(port_default)?;
-
-        Ok(Some(Choices {
-            port,
-            backends,
-            anthropic_default,
-            openai_chat_default,
-            anthropic_api_key,
-            openrouter_key,
-            openai_api_key,
-            awake,
-        }))
-    }
-
-    /// The backend multi-select. Pre-ticked from the existing config's
-    /// enabled set when there is one, else from what the machine has: a
-    /// claude settings file or the Workhorse repos ticks anthropic_sub,
-    /// the codex CLI's login ticks codex_sub, an opencode config ticks
-    /// openrouter. An empty answer is asked again: a toker with no
-    /// backend answers every request with a not-configured error.
-    fn ask_backends(&mut self, detected: &Detected) -> Result<Vec<&'static str>> {
-        let ticked_before: Vec<&str> = match &detected.config {
-            Some(config) => config.enabled_backends(),
-            None => {
-                let has = |pick: fn(&Frontend) -> bool| {
-                    detected.frontends.iter().any(|fd| pick(&fd.frontend))
-                };
-                let mut found = Vec::new();
-                if has(|frontend| {
-                    matches!(
-                        frontend,
-                        Frontend::Claude { .. } | Frontend::ClaudeWorkhorse { .. }
-                    )
-                }) {
-                    found.push("anthropic_sub");
-                }
-                if detected.codex_auth {
-                    found.push("codex_sub");
-                }
-                if has(|frontend| matches!(frontend, Frontend::Opencode { .. })) {
-                    found.push("openrouter");
-                }
-                found
-            }
-        };
-        let defaults: Vec<usize> = BACKENDS
-            .iter()
-            .enumerate()
-            .filter(|(_, (name, _))| ticked_before.contains(name))
-            .map(|(index, _)| index)
-            .collect();
-        let labels: Vec<&str> = BACKENDS.iter().map(|(_, label)| *label).collect();
-        for _ in 0..3 {
-            let picked = self.prompt.multi_select(
-                "Which backends should toker serve? (space toggles, enter accepts)",
-                &labels,
-                &defaults,
-            )?;
-            if picked.is_empty() {
-                self.say("  pick at least one backend — try again")?;
-                continue;
-            }
-            return Ok(picked.into_iter().map(|index| BACKENDS[index].0).collect());
-        }
-        bail!("no backend was picked")
-    }
-
-    /// One api-key backend's source, in this order:
-    /// the frontend brings its own (toker stores nothing), give it to
-    /// toker (the OS keyring, else the 0600 `toker.toml`), or an env var
-    /// in the systemd user environment. The existing config's choice is
-    /// preselected. The key itself is only ever the ANSWER (masked in the
-    /// real UI); it appears in no message and no output.
-    fn ask_api_key(
-        &mut self,
-        provider: &str,
-        default_env: &str,
-        existing: Option<(&str, bool, bool)>,
-    ) -> Result<KeyChoice> {
-        let options = [
-            "the frontend brings its own — toker stores nothing and passes the frontend's key through",
-            "give it to toker — kept in the OS keyring (toker.toml at mode 0600 when there is none)",
-            "an env var — set in the systemd user environment, not your shell's",
-        ];
-        // The existing choice, as far as the config can tell: a stored
-        // key is option 1, a renamed env var option 2. The default env
-        // name with nothing stored reads as the frontend bringing its
-        // own, which is what it does at runtime when the var is unset.
-        let stored = existing.is_some_and(|(_, keyring, literal)| keyring || literal);
-        let preselect = match existing {
-            Some(_) if stored => 1,
-            Some((env, _, _)) if env != default_env => 2,
-            _ => 0,
-        };
-        match self.prompt.select(
-            &format!("How should toker authenticate to {provider}?"),
-            &options,
-            Some(preselect),
-        )? {
-            0 => {
-                self.say(&format!(
-                    "  {provider}: toker stores no key; the frontend's own is passed through \
-                     (a request without one goes upstream unauthenticated)"
-                ))?;
-                Ok(KeyChoice::Frontend)
-            }
-            1 => {
-                let hint = if stored {
-                    " (empty keeps the stored one)"
-                } else {
-                    ""
-                };
-                for _ in 0..3 {
-                    let key = self.prompt.text(
-                        &format!("The {provider} API key, for the OS keyring{hint}"),
-                        None,
-                        true,
-                    )?;
-                    if !key.is_empty() {
-                        return Ok(KeyChoice::Store(key));
-                    }
-                    if stored {
-                        return Ok(KeyChoice::KeepStored);
-                    }
-                }
-                bail!("no {provider} key was given")
-            }
-            _ => {
-                let current = existing.map_or(default_env, |(env, _, _)| env);
-                let answer = self.prompt.text(
-                    &format!("Env var holding the {provider} API key"),
-                    Some(current),
-                    false,
-                )?;
-                let name = if answer.is_empty() {
-                    current.to_owned()
-                } else {
-                    answer
-                };
-                // The plain statement of where the variable must live:
-                // a variable exported in a shell rc is invisible to the
-                // service, and the symptom (401s) does not say why.
-                self.say(&format!(
-                    "  note: toker runs as a socket-activated systemd user service, so it sees \
-                     only the user manager's environment, not your shell's. Put {name} in \
-                     ~/.config/environment.d/*.conf (read at login), or run \
-                     `systemctl --user set-environment {name}=…`; then `toker restart` for a \
-                     running service to pick it up"
-                ))?;
-                Ok(KeyChoice::Env(name))
-            }
-        }
-    }
-
-    /// Place every key given to toker: the OS keyring when it takes the
-    /// write, else the 0600 `toker.toml` with a line saying so. Runs
-    /// before the config write, so the config records where each key
-    /// actually went.
-    fn place_keys(&mut self, choices: &mut Choices) -> Result<()> {
-        for (provider, slot) in [
-            ("anthropic_api", &mut choices.anthropic_api_key),
-            ("openrouter", &mut choices.openrouter_key),
-            ("openai_api", &mut choices.openai_api_key),
-        ] {
-            let Some(KeyChoice::Store(key)) = slot.as_ref() else {
-                continue;
-            };
-            let key = key.clone();
-            *slot = Some(match self.secrets.set(provider, &key) {
-                Ok(()) => {
-                    writeln!(
-                        self.out,
-                        "  {provider} key: stored in the OS keyring ({}/{provider})",
-                        crate::secrets::KEYRING_SERVICE
-                    )
-                    .context("writing the wizard's output")?;
-                    KeyChoice::Keyring
-                }
-                Err(error) => {
-                    // The error names the entry, never the key.
-                    writeln!(
-                        self.out,
-                        "  {provider} key: no OS keyring ({error:#}) — stored in toker.toml \
-                         at mode 0600 instead"
-                    )
-                    .context("writing the wizard's output")?;
-                    KeyChoice::Literal(key)
-                }
-            });
-        }
-        Ok(())
+        Ok(found)
     }
 
     /// The listener port: a text
@@ -2007,7 +1659,7 @@ impl<'a> Wizard<'a> {
         for _ in 0..3 {
             let answer = self
                 .prompt
-                .text("Listener port", Some(&default.to_string()), false)?;
+                .text("Listener port", Some(&default.to_string()))?;
             if answer.is_empty() {
                 return Ok(default);
             }
@@ -2030,7 +1682,7 @@ impl<'a> Wizard<'a> {
     /// not the file.
     fn write_step(
         &mut self,
-        choices: Option<&Choices>,
+        choices: &Choices,
         detected: &Detected,
         report: &mut RunReport,
     ) -> Result<Config> {
@@ -2051,9 +1703,11 @@ impl<'a> Wizard<'a> {
         // The store this run writes is the one the wizard was given, never
         // whatever the config's own default resolved to: a scratch run that
         // follows the latter writes into the real machine's store. Set here,
-        // before any branch, because one of the branches returns early.
+        // before any branch, because one of the branches returns early. The
+        // port likewise: it reaches the units, not the store.
         config.db_path = paths.db_path();
-        match choices {
+        config.port = choices.port;
+        match &choices.found {
             None if !had_file => {
                 // Already across, and nothing to change: writing the same
                 // rows back would be a no-op with a chance of going wrong.
@@ -2069,11 +1723,13 @@ impl<'a> Wizard<'a> {
                     file.display()
                 ))?;
             }
-            Some(choices) => {
-                let mut choices = choices.clone();
-                self.place_keys(&mut choices)?;
-                apply_choices(&mut config, &choices, paths)?;
+            Some(found) if found.is_empty() && !had_file => {
+                // Rows naming no provider would only activate a routing
+                // with nothing to route to.
+                self.say("no provider to configure — the store is left as it is")?;
+                return Ok(config);
             }
+            Some(found) => enable_found(&mut config, found, owned.is_some(), paths),
         }
         config
             .validate_retained()
@@ -2282,22 +1938,24 @@ impl<'a> Wizard<'a> {
 
     /// [`Step::VerifyService`] — the library's wiring check, the
     /// ordering rule's enforcement point. Failure aborts the wizard:
-    /// the frontends are NOT touched, and the error says so.
+    /// the frontends are NOT touched, and the error says so. `false`
+    /// means no provider is enabled, so there is nothing to verify and
+    /// nothing to wire: the run goes on to hand off to the dashboard,
+    /// where providers are enabled.
     async fn verify_step(
         &mut self,
         config: &Config,
         detected: &Detected,
         report: &mut RunReport,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.step(Step::VerifyService)?;
         let checks = verify_checks(config, detected);
         if checks.is_empty() {
-            self.say("no backend is enabled — there is nothing to verify and nothing to wire")?;
-            bail!(
-                "the wizard stopped before the frontends step: no backend is enabled in {}; \
-                 re-run `toker setup` and reconfigure",
-                self.paths.config_toml.display()
-            );
+            self.say(
+                "no provider is enabled — there is nothing to verify and nothing to wire; \
+                 enable one on the providers page of `toker tui`, then run setup again",
+            )?;
+            return Ok(false);
         }
         match verify::await_service_ready(config.port, &checks, self.verify_timeout).await {
             Ok(ready) => {
@@ -2309,7 +1967,7 @@ impl<'a> Wizard<'a> {
                     self.say(&format!("{} → {status}{whose}", check.describe()))?;
                 }
                 report.verified = Some(ready);
-                Ok(())
+                Ok(true)
             }
             Err(error) => {
                 self.say("verification failed — the frontends were NOT touched:")?;
@@ -2567,7 +2225,7 @@ impl<'a> Wizard<'a> {
     // ── the toggles ───────────────────────────────────────────────
 
     /// The plan's optional toggles, after the frontends: the awake
-    /// report (asked at the backends step — it is config), the
+    /// report (it is config, edited on the dashboard), the
     /// wake/hold/ping timers (a yes/no, then the slots: they install
     /// the hold and ping user timers and attempt the wake system timer
     /// through sudo; a no removes any an earlier run installed), and
@@ -2641,11 +2299,9 @@ impl<'a> Wizard<'a> {
             // account from, so the operator is the only source left. Refusing
             // here would leave every command refusing too.
             self.say("  toker knows no account those rows could belong to")?;
-            let address = self.prompt.text(
-                "which email address were those rows served on?",
-                None,
-                false,
-            )?;
+            let address = self
+                .prompt
+                .text("which email address were those rows served on?", None)?;
             let address = address.trim();
             if address.is_empty() {
                 bail!(
@@ -2783,7 +2439,6 @@ impl<'a> Wizard<'a> {
                      each pings {PING_DELAY_MINUTES} minutes later)"
                 ),
                 Some(&default),
-                false,
             )?;
             // The seam's contract: the wizard resolves an empty answer
             // to the default itself, so the real UI and the fake agree.
@@ -3392,58 +3047,49 @@ fn commit_configuration(config: &Config, paths: &Paths) -> Result<Option<i64>> {
     Ok(Some(revision.revision_id))
 }
 
-/// Apply the wizard's choices to the config read from the file or the
-/// store, leaving everything not answered here as it was. A chosen key
-/// source REPLACES the old one (picking the env var drops a stale
-/// literal; picking a literal stores the given key), so the
-/// configuration ends up saying exactly what was just answered. The
-/// store's path is not among the choices: [`Wizard::write_step`] pins
-/// it for every path through the run.
-fn apply_choices(config: &mut Config, choices: &Choices, paths: &Paths) -> Result<()> {
-    config.port = choices.port;
-    // The ticked set is exactly the enabled set: a ticked backend gets
-    // its block (an existing block keeps its hand edits), an unticked one
-    // loses it, because a block's presence is what enables a backend.
-    let ticked = |name: &str| choices.backends.contains(&name);
-    fn keep_or_create<T: Default>(slot: &mut Option<T>, on: bool) {
-        if on {
-            slot.get_or_insert_with(T::default);
-        } else {
-            *slot = None;
-        }
+/// Enable the providers setup found on a machine whose configuration named
+/// none (spec: USETUP#writing): codex_sub through the codex login, every
+/// other one through its keyring entry. While the configuration still
+/// decides routing, each protocol's default is the first found provider
+/// that binds it, in the historical order; once the store owns routing,
+/// the defaults live there.
+fn enable_found(config: &mut Config, found: &[&str], routing_owned: bool, paths: &Paths) {
+    let has = |name: &str| found.contains(&name);
+    if has("anthropic_sub") {
+        config
+            .anthropic_sub
+            .get_or_insert_with(Default::default)
+            .oauth_token_keyring = true;
     }
-    keep_or_create(&mut config.anthropic_sub, ticked("anthropic_sub"));
-    keep_or_create(&mut config.anthropic_api, ticked("anthropic_api"));
-    keep_or_create(&mut config.codex_sub, ticked("codex_sub"));
-    keep_or_create(&mut config.openrouter, ticked("openrouter"));
-    keep_or_create(&mut config.openai_api, ticked("openai_api"));
-    config.default_backend_anthropic = choices.anthropic_default.map(str::to_owned);
-    config.default_backend_openai_chat = choices.openai_chat_default.map(str::to_owned);
-    if let (Some(api), Some(key)) = (config.anthropic_api.as_mut(), &choices.anthropic_api_key) {
-        apply_key(
-            key,
-            &mut api.api_key_env,
-            &mut api.api_key_keyring,
-            &mut api.api_key,
-        )?;
+    if has("anthropic_api") {
+        config
+            .anthropic_api
+            .get_or_insert_with(Default::default)
+            .api_key_keyring = true;
     }
-    if let (Some(openrouter), Some(key)) = (config.openrouter.as_mut(), &choices.openrouter_key) {
-        apply_key(
-            key,
-            &mut openrouter.api_key_env,
-            &mut openrouter.api_key_keyring,
-            &mut openrouter.api_key,
-        )?;
+    if has("codex_sub") {
+        config.codex_sub.get_or_insert_with(Default::default);
     }
-    if let (Some(api), Some(key)) = (config.openai_api.as_mut(), &choices.openai_api_key) {
-        apply_key(
-            key,
-            &mut api.api_key_env,
-            &mut api.api_key_keyring,
-            &mut api.api_key,
-        )?;
+    if has("openrouter") {
+        config
+            .openrouter
+            .get_or_insert_with(Default::default)
+            .api_key_keyring = true;
     }
-    config.awake = choices.awake;
+    if has("openai_api") {
+        config
+            .openai_api
+            .get_or_insert_with(Default::default)
+            .api_key_keyring = true;
+    }
+    let first = |order: &[&str]| {
+        order
+            .iter()
+            .find(|name| !routing_owned && has(name))
+            .map(|name| (*name).to_owned())
+    };
+    config.default_backend_anthropic = first(ANTHROPIC_BACKENDS);
+    config.default_backend_openai_chat = first(OPENAI_CHAT_BACKENDS);
     // Workhorse runs its agents under a config directory of its own, so
     // their transcripts (and the custom titles it names sessions with)
     // are outside `~/.claude`, and without this root every Workhorse
@@ -3455,41 +3101,6 @@ fn apply_choices(config: &mut Config, choices: &Choices, paths: &Paths) -> Resul
             config.transcript_roots.push(root);
         }
     }
-    Ok(())
-}
-
-/// One key choice onto a provider block's key sources. A chosen source
-/// REPLACES the others, so the file says exactly what was just answered
-/// (the env var name is left as it is unless the choice names one: an
-/// unset variable is no source).
-fn apply_key(
-    key: &KeyChoice,
-    env: &mut String,
-    keyring: &mut bool,
-    literal: &mut Option<String>,
-) -> Result<()> {
-    match key {
-        KeyChoice::Frontend => {
-            *keyring = false;
-            *literal = None;
-        }
-        KeyChoice::Env(name) => {
-            *env = name.clone();
-            *keyring = false;
-            *literal = None;
-        }
-        KeyChoice::Keyring => {
-            *keyring = true;
-            *literal = None;
-        }
-        KeyChoice::Literal(key) => {
-            *keyring = false;
-            *literal = Some(key.clone());
-        }
-        KeyChoice::KeepStored => {}
-        KeyChoice::Store(_) => bail!("a key given to toker was never placed"),
-    }
-    Ok(())
 }
 
 /// One frontend's state-summary line: what its file says about its
@@ -3557,10 +3168,10 @@ fn what_changed(frontend: &Frontend, url: &str) -> String {
     }
 }
 
-/// Whether the raw `toker.toml` text carries an explicit `db_path` —
-/// the read side of the never-stomp rule in [`apply_choices`]. (The
-/// resolved [`Config`] cannot answer this: an absent key and a
-/// defaulted one look the same there.)
+/// Whether the raw `toker.toml` text carries an explicit `db_path`, for
+/// [`Wizard::refuse_a_file_naming_another_store`]. (The resolved
+/// [`Config`] cannot answer this: an absent key and a defaulted one look
+/// the same there.)
 fn toml_has_db_path(text: &str) -> bool {
     toml::from_str::<toml::Table>(text)
         .map(|table| table.contains_key("db_path"))
@@ -3629,24 +3240,8 @@ mod tests {
     /// One scripted answer.
     #[derive(Debug, Clone)]
     enum Answer {
-        Select(usize),
-        /// The ticked indices; `None` accepts the offered defaults.
-        MultiSelect(Option<Vec<usize>>),
         Confirm(bool),
         Text(String),
-    }
-
-    fn select(index: usize) -> Answer {
-        Answer::Select(index)
-    }
-
-    fn multi(ticked: &[usize]) -> Answer {
-        Answer::MultiSelect(Some(ticked.to_vec()))
-    }
-
-    /// Accept the multi-select's pre-ticked defaults (the Enter key).
-    fn multi_defaults() -> Answer {
-        Answer::MultiSelect(None)
     }
 
     fn confirm(yes: bool) -> Answer {
@@ -3662,8 +3257,6 @@ mod tests {
     struct Asked {
         kind: &'static str,
         message: String,
-        options: Vec<String>,
-        secret: bool,
         /// The default offered, rendered (`None` when none was).
         default: Option<String>,
     }
@@ -3690,19 +3283,10 @@ mod tests {
             &self.asked
         }
 
-        fn next(
-            &mut self,
-            kind: &'static str,
-            message: &str,
-            options: &[&str],
-            secret: bool,
-            default: Option<String>,
-        ) -> Answer {
+        fn next(&mut self, kind: &'static str, message: &str, default: Option<String>) -> Answer {
             self.asked.push(Asked {
                 kind,
                 message: message.to_owned(),
-                options: options.iter().map(|option| option.to_string()).collect(),
-                secret,
                 default,
             });
             self.answers.pop_front().unwrap_or_else(|| {
@@ -3712,52 +3296,27 @@ mod tests {
     }
 
     impl Prompt for ScriptedPrompt {
+        /// No scripted run reaches a select: the one left is the choice
+        /// between several accounts when attributing old rows.
         fn select(
             &mut self,
             message: &str,
-            options: &[&str],
+            _options: &[&str],
             default: Option<usize>,
         ) -> Result<usize> {
-            match self.next(
-                "select",
-                message,
-                options,
-                false,
-                default.map(|index| index.to_string()),
-            ) {
-                Answer::Select(index) => Ok(index),
-                other => panic!("select {message:?} was scripted {other:?}"),
-            }
-        }
-
-        fn multi_select(
-            &mut self,
-            message: &str,
-            options: &[&str],
-            defaults: &[usize],
-        ) -> Result<Vec<usize>> {
-            match self.next(
-                "multi_select",
-                message,
-                options,
-                false,
-                Some(format!("{defaults:?}")),
-            ) {
-                Answer::MultiSelect(Some(ticked)) => Ok(ticked),
-                Answer::MultiSelect(None) => Ok(defaults.to_vec()),
-                other => panic!("multi_select {message:?} was scripted {other:?}"),
-            }
+            let answer = self.next("select", message, default.map(|index| index.to_string()));
+            panic!("select {message:?} was scripted {answer:?}, and no test answers a select")
         }
 
         fn confirm(&mut self, message: &str, default: bool) -> Result<bool> {
-            match self.next("confirm", message, &[], false, Some(default.to_string())) {
+            match self.next("confirm", message, Some(default.to_string())) {
                 Answer::Confirm(yes) => Ok(yes),
                 other => panic!("confirm {message:?} was scripted {other:?}"),
             }
         }
 
-        fn text(&mut self, message: &str, default: Option<&str>, secret: bool) -> Result<String> {
-            match self.next("text", message, &[], secret, default.map(str::to_owned)) {
+        fn text(&mut self, message: &str, default: Option<&str>) -> Result<String> {
+            match self.next("text", message, default.map(str::to_owned)) {
                 Answer::Text(answer) => Ok(answer),
                 other => panic!("text {message:?} was scripted {other:?}"),
             }
@@ -3960,6 +3519,15 @@ mod tests {
             self
         }
 
+        /// Seed the fake keyring with an entry for each account, standing
+        /// for keys the operator put there.
+        fn with_keys(self, accounts: &[&str]) -> Rig {
+            for account in accounts {
+                self.secrets.insert(account, SCRIPTED_KEY);
+            }
+            self
+        }
+
         async fn run(&mut self, timeout: Duration) -> Result<RunReport> {
             let paths = Paths::scratch(&self.root);
             Wizard::new(
@@ -4147,19 +3715,21 @@ default_backend_anthropic = "codex_sub"
 
     // ── the scripted answers ──────────────────────────────────────
 
-    /// A full fresh-machine run: anthropic_sub and openrouter ticked
-    /// (whatever detection pre-ticked), openrouter's key via env,
-    /// awake on, the given port, yes to every detected frontend
-    /// (claude, [workhorse,] opencode, shell rc — the caller splices
-    /// the workhorse confirm in where detection found it), and no to
-    /// the wake/hold/ping timers (the default with none installed).
+    /// The secret every seeded keyring entry holds. Setup must never
+    /// read it, so it must never appear in a run's output.
+    const SCRIPTED_KEY: &str = "sk-scripted-never-read";
+
+    /// The keyring entries a fresh run finds, enabling the providers
+    /// [`answers_fresh`] answers for.
+    const FRESH_KEYS: &[&str] = &["anthropic_sub", "openrouter"];
+
+    /// A full fresh-machine run, with [`FRESH_KEYS`] in the keyring: the
+    /// given port, yes to every detected frontend (claude, [workhorse,]
+    /// opencode, shell rc — the caller splices the workhorse confirm in
+    /// where detection found it), and no to the wake/hold/ping timers
+    /// (the default with none installed).
     fn answers_fresh(port: u16) -> Vec<Answer> {
         vec![
-            multi(&[0, 3]),          // backends: anthropic_sub + openrouter
-            select(2),               // key source: env var
-            text(""),                // env name: keep the default
-            select(0),               // openai_chat default: openrouter
-            confirm(true),           // awake
             text(&port.to_string()), // the listener port
             confirm(true),           // claude
             confirm(true),           // opencode
@@ -4417,7 +3987,8 @@ default_backend_anthropic = "codex_sub"
                 ok_empty(),
                 ok_empty(),
             ]),
-        );
+        )
+        .with_keys(FRESH_KEYS);
         let unwired_claude = seed_claude(&rig.root);
         let unwired_opencode = seed_opencode(&rig.root);
         seed_rc(&rig.root);
@@ -4441,9 +4012,22 @@ default_backend_anthropic = "codex_sub"
             rig.paths().db_path().is_file(),
             "the wizard wrote into the store under its own root"
         );
-        let openrouter = config.openrouter.as_ref().expect("ticked");
-        assert_eq!(openrouter.api_key_env, "OPENROUTER_API_KEY");
+        // Each provider found in the keyring is enabled with the keyring
+        // as its credential source, and nothing else is enabled.
+        assert_eq!(config.enabled_backends(), ["anthropic_sub", "openrouter"]);
+        let openrouter = config.openrouter.as_ref().expect("found in the keyring");
+        assert!(openrouter.api_key_keyring);
         assert!(openrouter.api_key.is_none(), "no literal key was stored");
+        let sub = config.anthropic_sub.as_ref().expect("found in the keyring");
+        assert!(sub.oauth_token_keyring);
+        assert_eq!(
+            config.default_backend_anthropic.as_deref(),
+            Some("anthropic_sub")
+        );
+        assert_eq!(
+            config.default_backend_openai_chat.as_deref(),
+            Some("openrouter")
+        );
 
         // The store holds credential literals now, so its directory is the
         // thing that must be closed (spec: DCONF#state).
@@ -4546,13 +4130,14 @@ default_backend_anthropic = "codex_sub"
         let out = rig.out();
         transcript_snapshot("fresh_machine_transcript", &rig, port, &out);
         assert!(out.contains("none (fresh setup)"), "the config line: {out}");
-        // The env-var choice says plainly where the variable must live.
+        // What was enabled, and why; the rest is handed to the dashboard.
         assert!(
-            out.contains("socket-activated systemd user service")
-                && out.contains("environment.d")
-                && out.contains("systemctl --user set-environment OPENROUTER_API_KEY="),
-            "the systemd environment note: {out}"
+            out.contains("anthropic_sub: found in the keyring (toker/anthropic_sub)")
+                && out.contains("openrouter: found in the keyring (toker/openrouter)")
+                && out.contains("providers page of `toker tui`"),
+            "the providers found: {out}"
         );
+        assert!(!out.contains(SCRIPTED_KEY), "a key is never read: {out}");
         assert!(out.contains("unknown"), "the failed socket query: {out}");
         assert!(
             out.contains("codex login : ") && out.contains("not found"),
@@ -4588,30 +4173,12 @@ default_backend_anthropic = "codex_sub"
         );
         assert_ne!(unwired_opencode, opencode_wired(port));
 
-        // One multi-select offered every backend, pre-ticked from
-        // detection: claude's settings tick anthropic_sub, opencode's
-        // config ticks openrouter, and with no codex login codex_sub is
-        // offered unticked. One anthropic backend ticked: no default
-        // question.
+        // The port was the only configuration question: no provider, no
+        // credential, no default and no toggle was asked.
         let first = &rig.prompt.asked()[0];
-        assert_eq!(first.kind, "multi_select");
-        assert_eq!(first.options.len(), BACKENDS.len());
-        for (option, name) in first
-            .options
-            .iter()
-            .zip(BACKENDS.iter().map(|(name, _)| name))
-        {
-            assert!(option.starts_with(name), "{option} offers {name}");
-        }
-        assert_eq!(first.default.as_deref(), Some("[0, 3]"));
-        let chat_default = rig
-            .prompt
-            .asked()
-            .iter()
-            .find(|asked| asked.message.contains("openai_chat protocol"))
-            .expect("multiple Chat-capable backends ask for their default");
-        assert_eq!(chat_default.options, ["openrouter", "anthropic_sub"]);
-        assert_eq!(chat_default.default.as_deref(), Some("0"));
+        assert_eq!(first.kind, "text");
+        assert_eq!(first.message, "Listener port");
+        assert_eq!(rig.prompt.asked()[1].kind, "confirm");
     }
 
     #[tokio::test]
@@ -4623,7 +4190,8 @@ default_backend_anthropic = "codex_sub"
             root.to_path_buf(),
             answers_fresh(port),
             with_picker(vec![inactive(), ok_empty(), ok_empty()]),
-        );
+        )
+        .with_keys(FRESH_KEYS);
         seed_claude(&root);
         seed_opencode(&root);
         seed_rc(&root);
@@ -4638,19 +4206,21 @@ default_backend_anthropic = "codex_sub"
         let rc_once = std::fs::read(root.join(".bashrc")).expect("read the rc");
         let units_once = rig.runner.installed();
 
-        // Run two, same root: keep the config, leave every frontend,
-        // and no slots (the silent default).
+        // Run two, same root: keep the port, leave every frontend, and
+        // no slots (the silent default). The keyring now also holds an
+        // openai_api key, which a configured store does not pick up.
         let mut rerun = Rig::at(
             root.to_path_buf(),
             vec![
-                select(0),      // keep the config
+                text(""),       // the listener port: the installed one
                 confirm(true),  // claude: already wired
                 confirm(true),  // opencode: already wired
                 confirm(true),  // the shell rc: already wired
                 confirm(false), // wake/hold/ping timers: no
             ],
             with_picker(vec![active(), ok_empty(), ok_empty()]),
-        );
+        )
+        .with_keys(&["anthropic_sub", "openrouter", "openai_api"]);
         let report = rerun
             .run(VERIFY_TIMEOUT)
             .await
@@ -4690,18 +4260,27 @@ default_backend_anthropic = "codex_sub"
             vec![std::env::current_exe().expect("this test binary's path")],
             "an active listener is gracefully refreshed before verification"
         );
-        // The transcript pin: run two's first question was the
-        // keep-vs-reconfigure select, the frontend questions were
+        // The transcript pin: run two's first question was the port,
+        // offered as the installed one, the frontend questions were
         // confirms, and the last question was the timers confirm (no —
         // the default with none installed).
         let kinds: Vec<&str> = rerun.prompt.asked().iter().map(|a| a.kind).collect();
+        assert_eq!(kinds, ["text", "confirm", "confirm", "confirm", "confirm"]);
+        let port_text = port.to_string();
         assert_eq!(
-            kinds,
-            ["select", "confirm", "confirm", "confirm", "confirm"]
+            rerun.prompt.asked()[0].default.as_deref(),
+            Some(port_text.as_str())
         );
 
-        // The re-run detected everything and said so.
+        // The re-run detected everything and said so, and kept the
+        // providers rather than looking for more.
         let out = rerun.out();
+        assert!(
+            out.contains("providers anthropic_sub, openrouter — kept as they are"),
+            "{out}"
+        );
+        assert!(!out.contains("found in the keyring"), "{out}");
+        assert!(rig.stored().openai_api.is_none());
         assert!(out.contains("is active"), "{out}");
         assert!(out.contains("points at toker"), "{out}");
         assert!(out.contains("already wired, nothing to do"), "{out}");
@@ -4733,13 +4312,10 @@ default_backend_anthropic = "codex_sub"
         });
         let mut rig = Rig::new(
             "prefix-unstripped",
-            vec![
-                multi(&[0]), // anthropic_sub
-                confirm(true),
-                text(&port.to_string()),
-            ],
+            vec![text(&port.to_string())],
             vec![inactive(), ok_empty(), ok_empty()],
-        );
+        )
+        .with_keys(&["anthropic_sub"]);
         let before_claude = seed_claude(&rig.root);
 
         let error = rig
@@ -4764,15 +4340,13 @@ default_backend_anthropic = "codex_sub"
         let mut rig = Rig::new(
             "no-anthropic",
             vec![
-                multi(&[3]), // openrouter alone
-                select(0),   // its key: the frontend's own
-                confirm(true),
                 text(&port.to_string()),
                 confirm(true), // opencode
                 confirm(true), // the opencode plugin
             ],
             with_picker(vec![inactive(), ok_empty(), ok_empty()]),
-        );
+        )
+        .with_keys(&["openrouter"]);
         let before_claude = seed_claude(&rig.root);
         seed_opencode(&rig.root);
 
@@ -4809,16 +4383,10 @@ default_backend_anthropic = "codex_sub"
             "verify-fail",
             // The fresh script up to the port answer — the wizard
             // never reaches a frontend question.
-            vec![
-                multi(&[0, 3]), // backends: anthropic_sub + openrouter
-                select(2),      // openrouter key: an env var
-                text(""),
-                select(0), // openai_chat default: openrouter
-                confirm(true),
-                text(&port.to_string()),
-            ],
+            vec![text(&port.to_string())],
             vec![inactive(), ok_empty(), ok_empty()],
-        );
+        )
+        .with_keys(FRESH_KEYS);
         let before_claude = seed_claude(&rig.root);
         let before_opencode = seed_opencode(&rig.root);
 
@@ -4855,37 +4423,34 @@ default_backend_anthropic = "codex_sub"
         assert!(!rig.stored_rows().providers.is_empty());
         assert_eq!(rig.runner.installed().len(), 2);
         // And nothing was asked past the port.
-        assert_eq!(rig.prompt.asked().len(), 6);
+        assert_eq!(rig.prompt.asked().len(), 1);
     }
 
     #[tokio::test]
-    async fn an_existing_config_can_be_reconfigured_without_losing_hand_edits() {
+    async fn an_existing_file_keeps_its_providers_and_hand_edits_on_a_new_port() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "reconfigure",
             vec![
-                select(1),               // reconfigure
-                multi_defaults(),        // backends: the config's own (codex_sub)
-                confirm(true),           // awake
                 text("not-a-port"),      // a bad port is re-asked, not fatal
                 text(&port.to_string()), // the scratch port
                 confirm(true),           // claude
                 confirm(true),           // codex
             ],
             with_picker(vec![active(), ok_empty(), ok_empty()]),
-        );
+        )
+        // A key in the keyring does not add a provider to a file that
+        // already names one.
+        .with_keys(&["openrouter"]);
         std::fs::create_dir_all(rig.root.join(".config/toker")).expect("create the config dir");
         std::fs::write(rig.toml_path(), EXISTING_TOML).expect("seed the existing toml");
         std::fs::create_dir_all(rig.root.join(".codex")).expect("create the codex dir");
         std::fs::write(rig.root.join(".codex/auth.json"), "{}").expect("seed the codex login");
         seed_claude(&rig.root);
 
-        let report = rig
-            .run(VERIFY_TIMEOUT)
-            .await
-            .expect("the reconfigure run completes");
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
 
-        // The reconfigured choices applied…
+        // The new port applied…
         let config = rig.stored();
         assert_eq!(report.port, port);
         assert!(config.awake);
@@ -4898,18 +4463,15 @@ default_backend_anthropic = "codex_sub"
         assert!(active_document(&rig.paths()).contains("gpt-5.6-sol"));
         assert_eq!(report.routing_activated, Some(1));
 
-        // The existing config's enabled set was pre-ticked (codex_sub
-        // alone, though claude's settings exist: the config wins over
-        // detection) — and the note about the deliberate routing edit
-        // was printed.
-        assert_eq!(rig.prompt.asked()[1].kind, "multi_select");
-        assert_eq!(rig.prompt.asked()[1].default.as_deref(), Some("[2]"));
-        assert!(rig.stored().openrouter.is_none(), "not ticked, not enabled");
+        // The file's providers were kept as they were (codex_sub alone,
+        // though a codex login and an openrouter key exist).
+        assert_eq!(config.enabled_backends(), ["codex_sub"]);
         let out = rig.out();
         assert!(
-            out.contains("a deliberate operator edit in `toker tui`"),
+            out.contains("providers codex_sub — kept as they are"),
             "{out}"
         );
+        assert!(!out.contains("found in the keyring"), "{out}");
         assert!(
             out.contains("activated revision 1 from these choices"),
             "{out}"
@@ -4919,10 +4481,10 @@ default_backend_anthropic = "codex_sub"
             "{out}"
         );
 
-        assert!(report.config_written);
+        assert!(report.config_kept && report.config_written);
         assert_eq!(report.patched.len(), 2, "claude and codex were detected");
         // The existing config (no port key → the default 18123) was
-        // reconfigured onto the scratch port with the socket detected
+        // moved onto the scratch port with the socket detected
         // ACTIVE — the wizard printed the restart note instead of
         // ever restarting the live socket itself.
         assert!(
@@ -4959,30 +4521,17 @@ default_backend_anthropic = "codex_sub"
     }
 
     #[tokio::test]
-    async fn an_owned_machine_is_asked_no_defaults_and_keeps_its_revision() {
+    async fn an_owned_machine_keeps_its_revision() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "owned-reconfigure",
-            vec![
-                select(1),               // reconfigure
-                multi(&[0, 2]),          // anthropic_sub + codex_sub: two candidates
-                confirm(true),           // awake
-                text(&port.to_string()), // the scratch port
-                confirm(false),          // wake/hold/ping timers: no
-            ],
+            vec![text(&port.to_string())], // the scratch port
             vec![inactive(), ok_empty(), ok_empty()],
         );
         let before = seed_owned(&rig, EXISTING_TOML);
 
         let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
 
-        assert!(
-            !rig.prompt
-                .asked()
-                .iter()
-                .any(|asked| asked.message.contains("Default backend")),
-            "the database owns the defaults"
-        );
         let after = active_revision(&rig.paths()).expect("still active");
         assert_eq!(after.revision_id, before.revision_id);
         assert_eq!(after.fingerprint, before.fingerprint);
@@ -4992,8 +4541,7 @@ default_backend_anthropic = "codex_sub"
         // set of fields "dropped" from a rewrite.
         assert!(report.config_file_removed);
         assert!(!rig.toml_path().exists());
-        let config = rig.stored();
-        assert!(config.anthropic_sub.is_some() && config.codex_sub.is_some());
+        assert_eq!(rig.stored().enabled_backends(), ["codex_sub"]);
         let out = rig.out();
         assert!(
             out.contains("routing     : database-owned, revision 1"),
@@ -5010,7 +4558,7 @@ default_backend_anthropic = "codex_sub"
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "owned-keep",
-            vec![select(0)], // keep it as is
+            vec![text("")], // the listener port: the file's
             vec![inactive(), ok_empty(), ok_empty()],
         );
         let seeded = format!("port = {port}\n{EXISTING_TOML}");
@@ -5054,12 +4602,7 @@ default_backend_anthropic = "codex_sub"
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "write-fail",
-            vec![
-                select(1),               // reconfigure
-                multi(&[2]),             // codex_sub
-                confirm(true),           // awake
-                text(&port.to_string()), // the scratch port
-            ],
+            vec![text(&port.to_string())], // the scratch port
             vec![inactive()],
         );
         std::fs::create_dir_all(rig.root.join(".config/toker")).expect("create the config dir");
@@ -5090,12 +4633,7 @@ default_backend_anthropic = "codex_sub"
         // The next run finds a database-owned machine and writes the owned config.
         let mut next = Rig::at(
             rig.root.clone(),
-            vec![
-                select(1),
-                multi_defaults(),
-                confirm(true),
-                text(&port.to_string()),
-            ],
+            vec![text(&port.to_string())],
             vec![inactive(), ok_empty(), ok_empty()],
         );
         let report = next.run(VERIFY_TIMEOUT).await.expect("the recovery run");
@@ -5124,17 +4662,13 @@ default_backend_anthropic = "codex_sub"
             // no opencode, no shell rc, so no plugin offer)), then no
             // slots.
             vec![
-                multi(&[0, 3]),          // backends: anthropic_sub + openrouter
-                select(2),               // key source: env var
-                text(""),                // env name: keep the default
-                select(0),               // openai_chat default: openrouter
-                confirm(true),           // awake
                 text(&port.to_string()), // the listener port
                 confirm(true),           // workhorse
                 confirm(false),          // wake/hold/ping timers: no
             ],
             vec![inactive(), ok_empty(), ok_empty()],
-        );
+        )
+        .with_keys(FRESH_KEYS);
         let report = with
             .run(VERIFY_TIMEOUT)
             .await
@@ -5172,7 +4706,8 @@ default_backend_anthropic = "codex_sub"
             "workhorse-without",
             answers_fresh(port),
             with_picker(vec![inactive(), ok_empty(), ok_empty()]),
-        );
+        )
+        .with_keys(FRESH_KEYS);
         seed_claude(&without.root);
         seed_opencode(&without.root);
         seed_rc(&without.root);
@@ -5208,17 +4743,13 @@ default_backend_anthropic = "codex_sub"
             // The fresh script without frontend confirms (nothing
             // detected), no slots, plus the import yes.
             vec![
-                multi(&[0, 3]), // backends: anthropic_sub + openrouter
-                select(2),      // openrouter key: an env var
-                text(""),
-                select(0), // openai_chat default: openrouter
-                confirm(true),
                 text(&port.to_string()),
                 confirm(false), // wake/hold/ping timers: no
                 confirm(true),  // import the predecessor's history
             ],
             vec![inactive(), ok_empty(), ok_empty()],
-        );
+        )
+        .with_keys(FRESH_KEYS);
         let ctp = rig.paths().ctp_usage;
         if let Some(parent) = ctp.parent() {
             std::fs::create_dir_all(parent).expect("create the predecessor dir");
@@ -5257,154 +4788,117 @@ default_backend_anthropic = "codex_sub"
     }
 
     #[tokio::test]
-    async fn a_pasted_key_is_stored_but_never_echoed() {
+    async fn a_codex_login_on_a_fresh_store_enables_codex_sub() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
-        const KEY: &str = "sk-or-v1-this-must-never-appear-in-output";
         let mut rig = Rig::new(
-            "secret",
-            // The literal-key script with no frontends detected: the
-            // questions end at the port, then the slots text.
-            {
-                let mut answers = answers_fresh(port);
-                answers[1] = select(1); // key source: literal in toker.toml
-                answers[2] = text(KEY); // the key itself, masked in the real UI
-                answers.truncate(6); // nothing past the port is asked
-                answers.push(confirm(false)); // wake/hold/ping timers: no
-                answers
-            },
+            "detect-codex",
+            vec![
+                text(&port.to_string()), // the listener port
+                confirm(true),           // codex
+            ],
             vec![inactive(), ok_empty(), ok_empty()],
         );
-        // No secret service on this machine: the key falls back to the
-        // 0600 toml.
-        rig.secrets = MemoryStore::unavailable();
+        std::fs::create_dir_all(rig.root.join(".codex")).expect("create the codex dir");
+        std::fs::write(rig.root.join(".codex/auth.json"), "{}").expect("seed the codex login");
 
-        rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
 
-        // The key appears in NO output string the wizard produces…
+        let config = rig.stored();
+        assert_eq!(config.enabled_backends(), ["codex_sub"]);
+        assert_eq!(
+            config.default_backend_anthropic.as_deref(),
+            Some("codex_sub")
+        );
+        assert!(report.config_written && !report.config_kept);
         let out = rig.out();
-        assert!(!out.contains(KEY), "the wizard's output:\n{out}");
-        // …and in no question it asked (messages only, never answers).
-        for asked in rig.prompt.asked() {
-            assert!(
-                !asked.message.contains(KEY),
-                "the key leaked into a prompt: {:?}",
-                asked.message
-            );
-        }
-        // …and in no unit it installed.
-        for (_name, contents) in rig.runner.installed() {
-            assert!(!contents.contains(KEY), "the key leaked into a unit");
-        }
-
-        // The key IS stored — its one sanctioned home is now the row, in a
-        // store whose directory setup closed to everyone else.
-        let rows = rig.stored_rows();
+        assert!(out.contains("codex_sub: the codex login is at "), "{out}");
         assert!(
-            rows.providers
-                .iter()
-                .any(|row| row.cred_literal.as_deref() == Some(KEY)),
-            "the key is stored as a literal in the store"
+            out.contains("a deliberate operator edit in `toker tui`"),
+            "{out}"
         );
-        // And it was asked as a SECRET question — the seam masks the
-        // answer in the real UI, which is half of the never-echo rule.
-        let key_question = rig
-            .prompt
-            .asked()
-            .iter()
-            .find(|asked| asked.secret)
-            .expect("the key was asked as a secret question");
-        assert!(
-            key_question.message.contains("openrouter API key"),
-            "the secret question names the provider, not the key"
-        );
-        assert_eq!(key_question.kind, "text");
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(rig.paths().db_path().parent().expect("the state dir"))
-            .expect("metadata")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o077, 0, "the store's directory is closed");
-
-        // And the summary named only the SOURCE, never the value, and
-        // said why the key is not in the keyring.
-        assert!(out.contains("the literal in toker.toml"), "{out}");
-        assert!(out.contains("no OS keyring"), "{out}");
+        assert!(!out.contains("found in the keyring"), "{out}");
+        assert_eq!(rig.prompt.asked()[0].message, "Listener port");
     }
 
     #[tokio::test]
-    async fn a_key_given_to_toker_goes_to_the_keyring_and_the_other_choices_store_nothing() {
+    async fn keyring_entries_enable_their_providers_without_reading_a_key() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
-        const KEY: &str = "sk-ant-this-must-never-appear-in-output";
         let mut rig = Rig::new(
-            "keyring",
-            vec![
-                multi(&[1, 3]), // anthropic_api + openrouter
-                select(1),      // anthropic_api: give it to toker
-                text(KEY),      // the key, masked in the real UI
-                select(0),      // openrouter: the frontend brings its own
-                select(0),      // openai_chat default: openrouter
-                confirm(true),  // awake
-                text(&port.to_string()),
-            ],
+            "detect-keyring",
+            // Nothing to wire and no subscription: the port is the one
+            // question.
+            vec![text(&port.to_string())],
             vec![inactive(), ok_empty(), ok_empty()],
-        );
-        rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+        )
+        .with_keys(&["anthropic_api", "openai_api"]);
 
-        // The key is in the (fake) keyring and nowhere else.
-        assert_eq!(rig.secrets.peek("anthropic_api").as_deref(), Some(KEY));
-        assert_eq!(rig.secrets.peek("openrouter"), None);
-        let rows = rig.stored_rows();
-        assert!(
-            rows.providers.iter().all(|row| row.cred_literal.is_none()),
-            "choosing the keyring stores no literal"
-        );
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+
         let config = rig.stored();
-        let api = config.anthropic_api.as_ref().expect("enabled");
-        assert!(api.api_key_keyring);
-        let openrouter = config.openrouter.as_ref().expect("enabled");
-        assert!(!openrouter.api_key_keyring && openrouter.api_key.is_none());
-        let out = rig.out();
-        assert!(!out.contains(KEY), "{out}");
-        assert!(out.contains("stored in the OS keyring"), "{out}");
-        assert!(
-            out.contains("the frontend's own is passed through"),
-            "{out}"
-        );
-        // The auth question offered the three choices in the agreed
-        // order, the frontend's own first.
-        let auth = &rig.prompt.asked()[1];
-        assert!(auth.options[0].starts_with("the frontend brings its own"));
-        assert!(auth.options[1].starts_with("give it to toker"));
-        assert!(auth.options[2].starts_with("an env var"));
-
-        // A re-run over the stored key, answered with Enter: it stays
-        // where it is, and the stored choice is preselected.
-        let mut rerun = Rig::at(
-            rig.root.clone(),
-            vec![
-                select(1),        // reconfigure
-                multi_defaults(), // the same backends
-                select(1),        // anthropic_api: still toker's
-                text(""),         // empty keeps the stored key
-                select(0),        // openrouter: the frontend's own
-                confirm(true),
-                text(&port.to_string()),
-            ],
-            vec![inactive(), ok_empty(), ok_empty()],
-        );
-        rerun
-            .run(VERIFY_TIMEOUT)
-            .await
-            .expect("the rerun completes");
-        assert_eq!(rerun.prompt.asked()[2].default.as_deref(), Some("1"));
-        let config = rerun.stored();
+        assert_eq!(config.enabled_backends(), ["anthropic_api", "openai_api"]);
         assert!(
             config
                 .anthropic_api
                 .as_ref()
-                .expect("enabled")
+                .expect("found")
                 .api_key_keyring
         );
+        assert!(config.openai_api.as_ref().expect("found").api_key_keyring);
+        assert!(
+            rig.stored_rows()
+                .providers
+                .iter()
+                .all(|row| row.cred_literal.is_none()),
+            "no key was copied into the store"
+        );
+        assert!(report.verified.is_some());
+        assert_eq!(rig.secrets.reads(), 0, "presence only, never the value");
+        assert_eq!(rig.prompt.asked().len(), 1);
+        let out = rig.out();
+        assert!(!out.contains(SCRIPTED_KEY), "{out}");
+        assert!(
+            out.contains("anthropic_api: found in the keyring (toker/anthropic_api)")
+                && out.contains("openai_api: found in the keyring (toker/openai_api)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("anthropic_api key: env ANTHROPIC_API_KEY (systemd user environment) when set, else the OS keyring"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_no_credential_found_setup_enables_nothing_and_wires_nothing() {
+        let mut rig = Rig::new(
+            "detect-nothing",
+            vec![text("")], // the listener port: the default
+            vec![inactive(), ok_empty(), ok_empty()],
+        );
+        // No secret service on this machine, and no codex login.
+        rig.secrets = MemoryStore::unavailable();
+        let before_claude = seed_claude(&rig.root);
+
+        let report = rig
+            .run(VERIFY_TIMEOUT)
+            .await
+            .expect("the run completes, handing off to the dashboard");
+
+        assert!(!report.config_written && report.routing_activated.is_none());
+        assert!(report.verified.is_none());
+        assert!(report.patched.is_empty());
+        assert_eq!(
+            std::fs::read(rig.root.join(".claude/settings.json")).expect("read claude"),
+            before_claude,
+            "no client is pointed at a Toker with no provider"
+        );
+        assert_eq!(rig.prompt.asked().len(), 1, "{:?}", rig.prompt.asked());
+        let out = rig.out();
+        assert!(
+            out.contains("the keyring could not be checked") && out.contains("no secret service"),
+            "{out}"
+        );
+        assert!(out.contains("no provider credential found"), "{out}");
+        assert!(out.contains("no provider is enabled"), "{out}");
     }
 
     #[tokio::test]
@@ -5412,15 +4906,10 @@ default_backend_anthropic = "codex_sub"
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "openai-only",
-            vec![
-                multi(&[4]),             // openai_api only
-                select(2),               // key source: env var
-                text(""),                // keep OPENAI_API_KEY
-                confirm(true),           // awake
-                text(&port.to_string()), // listener port
-            ],
+            vec![text(&port.to_string())], // listener port
             vec![inactive(), ok_empty(), ok_empty()],
-        );
+        )
+        .with_keys(&["openai_api"]);
 
         rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
 
@@ -5432,74 +4921,11 @@ default_backend_anthropic = "codex_sub"
             Some("openai_api")
         );
         let api = config.openai_api.as_ref().expect("openai_api enabled");
-        assert_eq!(api.api_key_env, DEFAULT_OPENAI_API_KEY_ENV);
-        assert!(!api.api_key_keyring && api.api_key.is_none());
+        assert!(api.api_key_keyring && api.api_key.is_none());
         assert!(
             rig.out()
                 .contains("openai_api key: env OPENAI_API_KEY (systemd user environment)")
         );
-        assert!(
-            !rig.prompt
-                .asked()
-                .iter()
-                .any(|asked| asked.message.contains("Default backend")),
-            "one Chat backend needs no default question"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_ticked_set_is_the_enabled_set_and_a_default_is_asked_among_several() {
-        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
-        let mut rig = Rig::new(
-            "multi-select",
-            vec![
-                select(1),               // reconfigure
-                multi(&[]),              // nothing ticked: asked again
-                multi(&[0, 2]),          // anthropic_sub + codex_sub
-                select(1),               // the anthropic default: codex_sub
-                select(0),               // openai_chat default: codex_sub
-                confirm(true),           // awake
-                text(&port.to_string()), // the port
-                confirm(false),          // wake/hold/ping timers: no
-            ],
-            vec![inactive(), ok_empty(), ok_empty()],
-        );
-        std::fs::create_dir_all(rig.root.join(".config/toker")).expect("create the config dir");
-        std::fs::write(
-            rig.toml_path(),
-            "[providers.anthropic_sub]\n[providers.openrouter]\napi_key_env = \"MY_KEY\"\n",
-        )
-        .expect("seed the existing toml");
-
-        rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
-
-        let asked = rig.prompt.asked();
-        // The existing config's enabled set was pre-ticked.
-        assert_eq!(asked[1].default.as_deref(), Some("[0, 3]"));
-        assert!(rig.out().contains("pick at least one backend"));
-        // The default question offered exactly the ticked anthropic
-        // backends, the existing default preselected.
-        assert_eq!(asked[3].kind, "select");
-        assert_eq!(asked[3].options, ["anthropic_sub", "codex_sub"]);
-        assert_eq!(asked[3].default.as_deref(), Some("0"));
-        // No openrouter key was asked: it is no longer ticked.
-        assert!(
-            !asked
-                .iter()
-                .any(|asked| asked.message.contains("openrouter"))
-        );
-
-        let config = rig.stored();
-        assert_eq!(
-            config.enabled_backends(),
-            vec!["anthropic_sub", "codex_sub"]
-        );
-        // The defaults went to the store's revision, and the rows carry no
-        // routing at all (spec: RMIG#the-routing-fields).
-        assert!(!rig.toml_path().exists(), "the file went with the import");
-        assert!(active_document(&rig.paths()).contains("codex_sub"));
-        // codex_sub ticked without a login: said so.
-        assert!(rig.out().contains("no codex login"), "{}", rig.out());
     }
 
     #[tokio::test]
@@ -5507,9 +4933,7 @@ default_backend_anthropic = "codex_sub"
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "state-dir-fail",
-            vec![
-                select(0), // keep the config as it is
-            ],
+            vec![text("")], // the listener port: the file's
             // is-active only: with the state dir missing, nothing may
             // start, so reload and enable must never be called.
             vec![inactive()],
@@ -5561,13 +4985,10 @@ default_backend_anthropic = "codex_sub"
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "activation-fail",
-            vec![
-                multi(&[0]), // backends: anthropic_sub
-                confirm(true),
-                text(&port.to_string()),
-            ],
+            vec![text(&port.to_string())],
             vec![inactive()],
-        );
+        )
+        .with_keys(&["anthropic_sub"]);
         let before_claude = seed_claude(&rig.root);
         // A file where the state dir belongs: the ledger cannot be created.
         let state_dir = rig.paths().state_dir;
@@ -5595,19 +5016,13 @@ default_backend_anthropic = "codex_sub"
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "units-fail",
-            vec![
-                multi(&[0, 3]), // backends: anthropic_sub + openrouter
-                select(2),      // openrouter key: an env var
-                text(""),
-                select(0), // openai_chat default: openrouter
-                confirm(true),
-                text(&port.to_string()),
-            ],
+            vec![text(&port.to_string())],
             // is-active fine; daemon-reload FAILS — so enable must
             // never be called (only two scripted outcomes remain
             // before the fake would panic).
             vec![inactive(), reload_fails()],
-        );
+        )
+        .with_keys(FRESH_KEYS);
         let before_claude = seed_claude(&rig.root);
 
         let report = rig
@@ -5719,7 +5134,7 @@ default_backend_anthropic = "codex_sub"
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "same-db",
-            vec![select(0)], // keep it as is
+            vec![text("")], // the listener port: the file's
             vec![inactive(), ok_empty(), ok_empty()],
         );
         let seeded = format!(
@@ -5742,11 +5157,12 @@ default_backend_anthropic = "codex_sub"
             "plugin-declined",
             {
                 let mut answers = answers_fresh(port);
-                answers[9] = confirm(false); // the opt-out
+                answers[4] = confirm(false); // the opt-out
                 answers
             },
             with_picker(vec![inactive(), ok_empty(), ok_empty()]),
-        );
+        )
+        .with_keys(FRESH_KEYS);
         seed_claude(&declined.root);
         seed_opencode(&declined.root);
         seed_rc(&declined.root);
@@ -5781,11 +5197,12 @@ default_backend_anthropic = "codex_sub"
             "plugin-guarded",
             {
                 let mut answers = answers_fresh(port);
-                answers[9] = confirm(false); // the reinstall refusal
+                answers[4] = confirm(false); // the reinstall refusal
                 answers
             },
             with_picker(vec![inactive(), ok_empty(), ok_empty()]),
-        );
+        )
+        .with_keys(FRESH_KEYS);
         seed_claude(&guarded.root);
         seed_opencode(&guarded.root);
         seed_rc(&guarded.root);
@@ -5825,7 +5242,7 @@ default_backend_anthropic = "codex_sub"
             "timers-slots",
             {
                 let mut answers = answers_fresh(port);
-                answers.splice(10..11, [confirm(true), text("09:00, 12:30")]);
+                answers.splice(5..6, [confirm(true), text("09:00, 12:30")]);
                 answers
             },
             with_picker(vec![
@@ -5838,6 +5255,7 @@ default_backend_anthropic = "codex_sub"
                 ok_empty(), // enable --now toker-ping-1230.timer
             ]),
         )
+        .with_keys(FRESH_KEYS)
         .with_system(vec![ok_empty(), ok_empty()]);
         seed_claude(&rig.root);
         seed_opencode(&rig.root);
@@ -5953,7 +5371,7 @@ default_backend_anthropic = "codex_sub"
             "timers-sudo-fail",
             {
                 let mut answers = answers_fresh(port);
-                answers.splice(10..11, [confirm(true), text("09:00")]); // one slot
+                answers.splice(5..6, [confirm(true), text("09:00")]); // one slot
                 answers
             },
             with_picker(vec![
@@ -5965,6 +5383,7 @@ default_backend_anthropic = "codex_sub"
                 ok_empty(), // enable --now toker-ping-0900.timer
             ]),
         )
+        .with_keys(FRESH_KEYS)
         // sudo cannot run at all on this leg.
         .with_system(vec![Err(anyhow::anyhow!("sudo: command not found"))]);
         seed_claude(&rig.root);
@@ -6037,7 +5456,7 @@ default_backend_anthropic = "codex_sub"
             "timers-enable-refused",
             {
                 let mut answers = answers_fresh(port);
-                answers.splice(10..11, [confirm(true), text("09:00")]); // one slot
+                answers.splice(5..6, [confirm(true), text("09:00")]); // one slot
                 answers
             },
             with_picker(vec![
@@ -6049,6 +5468,7 @@ default_backend_anthropic = "codex_sub"
                 ok_empty(), // enable --now toker-ping-0900.timer
             ]),
         )
+        .with_keys(FRESH_KEYS)
         .with_system(vec![
             ok_empty(),
             outcome(false, "", "Failed to enable unit: Unit file is masked.\n"),
@@ -6088,7 +5508,7 @@ default_backend_anthropic = "codex_sub"
             "timers-user-fail",
             {
                 let mut answers = answers_fresh(port);
-                answers.splice(10..11, [confirm(true), text("09:00")]); // one slot
+                answers.splice(5..6, [confirm(true), text("09:00")]); // one slot
                 answers
             },
             with_picker(vec![
@@ -6098,6 +5518,7 @@ default_backend_anthropic = "codex_sub"
                 reload_fails(), // daemon-reload (timers) — the user manager is gone
             ]),
         )
+        .with_keys(FRESH_KEYS)
         .with_system(vec![ok_empty(), ok_empty()]);
         seed_claude(&rig.root);
         seed_opencode(&rig.root);
@@ -6137,21 +5558,20 @@ default_backend_anthropic = "codex_sub"
     }
 
     /// The picker is Claude publication, not an OpenRouter feature: with
-    /// claude as a frontend its units go in whatever backends are ticked.
+    /// claude as a frontend its units go in whatever providers are enabled.
     #[tokio::test]
     async fn claude_gets_the_picker_units_without_an_openrouter_backend() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "picker-no-openrouter",
             vec![
-                multi(&[0]),             // backends: anthropic_sub only
-                confirm(true),           // awake
                 text(&port.to_string()), // the listener port
                 confirm(true),           // claude
                 confirm(false),          // wake/hold/ping timers: no
             ],
             with_picker(vec![inactive(), ok_empty(), ok_empty()]),
-        );
+        )
+        .with_keys(&["anthropic_sub"]);
         let exe = std::env::current_exe().expect("the test binary");
         seed_claude(&rig.root);
 
@@ -6177,15 +5597,10 @@ default_backend_anthropic = "codex_sub"
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "picker-no-claude",
-            vec![
-                multi(&[3]),             // backends: openrouter only
-                select(2),               // openrouter key: an env var
-                text(""),                // the default env var
-                confirm(true),           // awake
-                text(&port.to_string()), // the listener port
-            ],
+            vec![text(&port.to_string())], // the listener port
             vec![inactive(), ok_empty(), ok_empty()],
-        );
+        )
+        .with_keys(&["openrouter"]);
 
         let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
 
@@ -6244,7 +5659,7 @@ default_backend_anthropic = "codex_sub"
             "timers-default-slots",
             {
                 let mut answers = answers_fresh(port);
-                answers.splice(10..11, [confirm(true), text("")]);
+                answers.splice(5..6, [confirm(true), text("")]);
                 answers
             },
             with_picker(vec![
@@ -6257,6 +5672,7 @@ default_backend_anthropic = "codex_sub"
                 ok_empty(), // enable --now toker-ping-1220.timer
             ]),
         )
+        .with_keys(FRESH_KEYS)
         .with_system(vec![ok_empty(), ok_empty()]);
         seed_claude(&rig.root);
         seed_opencode(&rig.root);
@@ -6300,15 +5716,10 @@ default_backend_anthropic = "codex_sub"
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "timers-no-anchor",
-            vec![
-                multi(&[3]),             // backends: openrouter only
-                select(2),               // openrouter key: an env var
-                text(""),                // the default env var
-                confirm(true),           // awake
-                text(&port.to_string()), // the listener port
-            ],
+            vec![text(&port.to_string())], // the listener port
             vec![inactive(), ok_empty(), ok_empty()],
-        );
+        )
+        .with_keys(&["openrouter"]);
 
         let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
 
@@ -6332,13 +5743,7 @@ default_backend_anthropic = "codex_sub"
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "timers-retire-no-anchor",
-            vec![
-                multi(&[3]),             // backends: openrouter only
-                select(2),               // openrouter key: an env var
-                text(""),                // the default env var
-                confirm(true),           // awake
-                text(&port.to_string()), // the listener port
-            ],
+            vec![text(&port.to_string())], // the listener port
             vec![
                 inactive(),
                 ok_empty(), // daemon-reload (units)
@@ -6348,6 +5753,7 @@ default_backend_anthropic = "codex_sub"
                 ok_empty(), // daemon-reload (removal)
             ],
         )
+        .with_keys(&["openrouter"])
         .with_system(vec![ok_empty()]);
         seed_units(
             &rig,
@@ -6407,6 +5813,7 @@ default_backend_anthropic = "codex_sub"
                 ok_empty(), // daemon-reload (removal)
             ]),
         )
+        .with_keys(FRESH_KEYS)
         .with_system(vec![ok_empty()]);
         seed_units(
             &rig,
@@ -6484,6 +5891,7 @@ default_backend_anthropic = "codex_sub"
             answers_fresh(port),
             with_picker(vec![inactive(), ok_empty(), ok_empty()]),
         )
+        .with_keys(FRESH_KEYS)
         .with_system(vec![Err(anyhow::anyhow!("sudo: a password is required"))]);
         seed_units(&rig, &[WAKE_TIMER_UNIT, WAKE_SERVICE_UNIT]);
         seed_claude(&rig.root);
@@ -6520,7 +5928,7 @@ default_backend_anthropic = "codex_sub"
             "timers-retire-stale",
             {
                 let mut answers = answers_fresh(port);
-                answers.splice(10..11, [confirm(true), text("07:20, 12:20")]);
+                answers.splice(5..6, [confirm(true), text("07:20, 12:20")]);
                 answers
             },
             with_picker(vec![
@@ -6534,6 +5942,7 @@ default_backend_anthropic = "codex_sub"
                 ok_empty(), // enable --now toker-ping-1220.timer
             ]),
         )
+        .with_keys(FRESH_KEYS)
         .with_system(vec![ok_empty(), ok_empty()]);
         seed_units(
             &rig,

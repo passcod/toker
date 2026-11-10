@@ -70,10 +70,8 @@ Only models that take tools are offered, but OpenRouter only guarantees Claude C
 
 ## Direct OpenAI API
 
-The setup wizard can enable `openai_api` and place its key in the OS keyring,
-read it from `OPENAI_API_KEY`, or leave authentication to the frontend.
-You can
-also switch it on afterwards from the providers page of `toker tui`.
+On a machine with no provider configured yet, `toker setup` enables `openai_api` when the OS keyring holds its key, under the service `toker` and the account `openai_api`.
+Otherwise switch it on from the providers page of `toker tui`.
 
 Make it the Chat default in the routing page: in the defaults tab (`3`), select
 the default whose scope is `openai_chat`, press `e`, set its route to

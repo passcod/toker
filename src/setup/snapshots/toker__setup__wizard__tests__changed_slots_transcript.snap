@@ -15,14 +15,16 @@ toker setup — the state of this machine
   codex login : [ROOT]/.codex/auth.json — not found
   predecessor history : none
 
-[1/6] choose backends
-  note: toker runs as a socket-activated systemd user service, so it sees only the user manager's environment, not your shell's. Put OPENROUTER_API_KEY in ~/.config/environment.d/*.conf (read at login), or run `systemctl --user set-environment OPENROUTER_API_KEY=…`; then `toker restart` for a running service to pick it up
+[1/6] providers and the port
+  anthropic_sub: found in the keyring (toker/anthropic_sub)
+  openrouter: found in the keyring (toker/openrouter)
+  other providers are configured on the providers page of `toker tui`
 
 [2/6] write the configuration
 wrote the configuration into the store
   port [PORT], awake on, backends anthropic_sub, openrouter
   routing: activated revision 1 from these choices — edit it in `toker tui`
-  openrouter key: env OPENROUTER_API_KEY (systemd user environment) when set, else the frontend's own key
+  openrouter key: env OPENROUTER_API_KEY (systemd user environment) when set, else the OS keyring
 
 [3/6] install + start the units
 installed toker.socket ([ROOT]/.config/systemd/user/toker.socket)

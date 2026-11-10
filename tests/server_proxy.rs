@@ -2132,8 +2132,7 @@ async fn a_keyring_key_is_read_by_the_service_and_injected() {
     openrouter.api_key = Some("sk-literal-loses".to_owned());
     // Never the real keyring: a map holding the key.
     let secrets = Arc::new(toker::secrets::MemoryStore::new());
-    toker::secrets::SecretStore::set(secrets.as_ref(), "openrouter", "sk-from-keyring")
-        .expect("seed the fake keyring");
+    secrets.insert("openrouter", "sk-from-keyring");
     let (addr, _store) = spawn_toker_seamed(config, Seams::isolated().with_secrets(secrets)).await;
 
     let body = chat_body("z-ai/glm-5.3", false);
