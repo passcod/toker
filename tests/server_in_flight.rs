@@ -146,6 +146,7 @@ fn test_config(upstream: reqwest::Url) -> Config {
         gates: GatesConfig::default(),
         notices: toker::config::NoticesConfig::default(),
         awake: false,
+        ping_schedule: false,
         transcript_roots: Vec::new(),
     }
 }

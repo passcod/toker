@@ -178,7 +178,18 @@ pub fn run(
     port: u16,
     settings: Option<SettingsSync>,
 ) -> anyhow::Result<()> {
-    let store = Store::open(db_path)?;
+    // Read-write for the accounts page's naming, but neither created nor
+    // migrated (spec: STORE#opening-the-store): a dashboard started with
+    // the store directory gone once left an empty store where the service
+    // looked.
+    let store = match Store::open_existing(db_path) {
+        Ok(store) => store,
+        Err(error) if error.is_missing_store() => anyhow::bail!(
+            "no store at {}: the service creates it when it starts (`toker setup` installs it)",
+            db_path.display()
+        ),
+        Err(error) => return Err(error.into()),
+    };
     // Taken before the terminal: the file this process was started
     // from, while it is still the one on disk.
     let mut exe = reexec::ExeWatch::current();

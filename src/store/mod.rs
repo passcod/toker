@@ -89,6 +89,14 @@ pub enum Error {
     InvalidAccountState(String),
 }
 
+impl Error {
+    /// Whether this is [`Store::open_read_only`] or [`Store::open_existing`]
+    /// finding no store at the path.
+    pub fn is_missing_store(&self) -> bool {
+        matches!(self, Error::Io(error) if error.kind() == std::io::ErrorKind::NotFound)
+    }
+}
+
 /// Result type for all store operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -112,6 +120,64 @@ pub fn default_db_path() -> Result<PathBuf> {
 /// connection (see the module docs for the concurrency choice).
 pub struct Store {
     conn: Mutex<Connection>,
+    /// The file [`Store::open`] opened, where it opened one.
+    file: Option<OpenedFile>,
+}
+
+/// A path and the file it named when the store was opened there.
+struct OpenedFile {
+    path: PathBuf,
+    id: FileId,
+}
+
+/// A file by device and inode: what a path names, which changes when the
+/// file is deleted or another is renamed over it, while a connection
+/// already open goes on reading and writing the one it opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    dev: u64,
+    ino: u64,
+}
+
+impl FileId {
+    fn of(path: &Path) -> std::io::Result<FileId> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(path)?;
+        Ok(FileId {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+}
+
+/// How a store path no longer names the file the store opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replaced {
+    /// Nothing is at the path.
+    Missing,
+    /// Another file is at the path.
+    OtherFile,
+}
+
+impl std::fmt::Display for Replaced {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Replaced::Missing => "is gone",
+            Replaced::OtherFile => "is now another file",
+        })
+    }
+}
+
+/// What a path names now against the file it named at open. A path that
+/// cannot be looked up for any reason but its absence says nothing about
+/// which file is there, so it is not taken for a replacement.
+fn compare_file(opened: FileId, now: std::io::Result<FileId>) -> Option<Replaced> {
+    match now {
+        Ok(now) if now == opened => None,
+        Ok(_) => Some(Replaced::OtherFile),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(Replaced::Missing),
+        Err(_) => None,
+    }
 }
 
 impl Store {
@@ -135,6 +201,17 @@ impl Store {
             close_state_dir(parent)?;
         }
         let mut conn = Connection::open(path)?;
+        // Taken straight after the open, so it names the file the connection
+        // holds (spec: DLIFE#keeping-to-its-store). An in-memory database has
+        // no file to lose.
+        let file = if path == Path::new(":memory:") {
+            None
+        } else {
+            Some(OpenedFile {
+                path: path.to_owned(),
+                id: FileId::of(path)?,
+            })
+        };
         conn.pragma_update(None, "foreign_keys", true)?;
         // Returns the effective mode ("wal", or "memory" on :memory:).
         conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
@@ -144,6 +221,7 @@ impl Store {
         schema::migrate(&mut conn)?;
         let store = Store {
             conn: Mutex::new(conn),
+            file,
         };
         if store.get_meta("created_at")?.is_none() {
             // Zero only if the system clock is before the epoch; good enough
@@ -159,24 +237,35 @@ impl Store {
 
     /// Open an existing ledger for reading only: no file or directory is
     /// created, no migration runs, and nothing (not even
-    /// `meta.created_at`) is written. The readers that are not the
-    /// service (`toker export`, `toker watch-context-window`) use this,
-    /// so pointing one at the wrong path fails instead of leaving an
-    /// empty ledger behind, and an older binary never migrates the live
-    /// file under the service.
+    /// `meta.created_at`) is written. Every command that only reads uses
+    /// this (spec: STORE#opening-the-store), so pointing one at the wrong
+    /// path fails instead of leaving an empty ledger behind, and an older
+    /// binary never migrates the live file under the service.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Store> {
-        use rusqlite::OpenFlags;
-        let path = path.as_ref();
+        Self::open_without_creating(path.as_ref(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    }
+
+    /// Open an existing ledger to read and write it, without creating it
+    /// or migrating it. For the commands besides the service that write a
+    /// row of their own: one run with the store directory gone must fail
+    /// rather than leave an empty store where the service will look, and
+    /// one run by a newer binary must not migrate the file under the
+    /// service still running the old one.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Store> {
+        Self::open_without_creating(path.as_ref(), rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+    }
+
+    fn open_without_creating(path: &Path, access: rusqlite::OpenFlags) -> Result<Store> {
         if !path.exists() {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("no ledger at {}", path.display()),
             )));
         }
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        // No CREATE flag: a file removed since the check above is an error
+        // here too, not a new empty database.
+        let conn =
+            Connection::open_with_flags(path, access | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         let version = conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
@@ -191,7 +280,17 @@ impl Store {
         }
         Ok(Store {
             conn: Mutex::new(conn),
+            file: None,
         })
+    }
+
+    /// Whether the path this store was opened at names another file now, or
+    /// none (spec: DLIFE#keeping-to-its-store). Every write after that goes
+    /// into a file nothing will open again. Only a store [`Store::open`]
+    /// opened on a file is checked; any other reads as never replaced.
+    pub fn replaced(&self) -> Option<Replaced> {
+        let file = self.file.as_ref()?;
+        compare_file(file.id, FileId::of(&file.path))
     }
 
     /// The mutexed connection; every operation goes through this, so
@@ -1085,6 +1184,7 @@ mod tests {
         SessionCostGroup, SessionLineage, Store, StoredCandidateState, StoredRoutingTrace,
         StoredRoutingTraceEvent, StoredSkipReason, WidenResult, is_api_measurement,
     };
+    use super::{FileId, Replaced, compare_file};
     use crate::ir::Release;
     use crate::policy::{
         ActivationScope, BindingId, CURRENT_FORMAT_VERSION, CandidateEvidence, CandidateId,
@@ -4628,14 +4728,15 @@ mod tests {
     fn the_in_flight_migration_keeps_every_row_and_leaves_started_ms_absent() {
         let dir = test_dir("in-flight-upgrade");
         let db = dir.join("toker.db");
-        let last = schema::MIGRATIONS.len();
+        // v26 adds the in-flight table: a store at v25 is the one before it.
+        let before = 25;
         std::fs::create_dir_all(&dir).expect("create the db parent dir");
         {
             let conn = Connection::open(&db).expect("open raw db");
-            for script in &schema::MIGRATIONS[..last - 1] {
+            for script in &schema::MIGRATIONS[..before] {
                 conn.execute_batch(script).expect("apply a migration");
             }
-            conn.pragma_update(None, "user_version", last as i64 - 1)
+            conn.pragma_update(None, "user_version", before as i64)
                 .expect("stamp the version before");
             for ts in [1_000, 2_000, 3_000] {
                 conn.execute(
@@ -4646,7 +4747,7 @@ mod tests {
             }
         }
         let store = Store::open(&db).expect("the database migrates");
-        assert_eq!(user_version(&store), last as i64);
+        assert_eq!(user_version(&store), schema::MIGRATIONS.len() as i64);
         let rows = store.requests_since(0, 10).expect("rows");
         assert_eq!(rows.len(), 3, "no row was lost");
         assert!(
@@ -4660,6 +4761,140 @@ mod tests {
         store.record_request(&row).expect("record");
         let newest = store.requests_since(4_000, 10).expect("rows");
         assert_eq!(newest[0].started_ms, Some(3_500));
+    }
+
+    #[test]
+    fn the_ping_schedule_migration_keeps_the_settings_and_reads_as_off() {
+        let dir = test_dir("ping-schedule-upgrade");
+        let db = dir.join("toker.db");
+        // v27 adds the column: a store at v26 is the one before it.
+        let before = 26;
+        std::fs::create_dir_all(&dir).expect("create the db parent dir");
+        {
+            let conn = Connection::open(&db).expect("open raw db");
+            for script in &schema::MIGRATIONS[..before] {
+                conn.execute_batch(script).expect("apply a migration");
+            }
+            conn.pragma_update(None, "user_version", before as i64)
+                .expect("stamp the version before");
+            conn.execute(
+                "INSERT INTO config_settings (id, awake, ping_header) VALUES (1, 0, 'x-ping')",
+                [],
+            )
+            .expect("insert the settings from before");
+        }
+        let store = Store::open(&db).expect("the database migrates");
+        assert_eq!(user_version(&store), schema::MIGRATIONS.len() as i64);
+        let settings = store.load_configuration().expect("load").settings;
+        assert_eq!(settings.awake, Some(false), "the row was kept");
+        assert_eq!(settings.ping_header.as_deref(), Some("x-ping"));
+        // Not set, which is off: a machine from before the switch pings
+        // nothing until the operator turns it on (spec: GPING#scope).
+        assert_eq!(settings.ping_schedule, None);
+    }
+
+    #[test]
+    fn a_store_still_at_its_path_is_not_replaced() {
+        let dir = test_dir("file-same");
+        let db = dir.join("toker.db");
+        let store = Store::open(&db).expect("open");
+        store.set_meta("probe", "written").expect("write");
+        assert_eq!(store.replaced(), None);
+        // Reopening the same file is not a replacement either.
+        drop(Store::open(&db).expect("reopen"));
+        assert_eq!(store.replaced(), None);
+    }
+
+    #[test]
+    fn a_store_whose_file_is_renamed_over_is_replaced() {
+        let dir = test_dir("file-other");
+        let db = dir.join("toker.db");
+        let store = Store::open(&db).expect("open");
+        let other = dir.join("other.db");
+        drop(Store::open(&other).expect("open another"));
+        std::fs::rename(&other, &db).expect("rename over");
+        assert_eq!(store.replaced(), Some(Replaced::OtherFile));
+    }
+
+    #[test]
+    fn a_store_whose_directory_is_gone_is_replaced() {
+        let dir = test_dir("file-missing");
+        let db = dir.join("state").join("toker.db");
+        let store = Store::open(&db).expect("open");
+        std::fs::remove_dir_all(dir.join("state")).expect("remove the state dir");
+        assert_eq!(store.replaced(), Some(Replaced::Missing));
+        // The service's successor creates a new store there, and the one
+        // still open does not take it for its own.
+        drop(Store::open(&db).expect("create anew"));
+        assert_eq!(store.replaced(), Some(Replaced::OtherFile));
+    }
+
+    #[test]
+    fn a_store_without_a_file_of_its_own_is_never_replaced() {
+        assert_eq!(mem_store().replaced(), None);
+        let dir = test_dir("file-read-only");
+        let db = dir.join("toker.db");
+        drop(Store::open(&db).expect("create"));
+        let reader = Store::open_read_only(&db).expect("open read-only");
+        std::fs::remove_file(&db).expect("remove");
+        assert_eq!(reader.replaced(), None);
+    }
+
+    #[test]
+    fn a_path_that_cannot_be_looked_up_is_not_a_replacement() {
+        let opened = FileId { dev: 1, ino: 2 };
+        assert_eq!(compare_file(opened, Ok(opened)), None);
+        assert_eq!(
+            compare_file(opened, Ok(FileId { dev: 1, ino: 3 })),
+            Some(Replaced::OtherFile)
+        );
+        assert_eq!(
+            compare_file(opened, Ok(FileId { dev: 4, ino: 2 })),
+            Some(Replaced::OtherFile)
+        );
+        assert_eq!(
+            compare_file(
+                opened,
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            ),
+            Some(Replaced::Missing)
+        );
+        assert_eq!(
+            compare_file(
+                opened,
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn opening_without_creating_leaves_a_missing_store_missing() {
+        let dir = test_dir("open-missing");
+        let db = dir.join("state").join("toker.db");
+        for opened in [Store::open_read_only(&db), Store::open_existing(&db)] {
+            assert!(opened.err().is_some_and(|error| error.is_missing_store()));
+        }
+        assert!(!db.exists(), "no file was created");
+        assert!(!dir.join("state").exists(), "no directory was created");
+    }
+
+    #[test]
+    fn opening_an_existing_store_writes_without_migrating() {
+        let dir = test_dir("open-existing");
+        let db = dir.join("toker.db");
+        {
+            let conn = Connection::open(&db).expect("open raw v1 db");
+            conn.execute_batch(schema::MIGRATIONS[0])
+                .expect("apply the v1 migration alone");
+            conn.pragma_update(None, "user_version", 1)
+                .expect("stamp v1");
+        }
+        let store = Store::open_existing(&db).expect("opens");
+        assert_eq!(user_version(&store), 1, "left at its own schema");
+        assert!(!store.schema_is_current().unwrap());
+        store.set_meta("probe", "written").expect("writes");
+        assert_eq!(store.get_meta("probe").unwrap().as_deref(), Some("written"));
     }
 
     #[test]

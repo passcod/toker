@@ -23,8 +23,8 @@ use super::InFlightGuard;
 use super::Server;
 use super::codex::{CodexFrontendWire, frontend_error_response};
 use super::proxy::{
-    ErrorWire, MAX_ERROR_BODY, buffer_up_to, is_compressed, is_event_stream, response_headers,
-    send_upstream_to, transport_failure, truncated_body, upstream_failure,
+    ErrorWire, MAX_ERROR_BODY, answers_stream_request, buffer_up_to, is_compressed,
+    response_headers, send_upstream_to, transport_failure, truncated_body, upstream_failure,
 };
 use super::record_anthropic::{
     AnthropicRecordCtx, record_codex_error, record_responses_measurement,
@@ -371,8 +371,20 @@ async fn forward(
             wants_stream,
         );
     }
-    if !is_event_stream(&headers) {
-        record_terminal_failure(record.as_ref(), status, "response_protocol");
+    if !answers_stream_request(&headers) {
+        if let Some(ctx) = record.as_ref() {
+            record_codex_error(
+                ctx,
+                status.as_u16(),
+                "response_protocol",
+                &format!(
+                    "OpenRouter Responses did not stream ({})",
+                    super::proxy::content_type_detail(&headers)
+                ),
+                None,
+                "openai_responses",
+            );
+        }
         return upstream_failure(ErrorWire::Openai, "OpenRouter Responses did not stream");
     }
     if wants_stream {

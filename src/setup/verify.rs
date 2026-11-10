@@ -29,6 +29,9 @@
 //!   stands and relays the upstream's 404 — exactly what a frontend
 //!   patched to that prefix would then get on every request. Only a
 //!   toker that strips the prefix answers its own status there.
+//! - [`Check::Listener`] — toker's own status on the bare listener, for
+//!   a machine where no other check applies: no provider is enabled,
+//!   so no usage path can answer, and no frontend has a prefix.
 //!
 //! What does NOT count as an answer: toker's own synthetic failure
 //! statuses (see [`TOKER_OWN_STATUSES`]) — the listener being up while
@@ -66,6 +69,10 @@ pub enum Check {
     Usage(String),
     /// toker's own status endpoint must answer under `/f/<this name>`.
     Prefix(String),
+    /// toker's own status endpoint must answer on the bare listener. The
+    /// check for a machine with no provider enabled and no prefixed
+    /// frontend, where nothing else can show the listener is up.
+    Listener,
 }
 
 impl Check {
@@ -74,6 +81,7 @@ impl Check {
         match self {
             Check::Usage(path) => path.clone(),
             Check::Prefix(name) => format!("/f/{name}/_toker/status"),
+            Check::Listener => "/_toker/status".to_owned(),
         }
     }
 
@@ -82,6 +90,7 @@ impl Check {
         match self {
             Check::Usage(path) => format!("POST {path}"),
             Check::Prefix(name) => format!("the /f/{name} prefix"),
+            Check::Listener => "the listener".to_owned(),
         }
     }
 }
@@ -168,6 +177,7 @@ enum Seen {
     TokerOwn(u16),
     NotConfigured(String),
     NoPrefix(u16),
+    NotToker(u16),
     Unreachable,
 }
 
@@ -178,7 +188,7 @@ async fn probe(client: &reqwest::Client, base: &str, check: &Check) -> Probe {
         Check::Usage(_) => client.post(&url).body(String::new()),
         // The control header names the operation, as the endpoint
         // requires; without it the answer is a 403, not a status.
-        Check::Prefix(_) => client.get(&url).header("x-toker-control", "status"),
+        Check::Prefix(_) | Check::Listener => client.get(&url).header("x-toker-control", "status"),
     };
     let Ok(response) = request.send().await else {
         return Probe::Not(Seen::Unreachable);
@@ -195,8 +205,9 @@ async fn probe(client: &reqwest::Client, base: &str, check: &Check) -> Probe {
                 Probe::Answered(status)
             }
         }
-        Check::Prefix(_) if status == 200 => Probe::Answered(status),
+        Check::Prefix(_) | Check::Listener if status == 200 => Probe::Answered(status),
         Check::Prefix(_) => Probe::Not(Seen::NoPrefix(status)),
+        Check::Listener => Probe::Not(Seen::NotToker(status)),
     }
 }
 
@@ -215,6 +226,9 @@ fn describe(answered: Option<u16>, last: &Option<Seen>) -> String {
                 "answered {status}, not toker's status — the running toker does not strip \
                  the prefix (an older build still serving? restart toker.service)"
             ),
+            Some(Seen::NotToker(status)) => {
+                format!("answered {status}, not toker's status — is something else on this port?")
+            }
             _ => "no response".to_owned(),
         },
     }
@@ -252,7 +266,8 @@ mod tests {
             .route(
                 "/f/{name}/_toker/status",
                 get(move || async move { status }),
-            );
+            )
+            .route("/_toker/status", get(|| async { StatusCode::OK }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind scratch");
@@ -263,6 +278,24 @@ mod tests {
                 .expect("the scratch server serves");
         });
         (port, handle)
+    }
+
+    #[tokio::test]
+    async fn the_listener_check_wants_tokers_own_status() {
+        let (port, _server) =
+            scratch_server(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED, true).await;
+        let ready = await_service_ready(port, &[Check::Listener], Duration::from_secs(5))
+            .await
+            .expect("the listener answers");
+        assert_eq!(ready.answers, vec![(Check::Listener, 200)]);
+
+        let error = await_service_ready(dropped_port(), &[Check::Listener], POLL * 2)
+            .await
+            .expect_err("nothing listens there");
+        assert!(
+            format!("{error:#}").contains("the listener: no response"),
+            "{error:#}"
+        );
     }
 
     /// A port with nothing on it (bound then dropped).

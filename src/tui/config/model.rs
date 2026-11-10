@@ -82,6 +82,10 @@ pub(super) struct Settings {
     pub(super) cold_min_tokens: Option<u64>,
     pub(super) cold_idle_min: Option<f64>,
     pub(super) awake: Option<bool>,
+    /// Not shown on any page yet, but carried back whole: the settings
+    /// edit replaces the row, so a page that dropped it would turn the
+    /// schedule off with every other settings change.
+    pub(super) ping_schedule: Option<bool>,
     pub(super) ping_header: Option<String>,
     pub(super) notice_default: Option<String>,
     pub(super) session_headers: Option<Vec<String>>,
@@ -1122,6 +1126,7 @@ fn settings_body(settings: &Settings) -> Value {
         "cold_min_tokens": settings.cold_min_tokens,
         "cold_idle_min": settings.cold_idle_min,
         "awake": settings.awake,
+        "ping_schedule": settings.ping_schedule,
         "ping_header": settings.ping_header,
         "notice_default": settings.notice_default,
         "session_headers": settings.session_headers,
@@ -1165,6 +1170,7 @@ fn parse_snapshot(body: &Value) -> Snapshot {
             cold_min_tokens: settings.get("cold_min_tokens").and_then(Value::as_u64),
             cold_idle_min: settings.get("cold_idle_min").and_then(Value::as_f64),
             awake: flag("awake"),
+            ping_schedule: flag("ping_schedule"),
             ping_header: text_of(&settings, "ping_header"),
             notice_default: text_of(&settings, "notice_default"),
             session_headers: names(&settings, "session_headers"),

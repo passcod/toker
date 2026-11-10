@@ -94,12 +94,13 @@ pub const EXIT_ROWS_UNATTRIBUTED: i32 = 79;
 ///
 /// A store that cannot be opened or read is not a refusal. The command is
 /// about to fail on its own terms, with a better account of why than this
-/// could give.
+/// could give. The store is only read (spec: STORE#opening-the-store), and
+/// one not there yet holds no rows to refuse over.
 pub fn refuse_while_rows_are_unattributed() -> anyhow::Result<()> {
     let Ok(path) = crate::config::store_path() else {
         return Ok(());
     };
-    let Ok(store) = crate::store::Store::open(&path) else {
+    let Ok(store) = crate::store::Store::open_read_only(&path) else {
         return Ok(());
     };
     let Ok(rows) = store.unattributed_row_count(ACCOUNTED_PROVIDER) else {

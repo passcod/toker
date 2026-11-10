@@ -1,5 +1,6 @@
 ---
 source: src/tui/routing/view.rs
+assertion_line: 1148
 expression: text
 ---
  ?   dashboard   routing   config   accounts   1 presentations → 2 rewrites 14 → 3 defaults ›       editing · rev 9 live
@@ -10,9 +11,8 @@ expression: text
 │ │  2  anthropic_sub/${model}           → claude-sub                                no cred · billed fallback      ≥1 │
 │     ┌ new rewrite                                                                                                    │
 │     │ revision 12 is now live; your edit is kept as you entered it                                                   │
-│     │ > id: new-rewrite▏                                                                                             │
 │     │   SCOPE                                                                                                        │
-│     │     kind: < protocol >                                                                                         │
+│     │ >   kind: < protocol >                                                                                         │
 │     │     protocol: < anthropic_messages >                                                                           │
 │     │   priority: 0                                                                                                  │
 │     │   MATCHES                                                                                                      │
@@ -21,6 +21,9 @@ expression: text
 │     │   ROUTE                                                                                                        │
 │     │     route: claude-sub                 2 candidates · anthropic_sub → openrouter                                │
 │     │     ARGUMENTS                                                                                                  │
+│     │       name: requested_model                                                                                    │
+│     │         VALUE                                                                                                  │
+│     │           kind: < requested_model >                                                                            │
 │     │       + add argument                                                                                           │
 │     └ [ctrl+s] save onto rev 12   [esc] cancel                                                                       │
 │ │  3  anthropic_api/${model}           → claude-api                                off                             - │

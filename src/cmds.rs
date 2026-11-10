@@ -24,8 +24,11 @@ use anyhow::bail;
 /// `serve`: config → store → server, with tracing on.
 pub async fn serve() -> anyhow::Result<()> {
     init_tracing();
-    let config = Config::load()?;
-    let store = Arc::new(Store::open(&config.db_path)?);
+    let (config, store) = Config::open_for_service()?;
+    let store = Arc::new(store);
+    // spec: GPING#scope — the service brings the marker in line when it
+    // starts, so a store edited while it was down still switches the jobs.
+    crate::server::sync_ping_marker(&config);
     tracing::info!(db = %config.db_path.display(), "serving");
     Server::new(config, store)?.serve().await
 }
@@ -84,14 +87,29 @@ fn hand_off_to_dashboard() -> anyhow::Result<()> {
 /// `status`: the resolved config (sans secrets) plus ledger summary.
 pub fn status() -> anyhow::Result<()> {
     let config = Config::load()?;
-    let store = Store::open(&config.db_path)?;
+    // Read-only (spec: STORE#opening-the-store); a store not there yet is a
+    // machine the service has not started on.
+    let store = match Store::open_read_only(&config.db_path) {
+        Ok(store) => Some(store),
+        Err(error) if error.is_missing_store() => None,
+        Err(error) => return Err(error.into()),
+    };
 
-    let routing_state = store.load_routing_policy_state()?;
+    let active_revision_id = match &store {
+        Some(store) => store.load_routing_policy_state()?.active_revision_id,
+        None => None,
+    };
     println!("port: {}", config.port);
-    println!("db: {}", config.db_path.display());
+    match &store {
+        Some(_) => println!("db: {}", config.db_path.display()),
+        None => println!(
+            "db: {} (not created yet: the service creates it when it starts)",
+            config.db_path.display()
+        ),
+    }
     println!(
         "routing: {}",
-        routing_state.active_revision_id.map_or_else(
+        active_revision_id.map_or_else(
             || "no active revision yet (the service creates revision one from this config)"
                 .to_owned(),
             |revision| format!("active revision {revision}")
@@ -103,7 +121,7 @@ pub fn status() -> anyhow::Result<()> {
     );
     // Before the first start, the config's defaults are what revision one
     // will be generated from; afterwards the revision owns routing.
-    if routing_state.active_revision_id.is_none() {
+    if active_revision_id.is_none() {
         println!(
             "default backend (anthropic): {}",
             config
@@ -160,6 +178,9 @@ pub fn status() -> anyhow::Result<()> {
         );
     }
 
+    let Some(store) = store else {
+        return Ok(());
+    };
     let rows = store.count_logical_requests()?;
     println!("requests: {rows}");
     match store.requests_since(0, 1)?.pop() {
@@ -454,7 +475,7 @@ pub fn promote_run(
     if model.trim().is_empty() {
         bail!("the model identity is blank");
     }
-    let store = Store::open(&config.db_path)?;
+    let store = Store::open_existing(&config.db_path)?;
     let matching = store.load_binding_learnings_for_model(model)?;
     let binding = match (&opts.binding, matching.as_slice()) {
         (Some(binding), _) => binding.clone(),
@@ -823,15 +844,18 @@ pub fn wait_arg(text: &str) -> Result<std::time::Duration, String> {
 /// `toker restart`: wait for the running toker to go quiet, ask it to
 /// drain and exit, and wait for systemd to start the next one.
 pub fn restart(max_wait: Option<std::time::Duration>, now: bool) -> anyhow::Result<()> {
-    let config = Config::load()?;
+    // The port alone: after `cargo install` the store may still have the
+    // schema of the binary this restart replaces, which only the new
+    // service migrates.
+    let port = crate::config::listener_port()?;
     let pacing = Pacing::REAL;
-    let control = HttpControl::new(config.port, pacing.request_timeout)?;
+    let control = HttpControl::new(port, pacing.request_timeout)?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
         .block_on(restart_run(
             &control,
-            config.port,
+            port,
             &RestartOpts { max_wait, now },
             &pacing,
             &mut std::io::stdout(),
@@ -1087,7 +1111,8 @@ pub async fn restart_run(
 
 /// `wake-arm`: a documented no-op — on Linux, wake is owned by the
 /// systemd system timer (`WakeSystem=true`), which `toker setup`
-/// installs and enables. The predecessor's one-shot `pmset schedule
+/// writes and the dashboard places in the system manager when the ping
+/// schedule is turned on. The predecessor's one-shot `pmset schedule
 /// wake` was macOS-only and has no counterpart here; the wizard never
 /// installs anything for this verb.
 pub fn wake_arm() -> anyhow::Result<()> {

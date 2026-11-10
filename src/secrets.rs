@@ -1,15 +1,16 @@
 //! API keys handed to toker, kept in the OS keyring.
 //!
-//! The setup wizard writes a key here when the operator chooses "give it
-//! to toker"; the service reads it once at startup. Both sides go through
-//! [`SecretStore`] so no test ever touches the real keyring: the wizard's
-//! tests and the server's inject a map-backed store instead.
+//! The operator puts a key there; the setup wizard only asks whether an
+//! entry exists, and the service reads it once at startup. Both sides go
+//! through [`SecretStore`] so no test ever touches the real keyring: the
+//! wizard's tests and the server's inject a map-backed store instead.
 //!
 //! spec: SEC#a-credential-is-never-logged-or-displayed (credentials): a key read here only ever becomes the
 //! provider's injected credential. It is never logged, and the errors
 //! below name the account, never the value.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -30,8 +31,8 @@ pub trait SecretStore: Send + Sync {
     /// The stored secret for `account`, `Ok(None)` when there is no entry.
     fn get(&self, account: &str) -> anyhow::Result<Option<String>>;
 
-    /// Store `secret` for `account`, replacing any earlier one.
-    fn set(&self, account: &str, secret: &str) -> anyhow::Result<()>;
+    /// Whether `account` has an entry, found without reading its secret.
+    fn exists(&self, account: &str) -> anyhow::Result<bool>;
 }
 
 /// The real keyring: the platform's own store (the Secret Service on
@@ -51,10 +52,21 @@ impl SecretStore for OsKeyring {
         }
     }
 
-    fn set(&self, account: &str, secret: &str) -> anyhow::Result<()> {
-        keyring::Entry::new(KEYRING_SERVICE, account)
-            .and_then(|entry| entry.set_password(secret))
-            .with_context(|| format!("writing the keyring entry {KEYRING_SERVICE}/{account}"))
+    fn exists(&self, account: &str) -> anyhow::Result<bool> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, account)
+            .with_context(|| format!("opening the keyring entry {KEYRING_SERVICE}/{account}"))?;
+        // Finding the credential searches the store by the entry's
+        // attributes and hands back a handle to it, without fetching the
+        // secret: setup asks only whether a key is there, and must not read
+        // it (spec: USETUP#writing). Several matching entries still mean
+        // one exists.
+        match entry.inner.get_credential() {
+            Ok(_) | Err(keyring::Error::Ambiguous(_)) => Ok(true),
+            Err(keyring::Error::NoEntry) => Ok(false),
+            Err(error) => Err(anyhow::Error::new(error).context(format!(
+                "looking up the keyring entry {KEYRING_SERVICE}/{account}"
+            ))),
+        }
     }
 }
 
@@ -108,6 +120,7 @@ pub fn read_key(
 /// for the map stands for "no secret service": every call fails.
 pub struct MemoryStore {
     entries: std::sync::Mutex<Option<std::collections::BTreeMap<String, String>>>,
+    reads: AtomicUsize,
 }
 
 impl MemoryStore {
@@ -115,6 +128,7 @@ impl MemoryStore {
     pub fn new() -> MemoryStore {
         MemoryStore {
             entries: std::sync::Mutex::new(Some(Default::default())),
+            reads: AtomicUsize::new(0),
         }
     }
 
@@ -122,16 +136,26 @@ impl MemoryStore {
     pub fn unavailable() -> MemoryStore {
         MemoryStore {
             entries: std::sync::Mutex::new(None),
+            reads: AtomicUsize::new(0),
         }
     }
 
-    /// The stored secret, for assertions.
-    pub fn peek(&self, account: &str) -> Option<String> {
-        self.entries
+    /// How many times a secret was asked for, so a test can show that a
+    /// caller only checking for an entry never read one.
+    pub fn reads(&self) -> usize {
+        self.reads.load(Ordering::Relaxed)
+    }
+
+    /// Seed `secret` for `account`, standing for a key the operator put
+    /// in the keyring. Does nothing on a store with no secret service.
+    pub fn insert(&self, account: &str, secret: &str) {
+        if let Some(entries) = &mut *self
+            .entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .and_then(|entries| entries.get(account).cloned())
+        {
+            entries.insert(account.to_owned(), secret.to_owned());
+        }
     }
 }
 
@@ -143,6 +167,7 @@ impl Default for MemoryStore {
 
 impl SecretStore for MemoryStore {
     fn get(&self, account: &str) -> anyhow::Result<Option<String>> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
         match &*self
             .entries
             .lock()
@@ -153,16 +178,13 @@ impl SecretStore for MemoryStore {
         }
     }
 
-    fn set(&self, account: &str, secret: &str) -> anyhow::Result<()> {
-        match &mut *self
+    fn exists(&self, account: &str) -> anyhow::Result<bool> {
+        match &*self
             .entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
         {
-            Some(entries) => {
-                entries.insert(account.to_owned(), secret.to_owned());
-                Ok(())
-            }
+            Some(entries) => Ok(entries.contains_key(account)),
             None => anyhow::bail!("no secret service"),
         }
     }
@@ -182,15 +204,15 @@ mod tests {
             Ok(Some("late".to_owned()))
         }
 
-        fn set(&self, _account: &str, _secret: &str) -> anyhow::Result<()> {
-            Ok(())
+        fn exists(&self, _account: &str) -> anyhow::Result<bool> {
+            Ok(true)
         }
     }
 
     #[test]
     fn every_keyring_failure_reads_as_no_key() {
         let store = Arc::new(MemoryStore::new());
-        store.set("openrouter", "sk-test").expect("set");
+        store.insert("openrouter", "sk-test");
         assert_eq!(
             read_key(store.clone(), "openrouter", KEYRING_READ_TIMEOUT).as_deref(),
             Some("sk-test")

@@ -33,28 +33,23 @@
 //! ([`patchers`]). A fully-wired machine re-run detects everything,
 //! changes nothing, and says so.
 //!
-//! Credentials (spec: SEC#a-credential-is-never-logged-or-displayed): a pasted key goes only into the OS keyring
-//! ([`SecretStore`] — tests inject a map) or, when there is none, the
-//! 0600 `toker.toml` — never into a prompt message, never into the
-//! wizard's output, never into a unit file. Tests pin the rule with a
-//! scripted key and an output scan.
+//! Credentials (spec: USETUP#writing): the wizard never asks for one. On
+//! a machine configured with no provider it enables codex_sub where the
+//! codex login is, and each provider with an entry in the OS keyring
+//! ([`SecretStore`] — tests inject a map), asking the keyring only
+//! whether the entry exists, never for its value.
 //!
-//! The wake/hold/ping timers are a
-//! real offer in the toggles step: a yes/no defaulting to what is
-//! installed, then a free-form `hh:mm` slot list (strictly validated;
-//! the default is the installed slots, else [`DEFAULT_SLOTS`]), the hold
-//! and per-slot ping USER units through the ordinary user-manager
-//! path, and the wake SYSTEM timer with the do-nothing service it
-//! starts — the only root-level pieces — staged into the units dir and
-//! linked and enabled by path through
-//! [`SystemRunner::systemctl_system`], which production runs as
-//! `sudo systemctl` (it says so first: sudo will be asked). Every
-//! timers failure is non-fatal with manual commands printed — a
-//! machine that never sleeps-or-wakes still pings fine while up. A no
-//! removes whatever an earlier run installed, and a changed slot list
-//! retires the ping timers of the slots it dropped. Without the
-//! anthropic subscription enabled the question is not asked at all and
-//! any installed timers are removed as a no would.
+//! The wake/hold/ping timers are installed on every run, unasked
+//! (spec: USETUP#installing-units). The hold and per-slot ping USER units
+//! go through the ordinary user-manager path and are enabled at once: their
+//! services wait on the marker the service keeps
+//! ([`timers::sync_ping_marker`]), so nothing runs until the ping schedule
+//! is turned on. They carry the slots an earlier run installed, else
+//! [`DEFAULT_SLOTS`]. The wake SYSTEM timer and the do-nothing service it
+//! starts are written into the units dir and no further: placing them in
+//! the system manager needs elevation, which the dashboard asks for when
+//! the schedule is turned on, so setup never reaches the system manager.
+//! Every timers failure is non-fatal with manual commands printed.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -64,13 +59,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use crate::config::{
-    ANTHROPIC_BACKENDS, Config, DEFAULT_ANTHROPIC_API_KEY_ENV, DEFAULT_OPENAI_API_KEY_ENV,
-    DEFAULT_OPENROUTER_API_KEY_ENV, DEFAULT_PORT, OPENAI_CHAT_BACKENDS,
-};
+use crate::config::{ANTHROPIC_BACKENDS, Config, DEFAULT_PORT, OPENAI_CHAT_BACKENDS};
 use crate::import::{self, ImportOpts};
 use crate::routing::ProtocolId;
-use crate::secrets::SecretStore;
+use crate::secrets::{KEYRING_SERVICE, SecretStore};
 use crate::setup::atomic::atomic_write_bytes;
 use crate::setup::patchers::{self, Frontend};
 use crate::setup::plugin;
@@ -87,13 +79,13 @@ pub const SOCKET_UNIT: &str = "toker.socket";
 pub const SERVICE_UNIT: &str = "toker.service";
 
 /// The wake SYSTEM timer's name —
-/// the only root-level piece. Staged into the user units dir (the one
-/// place the wizard can write without root) and enabled by path into
-/// the system manager through sudo; `WakeSystem=true` needs
-/// `CAP_WAKE_ALARM`, which the user manager lacks.
+/// the only root-level piece. Staged into the user units dir, the one
+/// place setup can write without root; it belongs in the system manager
+/// because `WakeSystem=true` needs `CAP_WAKE_ALARM`, which the user
+/// manager lacks, and setup leaves placing it there to the dashboard.
 pub const WAKE_TIMER_UNIT: &str = "toker-wake.timer";
 
-/// The service the wake timer starts — staged and linked beside it.
+/// The service the wake timer starts — staged beside it.
 /// A timer with no unit to activate is refused by systemd, so without
 /// this the wake timer never armed at all: the first install shipped
 /// the timer alone.
@@ -114,7 +106,7 @@ pub const PICKER_TIMER_UNIT: &str = "toker-picker.timer";
 /// The picker USER service, which the timer starts and setup runs once.
 pub const PICKER_SERVICE_UNIT: &str = "toker-picker.service";
 
-/// The slots offered when no earlier run left any: the predecessor's
+/// The slots installed when no earlier run left any: the predecessor's
 /// schedule. A slot is the wake and hold, and its ping fires
 /// [`PING_DELAY_MINUTES`] later: 07:20's ping at 07:31 anchors its
 /// window on floor(07:31, 10 min) = 07:30, ending 12:30, and 12:20's
@@ -122,55 +114,31 @@ pub const PICKER_SERVICE_UNIT: &str = "toker-picker.service";
 /// morning, re-opened after lunch).
 pub const DEFAULT_SLOTS: &str = "07:20, 12:20";
 
-/// The wake/hold/ping units an earlier run left in the units dir — the
-/// wake pair is staged there too, so its presence stands for the
-/// system install.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct InstalledTimers {
-    hold: bool,
-    /// The slots of the per-slot ping timers, `hh:mm`, sorted.
-    ping_slots: Vec<String>,
-    wake_timer: bool,
-    wake_service: bool,
-}
-
-impl InstalledTimers {
-    /// Read the units dir. Unreadable is none installed: the dir is
-    /// created by the first install, so a fresh machine has none.
-    fn read(units_dir: &Path) -> InstalledTimers {
-        let mut found = InstalledTimers::default();
-        let Ok(entries) = std::fs::read_dir(units_dir) else {
-            return found;
-        };
-        for entry in entries.flatten() {
+/// The slots of the per-slot ping timers an earlier run left in the units
+/// dir, `hh:mm`, sorted. Unreadable is none installed: the dir is created
+/// by the first install, so a fresh machine has none.
+fn installed_ping_slots(units_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(units_dir) else {
+        return Vec::new();
+    };
+    let mut slots: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            // toker-ping-HHMM.timer, the stem's colon munged away (see
+            // ping_unit_stem).
             let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            match name {
-                HOLD_TIMER_UNIT => found.hold = true,
-                WAKE_TIMER_UNIT => found.wake_timer = true,
-                WAKE_SERVICE_UNIT => found.wake_service = true,
-                _ => {
-                    // toker-ping-HHMM.timer, the stem's colon munged
-                    // away (see ping_unit_stem).
-                    let slot = name
-                        .strip_prefix("toker-ping-")
-                        .and_then(|rest| rest.strip_suffix(".timer"))
-                        .filter(|hhmm| hhmm.len() == 4 && hhmm.is_char_boundary(2))
-                        .map(|hhmm| format!("{}:{}", &hhmm[..2], &hhmm[2..]))
-                        .filter(|slot| timers::parse_slot(slot).is_some());
-                    if let Some(slot) = slot {
-                        found.ping_slots.push(slot);
-                    }
-                }
-            }
-        }
-        found.ping_slots.sort();
-        found
-    }
-
-    fn any(&self) -> bool {
-        self.hold || self.wake_timer || self.wake_service || !self.ping_slots.is_empty()
-    }
+            let hhmm = name
+                .to_str()?
+                .strip_prefix("toker-ping-")?
+                .strip_suffix(".timer")?
+                .to_owned();
+            (hhmm.len() == 4 && hhmm.is_char_boundary(2))
+                .then(|| format!("{}:{}", &hhmm[..2], &hhmm[2..]))
+                .filter(|slot| timers::parse_slot(slot).is_some())
+        })
+        .collect();
+    slots.sort();
+    slots
 }
 
 /// How long [`Step::VerifyService`] waits for the listener to answer
@@ -187,24 +155,13 @@ pub trait Prompt {
     /// preselected answer.
     fn select(&mut self, message: &str, options: &[&str], default: Option<usize>) -> Result<usize>;
 
-    /// Pick any of `options`; `defaults` are the indices offered
-    /// ticked. Returns the ticked indices, ascending.
-    fn multi_select(
-        &mut self,
-        message: &str,
-        options: &[&str],
-        defaults: &[usize],
-    ) -> Result<Vec<usize>>;
-
     /// A yes/no, with `default` as the suggested answer.
     fn confirm(&mut self, message: &str, default: bool) -> Result<bool>;
 
     /// A free-text answer. An empty answer means "take the default"
     /// when one is given (the wizard resolves empties itself, so the
-    /// real UI and the fake agree). `secret: true` is key entry: the
-    /// real UI renders a password prompt and never echoes the answer;
-    /// the wizard stores it but never prints it (spec: SEC#a-credential-is-never-logged-or-displayed).
-    fn text(&mut self, message: &str, default: Option<&str>, secret: bool) -> Result<String>;
+    /// real UI and the fake agree).
+    fn text(&mut self, message: &str, default: Option<&str>) -> Result<String>;
 }
 
 /// The real prompt UI: inquire.
@@ -223,33 +180,13 @@ impl Prompt for InquirePrompt {
             .expect("inquire returns one of the offered options"))
     }
 
-    fn multi_select(
-        &mut self,
-        message: &str,
-        options: &[&str],
-        defaults: &[usize],
-    ) -> Result<Vec<usize>> {
-        let answer = inquire::MultiSelect::new(message, options.to_vec())
-            .with_default(defaults)
-            .raw_prompt()?;
-        let mut ticked: Vec<usize> = answer.iter().map(|option| option.index).collect();
-        ticked.sort_unstable();
-        Ok(ticked)
-    }
-
     fn confirm(&mut self, message: &str, default: bool) -> Result<bool> {
         Ok(inquire::Confirm::new(message)
             .with_default(default)
             .prompt()?)
     }
 
-    fn text(&mut self, message: &str, default: Option<&str>, secret: bool) -> Result<String> {
-        if secret {
-            // A key is entered masked; inquire's Password takes no
-            // default (an echoed default would be the key-echo the
-            // rule forbids).
-            return Ok(inquire::Password::new(message).prompt()?);
-        }
+    fn text(&mut self, message: &str, default: Option<&str>) -> Result<String> {
         let mut question = inquire::Text::new(message);
         if let Some(default) = default {
             question = question.with_default(default);
@@ -265,12 +202,6 @@ pub trait SystemRunner {
     /// Run `systemctl --user <args>` to completion.
     fn systemctl_user(&self, args: &[&str]) -> Result<Output>;
 
-    /// Run `systemctl <args>` against the SYSTEM manager, as root —
-    /// production goes through `sudo systemctl` (say so before
-    /// calling: sudo will ask). The wake pair's link, enable and
-    /// disable are the only calls the wizard makes here.
-    fn systemctl_system(&self, args: &[&str]) -> Result<Output>;
-
     /// Ask the installed binary to replace the running service through
     /// its draining control endpoint. A setup re-run may have changed the
     /// config or unit while the old process still holds both in memory;
@@ -281,10 +212,6 @@ pub trait SystemRunner {
     /// written. Declarative: the same contents install cleanly over an
     /// earlier install of the same unit.
     fn install_unit(&self, name: &str, contents: &str) -> Result<PathBuf>;
-
-    /// Remove a unit file from the user units dir. A file already gone
-    /// is success: the goal is its absence.
-    fn remove_unit(&self, name: &str) -> Result<()>;
 }
 
 /// The real runner: `systemctl --user` via std::process, unit files
@@ -310,16 +237,6 @@ impl SystemRunner for ProcessRunner {
             .with_context(|| format!("running systemctl --user {}", args.join(" ")))
     }
 
-    fn systemctl_system(&self, args: &[&str]) -> Result<Output> {
-        // sudo, so the wizard says so before every call: the wake
-        // pair is the only root-level thing toker touches.
-        std::process::Command::new("sudo")
-            .arg("systemctl")
-            .args(args)
-            .output()
-            .with_context(|| format!("running sudo systemctl {}", args.join(" ")))
-    }
-
     fn graceful_restart(&self, exe: &Path) -> Result<ExitStatus> {
         // Keep stdio attached: `toker restart` may wait for a quiet moment,
         // and its progress (including the Ctrl-C promise) must stay visible.
@@ -340,16 +257,6 @@ impl SystemRunner for ProcessRunner {
             Ok(())
         })?;
         Ok(path)
-    }
-
-    fn remove_unit(&self, name: &str) -> Result<()> {
-        let path = self.units_dir.join(name);
-        match std::fs::remove_file(&path) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                Err(error).with_context(|| format!("removing {}", path.display()))
-            }
-            _ => Ok(()),
-        }
     }
 }
 
@@ -414,6 +321,7 @@ impl Paths {
         // for every other process, and a setup that wrote the XDG one
         // anyway would leave its rows where nothing reads them.
         let store = crate::config::store_path()?;
+        let codex_auth = crate::config::default_codex_auth_path();
         Ok(Paths {
             config_toml: crate::config::config_path()?,
             units_dir: config_home.join("systemd").join("user"),
@@ -422,8 +330,10 @@ impl Paths {
             opencode_config: config_home.join("opencode").join("opencode.json"),
             shell_rcs: vec![home.join(".bashrc"), home.join(".zshrc")],
             ctp_usage: data_home.join("claude-token-proxy").join("usage.jsonl"),
-            codex_auth: home.join(".codex").join("auth.json"),
-            codex_config: home.join(".codex").join("config.toml"),
+            // The service's own resolution, CODEX_HOME included, so the
+            // directory the unit lets it write is the one it refreshes in.
+            codex_config: codex_auth.with_file_name("config.toml"),
+            codex_auth,
             state_dir: store
                 .parent()
                 .map(Path::to_path_buf)
@@ -504,8 +414,8 @@ WantedBy=sockets.target
 /// of which `%h` can express).
 ///
 /// `extra_writable` are directories outside the state dir the service
-/// must write: the codex login's, when codex_sub is enabled, because a
-/// refresh persists the new tokens by renaming over `auth.json` there.
+/// must write: the codex login's, because a refresh persists the new
+/// tokens by renaming over `auth.json` there.
 /// Under `ProtectHome=read-only` that rename failed, so every refresh
 /// was lost and the next start refreshed again from the stale token.
 /// Each is `-`-prefixed: a missing one is skipped, where a missing state
@@ -575,13 +485,14 @@ MemoryDenyWriteExecute=true
     )
 }
 
-/// The directories outside the state dir that `config`'s backends write
-/// (see [`service_unit`]).
-pub fn extra_writable(config: &Config) -> Vec<PathBuf> {
-    config
-        .codex_sub
-        .as_ref()
-        .and_then(|codex| codex.auth_path.parent())
+/// The directories outside the state dir the service may write (see
+/// [`service_unit`]). The codex login's is there whether or not codex_sub
+/// is enabled, since it is turned on from the dashboard without setup
+/// running again (spec: DCONF#the-one-write-outside-it).
+pub fn extra_writable(paths: &Paths) -> Vec<PathBuf> {
+    paths
+        .codex_auth
+        .parent()
         .map(Path::to_path_buf)
         .into_iter()
         .collect()
@@ -608,8 +519,8 @@ Description=toker wake timer (wakes the machine at the chosen slots)
 [Timer]
 # The only root-level piece toker installs: WakeSystem=true needs
 # CAP_WAKE_ALARM, which the user manager lacks, so this unit belongs to
-# the system manager and `toker setup` enables it through sudo. Wakes
-# from suspend only — a machine that is powered off stays off.
+# the system manager. Wakes from suspend only — a machine that is
+# powered off stays off.
 WakeSystem=true
 {on_calendar}# A missed wake is not worth honouring late: the ping would refuse its
 # slot anyway, and a wake at an arbitrary hour is what this avoids. To
@@ -649,8 +560,9 @@ ExecStart=/bin/true
 /// machine is suspended fires on resume, and the hold then keeps the
 /// machine up those 15 minutes so the ping (11 m after the slot) can
 /// fire; `Persistent=false` keeps a missed slot from re-running hours
-/// late — the ping's own lateness guard refuses those anyway.
-pub fn hold_user_units(slots: &[String], exe: &Path) -> (String, String) {
+/// late — the ping's own lateness guard refuses those anyway. The service
+/// runs only while the marker in `state_dir` is there (spec: GPING#scope).
+pub fn hold_user_units(slots: &[String], exe: &Path, state_dir: &Path) -> (String, String) {
     let mut on_calendar = String::new();
     for slot in slots {
         on_calendar.push_str(&format!("OnCalendar=Mon..Fri {slot}\n"));
@@ -678,6 +590,11 @@ WantedBy=timers.target
     let service = format!(
         r#"[Unit]
 Description=toker hold service (holds the idle-sleep lock for its span)
+# Only while the schedule is on and a provider that anchors its windows
+# is enabled: toker keeps the marker, so the dashboard switches this
+# without elevation. On the service, not the timer, whose condition is
+# read once when it starts.
+ConditionPathExists={marker}
 
 [Service]
 Type=oneshot
@@ -689,6 +606,7 @@ TimeoutStartSec=0
 ExecStart="{exe}" hold --for={HOLD_UNIT_FOR}
 "#,
         exe = exe.display(),
+        marker = timers::ping_marker(state_dir).display(),
     );
     (timer, service)
 }
@@ -754,8 +672,10 @@ pub struct PingUnits {
 /// service running the ping verb **for that slot**. Per-slot because
 /// the `--slot` argument must match its timer's clock time: a shared
 /// service cannot know which slot fired. The slots must already be
-/// validated `hh:mm` (the wizard validates before calling).
-pub fn ping_user_units(slots: &[String], exe: &Path) -> Vec<PingUnits> {
+/// validated `hh:mm` (the wizard validates before calling). Each service
+/// runs only while the marker in `state_dir` is there (spec: GPING#scope).
+pub fn ping_user_units(slots: &[String], exe: &Path, state_dir: &Path) -> Vec<PingUnits> {
+    let marker = timers::ping_marker(state_dir);
     slots
         .iter()
         .filter_map(|slot| {
@@ -792,6 +712,9 @@ WantedBy=timers.target
             let service = format!(
                 r#"[Unit]
 Description=toker ping service (opens the {slot} quota window)
+# As for the hold: only while toker keeps the marker, and on the service
+# rather than the timer.
+ConditionPathExists={marker}
 
 [Service]
 Type=oneshot
@@ -807,6 +730,7 @@ TimeoutStartSec=3m
 ExecStart="{exe}" ping-window --slot={slot}
 "#,
                 exe = exe.display(),
+                marker = marker.display(),
             );
             Some(PingUnits {
                 slot: slot.clone(),
@@ -889,11 +813,14 @@ fn protocol_enabled(config: &Config, protocol: ProtocolId) -> bool {
     }
 }
 
-/// What verify must see answer before the frontends step: for each
-/// protocol with a backend, the usage path of every detected frontend
-/// that speaks it, through the very prefix it will be pointed at, plus
-/// that prefix reaching toker itself ([`verify::Check::Prefix`]); the
-/// bare usage path when no frontend of the protocol was detected.
+/// What verify must see answer before the frontends step: every detected
+/// frontend's prefix reaching toker itself ([`verify::Check::Prefix`]);
+/// for each protocol with a provider, the usage path of every detected
+/// frontend that speaks it, through the very prefix it will be pointed
+/// at, or the bare usage path when no frontend of the protocol was
+/// detected. A protocol with no provider has no usage path to probe, as
+/// toker answers it as not configured, so where nothing else applies the
+/// bare listener's status stands in ([`verify::Check::Listener`]).
 fn verify_checks(config: &Config, detected: &Detected) -> Vec<verify::Check> {
     let mut checks: Vec<verify::Check> = Vec::new();
     let mut push = |check: verify::Check| {
@@ -906,24 +833,27 @@ fn verify_checks(config: &Config, detected: &Detected) -> Vec<verify::Check> {
         (ProtocolId::OpenAiChat, "/v1/chat/completions"),
         (ProtocolId::OpenAiResponses, "/v1/responses"),
     ] {
-        if !protocol_enabled(config, protocol) {
-            continue;
-        }
+        let enabled = protocol_enabled(config, protocol);
         let speakers: Vec<&Frontend> = detected
             .frontends
             .iter()
             .map(|fd| &fd.frontend)
             .filter(|frontend| frontend.protocol() == protocol)
             .collect();
-        if speakers.is_empty() {
+        if enabled && speakers.is_empty() {
             push(verify::Check::Usage(bare.to_owned()));
         }
         for frontend in speakers {
             if let Some(name) = frontend.prefix() {
                 push(verify::Check::Prefix(name.to_owned()));
             }
-            push(verify::Check::Usage(frontend.usage_path()));
+            if enabled {
+                push(verify::Check::Usage(frontend.usage_path()));
+            }
         }
+    }
+    if checks.is_empty() {
+        checks.push(verify::Check::Listener);
     }
     checks
 }
@@ -1061,75 +991,25 @@ struct FrontendDetected {
 
 // ── the wizard's config choices ────────────────────────────────────────
 
-/// How one api-key backend authenticates.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum KeyChoice {
-    /// Store nothing: the frontend sends its own key, which toker passes
-    /// through (pass-through-when-present).
-    Frontend,
-    /// A key given to toker, before it is placed: the keyring when there
-    /// is one, else the 0600 `toker.toml` ([`Wizard::place_keys`]).
-    Store(String),
-    /// "Give it to toker" with an empty answer over a key toker already
-    /// stores: keep it where it is.
-    KeepStored,
-    /// Placed in the keyring.
-    Keyring,
-    /// Placed in the 0600 `toker.toml`: no secret service was available.
-    Literal(String),
-    /// An env var, which must be in the systemd user manager's
-    /// environment (the service never sees the shell's).
-    Env(String),
-}
-
-/// The backends/defaults/toggles the wizard asked about (the plan's
-/// steps 1-2), applied to the config at [`Step::WriteConfig`].
+/// What step one settled, applied to the configuration at
+/// [`Step::WriteConfig`].
 #[derive(Debug, Clone)]
 struct Choices {
     port: u16,
-    /// The ticked backends, in [`BACKENDS`] order: exactly the set the
-    /// written config enables.
-    backends: Vec<&'static str>,
-    /// The anthropic protocol's default, among the ticked; `None` when
-    /// no anthropic backend is ticked, or when the database already owns
-    /// routing and the question is not asked.
-    anthropic_default: Option<&'static str>,
-    /// The openai_chat protocol's default, among the ticked; `None` when
-    /// no Chat-capable backend is ticked, or when the database already
-    /// owns routing.
-    openai_chat_default: Option<&'static str>,
-    /// Asked only when anthropic_api is ticked.
-    anthropic_api_key: Option<KeyChoice>,
-    /// Asked only when openrouter is ticked.
-    openrouter_key: Option<KeyChoice>,
-    /// Asked only when openai_api is ticked.
-    openai_api_key: Option<KeyChoice>,
-    awake: bool,
+    /// The providers found on a machine whose configuration names none,
+    /// in [`PROVIDERS`] order; `None` when it names any, and they are kept
+    /// as they are.
+    found: Option<Vec<&'static str>>,
 }
 
-/// Every backend the wizard offers, in the multi-select's order, with
-/// the line that says what it is.
-const BACKENDS: &[(&str, &str)] = &[
-    (
-        "anthropic_sub",
-        "anthropic_sub — the Claude subscription (Claude login or configured OAuth token)",
-    ),
-    (
-        "anthropic_api",
-        "anthropic_api — the Anthropic API, by API key",
-    ),
-    (
-        "codex_sub",
-        "codex_sub — the ChatGPT subscription, through the codex CLI's login",
-    ),
-    (
-        "openrouter",
-        "openrouter — the openai-chat protocol (opencode), by API key",
-    ),
-    (
-        "openai_api",
-        "openai_api — the direct OpenAI Chat Completions API, by API key",
-    ),
+/// Every provider, in the order setup looks for their credentials. The
+/// keyring account of each is its name.
+const PROVIDERS: &[&str] = &[
+    "anthropic_sub",
+    "anthropic_api",
+    "codex_sub",
+    "openrouter",
+    "openai_api",
 ];
 
 // ── the report ─────────────────────────────────────────────────────────
@@ -1177,27 +1057,18 @@ pub struct RunReport {
     pub plugin_installed: Option<PathBuf>,
     /// The plugin was offered and declined.
     pub plugin_declined: bool,
-    /// The wake/hold/ping slots chosen this run; empty means the timers were
-    /// declined, in which
-    /// case nothing was installed and any an earlier run left were
-    /// removed ([`RunReport::timers_removed`]).
+    /// The wake/hold/ping slots the timers carry: the ones an earlier run
+    /// installed, else [`DEFAULT_SLOTS`]. Empty when the run did not reach
+    /// the timers.
     pub timer_slots: Vec<String>,
-    /// The timer units disabled and removed this run: all of them when
-    /// the timers were declined, else the ping pairs of slots no longer
-    /// chosen.
-    pub timers_removed: Vec<String>,
     /// The timer units installed this run: the hold pair, the per-slot
-    /// ping pairs, and the staged wake system timer.
+    /// ping pairs, and the staged wake pair.
     pub timers_installed: Vec<String>,
-    /// Every user-timer install, daemon-reload and enable succeeded.
+    /// Every timer install, the daemon-reload and each enable succeeded.
     pub timers_ok: bool,
-    /// Manual commands for the user timers when [`RunReport::timers_ok`]
-    /// is false.
+    /// Manual commands for the timers when [`RunReport::timers_ok`] is
+    /// false.
     pub timers_manual: Vec<String>,
-    /// The wake SYSTEM timer was enabled through sudo this run.
-    pub wake_enabled: bool,
-    /// Manual commands for the wake timer when not enabled.
-    pub wake_manual: Vec<String>,
     /// What became of the Claude `/model` picker sync, when claude is a
     /// frontend.
     pub picker: Option<String>,
@@ -1220,7 +1091,8 @@ pub struct RunReport {
 pub struct Wizard<'a> {
     prompt: &'a mut dyn Prompt,
     runner: &'a dyn SystemRunner,
-    /// Where a key given to toker is kept ([`Wizard::place_keys`]).
+    /// The keyring, asked only whether a provider's entry exists
+    /// ([`Wizard::find_providers`]).
     secrets: &'a dyn SecretStore,
     paths: &'a Paths,
     out: &'a mut dyn Write,
@@ -1259,8 +1131,8 @@ impl<'a> Wizard<'a> {
         }
         let mut report = RunReport::default();
 
-        let choices = self.choose_backends(&detected)?;
-        let current = self.write_step(choices.as_ref(), &detected, &mut report)?;
+        let choices = self.providers_step(&detected)?;
+        let current = self.write_step(&choices, &detected, &mut report)?;
         report.port = current.port;
         // Before the units: the service refuses to start while the ledger
         // holds rows from before accounts were recorded.
@@ -1272,9 +1144,10 @@ impl<'a> Wizard<'a> {
         // would fail against the new port with the old listener still
         // serving. The wizard deliberately never restarts a live
         // socket (a restart drops every live session through it), so
-        // it says the one command that finishes the change instead.
-        if report.config_written
-            && detected.socket_active == Some(true)
+        // it says the one command that finishes the change instead. The
+        // port is not in the store, so a kept configuration can change it
+        // too.
+        if detected.socket_active == Some(true)
             && detected
                 .config
                 .as_ref()
@@ -1544,7 +1417,7 @@ impl<'a> Wizard<'a> {
             "  codex login : {} — {}",
             self.paths.codex_auth.display(),
             if detected.codex_auth {
-                "found (codex_sub is pre-ticked)"
+                "found"
             } else {
                 "not found"
             },
@@ -1650,353 +1523,89 @@ impl<'a> Wizard<'a> {
         Ok(())
     }
 
-    // ── step 1: choose backends ───────────────────────────────────
+    // ── step 1: providers and the port ────────────────────────────
 
-    /// [`Step::ChooseBackends`] — the plan's "backends → defaults →
-    /// toggles" questions: which backends toker serves (one
-    /// multi-select, pre-ticked from what the machine has), the auth of
-    /// each ticked key backend, the default per protocol among the
-    /// ticked ones (asked only when there is a choice), the awake toggle,
-    /// and the port. An existing config is offered keep-vs-reconfigure
-    /// first; `Ok(None)` means "keep" — the caller writes nothing. Every
-    /// existing value preselects its own answer, so a re-run can be
-    /// walked through with Enter.
-    fn choose_backends(&mut self, detected: &Detected) -> Result<Option<Choices>> {
-        self.step(Step::ChooseBackends)?;
+    /// [`Step::Providers`] — settle which providers serve, and ask the
+    /// port, the one question here (spec: USETUP#writing). A
+    /// configuration that names any provider keeps them as they are; one
+    /// that names none gets every provider whose credential setup finds.
+    /// Everything else about providers is edited on the dashboard.
+    fn providers_step(&mut self, detected: &Detected) -> Result<Choices> {
+        self.step(Step::Providers)?;
         let existing = detected.config.as_ref();
-        if existing.is_some() {
-            let options = ["keep it as is", "reconfigure"];
-            let found = if self.paths.config_toml.is_file() {
-                self.paths.config_toml.display().to_string()
-            } else {
-                format!("the configuration in {}", self.paths.db_path().display())
-            };
-            let keep = self.prompt.select(
-                &format!("Found {found} — what should the wizard do?"),
-                &options,
-                Some(0),
-            )? == 0;
-            if keep {
-                return Ok(None);
+        let found = match existing {
+            Some(config) if !config.enabled_backends().is_empty() => {
+                self.say(&format!(
+                    "  providers {} — kept as they are",
+                    backends_list(config)
+                ))?;
+                None
+            }
+            _ => Some(self.find_providers(detected)?),
+        };
+        // Setup goes on either way: a provider enabled on the dashboard
+        // later needs no second run (spec: USETUP#writing).
+        if found.as_ref().is_some_and(Vec::is_empty) {
+            self.say(
+                "  no provider credential found, so none is enabled — providers are \
+                 enabled on the providers page of `toker tui`",
+            )?;
+        } else {
+            self.say("  other providers are configured on the providers page of `toker tui`")?;
+        }
+        let port_default = existing.map(|config| config.port).unwrap_or(DEFAULT_PORT);
+        let port = self.ask_port(port_default)?;
+        Ok(Choices { port, found })
+    }
+
+    /// The providers whose credential is on this machine, each said with
+    /// where it was found: codex_sub where the codex CLI's login is, and
+    /// each provider with an entry in the keyring. The keyring is asked
+    /// whether an entry exists, never for its value (spec: USETUP#writing).
+    /// A keyring that cannot be asked enables nothing, and says why.
+    fn find_providers(&mut self, detected: &Detected) -> Result<Vec<&'static str>> {
+        let mut found = Vec::new();
+        let mut keyring_error = None;
+        for &provider in PROVIDERS {
+            if provider == "codex_sub" {
+                if detected.codex_auth {
+                    self.say(&format!(
+                        "  codex_sub: the codex login is at {}",
+                        self.paths.codex_auth.display()
+                    ))?;
+                    found.push(provider);
+                }
+                continue;
+            }
+            // One failure stands for the whole keyring: asking again
+            // per provider would only repeat it.
+            if keyring_error.is_some() {
+                continue;
+            }
+            match self.secrets.exists(provider) {
+                Ok(true) => {
+                    self.say(&format!(
+                        "  {provider}: found in the keyring ({KEYRING_SERVICE}/{provider})"
+                    ))?;
+                    found.push(provider);
+                }
+                Ok(false) => {}
+                Err(error) => keyring_error = Some(error),
             }
         }
-
-        let backends = self.ask_backends(detected)?;
-        let ticked = |name: &str| backends.contains(&name);
-
-        let anthropic_api_key = if ticked("anthropic_api") {
-            let api = existing.and_then(|config| config.anthropic_api.as_ref());
-            Some(self.ask_api_key(
-                "anthropic_api",
-                DEFAULT_ANTHROPIC_API_KEY_ENV,
-                api.map(|api| {
-                    (
-                        api.api_key_env.as_str(),
-                        api.api_key_keyring,
-                        api.api_key.is_some(),
-                    )
-                }),
-            )?)
-        } else {
-            None
-        };
-        if ticked("codex_sub") {
-            if !detected.codex_auth {
-                self.say(&format!(
-                    "  note: there is no codex login at {} yet — `codex login` creates it, \
-                     and codex_sub answers 401s until then",
-                    self.paths.codex_auth.display()
-                ))?;
-            }
+        if let Some(error) = keyring_error {
+            // The error names the entry, never a value.
+            self.say(&format!(
+                "  the keyring could not be checked ({error:#}), so nothing is enabled from it"
+            ))?;
+        }
+        if found.contains(&"codex_sub") {
             self.say(
                 "  note: the model routing that makes the translated route useful \
                  is a deliberate operator edit in `toker tui` — the wizard writes none",
             )?;
         }
-        let openrouter_key = if ticked("openrouter") {
-            let openrouter = existing.and_then(|config| config.openrouter.as_ref());
-            Some(self.ask_api_key(
-                "openrouter",
-                DEFAULT_OPENROUTER_API_KEY_ENV,
-                openrouter.map(|openrouter| {
-                    (
-                        openrouter.api_key_env.as_str(),
-                        openrouter.api_key_keyring,
-                        openrouter.api_key.is_some(),
-                    )
-                }),
-            )?)
-        } else {
-            None
-        };
-        let openai_api_key = if ticked("openai_api") {
-            let api = existing.and_then(|config| config.openai_api.as_ref());
-            Some(self.ask_api_key(
-                "openai_api",
-                DEFAULT_OPENAI_API_KEY_ENV,
-                api.map(|api| {
-                    (
-                        api.api_key_env.as_str(),
-                        api.api_key_keyring,
-                        api.api_key.is_some(),
-                    )
-                }),
-            )?)
-        } else {
-            None
-        };
-
-        // Each protocol's default, among the ticked backends that bind it,
-        // is only asked while the config still decides routing: once the
-        // database owns it, the routing TUI is where defaults live.
-        let owned = detected.routing.is_some();
-        let candidates: Vec<&'static str> = ANTHROPIC_BACKENDS
-            .iter()
-            .copied()
-            .filter(|name| ticked(name))
-            .collect();
-        let anthropic_default = match candidates.as_slice() {
-            _ if owned => None,
-            [] => None,
-            [only] => Some(*only),
-            several => {
-                let current = existing
-                    .and_then(|config| config.default_backend_anthropic.as_deref())
-                    .unwrap_or(ANTHROPIC_BACKENDS[0]);
-                let default = several.iter().position(|name| *name == current);
-                Some(
-                    several[self.prompt.select(
-                        "Default backend for the anthropic protocol (claude and friends)? \
-                     (bare model names go here; a provider/ prefix picks another per request)",
-                        several,
-                        default.or(Some(0)),
-                    )?],
-                )
-            }
-        };
-
-        let candidates: Vec<&'static str> = OPENAI_CHAT_BACKENDS
-            .iter()
-            .copied()
-            .filter(|name| ticked(name))
-            .collect();
-        let openai_chat_default = match candidates.as_slice() {
-            _ if owned => None,
-            [] => None,
-            [only] => Some(*only),
-            several => {
-                let current = existing
-                    .and_then(|config| config.default_backend_openai_chat.as_deref())
-                    .unwrap_or(OPENAI_CHAT_BACKENDS[0]);
-                let default = several.iter().position(|name| *name == current);
-                Some(
-                    several[self.prompt.select(
-                        "Default backend for the openai_chat protocol (opencode and friends)? \
-                         (bare model names go here; a provider/ prefix picks another per request)",
-                        several,
-                        default.or(Some(0)),
-                    )?],
-                )
-            }
-        };
-
-        let awake_default = existing.map(|config| config.awake).unwrap_or(true);
-        let awake = self.prompt.confirm(
-            "Hold an idle-sleep lock while agent sessions are live (awake)?",
-            awake_default,
-        )?;
-        let port_default = existing.map(|config| config.port).unwrap_or(DEFAULT_PORT);
-        let port = self.ask_port(port_default)?;
-
-        Ok(Some(Choices {
-            port,
-            backends,
-            anthropic_default,
-            openai_chat_default,
-            anthropic_api_key,
-            openrouter_key,
-            openai_api_key,
-            awake,
-        }))
-    }
-
-    /// The backend multi-select. Pre-ticked from the existing config's
-    /// enabled set when there is one, else from what the machine has: a
-    /// claude settings file or the Workhorse repos ticks anthropic_sub,
-    /// the codex CLI's login ticks codex_sub, an opencode config ticks
-    /// openrouter. An empty answer is asked again: a toker with no
-    /// backend answers every request with a not-configured error.
-    fn ask_backends(&mut self, detected: &Detected) -> Result<Vec<&'static str>> {
-        let ticked_before: Vec<&str> = match &detected.config {
-            Some(config) => config.enabled_backends(),
-            None => {
-                let has = |pick: fn(&Frontend) -> bool| {
-                    detected.frontends.iter().any(|fd| pick(&fd.frontend))
-                };
-                let mut found = Vec::new();
-                if has(|frontend| {
-                    matches!(
-                        frontend,
-                        Frontend::Claude { .. } | Frontend::ClaudeWorkhorse { .. }
-                    )
-                }) {
-                    found.push("anthropic_sub");
-                }
-                if detected.codex_auth {
-                    found.push("codex_sub");
-                }
-                if has(|frontend| matches!(frontend, Frontend::Opencode { .. })) {
-                    found.push("openrouter");
-                }
-                found
-            }
-        };
-        let defaults: Vec<usize> = BACKENDS
-            .iter()
-            .enumerate()
-            .filter(|(_, (name, _))| ticked_before.contains(name))
-            .map(|(index, _)| index)
-            .collect();
-        let labels: Vec<&str> = BACKENDS.iter().map(|(_, label)| *label).collect();
-        for _ in 0..3 {
-            let picked = self.prompt.multi_select(
-                "Which backends should toker serve? (space toggles, enter accepts)",
-                &labels,
-                &defaults,
-            )?;
-            if picked.is_empty() {
-                self.say("  pick at least one backend — try again")?;
-                continue;
-            }
-            return Ok(picked.into_iter().map(|index| BACKENDS[index].0).collect());
-        }
-        bail!("no backend was picked")
-    }
-
-    /// One api-key backend's source, in this order:
-    /// the frontend brings its own (toker stores nothing), give it to
-    /// toker (the OS keyring, else the 0600 `toker.toml`), or an env var
-    /// in the systemd user environment. The existing config's choice is
-    /// preselected. The key itself is only ever the ANSWER (masked in the
-    /// real UI); it appears in no message and no output.
-    fn ask_api_key(
-        &mut self,
-        provider: &str,
-        default_env: &str,
-        existing: Option<(&str, bool, bool)>,
-    ) -> Result<KeyChoice> {
-        let options = [
-            "the frontend brings its own — toker stores nothing and passes the frontend's key through",
-            "give it to toker — kept in the OS keyring (toker.toml at mode 0600 when there is none)",
-            "an env var — set in the systemd user environment, not your shell's",
-        ];
-        // The existing choice, as far as the config can tell: a stored
-        // key is option 1, a renamed env var option 2. The default env
-        // name with nothing stored reads as the frontend bringing its
-        // own, which is what it does at runtime when the var is unset.
-        let stored = existing.is_some_and(|(_, keyring, literal)| keyring || literal);
-        let preselect = match existing {
-            Some(_) if stored => 1,
-            Some((env, _, _)) if env != default_env => 2,
-            _ => 0,
-        };
-        match self.prompt.select(
-            &format!("How should toker authenticate to {provider}?"),
-            &options,
-            Some(preselect),
-        )? {
-            0 => {
-                self.say(&format!(
-                    "  {provider}: toker stores no key; the frontend's own is passed through \
-                     (a request without one goes upstream unauthenticated)"
-                ))?;
-                Ok(KeyChoice::Frontend)
-            }
-            1 => {
-                let hint = if stored {
-                    " (empty keeps the stored one)"
-                } else {
-                    ""
-                };
-                for _ in 0..3 {
-                    let key = self.prompt.text(
-                        &format!("The {provider} API key, for the OS keyring{hint}"),
-                        None,
-                        true,
-                    )?;
-                    if !key.is_empty() {
-                        return Ok(KeyChoice::Store(key));
-                    }
-                    if stored {
-                        return Ok(KeyChoice::KeepStored);
-                    }
-                }
-                bail!("no {provider} key was given")
-            }
-            _ => {
-                let current = existing.map_or(default_env, |(env, _, _)| env);
-                let answer = self.prompt.text(
-                    &format!("Env var holding the {provider} API key"),
-                    Some(current),
-                    false,
-                )?;
-                let name = if answer.is_empty() {
-                    current.to_owned()
-                } else {
-                    answer
-                };
-                // The plain statement of where the variable must live:
-                // a variable exported in a shell rc is invisible to the
-                // service, and the symptom (401s) does not say why.
-                self.say(&format!(
-                    "  note: toker runs as a socket-activated systemd user service, so it sees \
-                     only the user manager's environment, not your shell's. Put {name} in \
-                     ~/.config/environment.d/*.conf (read at login), or run \
-                     `systemctl --user set-environment {name}=…`; then `toker restart` for a \
-                     running service to pick it up"
-                ))?;
-                Ok(KeyChoice::Env(name))
-            }
-        }
-    }
-
-    /// Place every key given to toker: the OS keyring when it takes the
-    /// write, else the 0600 `toker.toml` with a line saying so. Runs
-    /// before the config write, so the config records where each key
-    /// actually went.
-    fn place_keys(&mut self, choices: &mut Choices) -> Result<()> {
-        for (provider, slot) in [
-            ("anthropic_api", &mut choices.anthropic_api_key),
-            ("openrouter", &mut choices.openrouter_key),
-            ("openai_api", &mut choices.openai_api_key),
-        ] {
-            let Some(KeyChoice::Store(key)) = slot.as_ref() else {
-                continue;
-            };
-            let key = key.clone();
-            *slot = Some(match self.secrets.set(provider, &key) {
-                Ok(()) => {
-                    writeln!(
-                        self.out,
-                        "  {provider} key: stored in the OS keyring ({}/{provider})",
-                        crate::secrets::KEYRING_SERVICE
-                    )
-                    .context("writing the wizard's output")?;
-                    KeyChoice::Keyring
-                }
-                Err(error) => {
-                    // The error names the entry, never the key.
-                    writeln!(
-                        self.out,
-                        "  {provider} key: no OS keyring ({error:#}) — stored in toker.toml \
-                         at mode 0600 instead"
-                    )
-                    .context("writing the wizard's output")?;
-                    KeyChoice::Literal(key)
-                }
-            });
-        }
-        Ok(())
+        Ok(found)
     }
 
     /// The listener port: a text
@@ -2007,7 +1616,7 @@ impl<'a> Wizard<'a> {
         for _ in 0..3 {
             let answer = self
                 .prompt
-                .text("Listener port", Some(&default.to_string()), false)?;
+                .text("Listener port", Some(&default.to_string()))?;
             if answer.is_empty() {
                 return Ok(default);
             }
@@ -2030,7 +1639,7 @@ impl<'a> Wizard<'a> {
     /// not the file.
     fn write_step(
         &mut self,
-        choices: Option<&Choices>,
+        choices: &Choices,
         detected: &Detected,
         report: &mut RunReport,
     ) -> Result<Config> {
@@ -2051,9 +1660,11 @@ impl<'a> Wizard<'a> {
         // The store this run writes is the one the wizard was given, never
         // whatever the config's own default resolved to: a scratch run that
         // follows the latter writes into the real machine's store. Set here,
-        // before any branch, because one of the branches returns early.
+        // before any branch, because one of the branches returns early. The
+        // port likewise: it reaches the units, not the store.
         config.db_path = paths.db_path();
-        match choices {
+        config.port = choices.port;
+        match &choices.found {
             None if !had_file => {
                 // Already across, and nothing to change: writing the same
                 // rows back would be a no-op with a chance of going wrong.
@@ -2069,11 +1680,7 @@ impl<'a> Wizard<'a> {
                     file.display()
                 ))?;
             }
-            Some(choices) => {
-                let mut choices = choices.clone();
-                self.place_keys(&mut choices)?;
-                apply_choices(&mut config, &choices, paths)?;
-            }
+            Some(found) => enable_found(&mut config, found, owned.is_some(), paths),
         }
         config
             .validate_retained()
@@ -2166,7 +1773,7 @@ impl<'a> Wizard<'a> {
             (SOCKET_UNIT, socket_unit(port)),
             (
                 SERVICE_UNIT,
-                service_unit(&exe, &self.paths.db_path(), &extra_writable(current)),
+                service_unit(&exe, &self.paths.db_path(), &extra_writable(self.paths)),
             ),
         ];
 
@@ -2291,20 +1898,14 @@ impl<'a> Wizard<'a> {
     ) -> Result<()> {
         self.step(Step::VerifyService)?;
         let checks = verify_checks(config, detected);
-        if checks.is_empty() {
-            self.say("no backend is enabled — there is nothing to verify and nothing to wire")?;
-            bail!(
-                "the wizard stopped before the frontends step: no backend is enabled in {}; \
-                 re-run `toker setup` and reconfigure",
-                self.paths.config_toml.display()
-            );
-        }
         match verify::await_service_ready(config.port, &checks, self.verify_timeout).await {
             Ok(ready) => {
                 for (check, status) in &ready.answers {
                     let whose = match check {
                         verify::Check::Usage(_) => " (the upstream's verdict)",
-                        verify::Check::Prefix(_) => " (toker's own status)",
+                        verify::Check::Prefix(_) | verify::Check::Listener => {
+                            " (toker's own status)"
+                        }
                     };
                     self.say(&format!("{} → {status}{whose}", check.describe()))?;
                 }
@@ -2342,17 +1943,17 @@ impl<'a> Wizard<'a> {
             let frontend = &detected.frontend;
             let url = frontend.base_url(port);
             let name = frontend.describe();
-            // A frontend whose protocol has no backend would get only
-            // not-configured errors from toker: it is left where it is.
+            // Offered all the same: the listener is up, and a provider
+            // enabled on the dashboard later serves it with no second
+            // setup run (spec: USETUP#writing). Until then toker answers
+            // it as not configured, so the operator is told before saying
+            // yes.
             if !protocol_enabled(config, frontend.protocol()) {
                 self.say(&format!(
-                    "{name}: not offered — no {} backend is enabled",
+                    "{name}: no {} provider is enabled yet — it gets not-configured errors \
+                     until one is enabled in `toker tui`",
                     frontend.protocol()
                 ))?;
-                report
-                    .left_unchanged
-                    .push(format!("{name} (no {} backend)", frontend.protocol()));
-                continue;
             }
             // Wired means this port AND this frontend's own prefix: a
             // claude still on the bare listener is re-offered, so its
@@ -2567,12 +2168,10 @@ impl<'a> Wizard<'a> {
     // ── the toggles ───────────────────────────────────────────────
 
     /// The plan's optional toggles, after the frontends: the awake
-    /// report (asked at the backends step — it is config), the
-    /// wake/hold/ping timers (a yes/no, then the slots: they install
-    /// the hold and ping user timers and attempt the wake system timer
-    /// through sudo; a no removes any an earlier run installed), and
-    /// the history import offer (when
-    /// the source exists: the existing `toker import` logic,
+    /// report (it is config, edited on the dashboard), the
+    /// wake/hold/ping timers (installed unasked, waiting on the ping
+    /// marker; see [`Wizard::timers_step`]), and the history import offer
+    /// (when the source exists: the existing `toker import` logic,
     /// in-process, into the ledger the config names).
     /// Move a store's pre-account rows onto the account that served them
     /// (spec: ACCT#moving-a-machine-onto-accounts).
@@ -2641,11 +2240,9 @@ impl<'a> Wizard<'a> {
             // account from, so the operator is the only source left. Refusing
             // here would leave every command refusing too.
             self.say("  toker knows no account those rows could belong to")?;
-            let address = self.prompt.text(
-                "which email address were those rows served on?",
-                None,
-                false,
-            )?;
+            let address = self
+                .prompt
+                .text("which email address were those rows served on?", None)?;
             let address = address.trim();
             if address.is_empty() {
                 bail!(
@@ -2699,33 +2296,7 @@ impl<'a> Wizard<'a> {
             "  awake (idle-sleep lock while sessions are live): {}",
             on_off(current.awake)
         ))?;
-        // Asked as a yes/no first, defaulting to what is installed: the
-        // slots used to be one free-text question whose "clear for none"
-        // could not work, because the prompt hands back its default for
-        // an empty answer — declining installed the default timers.
-        let installed = InstalledTimers::read(&self.paths.units_dir);
-        // Only the Anthropic subscription anchors a window to the request
-        // that opens it, so without it there is nothing a ping could
-        // place: the timers are not offered, and any an earlier run
-        // installed are retired like a dropped slot's.
-        // spec: GPING#scope
-        if current.anthropic_sub.is_none() {
-            if installed.any() {
-                self.say("  no configured provider anchors a quota window to its opening request")?;
-                self.remove_timers_step(&installed, report)?;
-            }
-        } else {
-            let wanted = self.prompt.confirm(
-                "Wake the machine on weekdays to open quota windows on a schedule (wake/hold/ping timers)?",
-                installed.any(),
-            )?;
-            if wanted {
-                let slots = self.ask_slots(&installed)?;
-                self.timers_step(&slots, &installed, report)?;
-            } else if installed.any() {
-                self.remove_timers_step(&installed, report)?;
-            }
-        }
+        self.timers_step(report)?;
         if !detected.ctp_usage {
             self.say("  predecessor history: none to import")?;
             return Ok(());
@@ -2766,101 +2337,36 @@ impl<'a> Wizard<'a> {
         Ok(())
     }
 
-    /// The wake/hold/ping slot question, once the timers are wanted: a
-    /// free-form `hh:mm` list, strictly validated (a bad token is named
-    /// and re-asked). The default is the slots an earlier run installed,
-    /// else [`DEFAULT_SLOTS`]; an empty answer takes it.
-    fn ask_slots(&mut self, installed: &InstalledTimers) -> Result<Vec<String>> {
-        let default = if installed.ping_slots.is_empty() {
-            DEFAULT_SLOTS.to_owned()
-        } else {
-            installed.ping_slots.join(", ")
-        };
-        for _ in 0..3 {
-            let answer = self.prompt.text(
-                &format!(
-                    "Weekday (Mon..Fri) wake/hold/ping slots (hh:mm, comma- or space-separated; \
-                     each pings {PING_DELAY_MINUTES} minutes later)"
-                ),
-                Some(&default),
-                false,
-            )?;
-            // The seam's contract: the wizard resolves an empty answer
-            // to the default itself, so the real UI and the fake agree.
-            let answer = if answer.trim().is_empty() {
-                default.as_str()
-            } else {
-                answer.as_str()
-            };
-            match timers::parse_slot_list(answer) {
-                Ok(slots) if !slots.is_empty() => return Ok(slots),
-                Ok(_) => self.say("  no slots given — try again")?,
-                Err(bad) => self.say(&format!("  {bad:?} is not a hh:mm slot — try again"))?,
-            }
-        }
-        bail!("no valid slots were given")
-    }
-
-    /// The timers proper, once slots are chosen. The hold and per-slot ping
-    /// units go through the
-    /// ordinary user-manager path (`install_unit`, `daemon-reload`,
-    /// `enable --now` per timer); the wake SYSTEM timer follows in
-    /// [`Wizard::wake_step`]. The ping timers of slots an earlier run
-    /// chose and this one did not are disabled and removed, not left
-    /// firing for a schedule nobody asked for. Every failure here is
-    /// non-fatal with the manual commands printed.
-    fn timers_step(
-        &mut self,
-        slots: &[String],
-        installed: &InstalledTimers,
-        report: &mut RunReport,
-    ) -> Result<()> {
+    /// The timers, unasked and whether or not the schedule is on. The hold
+    /// and per-slot ping units go through the ordinary user-manager path
+    /// (`install_unit`, `daemon-reload`, `enable --now` per timer); their
+    /// services wait on the ping marker, so enabling them starts nothing
+    /// the operator has not turned on. The wake pair is written beside them
+    /// and goes no further. Every failure here is non-fatal with the manual
+    /// commands printed.
+    // spec: USETUP#installing-units
+    fn timers_step(&mut self, report: &mut RunReport) -> Result<()> {
         let exe = std::env::current_exe().context("resolving the running binary's own path")?;
-        report.timer_slots = slots.to_vec();
+        // The slots are chosen on the dashboard, so a re-run keeps whatever
+        // is installed rather than putting the default back.
+        let mut slots = installed_ping_slots(&self.paths.units_dir);
+        if slots.is_empty() {
+            slots = timers::parse_slot_list(DEFAULT_SLOTS).expect("the default slots parse");
+        }
+        report.timer_slots = slots.clone();
 
         // The user units: one hold pair, plus one ping pair per slot.
-        let (hold_timer, hold_service) = hold_user_units(slots, &exe);
+        let (hold_timer, hold_service) = hold_user_units(&slots, &exe, &self.paths.state_dir);
         let mut units = vec![
             (HOLD_TIMER_UNIT.to_owned(), hold_timer),
             (HOLD_SERVICE_UNIT.to_owned(), hold_service),
         ];
-        let pings = ping_user_units(slots, &exe);
+        let pings = ping_user_units(&slots, &exe, &self.paths.state_dir);
         for pair in &pings {
             units.push((pair.timer_name.clone(), pair.timer.clone()));
             units.push((pair.service_name.clone(), pair.service.clone()));
         }
-
-        let mut ok = true;
-        for (name, contents) in &units {
-            match self.runner.install_unit(name, contents) {
-                Ok(path) => {
-                    self.say(&format!("installed {} ({})", name, path.display()))?;
-                    report.timers_installed.push(name.clone());
-                }
-                Err(error) => {
-                    ok = false;
-                    self.say(&format!("installing {name} failed: {error:#}"))?;
-                    self.say("  the unit contents, to place by hand:")?;
-                    for line in contents.lines() {
-                        self.say(&format!("    | {line}"))?;
-                    }
-                    report.timers_manual.push(format!(
-                        "write {name} into {}",
-                        self.paths.units_dir.join(name).display()
-                    ));
-                }
-            }
-        }
-
-        let stale: Vec<String> = installed
-            .ping_slots
-            .iter()
-            .filter(|slot| !slots.contains(slot))
-            .map(|slot| format!("{}.timer", ping_unit_stem(slot)))
-            .collect();
-        // Not gating the enables below: a stale timer that will not go
-        // is no reason to leave the chosen ones off.
-        let retired = self.retire_user_timers(&stale, report)?;
+        let mut ok = self.install_timer_units(&units, "installed", report)?;
 
         let mut timer_names = vec![HOLD_TIMER_UNIT.to_owned()];
         timer_names.extend(pings.iter().map(|pair| pair.timer_name.clone()));
@@ -2903,276 +2409,57 @@ impl<'a> Wizard<'a> {
                     .timers_manual
                     .push(format!("systemctl --user enable --now {timer}"));
             }
-            self.say("the user timers did not all come up — the wake timer is still attempted")?;
-        } else if !retired {
-            self.say("the timers of slots no longer chosen were not all removed")?;
         }
-        if !(ok && retired) {
-            self.say("finish the user timers by hand:")?;
+
+        // The wake pair is only written: it belongs to the system manager,
+        // which needs elevation, and that is asked for on the dashboard when
+        // the schedule is turned on. Independent of the user timers' fate.
+        let wake = [
+            (WAKE_SERVICE_UNIT.to_owned(), wake_system_service()),
+            (WAKE_TIMER_UNIT.to_owned(), wake_system_unit(&slots)),
+        ];
+        let staged = self.install_timer_units(&wake, "staged", report)?;
+
+        report.timers_ok = ok && staged;
+        if !report.timers_ok {
+            self.say("the timers did not all come up; finish by hand:")?;
             for command in &report.timers_manual {
                 self.say(&format!("  {command}"))?;
             }
         }
-        report.timers_ok = ok && retired;
-
-        // The wake SYSTEM timer: independent of the user timers' fate
-        // (a machine that never wakes still holds and pings fine while
-        // it is up).
-        self.wake_step(slots, report)
+        Ok(())
     }
 
-    /// Disable (`--now`) and remove each user timer and the service of
-    /// the same stem. A timer that will not disable keeps its files, so
-    /// the manual command still has something to act on. Returns whether
-    /// every one went.
-    fn retire_user_timers(&mut self, timers: &[String], report: &mut RunReport) -> Result<bool> {
+    /// Write each unit into the units dir, recording what went and the
+    /// manual step for what did not. Returns whether every one went.
+    fn install_timer_units(
+        &mut self,
+        units: &[(String, String)],
+        done: &str,
+        report: &mut RunReport,
+    ) -> Result<bool> {
         let mut ok = true;
-        for timer in timers {
-            let service = timer.replace(".timer", ".service");
-            match self.runner.systemctl_user(&["disable", "--now", timer]) {
-                Ok(output) if output.status.success() => {
-                    self.say(&format!("systemctl --user disable --now {timer} — ok"))?;
+        for (name, contents) in units {
+            match self.runner.install_unit(name, contents) {
+                Ok(path) => {
+                    self.say(&format!("{done} {} ({})", name, path.display()))?;
+                    report.timers_installed.push(name.clone());
                 }
-                other => {
+                Err(error) => {
                     ok = false;
-                    self.say(&format!(
-                        "systemctl --user disable --now {timer} failed: {}",
-                        stderr_of(&other)
-                    ))?;
-                    report
-                        .timers_manual
-                        .push(format!("systemctl --user disable --now {timer}"));
-                    continue;
-                }
-            }
-            for name in [timer, &service] {
-                match self.runner.remove_unit(name) {
-                    Ok(()) => {
-                        self.say(&format!("removed {name}"))?;
-                        report.timers_removed.push(name.clone());
+                    self.say(&format!("writing {name} failed: {error:#}"))?;
+                    self.say("  the unit contents, to place by hand:")?;
+                    for line in contents.lines() {
+                        self.say(&format!("    | {line}"))?;
                     }
-                    Err(error) => {
-                        ok = false;
-                        self.say(&format!("removing {name} failed: {error:#}"))?;
-                        report
-                            .timers_manual
-                            .push(format!("rm {}", self.paths.units_dir.join(name).display()));
-                    }
+                    report.timers_manual.push(format!(
+                        "write {name} into {}",
+                        self.paths.units_dir.join(name).display()
+                    ));
                 }
             }
         }
         Ok(ok)
-    }
-
-    /// The timers were declined while an earlier run's are installed:
-    /// disable and remove them all — the user units through the user
-    /// manager, the wake pair through the same sudo path that enabled
-    /// it. Non-fatal like the install, with the manual commands printed.
-    fn remove_timers_step(
-        &mut self,
-        installed: &InstalledTimers,
-        report: &mut RunReport,
-    ) -> Result<()> {
-        self.say("removing the wake/hold/ping timers an earlier run installed")?;
-        let mut timers = Vec::new();
-        if installed.hold {
-            timers.push(HOLD_TIMER_UNIT.to_owned());
-        }
-        timers.extend(
-            installed
-                .ping_slots
-                .iter()
-                .map(|slot| format!("{}.timer", ping_unit_stem(slot))),
-        );
-        let mut ok = self.retire_user_timers(&timers, report)?;
-        if !timers.is_empty() {
-            match self.runner.systemctl_user(&["daemon-reload"]) {
-                Ok(output) if output.status.success() => {
-                    self.say("systemctl --user daemon-reload — ok")?
-                }
-                other => {
-                    ok = false;
-                    self.say(&format!(
-                        "systemctl --user daemon-reload failed: {}",
-                        stderr_of(&other)
-                    ))?;
-                    report
-                        .timers_manual
-                        .push("systemctl --user daemon-reload".to_owned());
-                }
-            }
-        }
-        report.timers_ok = ok;
-        if !ok {
-            self.say("the user timers were not all removed; finish by hand:")?;
-            for command in &report.timers_manual {
-                self.say(&format!("  {command}"))?;
-            }
-        }
-
-        if !(installed.wake_timer || installed.wake_service) {
-            return Ok(());
-        }
-        // Only the units that exist: an install from before the wake
-        // service was written has the timer alone, and disabling a unit
-        // systemd has never heard of fails the whole call.
-        let mut wake = Vec::new();
-        if installed.wake_timer {
-            wake.push(WAKE_TIMER_UNIT);
-        }
-        if installed.wake_service {
-            wake.push(WAKE_SERVICE_UNIT);
-        }
-        self.say("disabling the wake system timer — sudo will be asked")?;
-        let mut args = vec!["disable", "--now"];
-        args.extend(&wake);
-        match self.runner.systemctl_system(&args) {
-            Ok(output) if output.status.success() => {
-                self.say(&format!("sudo systemctl {} — ok", args.join(" ")))?;
-                for name in &wake {
-                    match self.runner.remove_unit(name) {
-                        Ok(()) => {
-                            self.say(&format!("removed the staged {name}"))?;
-                            report.timers_removed.push((*name).to_owned());
-                        }
-                        Err(error) => {
-                            self.say(&format!("removing the staged {name} failed: {error:#}"))?;
-                            report
-                                .wake_manual
-                                .push(format!("rm {}", self.paths.units_dir.join(name).display()));
-                        }
-                    }
-                }
-            }
-            other => {
-                self.say(&format!(
-                    "disabling the wake system timer failed: {}",
-                    stderr_of(&other)
-                ))?;
-                // The staged files stay: the system manager may still
-                // link to them, and the manual disable needs them.
-                report.wake_manual = vec![
-                    format!("sudo systemctl {}", args.join(" ")),
-                    format!(
-                        "sudo rm -f /etc/systemd/system/{WAKE_TIMER_UNIT} \
-                         /etc/systemd/system/{WAKE_SERVICE_UNIT} && sudo systemctl daemon-reload"
-                    ),
-                ];
-                self.say("the wake timer is still enabled — it will keep waking the machine;")?;
-                self.say("finish by hand:")?;
-                for command in &report.wake_manual {
-                    self.say(&format!("  {command}"))?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// The wake SYSTEM timer — the only root-level piece. The timer and
-    /// the do-nothing service it activates are staged where the wizard
-    /// can write (the user units dir), the service is linked into the
-    /// system manager by path (`sudo systemctl link`), and the timer is
-    /// enabled by path (`sudo systemctl enable --now`): systemctl links
-    /// a unit file outside the search paths into `/etc/systemd/system`
-    /// itself. The service is linked rather than enabled because it has
-    /// no `[Install]` — the timer is what starts it. Where the staging
-    /// filesystem is one the system manager refuses to link from (or
-    /// sudo is declined), the failure is non-fatal and the manual
-    /// commands — a plain copy of both into `/etc/systemd/system`, then
-    /// enable by name — are printed.
-    fn wake_step(&mut self, slots: &[String], report: &mut RunReport) -> Result<()> {
-        let units = [
-            (WAKE_SERVICE_UNIT, wake_system_service()),
-            (WAKE_TIMER_UNIT, wake_system_unit(slots)),
-        ];
-        let mut staged = Vec::new();
-        for (name, contents) in &units {
-            match self.runner.install_unit(name, contents) {
-                Ok(path) => {
-                    self.say(&format!("staged {} ({})", name, path.display()))?;
-                    report.timers_installed.push((*name).to_owned());
-                    staged.push(path.display().to_string());
-                }
-                Err(error) => {
-                    report.wake_manual.push(format!(
-                        "write {name} into /etc/systemd/system (contents below)"
-                    ));
-                    self.say(&format!("staging {name} failed: {error:#}"))?;
-                    self.say("  the unit contents, to place by hand into /etc/systemd/system:")?;
-                    for line in contents.lines() {
-                        self.say(&format!("    | {line}"))?;
-                    }
-                }
-            }
-        }
-        if staged.len() != units.len() {
-            report.wake_manual.push(format!(
-                "sudo systemctl daemon-reload && sudo systemctl enable --now {WAKE_TIMER_UNIT}"
-            ));
-            self.say_wake_manual(report)?;
-            return Ok(());
-        }
-        let (service_path, timer_path) = (&staged[0], &staged[1]);
-
-        self.say(
-            "enabling the wake system timer — sudo will be asked \
-             (WakeSystem=true needs the system manager: the user manager lacks CAP_WAKE_ALARM)",
-        )?;
-        let link = self.runner.systemctl_system(&["link", service_path]);
-        let linked = match &link {
-            Ok(output) if output.status.success() => {
-                self.say(&format!("sudo systemctl link {service_path} — ok"))?;
-                true
-            }
-            other => {
-                self.say(&format!(
-                    "linking the wake service failed: {}",
-                    stderr_of(other)
-                ))?;
-                false
-            }
-        };
-        let enabled = linked
-            && match self
-                .runner
-                .systemctl_system(&["enable", "--now", timer_path])
-            {
-                Ok(output) if output.status.success() => {
-                    self.say(&format!("sudo systemctl enable --now {timer_path} — ok"))?;
-                    true
-                }
-                other => {
-                    self.say(&format!(
-                        "enabling the wake system timer failed: {}",
-                        stderr_of(&other)
-                    ))?;
-                    false
-                }
-            };
-        if enabled {
-            report.wake_enabled = true;
-        } else {
-            report.wake_manual = vec![
-                format!("sudo cp {service_path} /etc/systemd/system/{WAKE_SERVICE_UNIT}"),
-                format!("sudo cp {timer_path} /etc/systemd/system/{WAKE_TIMER_UNIT}"),
-                format!(
-                    "sudo systemctl daemon-reload && sudo systemctl enable --now {WAKE_TIMER_UNIT}"
-                ),
-            ];
-            self.say_wake_manual(report)?;
-        }
-        Ok(())
-    }
-
-    /// The wake failure's report: what is not working and the one or
-    /// two commands that finish it by hand.
-    fn say_wake_manual(&mut self, report: &RunReport) -> Result<()> {
-        self.say("the wake timer is NOT enabled — the machine will not wake for its slots;")?;
-        self.say("finish by hand:")?;
-        for command in &report.wake_manual {
-            self.say(&format!("  {command}"))?;
-        }
-        Ok(())
     }
 
     // ── step 6: done ──────────────────────────────────────────────
@@ -3249,34 +2536,19 @@ impl<'a> Wizard<'a> {
             None => "not imported".to_owned(),
         };
         self.say(&format!("  ledger    : {ledger}"))?;
-        let mut manual = Vec::new();
-        manual.extend(report.timers_manual.iter().cloned());
-        manual.extend(report.wake_manual.iter().cloned());
-        let removed = if report.timers_removed.is_empty() {
-            String::new()
-        } else {
-            format!("; removed {}", report.timers_removed.join(", "))
-        };
         let timers = if report.timer_slots.is_empty() {
-            if manual.is_empty() {
-                format!("none{removed}")
-            } else {
-                format!(
-                    "none — NOT fully removed{removed} — finish by hand: {}",
-                    manual.join(" && ")
-                )
-            }
-        } else if report.timers_ok && report.wake_enabled {
+            "not reached".to_owned()
+        } else if report.timers_ok {
             format!(
-                "slots {} — hold+ping user timers installed and enabled; \
-                 wake system timer enabled{removed}",
+                "slots {} — hold+ping user timers enabled, wake timer staged; \
+                 pings run once the ping schedule is turned on",
                 report.timer_slots.join(", ")
             )
         } else {
             format!(
-                "slots {} — NOT fully up{removed} — finish by hand: {}",
+                "slots {} — NOT fully up — finish by hand: {}",
                 report.timer_slots.join(", "),
-                manual.join(" && ")
+                report.timers_manual.join(" && ")
             )
         };
         self.say(&format!("  timers    : {timers}"))?;
@@ -3392,58 +2664,49 @@ fn commit_configuration(config: &Config, paths: &Paths) -> Result<Option<i64>> {
     Ok(Some(revision.revision_id))
 }
 
-/// Apply the wizard's choices to the config read from the file or the
-/// store, leaving everything not answered here as it was. A chosen key
-/// source REPLACES the old one (picking the env var drops a stale
-/// literal; picking a literal stores the given key), so the
-/// configuration ends up saying exactly what was just answered. The
-/// store's path is not among the choices: [`Wizard::write_step`] pins
-/// it for every path through the run.
-fn apply_choices(config: &mut Config, choices: &Choices, paths: &Paths) -> Result<()> {
-    config.port = choices.port;
-    // The ticked set is exactly the enabled set: a ticked backend gets
-    // its block (an existing block keeps its hand edits), an unticked one
-    // loses it, because a block's presence is what enables a backend.
-    let ticked = |name: &str| choices.backends.contains(&name);
-    fn keep_or_create<T: Default>(slot: &mut Option<T>, on: bool) {
-        if on {
-            slot.get_or_insert_with(T::default);
-        } else {
-            *slot = None;
-        }
+/// Enable the providers setup found on a machine whose configuration named
+/// none (spec: USETUP#writing): codex_sub through the codex login, every
+/// other one through its keyring entry. While the configuration still
+/// decides routing, each protocol's default is the first found provider
+/// that binds it, in the historical order; once the store owns routing,
+/// the defaults live there.
+fn enable_found(config: &mut Config, found: &[&str], routing_owned: bool, paths: &Paths) {
+    let has = |name: &str| found.contains(&name);
+    if has("anthropic_sub") {
+        config
+            .anthropic_sub
+            .get_or_insert_with(Default::default)
+            .oauth_token_keyring = true;
     }
-    keep_or_create(&mut config.anthropic_sub, ticked("anthropic_sub"));
-    keep_or_create(&mut config.anthropic_api, ticked("anthropic_api"));
-    keep_or_create(&mut config.codex_sub, ticked("codex_sub"));
-    keep_or_create(&mut config.openrouter, ticked("openrouter"));
-    keep_or_create(&mut config.openai_api, ticked("openai_api"));
-    config.default_backend_anthropic = choices.anthropic_default.map(str::to_owned);
-    config.default_backend_openai_chat = choices.openai_chat_default.map(str::to_owned);
-    if let (Some(api), Some(key)) = (config.anthropic_api.as_mut(), &choices.anthropic_api_key) {
-        apply_key(
-            key,
-            &mut api.api_key_env,
-            &mut api.api_key_keyring,
-            &mut api.api_key,
-        )?;
+    if has("anthropic_api") {
+        config
+            .anthropic_api
+            .get_or_insert_with(Default::default)
+            .api_key_keyring = true;
     }
-    if let (Some(openrouter), Some(key)) = (config.openrouter.as_mut(), &choices.openrouter_key) {
-        apply_key(
-            key,
-            &mut openrouter.api_key_env,
-            &mut openrouter.api_key_keyring,
-            &mut openrouter.api_key,
-        )?;
+    if has("codex_sub") {
+        config.codex_sub.get_or_insert_with(Default::default);
     }
-    if let (Some(api), Some(key)) = (config.openai_api.as_mut(), &choices.openai_api_key) {
-        apply_key(
-            key,
-            &mut api.api_key_env,
-            &mut api.api_key_keyring,
-            &mut api.api_key,
-        )?;
+    if has("openrouter") {
+        config
+            .openrouter
+            .get_or_insert_with(Default::default)
+            .api_key_keyring = true;
     }
-    config.awake = choices.awake;
+    if has("openai_api") {
+        config
+            .openai_api
+            .get_or_insert_with(Default::default)
+            .api_key_keyring = true;
+    }
+    let first = |order: &[&str]| {
+        order
+            .iter()
+            .find(|name| !routing_owned && has(name))
+            .map(|name| (*name).to_owned())
+    };
+    config.default_backend_anthropic = first(ANTHROPIC_BACKENDS);
+    config.default_backend_openai_chat = first(OPENAI_CHAT_BACKENDS);
     // Workhorse runs its agents under a config directory of its own, so
     // their transcripts (and the custom titles it names sessions with)
     // are outside `~/.claude`, and without this root every Workhorse
@@ -3455,41 +2718,6 @@ fn apply_choices(config: &mut Config, choices: &Choices, paths: &Paths) -> Resul
             config.transcript_roots.push(root);
         }
     }
-    Ok(())
-}
-
-/// One key choice onto a provider block's key sources. A chosen source
-/// REPLACES the others, so the file says exactly what was just answered
-/// (the env var name is left as it is unless the choice names one: an
-/// unset variable is no source).
-fn apply_key(
-    key: &KeyChoice,
-    env: &mut String,
-    keyring: &mut bool,
-    literal: &mut Option<String>,
-) -> Result<()> {
-    match key {
-        KeyChoice::Frontend => {
-            *keyring = false;
-            *literal = None;
-        }
-        KeyChoice::Env(name) => {
-            *env = name.clone();
-            *keyring = false;
-            *literal = None;
-        }
-        KeyChoice::Keyring => {
-            *keyring = true;
-            *literal = None;
-        }
-        KeyChoice::Literal(key) => {
-            *keyring = false;
-            *literal = Some(key.clone());
-        }
-        KeyChoice::KeepStored => {}
-        KeyChoice::Store(_) => bail!("a key given to toker was never placed"),
-    }
-    Ok(())
 }
 
 /// One frontend's state-summary line: what its file says about its
@@ -3557,10 +2785,10 @@ fn what_changed(frontend: &Frontend, url: &str) -> String {
     }
 }
 
-/// Whether the raw `toker.toml` text carries an explicit `db_path` —
-/// the read side of the never-stomp rule in [`apply_choices`]. (The
-/// resolved [`Config`] cannot answer this: an absent key and a
-/// defaulted one look the same there.)
+/// Whether the raw `toker.toml` text carries an explicit `db_path`, for
+/// [`Wizard::refuse_a_file_naming_another_store`]. (The resolved
+/// [`Config`] cannot answer this: an absent key and a defaulted one look
+/// the same there.)
 fn toml_has_db_path(text: &str) -> bool {
     toml::from_str::<toml::Table>(text)
         .map(|table| table.contains_key("db_path"))
@@ -3629,24 +2857,8 @@ mod tests {
     /// One scripted answer.
     #[derive(Debug, Clone)]
     enum Answer {
-        Select(usize),
-        /// The ticked indices; `None` accepts the offered defaults.
-        MultiSelect(Option<Vec<usize>>),
         Confirm(bool),
         Text(String),
-    }
-
-    fn select(index: usize) -> Answer {
-        Answer::Select(index)
-    }
-
-    fn multi(ticked: &[usize]) -> Answer {
-        Answer::MultiSelect(Some(ticked.to_vec()))
-    }
-
-    /// Accept the multi-select's pre-ticked defaults (the Enter key).
-    fn multi_defaults() -> Answer {
-        Answer::MultiSelect(None)
     }
 
     fn confirm(yes: bool) -> Answer {
@@ -3662,8 +2874,6 @@ mod tests {
     struct Asked {
         kind: &'static str,
         message: String,
-        options: Vec<String>,
-        secret: bool,
         /// The default offered, rendered (`None` when none was).
         default: Option<String>,
     }
@@ -3690,19 +2900,10 @@ mod tests {
             &self.asked
         }
 
-        fn next(
-            &mut self,
-            kind: &'static str,
-            message: &str,
-            options: &[&str],
-            secret: bool,
-            default: Option<String>,
-        ) -> Answer {
+        fn next(&mut self, kind: &'static str, message: &str, default: Option<String>) -> Answer {
             self.asked.push(Asked {
                 kind,
                 message: message.to_owned(),
-                options: options.iter().map(|option| option.to_string()).collect(),
-                secret,
                 default,
             });
             self.answers.pop_front().unwrap_or_else(|| {
@@ -3712,52 +2913,27 @@ mod tests {
     }
 
     impl Prompt for ScriptedPrompt {
+        /// No scripted run reaches a select: the one left is the choice
+        /// between several accounts when attributing old rows.
         fn select(
             &mut self,
             message: &str,
-            options: &[&str],
+            _options: &[&str],
             default: Option<usize>,
         ) -> Result<usize> {
-            match self.next(
-                "select",
-                message,
-                options,
-                false,
-                default.map(|index| index.to_string()),
-            ) {
-                Answer::Select(index) => Ok(index),
-                other => panic!("select {message:?} was scripted {other:?}"),
-            }
-        }
-
-        fn multi_select(
-            &mut self,
-            message: &str,
-            options: &[&str],
-            defaults: &[usize],
-        ) -> Result<Vec<usize>> {
-            match self.next(
-                "multi_select",
-                message,
-                options,
-                false,
-                Some(format!("{defaults:?}")),
-            ) {
-                Answer::MultiSelect(Some(ticked)) => Ok(ticked),
-                Answer::MultiSelect(None) => Ok(defaults.to_vec()),
-                other => panic!("multi_select {message:?} was scripted {other:?}"),
-            }
+            let answer = self.next("select", message, default.map(|index| index.to_string()));
+            panic!("select {message:?} was scripted {answer:?}, and no test answers a select")
         }
 
         fn confirm(&mut self, message: &str, default: bool) -> Result<bool> {
-            match self.next("confirm", message, &[], false, Some(default.to_string())) {
+            match self.next("confirm", message, Some(default.to_string())) {
                 Answer::Confirm(yes) => Ok(yes),
                 other => panic!("confirm {message:?} was scripted {other:?}"),
             }
         }
 
-        fn text(&mut self, message: &str, default: Option<&str>, secret: bool) -> Result<String> {
-            match self.next("text", message, &[], secret, default.map(str::to_owned)) {
+        fn text(&mut self, message: &str, default: Option<&str>) -> Result<String> {
+            match self.next("text", message, default.map(str::to_owned)) {
                 Answer::Text(answer) => Ok(answer),
                 other => panic!("text {message:?} was scripted {other:?}"),
             }
@@ -3767,20 +2943,16 @@ mod tests {
     // ── the recording fake runner ─────────────────────────────────
 
     /// The fake runner: scripted systemctl outcomes in call order,
-    /// every call and every unit install recorded (user and sudo
-    /// systemctl recorded separately). Install writes the scratch
-    /// units dir so a run's files exist like they would for real.
-    /// NO systemctl is ever executed — user or system — the machine's
-    /// live toker.socket is enabled and serving while these tests run.
+    /// every call and every unit install recorded. Install writes the
+    /// scratch units dir so a run's files exist like they would for real.
+    /// NO systemctl is ever executed — the machine's live toker.socket is
+    /// enabled and serving while these tests run.
     #[derive(Clone, Default)]
     struct FakeRunner {
         units_dir: PathBuf,
         outcomes: Arc<Mutex<VecDeque<Result<Output>>>>,
-        system_outcomes: Arc<Mutex<VecDeque<Result<Output>>>>,
         calls: Arc<Mutex<Vec<Vec<String>>>>,
-        system_calls: Arc<Mutex<Vec<Vec<String>>>>,
         installed: Arc<Mutex<Vec<(String, String)>>>,
-        removed: Arc<Mutex<Vec<String>>>,
         restarts: Arc<Mutex<Vec<PathBuf>>>,
     }
 
@@ -3789,25 +2961,14 @@ mod tests {
             FakeRunner {
                 units_dir,
                 outcomes: Arc::new(Mutex::new(outcomes.into())),
-                system_outcomes: Arc::new(Mutex::new(VecDeque::new())),
                 calls: Arc::new(Mutex::new(Vec::new())),
-                system_calls: Arc::new(Mutex::new(Vec::new())),
                 installed: Arc::new(Mutex::new(Vec::new())),
-                removed: Arc::new(Mutex::new(Vec::new())),
                 restarts: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
-        fn removed(&self) -> Vec<String> {
-            self.removed.lock().unwrap().clone()
-        }
-
         fn calls(&self) -> Vec<Vec<String>> {
             self.calls.lock().unwrap().clone()
-        }
-
-        fn system_calls(&self) -> Vec<Vec<String>> {
-            self.system_calls.lock().unwrap().clone()
         }
 
         fn installed(&self) -> Vec<(String, String)> {
@@ -3832,18 +2993,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("no scripted systemctl outcome for {args:?}"))
         }
 
-        fn systemctl_system(&self, args: &[&str]) -> Result<Output> {
-            self.system_calls
-                .lock()
-                .unwrap()
-                .push(args.iter().map(|arg| arg.to_string()).collect());
-            self.system_outcomes
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_else(|| panic!("no scripted sudo systemctl outcome for {args:?}"))
-        }
-
         fn graceful_restart(&self, exe: &Path) -> Result<ExitStatus> {
             self.restarts.lock().unwrap().push(exe.to_owned());
             Ok(ok_empty()?.status)
@@ -3858,12 +3007,6 @@ mod tests {
                 .unwrap()
                 .push((name.to_owned(), contents.to_owned()));
             Ok(path)
-        }
-
-        fn remove_unit(&self, name: &str) -> Result<()> {
-            let _ = std::fs::remove_file(self.units_dir.join(name));
-            self.removed.lock().unwrap().push(name.to_owned());
-            Ok(())
         }
     }
 
@@ -3882,10 +3025,19 @@ mod tests {
         outcome(true, "", "")
     }
 
-    /// `outcomes` with the picker step's three after them (it runs
-    /// last): daemon-reload, enable --now toker-picker.timer, and the
-    /// first sync's start of toker-picker.service.
-    fn with_picker(mut outcomes: Vec<Result<Output>>) -> Vec<Result<Output>> {
+    /// `outcomes` with the timers step's four after them, at the
+    /// default slots: daemon-reload, then enable --now of the hold timer
+    /// and each ping timer.
+    fn with_timers(mut outcomes: Vec<Result<Output>>) -> Vec<Result<Output>> {
+        outcomes.extend([ok_empty(), ok_empty(), ok_empty(), ok_empty()]);
+        outcomes
+    }
+
+    /// [`with_timers`], then the picker step's three (it runs last):
+    /// daemon-reload, enable --now toker-picker.timer, and the first
+    /// sync's start of toker-picker.service.
+    fn with_timers_and_picker(outcomes: Vec<Result<Output>>) -> Vec<Result<Output>> {
+        let mut outcomes = with_timers(outcomes);
         outcomes.extend([ok_empty(), ok_empty(), ok_empty()]);
         outcomes
     }
@@ -3951,12 +3103,12 @@ mod tests {
             }
         }
 
-        /// Script the sudo outcomes (the wake timer's enables). A run
-        /// without any scripted sudo outcome panics if it reaches a
-        /// `systemctl_system` call — the wake leg must be scripted
-        /// deliberately.
-        fn with_system(self, system: Vec<Result<Output>>) -> Rig {
-            *self.runner.system_outcomes.lock().unwrap() = system.into();
+        /// Seed the fake keyring with an entry for each account, standing
+        /// for keys the operator put there.
+        fn with_keys(self, accounts: &[&str]) -> Rig {
+            for account in accounts {
+                self.secrets.insert(account, SCRIPTED_KEY);
+            }
             self
         }
 
@@ -4019,6 +3171,10 @@ mod tests {
             .route("/v1/chat/completions", post(move || async move { chat }))
             .route(
                 "/f/{name}/_toker/status",
+                axum::routing::get(|| async { StatusCode::OK }),
+            )
+            .route(
+                "/_toker/status",
                 axum::routing::get(|| async { StatusCode::OK }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -4147,25 +3303,25 @@ default_backend_anthropic = "codex_sub"
 
     // ── the scripted answers ──────────────────────────────────────
 
-    /// A full fresh-machine run: anthropic_sub and openrouter ticked
-    /// (whatever detection pre-ticked), openrouter's key via env,
-    /// awake on, the given port, yes to every detected frontend
-    /// (claude, [workhorse,] opencode, shell rc — the caller splices
-    /// the workhorse confirm in where detection found it), and no to
-    /// the wake/hold/ping timers (the default with none installed).
+    /// The secret every seeded keyring entry holds. Setup must never
+    /// read it, so it must never appear in a run's output.
+    const SCRIPTED_KEY: &str = "sk-scripted-never-read";
+
+    /// The keyring entries a fresh run finds, enabling the providers
+    /// [`answers_fresh`] answers for.
+    const FRESH_KEYS: &[&str] = &["anthropic_sub", "openrouter"];
+
+    /// A full fresh-machine run, with [`FRESH_KEYS`] in the keyring: the
+    /// given port, yes to every detected frontend (claude, [workhorse,]
+    /// opencode, shell rc — the caller splices the workhorse confirm in
+    /// where detection found it), and yes to the opencode plugin.
     fn answers_fresh(port: u16) -> Vec<Answer> {
         vec![
-            multi(&[0, 3]),          // backends: anthropic_sub + openrouter
-            select(2),               // key source: env var
-            text(""),                // env name: keep the default
-            select(0),               // openai_chat default: openrouter
-            confirm(true),           // awake
             text(&port.to_string()), // the listener port
             confirm(true),           // claude
             confirm(true),           // opencode
             confirm(true),           // shell rc
             confirm(true),           // the opencode plugin (opt-out, on)
-            confirm(false),          // wake/hold/ping timers: no
         ]
     }
 
@@ -4209,35 +3365,23 @@ default_backend_anthropic = "codex_sub"
     // ── the tests ──────────────────────────────────────────────────
 
     #[test]
-    fn codex_s_login_dir_is_writable_only_when_codex_is_enabled() {
+    fn codex_s_login_dir_is_writable_whether_or_not_codex_is_enabled() {
         // A refresh renames over auth.json in its own directory; under
         // ProtectHome=read-only that failed and every refresh was lost.
-        let dir = crate::setup::test_dir("codex-writable");
-        let with = dir.join("with.toml");
-        std::fs::write(
-            &with,
-            "[providers.codex_sub]\nauth_path = \"/home/u/.codex/auth.json\"\n",
-        )
-        .expect("write config");
-        let config = Config::load_from(&with).expect("loads");
+        let paths = Paths::scratch(Path::new("/home/u"));
         assert_eq!(
-            extra_writable(&config),
+            extra_writable(&paths),
             vec![PathBuf::from("/home/u/.codex")]
         );
         let unit = service_unit(
             Path::new("/opt/toker/toker"),
             Path::new("/srv/state/toker/toker.db"),
-            &extra_writable(&config),
+            &[PathBuf::from("/home/u/.codex")],
         );
         assert!(unit.contains("ReadWritePaths=/srv/state/toker\n"));
         // Optional: a missing login dir must not fail the start the way a
         // missing state dir does.
         assert!(unit.contains("ReadWritePaths=-/home/u/.codex\n"));
-
-        let without = dir.join("without.toml");
-        std::fs::write(&without, "[providers.anthropic_sub]\n").expect("write config");
-        let config = Config::load_from(&without).expect("loads");
-        assert!(extra_writable(&config).is_empty());
     }
 
     #[test]
@@ -4367,7 +3511,8 @@ default_backend_anthropic = "codex_sub"
 
         // The hold pair: the slots verbatim, Persistent=false, and the
         // verb with the pinned 15 m span.
-        let (hold_timer, hold_service) = hold_user_units(&slots, exe);
+        let state_dir = Path::new("/home/user/.local/share/toker");
+        let (hold_timer, hold_service) = hold_user_units(&slots, exe, state_dir);
         unit_snapshot("hold_timer", &hold_timer);
         unit_snapshot("hold_service", &hold_service);
 
@@ -4385,7 +3530,7 @@ default_backend_anthropic = "codex_sub"
         // 23:55 slot wraps to 00:06, which a daily OnCalendar reads as
         // the next day, exactly 11 m later — and the service carrying
         // ITS OWN slot. Per-slot unit names (no colon in unit names).
-        let pings = ping_user_units(&slots, exe);
+        let pings = ping_user_units(&slots, exe, state_dir);
         assert_eq!(pings.len(), 2, "one timer+service pair per slot");
         assert_eq!(pings[0].timer_name, "toker-ping-0900.timer");
         assert_eq!(pings[0].service_name, "toker-ping-0900.service");
@@ -4412,12 +3557,13 @@ default_backend_anthropic = "codex_sub"
             // The socket query FAILS (no systemd reachable): non-fatal
             // by design, reported as "unknown" — the state summary
             // must say so, not stop.
-            with_picker(vec![
+            with_timers_and_picker(vec![
                 Err(anyhow::anyhow!("systemctl: command not found")),
                 ok_empty(),
                 ok_empty(),
             ]),
-        );
+        )
+        .with_keys(FRESH_KEYS);
         let unwired_claude = seed_claude(&rig.root);
         let unwired_opencode = seed_opencode(&rig.root);
         seed_rc(&rig.root);
@@ -4441,9 +3587,22 @@ default_backend_anthropic = "codex_sub"
             rig.paths().db_path().is_file(),
             "the wizard wrote into the store under its own root"
         );
-        let openrouter = config.openrouter.as_ref().expect("ticked");
-        assert_eq!(openrouter.api_key_env, "OPENROUTER_API_KEY");
+        // Each provider found in the keyring is enabled with the keyring
+        // as its credential source, and nothing else is enabled.
+        assert_eq!(config.enabled_backends(), ["anthropic_sub", "openrouter"]);
+        let openrouter = config.openrouter.as_ref().expect("found in the keyring");
+        assert!(openrouter.api_key_keyring);
         assert!(openrouter.api_key.is_none(), "no literal key was stored");
+        let sub = config.anthropic_sub.as_ref().expect("found in the keyring");
+        assert!(sub.oauth_token_keyring);
+        assert_eq!(
+            config.default_backend_anthropic.as_deref(),
+            Some("anthropic_sub")
+        );
+        assert_eq!(
+            config.default_backend_openai_chat.as_deref(),
+            Some("openrouter")
+        );
 
         // The store holds credential literals now, so its directory is the
         // thing that must be closed (spec: DCONF#state).
@@ -4474,9 +3633,10 @@ default_backend_anthropic = "codex_sub"
             (SOCKET_UNIT.to_owned(), socket_unit(port)),
             (
                 SERVICE_UNIT.to_owned(),
-                service_unit(&exe, &rig.paths().db_path(), &[]),
+                service_unit(&exe, &rig.paths().db_path(), &extra_writable(&rig.paths())),
             ),
         ];
+        units.extend(timers_installed(&rig, &exe, &default_slots()));
         units.extend(picker_installed(&rig, &exe));
         assert_eq!(
             rig.runner.installed(),
@@ -4488,6 +3648,7 @@ default_backend_anthropic = "codex_sub"
             vec!["daemon-reload"],
             vec!["enable", "--now", SOCKET_UNIT],
         ]);
+        calls.extend(timer_calls(&default_slots()));
         calls.extend(picker_calls());
         assert_eq!(rig.runner.calls(), calls);
 
@@ -4546,39 +3707,23 @@ default_backend_anthropic = "codex_sub"
         let out = rig.out();
         transcript_snapshot("fresh_machine_transcript", &rig, port, &out);
         assert!(out.contains("none (fresh setup)"), "the config line: {out}");
-        // The env-var choice says plainly where the variable must live.
+        // What was enabled, and why; the rest is handed to the dashboard.
         assert!(
-            out.contains("socket-activated systemd user service")
-                && out.contains("environment.d")
-                && out.contains("systemctl --user set-environment OPENROUTER_API_KEY="),
-            "the systemd environment note: {out}"
+            out.contains("anthropic_sub: found in the keyring (toker/anthropic_sub)")
+                && out.contains("openrouter: found in the keyring (toker/openrouter)")
+                && out.contains("providers page of `toker tui`"),
+            "the providers found: {out}"
         );
+        assert!(!out.contains(SCRIPTED_KEY), "a key is never read: {out}");
         assert!(out.contains("unknown"), "the failed socket query: {out}");
         assert!(
             out.contains("codex login : ") && out.contains("not found"),
             "{out}"
         );
-        // The timers question was asked (the last question of the
-        // run), defaulting to no with none installed, and the no
-        // installed nothing: no slots asked, no enable attempted,
-        // nothing printed about wake.
-        let asked = rig.prompt.asked();
-        assert!(
-            asked.last().is_some_and(|asked| asked.kind == "confirm"
-                && asked.message.contains("wake/hold/ping timers")
-                && asked.default.as_deref() == Some("false")),
-            "the timers question: {asked:?}"
-        );
-        assert!(!out.contains("toker-hold"), "{out}");
-        assert!(!out.contains("toker-ping"), "{out}");
-        assert!(!out.contains("toker-wake"), "{out}");
+        // The timers went in unasked, at the default slots.
+        assert_eq!(report.timer_slots, default_slots());
+        assert!(report.timers_ok);
         assert!(!out.contains("sudo"), "{out}");
-        assert!(rig.runner.removed().is_empty(), "nothing to remove");
-        assert!(rig.runner.system_calls().is_empty());
-        assert!(
-            out.contains("timers    : none\n"),
-            "the summary names the decline: {out}"
-        );
 
         // The fixture seeds were what the files said before the run —
         // i.e. the run really rewired them.
@@ -4588,30 +3733,12 @@ default_backend_anthropic = "codex_sub"
         );
         assert_ne!(unwired_opencode, opencode_wired(port));
 
-        // One multi-select offered every backend, pre-ticked from
-        // detection: claude's settings tick anthropic_sub, opencode's
-        // config ticks openrouter, and with no codex login codex_sub is
-        // offered unticked. One anthropic backend ticked: no default
-        // question.
+        // The port was the only configuration question: no provider, no
+        // credential, no default and no toggle was asked.
         let first = &rig.prompt.asked()[0];
-        assert_eq!(first.kind, "multi_select");
-        assert_eq!(first.options.len(), BACKENDS.len());
-        for (option, name) in first
-            .options
-            .iter()
-            .zip(BACKENDS.iter().map(|(name, _)| name))
-        {
-            assert!(option.starts_with(name), "{option} offers {name}");
-        }
-        assert_eq!(first.default.as_deref(), Some("[0, 3]"));
-        let chat_default = rig
-            .prompt
-            .asked()
-            .iter()
-            .find(|asked| asked.message.contains("openai_chat protocol"))
-            .expect("multiple Chat-capable backends ask for their default");
-        assert_eq!(chat_default.options, ["openrouter", "anthropic_sub"]);
-        assert_eq!(chat_default.default.as_deref(), Some("0"));
+        assert_eq!(first.kind, "text");
+        assert_eq!(first.message, "Listener port");
+        assert_eq!(rig.prompt.asked()[1].kind, "confirm");
     }
 
     #[tokio::test]
@@ -4622,8 +3749,9 @@ default_backend_anthropic = "codex_sub"
         let mut rig = Rig::at(
             root.to_path_buf(),
             answers_fresh(port),
-            with_picker(vec![inactive(), ok_empty(), ok_empty()]),
-        );
+            with_timers_and_picker(vec![inactive(), ok_empty(), ok_empty()]),
+        )
+        .with_keys(FRESH_KEYS);
         seed_claude(&root);
         seed_opencode(&root);
         seed_rc(&root);
@@ -4638,19 +3766,20 @@ default_backend_anthropic = "codex_sub"
         let rc_once = std::fs::read(root.join(".bashrc")).expect("read the rc");
         let units_once = rig.runner.installed();
 
-        // Run two, same root: keep the config, leave every frontend,
-        // and no slots (the silent default).
+        // Run two, same root: keep the port and leave every frontend. The
+        // keyring now also holds an openai_api key, which a configured
+        // store does not pick up.
         let mut rerun = Rig::at(
             root.to_path_buf(),
             vec![
-                select(0),      // keep the config
-                confirm(true),  // claude: already wired
-                confirm(true),  // opencode: already wired
-                confirm(true),  // the shell rc: already wired
-                confirm(false), // wake/hold/ping timers: no
+                text(""),      // the listener port: the installed one
+                confirm(true), // claude: already wired
+                confirm(true), // opencode: already wired
+                confirm(true), // the shell rc: already wired
             ],
-            with_picker(vec![active(), ok_empty(), ok_empty()]),
-        );
+            with_timers_and_picker(vec![active(), ok_empty(), ok_empty()]),
+        )
+        .with_keys(&["anthropic_sub", "openrouter", "openai_api"]);
         let report = rerun
             .run(VERIFY_TIMEOUT)
             .await
@@ -4690,18 +3819,26 @@ default_backend_anthropic = "codex_sub"
             vec![std::env::current_exe().expect("this test binary's path")],
             "an active listener is gracefully refreshed before verification"
         );
-        // The transcript pin: run two's first question was the
-        // keep-vs-reconfigure select, the frontend questions were
-        // confirms, and the last question was the timers confirm (no —
-        // the default with none installed).
+        // The transcript pin: run two's first question was the port,
+        // offered as the installed one, and the frontend questions were
+        // confirms.
         let kinds: Vec<&str> = rerun.prompt.asked().iter().map(|a| a.kind).collect();
+        assert_eq!(kinds, ["text", "confirm", "confirm", "confirm"]);
+        let port_text = port.to_string();
         assert_eq!(
-            kinds,
-            ["select", "confirm", "confirm", "confirm", "confirm"]
+            rerun.prompt.asked()[0].default.as_deref(),
+            Some(port_text.as_str())
         );
 
-        // The re-run detected everything and said so.
+        // The re-run detected everything and said so, and kept the
+        // providers rather than looking for more.
         let out = rerun.out();
+        assert!(
+            out.contains("providers anthropic_sub, openrouter — kept as they are"),
+            "{out}"
+        );
+        assert!(!out.contains("found in the keyring"), "{out}");
+        assert!(rig.stored().openai_api.is_none());
         assert!(out.contains("is active"), "{out}");
         assert!(out.contains("points at toker"), "{out}");
         assert!(out.contains("already wired, nothing to do"), "{out}");
@@ -4733,13 +3870,10 @@ default_backend_anthropic = "codex_sub"
         });
         let mut rig = Rig::new(
             "prefix-unstripped",
-            vec![
-                multi(&[0]), // anthropic_sub
-                confirm(true),
-                text(&port.to_string()),
-            ],
+            vec![text(&port.to_string())],
             vec![inactive(), ok_empty(), ok_empty()],
-        );
+        )
+        .with_keys(&["anthropic_sub"]);
         let before_claude = seed_claude(&rig.root);
 
         let error = rig
@@ -4759,47 +3893,47 @@ default_backend_anthropic = "codex_sub"
     }
 
     #[tokio::test]
-    async fn a_frontend_whose_protocol_has_no_backend_is_not_offered() {
+    async fn a_frontend_whose_protocol_has_no_provider_is_still_wired() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "no-anthropic",
             vec![
-                multi(&[3]), // openrouter alone
-                select(0),   // its key: the frontend's own
-                confirm(true),
                 text(&port.to_string()),
+                confirm(true), // claude, with no anthropic provider yet
                 confirm(true), // opencode
                 confirm(true), // the opencode plugin
             ],
-            with_picker(vec![inactive(), ok_empty(), ok_empty()]),
-        );
-        let before_claude = seed_claude(&rig.root);
+            with_timers_and_picker(vec![inactive(), ok_empty(), ok_empty()]),
+        )
+        .with_keys(&["openrouter"]);
+        seed_claude(&rig.root);
         seed_opencode(&rig.root);
 
         let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
-        // Verify probed only the openai path; claude was never asked
-        // about and never touched.
+        // Claude's prefix was verified, but no usage path of a protocol
+        // toker would answer as not configured.
         assert_eq!(
             report.verified.expect("verified").answers,
-            vec![(verify::Check::Usage("/v1/chat/completions".to_owned()), 401)]
+            vec![
+                (verify::Check::Prefix("claude".to_owned()), 200),
+                (verify::Check::Usage("/v1/chat/completions".to_owned()), 401),
+            ]
         );
         assert!(
+            rig.out().contains(
+                "no anthropic provider is enabled yet — it gets not-configured errors \
+                 until one is enabled in `toker tui`"
+            ),
+            "{}",
             rig.out()
-                .contains("not offered — no anthropic backend is enabled")
         );
-        assert!(
-            !rig.prompt
-                .asked()
-                .iter()
-                .any(|asked| asked.message.contains("claude")),
-            "{:?}",
-            rig.prompt.asked()
-        );
+        // Wired all the same: an anthropic provider enabled on the
+        // dashboard later serves it without setup running again.
         assert_eq!(
             std::fs::read(rig.root.join(".claude/settings.json")).expect("read claude"),
-            before_claude
+            claude_wired(port)
         );
-        assert_eq!(report.patched.len(), 1, "opencode alone");
+        assert_eq!(report.patched.len(), 2, "claude and opencode");
     }
 
     #[tokio::test]
@@ -4809,16 +3943,10 @@ default_backend_anthropic = "codex_sub"
             "verify-fail",
             // The fresh script up to the port answer — the wizard
             // never reaches a frontend question.
-            vec![
-                multi(&[0, 3]), // backends: anthropic_sub + openrouter
-                select(2),      // openrouter key: an env var
-                text(""),
-                select(0), // openai_chat default: openrouter
-                confirm(true),
-                text(&port.to_string()),
-            ],
+            vec![text(&port.to_string())],
             vec![inactive(), ok_empty(), ok_empty()],
-        );
+        )
+        .with_keys(FRESH_KEYS);
         let before_claude = seed_claude(&rig.root);
         let before_opencode = seed_opencode(&rig.root);
 
@@ -4855,37 +3983,34 @@ default_backend_anthropic = "codex_sub"
         assert!(!rig.stored_rows().providers.is_empty());
         assert_eq!(rig.runner.installed().len(), 2);
         // And nothing was asked past the port.
-        assert_eq!(rig.prompt.asked().len(), 6);
+        assert_eq!(rig.prompt.asked().len(), 1);
     }
 
     #[tokio::test]
-    async fn an_existing_config_can_be_reconfigured_without_losing_hand_edits() {
+    async fn an_existing_file_keeps_its_providers_and_hand_edits_on_a_new_port() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "reconfigure",
             vec![
-                select(1),               // reconfigure
-                multi_defaults(),        // backends: the config's own (codex_sub)
-                confirm(true),           // awake
                 text("not-a-port"),      // a bad port is re-asked, not fatal
                 text(&port.to_string()), // the scratch port
                 confirm(true),           // claude
                 confirm(true),           // codex
             ],
-            with_picker(vec![active(), ok_empty(), ok_empty()]),
-        );
+            with_timers_and_picker(vec![active(), ok_empty(), ok_empty()]),
+        )
+        // A key in the keyring does not add a provider to a file that
+        // already names one.
+        .with_keys(&["openrouter"]);
         std::fs::create_dir_all(rig.root.join(".config/toker")).expect("create the config dir");
         std::fs::write(rig.toml_path(), EXISTING_TOML).expect("seed the existing toml");
         std::fs::create_dir_all(rig.root.join(".codex")).expect("create the codex dir");
         std::fs::write(rig.root.join(".codex/auth.json"), "{}").expect("seed the codex login");
         seed_claude(&rig.root);
 
-        let report = rig
-            .run(VERIFY_TIMEOUT)
-            .await
-            .expect("the reconfigure run completes");
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
 
-        // The reconfigured choices applied…
+        // The new port applied…
         let config = rig.stored();
         assert_eq!(report.port, port);
         assert!(config.awake);
@@ -4898,18 +4023,15 @@ default_backend_anthropic = "codex_sub"
         assert!(active_document(&rig.paths()).contains("gpt-5.6-sol"));
         assert_eq!(report.routing_activated, Some(1));
 
-        // The existing config's enabled set was pre-ticked (codex_sub
-        // alone, though claude's settings exist: the config wins over
-        // detection) — and the note about the deliberate routing edit
-        // was printed.
-        assert_eq!(rig.prompt.asked()[1].kind, "multi_select");
-        assert_eq!(rig.prompt.asked()[1].default.as_deref(), Some("[2]"));
-        assert!(rig.stored().openrouter.is_none(), "not ticked, not enabled");
+        // The file's providers were kept as they were (codex_sub alone,
+        // though a codex login and an openrouter key exist).
+        assert_eq!(config.enabled_backends(), ["codex_sub"]);
         let out = rig.out();
         assert!(
-            out.contains("a deliberate operator edit in `toker tui`"),
+            out.contains("providers codex_sub — kept as they are"),
             "{out}"
         );
+        assert!(!out.contains("found in the keyring"), "{out}");
         assert!(
             out.contains("activated revision 1 from these choices"),
             "{out}"
@@ -4919,10 +4041,10 @@ default_backend_anthropic = "codex_sub"
             "{out}"
         );
 
-        assert!(report.config_written);
+        assert!(report.config_kept && report.config_written);
         assert_eq!(report.patched.len(), 2, "claude and codex were detected");
         // The existing config (no port key → the default 18123) was
-        // reconfigured onto the scratch port with the socket detected
+        // moved onto the scratch port with the socket detected
         // ACTIVE — the wizard printed the restart note instead of
         // ever restarting the live socket itself.
         assert!(
@@ -4959,30 +4081,17 @@ default_backend_anthropic = "codex_sub"
     }
 
     #[tokio::test]
-    async fn an_owned_machine_is_asked_no_defaults_and_keeps_its_revision() {
+    async fn an_owned_machine_keeps_its_revision() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "owned-reconfigure",
-            vec![
-                select(1),               // reconfigure
-                multi(&[0, 2]),          // anthropic_sub + codex_sub: two candidates
-                confirm(true),           // awake
-                text(&port.to_string()), // the scratch port
-                confirm(false),          // wake/hold/ping timers: no
-            ],
-            vec![inactive(), ok_empty(), ok_empty()],
+            vec![text(&port.to_string())], // the scratch port
+            with_timers(vec![inactive(), ok_empty(), ok_empty()]),
         );
         let before = seed_owned(&rig, EXISTING_TOML);
 
         let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
 
-        assert!(
-            !rig.prompt
-                .asked()
-                .iter()
-                .any(|asked| asked.message.contains("Default backend")),
-            "the database owns the defaults"
-        );
         let after = active_revision(&rig.paths()).expect("still active");
         assert_eq!(after.revision_id, before.revision_id);
         assert_eq!(after.fingerprint, before.fingerprint);
@@ -4992,8 +4101,7 @@ default_backend_anthropic = "codex_sub"
         // set of fields "dropped" from a rewrite.
         assert!(report.config_file_removed);
         assert!(!rig.toml_path().exists());
-        let config = rig.stored();
-        assert!(config.anthropic_sub.is_some() && config.codex_sub.is_some());
+        assert_eq!(rig.stored().enabled_backends(), ["codex_sub"]);
         let out = rig.out();
         assert!(
             out.contains("routing     : database-owned, revision 1"),
@@ -5010,8 +4118,8 @@ default_backend_anthropic = "codex_sub"
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "owned-keep",
-            vec![select(0)], // keep it as is
-            vec![inactive(), ok_empty(), ok_empty()],
+            vec![text("")], // the listener port: the file's
+            with_timers(vec![inactive(), ok_empty(), ok_empty()]),
         );
         let seeded = format!("port = {port}\n{EXISTING_TOML}");
         seed_owned(&rig, &seeded);
@@ -5054,12 +4162,7 @@ default_backend_anthropic = "codex_sub"
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "write-fail",
-            vec![
-                select(1),               // reconfigure
-                multi(&[2]),             // codex_sub
-                confirm(true),           // awake
-                text(&port.to_string()), // the scratch port
-            ],
+            vec![text(&port.to_string())], // the scratch port
             vec![inactive()],
         );
         std::fs::create_dir_all(rig.root.join(".config/toker")).expect("create the config dir");
@@ -5090,13 +4193,8 @@ default_backend_anthropic = "codex_sub"
         // The next run finds a database-owned machine and writes the owned config.
         let mut next = Rig::at(
             rig.root.clone(),
-            vec![
-                select(1),
-                multi_defaults(),
-                confirm(true),
-                text(&port.to_string()),
-            ],
-            vec![inactive(), ok_empty(), ok_empty()],
+            vec![text(&port.to_string())],
+            with_timers(vec![inactive(), ok_empty(), ok_empty()]),
         );
         let report = next.run(VERIFY_TIMEOUT).await.expect("the recovery run");
         assert_eq!(report.routing_owned, Some(1));
@@ -5119,22 +4217,16 @@ default_backend_anthropic = "codex_sub"
         );
         let mut with = Rig::at(
             with_dir.to_path_buf(),
-            // The fresh script up to the port, with_picker(the workhorse confirm
+            // The fresh script up to the port, then the workhorse confirm
             // (the only frontend detected here — no user-level claude,
-            // no opencode, no shell rc, so no plugin offer)), then no
-            // slots.
+            // no opencode, no shell rc, so no plugin offer).
             vec![
-                multi(&[0, 3]),          // backends: anthropic_sub + openrouter
-                select(2),               // key source: env var
-                text(""),                // env name: keep the default
-                select(0),               // openai_chat default: openrouter
-                confirm(true),           // awake
                 text(&port.to_string()), // the listener port
                 confirm(true),           // workhorse
-                confirm(false),          // wake/hold/ping timers: no
             ],
-            vec![inactive(), ok_empty(), ok_empty()],
-        );
+            with_timers(vec![inactive(), ok_empty(), ok_empty()]),
+        )
+        .with_keys(FRESH_KEYS);
         let report = with
             .run(VERIFY_TIMEOUT)
             .await
@@ -5171,8 +4263,9 @@ default_backend_anthropic = "codex_sub"
         let mut without = Rig::new(
             "workhorse-without",
             answers_fresh(port),
-            with_picker(vec![inactive(), ok_empty(), ok_empty()]),
-        );
+            with_timers_and_picker(vec![inactive(), ok_empty(), ok_empty()]),
+        )
+        .with_keys(FRESH_KEYS);
         seed_claude(&without.root);
         seed_opencode(&without.root);
         seed_rc(&without.root);
@@ -5206,19 +4299,14 @@ default_backend_anthropic = "codex_sub"
         let mut rig = Rig::new(
             "import",
             // The fresh script without frontend confirms (nothing
-            // detected), no slots, plus the import yes.
+            // detected), plus the import yes.
             vec![
-                multi(&[0, 3]), // backends: anthropic_sub + openrouter
-                select(2),      // openrouter key: an env var
-                text(""),
-                select(0), // openai_chat default: openrouter
-                confirm(true),
                 text(&port.to_string()),
-                confirm(false), // wake/hold/ping timers: no
-                confirm(true),  // import the predecessor's history
+                confirm(true), // import the predecessor's history
             ],
-            vec![inactive(), ok_empty(), ok_empty()],
-        );
+            with_timers(vec![inactive(), ok_empty(), ok_empty()]),
+        )
+        .with_keys(FRESH_KEYS);
         let ctp = rig.paths().ctp_usage;
         if let Some(parent) = ctp.parent() {
             std::fs::create_dir_all(parent).expect("create the predecessor dir");
@@ -5257,154 +4345,156 @@ default_backend_anthropic = "codex_sub"
     }
 
     #[tokio::test]
-    async fn a_pasted_key_is_stored_but_never_echoed() {
+    async fn a_codex_login_on_a_fresh_store_enables_codex_sub() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
-        const KEY: &str = "sk-or-v1-this-must-never-appear-in-output";
         let mut rig = Rig::new(
-            "secret",
-            // The literal-key script with no frontends detected: the
-            // questions end at the port, then the slots text.
-            {
-                let mut answers = answers_fresh(port);
-                answers[1] = select(1); // key source: literal in toker.toml
-                answers[2] = text(KEY); // the key itself, masked in the real UI
-                answers.truncate(6); // nothing past the port is asked
-                answers.push(confirm(false)); // wake/hold/ping timers: no
-                answers
-            },
-            vec![inactive(), ok_empty(), ok_empty()],
+            "detect-codex",
+            vec![
+                text(&port.to_string()), // the listener port
+                confirm(true),           // codex
+            ],
+            with_timers(vec![inactive(), ok_empty(), ok_empty()]),
         );
-        // No secret service on this machine: the key falls back to the
-        // 0600 toml.
-        rig.secrets = MemoryStore::unavailable();
+        std::fs::create_dir_all(rig.root.join(".codex")).expect("create the codex dir");
+        std::fs::write(rig.root.join(".codex/auth.json"), "{}").expect("seed the codex login");
 
-        rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
 
-        // The key appears in NO output string the wizard produces…
+        let config = rig.stored();
+        assert_eq!(config.enabled_backends(), ["codex_sub"]);
+        assert_eq!(
+            config.default_backend_anthropic.as_deref(),
+            Some("codex_sub")
+        );
+        assert!(report.config_written && !report.config_kept);
         let out = rig.out();
-        assert!(!out.contains(KEY), "the wizard's output:\n{out}");
-        // …and in no question it asked (messages only, never answers).
-        for asked in rig.prompt.asked() {
-            assert!(
-                !asked.message.contains(KEY),
-                "the key leaked into a prompt: {:?}",
-                asked.message
-            );
-        }
-        // …and in no unit it installed.
-        for (_name, contents) in rig.runner.installed() {
-            assert!(!contents.contains(KEY), "the key leaked into a unit");
-        }
-
-        // The key IS stored — its one sanctioned home is now the row, in a
-        // store whose directory setup closed to everyone else.
-        let rows = rig.stored_rows();
+        assert!(out.contains("codex_sub: the codex login is at "), "{out}");
         assert!(
-            rows.providers
-                .iter()
-                .any(|row| row.cred_literal.as_deref() == Some(KEY)),
-            "the key is stored as a literal in the store"
+            out.contains("a deliberate operator edit in `toker tui`"),
+            "{out}"
         );
-        // And it was asked as a SECRET question — the seam masks the
-        // answer in the real UI, which is half of the never-echo rule.
-        let key_question = rig
-            .prompt
-            .asked()
-            .iter()
-            .find(|asked| asked.secret)
-            .expect("the key was asked as a secret question");
-        assert!(
-            key_question.message.contains("openrouter API key"),
-            "the secret question names the provider, not the key"
-        );
-        assert_eq!(key_question.kind, "text");
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(rig.paths().db_path().parent().expect("the state dir"))
-            .expect("metadata")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o077, 0, "the store's directory is closed");
-
-        // And the summary named only the SOURCE, never the value, and
-        // said why the key is not in the keyring.
-        assert!(out.contains("the literal in toker.toml"), "{out}");
-        assert!(out.contains("no OS keyring"), "{out}");
+        assert!(!out.contains("found in the keyring"), "{out}");
+        assert_eq!(rig.prompt.asked()[0].message, "Listener port");
     }
 
     #[tokio::test]
-    async fn a_key_given_to_toker_goes_to_the_keyring_and_the_other_choices_store_nothing() {
+    async fn keyring_entries_enable_their_providers_without_reading_a_key() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
-        const KEY: &str = "sk-ant-this-must-never-appear-in-output";
         let mut rig = Rig::new(
-            "keyring",
-            vec![
-                multi(&[1, 3]), // anthropic_api + openrouter
-                select(1),      // anthropic_api: give it to toker
-                text(KEY),      // the key, masked in the real UI
-                select(0),      // openrouter: the frontend brings its own
-                select(0),      // openai_chat default: openrouter
-                confirm(true),  // awake
-                text(&port.to_string()),
-            ],
-            vec![inactive(), ok_empty(), ok_empty()],
-        );
-        rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+            "detect-keyring",
+            // Nothing to wire and no subscription: the port is the one
+            // question.
+            vec![text(&port.to_string())],
+            with_timers(vec![inactive(), ok_empty(), ok_empty()]),
+        )
+        .with_keys(&["anthropic_api", "openai_api"]);
 
-        // The key is in the (fake) keyring and nowhere else.
-        assert_eq!(rig.secrets.peek("anthropic_api").as_deref(), Some(KEY));
-        assert_eq!(rig.secrets.peek("openrouter"), None);
-        let rows = rig.stored_rows();
-        assert!(
-            rows.providers.iter().all(|row| row.cred_literal.is_none()),
-            "choosing the keyring stores no literal"
-        );
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+
         let config = rig.stored();
-        let api = config.anthropic_api.as_ref().expect("enabled");
-        assert!(api.api_key_keyring);
-        let openrouter = config.openrouter.as_ref().expect("enabled");
-        assert!(!openrouter.api_key_keyring && openrouter.api_key.is_none());
-        let out = rig.out();
-        assert!(!out.contains(KEY), "{out}");
-        assert!(out.contains("stored in the OS keyring"), "{out}");
-        assert!(
-            out.contains("the frontend's own is passed through"),
-            "{out}"
-        );
-        // The auth question offered the three choices in the agreed
-        // order, the frontend's own first.
-        let auth = &rig.prompt.asked()[1];
-        assert!(auth.options[0].starts_with("the frontend brings its own"));
-        assert!(auth.options[1].starts_with("give it to toker"));
-        assert!(auth.options[2].starts_with("an env var"));
-
-        // A re-run over the stored key, answered with Enter: it stays
-        // where it is, and the stored choice is preselected.
-        let mut rerun = Rig::at(
-            rig.root.clone(),
-            vec![
-                select(1),        // reconfigure
-                multi_defaults(), // the same backends
-                select(1),        // anthropic_api: still toker's
-                text(""),         // empty keeps the stored key
-                select(0),        // openrouter: the frontend's own
-                confirm(true),
-                text(&port.to_string()),
-            ],
-            vec![inactive(), ok_empty(), ok_empty()],
-        );
-        rerun
-            .run(VERIFY_TIMEOUT)
-            .await
-            .expect("the rerun completes");
-        assert_eq!(rerun.prompt.asked()[2].default.as_deref(), Some("1"));
-        let config = rerun.stored();
+        assert_eq!(config.enabled_backends(), ["anthropic_api", "openai_api"]);
         assert!(
             config
                 .anthropic_api
                 .as_ref()
-                .expect("enabled")
+                .expect("found")
                 .api_key_keyring
         );
+        assert!(config.openai_api.as_ref().expect("found").api_key_keyring);
+        assert!(
+            rig.stored_rows()
+                .providers
+                .iter()
+                .all(|row| row.cred_literal.is_none()),
+            "no key was copied into the store"
+        );
+        assert!(report.verified.is_some());
+        assert_eq!(rig.secrets.reads(), 0, "presence only, never the value");
+        assert_eq!(rig.prompt.asked().len(), 1);
+        let out = rig.out();
+        assert!(!out.contains(SCRIPTED_KEY), "{out}");
+        assert!(
+            out.contains("anthropic_api: found in the keyring (toker/anthropic_api)")
+                && out.contains("openai_api: found in the keyring (toker/openai_api)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("anthropic_api key: env ANTHROPIC_API_KEY (systemd user environment) when set, else the OS keyring"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_no_credential_found_setup_still_completes() {
+        // A Claude-only machine: no secret service and no codex login,
+        // so no provider is found, and setup does the whole setup anyway
+        // (spec: USETUP#writing).
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "detect-nothing",
+            vec![
+                text(&port.to_string()), // the listener port
+                confirm(true),           // claude
+                confirm(true),           // shell rc
+            ],
+            with_timers_and_picker(vec![inactive(), ok_empty(), ok_empty()]),
+        );
+        rig.secrets = MemoryStore::unavailable();
+        seed_claude(&rig.root);
+        seed_rc(&rig.root);
+
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+
+        // The configuration is written, with no provider enabled.
+        assert!(report.config_written);
+        assert_eq!(report.routing_activated, Some(1));
+        assert!(rig.stored().enabled_backends().is_empty());
+        // The units are installed.
+        assert!(report.units_ok);
+        assert_eq!(report.units_installed, [SOCKET_UNIT, SERVICE_UNIT]);
+        // Verify proved claude's prefix, the one check a Toker with no
+        // provider can pass, and the clients were pointed at it.
+        assert_eq!(
+            report.verified.expect("verified").answers,
+            vec![(verify::Check::Prefix("claude".to_owned()), 200)]
+        );
+        assert_eq!(
+            std::fs::read(rig.root.join(".claude/settings.json")).expect("read claude"),
+            claude_wired(port)
+        );
+        assert_eq!(report.patched.len(), 2, "claude and the shell rc");
+        let out = rig.out();
+        assert!(
+            out.contains("the keyring could not be checked") && out.contains("no secret service"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "no provider credential found, so none is enabled — providers are enabled \
+                 on the providers page of `toker tui`"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("run setup again"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn with_no_provider_and_no_frontend_verify_asks_the_listener() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "detect-nothing-bare",
+            vec![text(&port.to_string())],
+            with_timers(vec![inactive(), ok_empty(), ok_empty()]),
+        );
+
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+
+        assert!(report.config_written && report.units_ok);
+        assert_eq!(
+            report.verified.expect("verified").answers,
+            vec![(verify::Check::Listener, 200)]
+        );
+        assert!(rig.out().contains("no frontends detected"), "{}", rig.out());
     }
 
     #[tokio::test]
@@ -5412,15 +4502,10 @@ default_backend_anthropic = "codex_sub"
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "openai-only",
-            vec![
-                multi(&[4]),             // openai_api only
-                select(2),               // key source: env var
-                text(""),                // keep OPENAI_API_KEY
-                confirm(true),           // awake
-                text(&port.to_string()), // listener port
-            ],
-            vec![inactive(), ok_empty(), ok_empty()],
-        );
+            vec![text(&port.to_string())], // listener port
+            with_timers(vec![inactive(), ok_empty(), ok_empty()]),
+        )
+        .with_keys(&["openai_api"]);
 
         rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
 
@@ -5432,74 +4517,11 @@ default_backend_anthropic = "codex_sub"
             Some("openai_api")
         );
         let api = config.openai_api.as_ref().expect("openai_api enabled");
-        assert_eq!(api.api_key_env, DEFAULT_OPENAI_API_KEY_ENV);
-        assert!(!api.api_key_keyring && api.api_key.is_none());
+        assert!(api.api_key_keyring && api.api_key.is_none());
         assert!(
             rig.out()
                 .contains("openai_api key: env OPENAI_API_KEY (systemd user environment)")
         );
-        assert!(
-            !rig.prompt
-                .asked()
-                .iter()
-                .any(|asked| asked.message.contains("Default backend")),
-            "one Chat backend needs no default question"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_ticked_set_is_the_enabled_set_and_a_default_is_asked_among_several() {
-        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
-        let mut rig = Rig::new(
-            "multi-select",
-            vec![
-                select(1),               // reconfigure
-                multi(&[]),              // nothing ticked: asked again
-                multi(&[0, 2]),          // anthropic_sub + codex_sub
-                select(1),               // the anthropic default: codex_sub
-                select(0),               // openai_chat default: codex_sub
-                confirm(true),           // awake
-                text(&port.to_string()), // the port
-                confirm(false),          // wake/hold/ping timers: no
-            ],
-            vec![inactive(), ok_empty(), ok_empty()],
-        );
-        std::fs::create_dir_all(rig.root.join(".config/toker")).expect("create the config dir");
-        std::fs::write(
-            rig.toml_path(),
-            "[providers.anthropic_sub]\n[providers.openrouter]\napi_key_env = \"MY_KEY\"\n",
-        )
-        .expect("seed the existing toml");
-
-        rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
-
-        let asked = rig.prompt.asked();
-        // The existing config's enabled set was pre-ticked.
-        assert_eq!(asked[1].default.as_deref(), Some("[0, 3]"));
-        assert!(rig.out().contains("pick at least one backend"));
-        // The default question offered exactly the ticked anthropic
-        // backends, the existing default preselected.
-        assert_eq!(asked[3].kind, "select");
-        assert_eq!(asked[3].options, ["anthropic_sub", "codex_sub"]);
-        assert_eq!(asked[3].default.as_deref(), Some("0"));
-        // No openrouter key was asked: it is no longer ticked.
-        assert!(
-            !asked
-                .iter()
-                .any(|asked| asked.message.contains("openrouter"))
-        );
-
-        let config = rig.stored();
-        assert_eq!(
-            config.enabled_backends(),
-            vec!["anthropic_sub", "codex_sub"]
-        );
-        // The defaults went to the store's revision, and the rows carry no
-        // routing at all (spec: RMIG#the-routing-fields).
-        assert!(!rig.toml_path().exists(), "the file went with the import");
-        assert!(active_document(&rig.paths()).contains("codex_sub"));
-        // codex_sub ticked without a login: said so.
-        assert!(rig.out().contains("no codex login"), "{}", rig.out());
     }
 
     #[tokio::test]
@@ -5507,9 +4529,7 @@ default_backend_anthropic = "codex_sub"
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "state-dir-fail",
-            vec![
-                select(0), // keep the config as it is
-            ],
+            vec![text("")], // the listener port: the file's
             // is-active only: with the state dir missing, nothing may
             // start, so reload and enable must never be called.
             vec![inactive()],
@@ -5561,13 +4581,10 @@ default_backend_anthropic = "codex_sub"
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "activation-fail",
-            vec![
-                multi(&[0]), // backends: anthropic_sub
-                confirm(true),
-                text(&port.to_string()),
-            ],
+            vec![text(&port.to_string())],
             vec![inactive()],
-        );
+        )
+        .with_keys(&["anthropic_sub"]);
         let before_claude = seed_claude(&rig.root);
         // A file where the state dir belongs: the ledger cannot be created.
         let state_dir = rig.paths().state_dir;
@@ -5595,19 +4612,13 @@ default_backend_anthropic = "codex_sub"
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "units-fail",
-            vec![
-                multi(&[0, 3]), // backends: anthropic_sub + openrouter
-                select(2),      // openrouter key: an env var
-                text(""),
-                select(0), // openai_chat default: openrouter
-                confirm(true),
-                text(&port.to_string()),
-            ],
+            vec![text(&port.to_string())],
             // is-active fine; daemon-reload FAILS — so enable must
             // never be called (only two scripted outcomes remain
             // before the fake would panic).
             vec![inactive(), reload_fails()],
-        );
+        )
+        .with_keys(FRESH_KEYS);
         let before_claude = seed_claude(&rig.root);
 
         let report = rig
@@ -5719,8 +4730,8 @@ default_backend_anthropic = "codex_sub"
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "same-db",
-            vec![select(0)], // keep it as is
-            vec![inactive(), ok_empty(), ok_empty()],
+            vec![text("")], // the listener port: the file's
+            with_timers(vec![inactive(), ok_empty(), ok_empty()]),
         );
         let seeded = format!(
             "db_path = \"{}\"\nport = {port}\n{EXISTING_TOML}",
@@ -5742,11 +4753,12 @@ default_backend_anthropic = "codex_sub"
             "plugin-declined",
             {
                 let mut answers = answers_fresh(port);
-                answers[9] = confirm(false); // the opt-out
+                answers[4] = confirm(false); // the opt-out
                 answers
             },
-            with_picker(vec![inactive(), ok_empty(), ok_empty()]),
-        );
+            with_timers_and_picker(vec![inactive(), ok_empty(), ok_empty()]),
+        )
+        .with_keys(FRESH_KEYS);
         seed_claude(&declined.root);
         seed_opencode(&declined.root);
         seed_rc(&declined.root);
@@ -5781,11 +4793,12 @@ default_backend_anthropic = "codex_sub"
             "plugin-guarded",
             {
                 let mut answers = answers_fresh(port);
-                answers[9] = confirm(false); // the reinstall refusal
+                answers[4] = confirm(false); // the reinstall refusal
                 answers
             },
-            with_picker(vec![inactive(), ok_empty(), ok_empty()]),
-        );
+            with_timers_and_picker(vec![inactive(), ok_empty(), ok_empty()]),
+        )
+        .with_keys(FRESH_KEYS);
         seed_claude(&guarded.root);
         seed_opencode(&guarded.root);
         seed_rc(&guarded.root);
@@ -5815,290 +4828,165 @@ default_backend_anthropic = "codex_sub"
 
     // ── the wake/hold/ping timers ─────────────────────────────────
 
-    /// The full slots leg: the hold pair and both ping pairs install
-    /// and enable through the user manager, the wake unit is staged
-    /// into the units dir and enabled by path through sudo.
+    /// A fresh run installs and enables the hold and ping timers at the
+    /// default slots without asking, and writes the wake pair beside them
+    /// without placing it anywhere: the runner has no way to reach the
+    /// system manager, and the user manager is never asked to enable it.
     #[tokio::test]
-    async fn slots_install_and_enable_the_hold_ping_and_wake_timers() {
+    async fn a_fresh_run_installs_the_timers_at_the_default_slots_unasked() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
-            "timers-slots",
-            {
-                let mut answers = answers_fresh(port);
-                answers.splice(10..11, [confirm(true), text("09:00, 12:30")]);
-                answers
-            },
-            with_picker(vec![
-                inactive(), // is-active
-                ok_empty(), // daemon-reload (units)
-                ok_empty(), // enable --now socket
-                ok_empty(), // daemon-reload (timers)
-                ok_empty(), // enable --now toker-hold.timer
-                ok_empty(), // enable --now toker-ping-0900.timer
-                ok_empty(), // enable --now toker-ping-1230.timer
-            ]),
+            "timers-fresh",
+            answers_fresh(port),
+            with_timers_and_picker(vec![inactive(), ok_empty(), ok_empty()]),
         )
-        .with_system(vec![ok_empty(), ok_empty()]);
+        .with_keys(FRESH_KEYS);
         seed_claude(&rig.root);
         seed_opencode(&rig.root);
         seed_rc(&rig.root);
 
-        let report = rig
-            .run(VERIFY_TIMEOUT)
-            .await
-            .expect("the slots run completes");
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
 
-        let exe = std::env::current_exe().expect("this test binary's path");
-        let slots = ["09:00".to_owned(), "12:30".to_owned()];
-        let pings = ping_user_units(&slots, &exe);
-        let (hold_timer, hold_service) = hold_user_units(&slots, &exe);
+        let slots = default_slots();
+        assert_eq!(slots, ["07:20", "12:20"]);
+        assert_eq!(report.timer_slots, slots);
+        assert!(report.timers_ok);
+        assert!(report.timers_manual.is_empty());
 
         // The units installed, in order, byte-for-byte the generators'
-        // output — including the staged wake system timer.
+        // output, the wake pair last.
+        let exe = std::env::current_exe().expect("this test binary's path");
+        let installed = rig.runner.installed();
         assert_eq!(
-            rig.runner.installed(),
-            vec![
-                (SOCKET_UNIT.to_owned(), socket_unit(port)),
-                (
-                    SERVICE_UNIT.to_owned(),
-                    service_unit(&exe, &rig.paths().db_path(), &[])
-                ),
-                (HOLD_TIMER_UNIT.to_owned(), hold_timer),
-                (HOLD_SERVICE_UNIT.to_owned(), hold_service),
-                (pings[0].timer_name.clone(), pings[0].timer.clone()),
-                (pings[0].service_name.clone(), pings[0].service.clone()),
-                (pings[1].timer_name.clone(), pings[1].timer.clone()),
-                (pings[1].service_name.clone(), pings[1].service.clone()),
-                (WAKE_SERVICE_UNIT.to_owned(), wake_system_service()),
-                (WAKE_TIMER_UNIT.to_owned(), wake_system_unit(&slots)),
-            ]
-            .into_iter()
-            .chain(picker_installed(&rig, &exe))
-            .collect::<Vec<_>>(),
-            "socket, service, hold pair, one ping pair per slot, staged wake pair, picker pair"
+            installed[2..installed.len() - 2],
+            timers_installed(&rig, &exe, &slots)
         );
+        // The services wait on the marker, so enabling the timers starts
+        // nothing until the schedule is turned on.
+        let marker = timers::ping_marker(&rig.paths().state_dir);
+        let condition = format!("ConditionPathExists={}", marker.display());
+        for (name, contents) in &installed {
+            if name.starts_with("toker-hold.") || name.starts_with("toker-ping-") {
+                assert_eq!(
+                    contents.contains(&condition),
+                    name.ends_with(".service"),
+                    "{name}: {contents}"
+                );
+            }
+        }
+        assert!(!marker.exists(), "setup does not turn the schedule on");
 
-        // The user-manager calls, in the wizard's exact order.
-        assert_eq!(
-            rig.runner.calls(),
-            vec![
-                vec!["is-active", SOCKET_UNIT],
-                vec!["daemon-reload"],
-                vec!["enable", "--now", SOCKET_UNIT],
-                vec!["daemon-reload"],
-                vec!["enable", "--now", HOLD_TIMER_UNIT],
-                vec!["enable", "--now", "toker-ping-0900.timer"],
-                vec!["enable", "--now", "toker-ping-1230.timer"],
-            ]
-            .into_iter()
-            .map(|call| call.into_iter().map(str::to_owned).collect::<Vec<_>>())
-            .chain(picker_calls())
-            .collect::<Vec<_>>(),
-        );
-
-        // The wake leg: two sudo calls, both by path — link the
-        // service the timer starts (it has no [Install] to enable),
-        // then enable the timer. A timer whose unit is missing is
-        // refused, which is how the first install never armed.
-        let staged = rig.paths().units_dir.join(WAKE_TIMER_UNIT);
-        let staged_service = rig.paths().units_dir.join(WAKE_SERVICE_UNIT);
-        assert_eq!(
-            rig.runner.system_calls(),
-            vec![
-                vec!["link".to_owned(), staged_service.display().to_string()],
-                vec![
-                    "enable".to_owned(),
-                    "--now".to_owned(),
-                    staged.display().to_string(),
-                ],
-            ],
-            "sudo systemctl link <service>, then enable --now <timer>"
-        );
-
-        assert_eq!(report.timer_slots, slots);
-        assert!(report.timers_ok, "the user timers came up");
-        assert!(report.wake_enabled, "the wake timer was sudo-enabled");
-        assert!(report.units_ok, "the main spine is unaffected");
-
-        // The transcript: the sudo warning appears before the call,
-        // and the summary reports all three timers.
-        let out = rig.out();
-        transcript_snapshot("timers_slots_transcript", &rig, port, &out);
+        let calls = rig.runner.calls();
+        assert_eq!(calls[3..calls.len() - 3], timer_calls(&slots));
         assert!(
-            out.contains("sudo will be asked"),
-            "the sudo prompt is in the transcript: {out}"
-        );
-        assert!(
-            out.contains("CAP_WAKE_ALARM"),
-            "the sudo warning says why: {out}"
-        );
-        assert!(
-            out.contains(&format!("sudo systemctl enable --now {}", staged.display())),
-            "{out}"
-        );
-        assert!(
-            out.contains("timers    : slots 09:00, 12:30"),
-            "the summary's timers line: {out}"
-        );
-    }
-
-    /// The sudo-failure leg: the wake enable fails, and the user
-    /// timers it leaves standing are still installed and enabled —
-    /// the manual commands carry the copy into /etc and the enable by
-    /// name.
-    #[tokio::test]
-    async fn a_failed_sudo_keeps_the_user_timers_and_prints_manual_commands() {
-        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
-        let mut rig = Rig::new(
-            "timers-sudo-fail",
-            {
-                let mut answers = answers_fresh(port);
-                answers.splice(10..11, [confirm(true), text("09:00")]); // one slot
-                answers
-            },
-            with_picker(vec![
-                inactive(),
-                ok_empty(), // daemon-reload (units)
-                ok_empty(), // enable --now socket
-                ok_empty(), // daemon-reload (timers)
-                ok_empty(), // enable --now toker-hold.timer
-                ok_empty(), // enable --now toker-ping-0900.timer
-            ]),
-        )
-        // sudo cannot run at all on this leg.
-        .with_system(vec![Err(anyhow::anyhow!("sudo: command not found"))]);
-        seed_claude(&rig.root);
-        seed_opencode(&rig.root);
-        seed_rc(&rig.root);
-
-        let report = rig
-            .run(VERIFY_TIMEOUT)
-            .await
-            .expect("a failed wake enable is non-fatal");
-
-        // The user timers stand on their own.
-        assert!(report.timers_ok, "the user timers came up");
-        assert_eq!(
-            report
-                .timers_installed
+            calls
                 .iter()
-                .filter(|name| name.starts_with("toker-ping"))
-                .count(),
-            2,
-            "the ping pair is installed: {:?}",
-            report.timers_installed
-        );
-        assert!(!report.wake_enabled);
-        let out = rig.out();
-        transcript_snapshot("failed_sudo_transcript", &rig, port, &out);
-        assert!(
-            out.contains("linking the wake service failed: sudo: command not found"),
-            "{out}"
+                .flatten()
+                .all(|arg| !arg.contains("toker-wake")),
+            "the wake pair is only written: {calls:?}"
         );
         assert_eq!(
-            rig.runner.system_calls().len(),
-            1,
-            "the timer is not enabled once its service failed to link"
+            rig.prompt.asked().len(),
+            answers_fresh(port).len(),
+            "only the port and the frontends are asked: {:?}",
+            rig.prompt.asked()
         );
-        assert!(out.contains("wake timer is NOT enabled"), "{out}");
-        // The manual commands: the copy into /etc, then the enable by
-        // name — and they ride the summary too.
-        let staged = rig.paths().units_dir.join(WAKE_TIMER_UNIT);
-        let cp = format!(
-            "sudo cp {} /etc/systemd/system/{WAKE_TIMER_UNIT}",
-            staged.display()
-        );
-        assert!(out.contains(&cp), "the copy command: {out}");
-        let staged_service = rig.paths().units_dir.join(WAKE_SERVICE_UNIT);
-        let cp_service = format!(
-            "sudo cp {} /etc/systemd/system/{WAKE_SERVICE_UNIT}",
-            staged_service.display()
-        );
-        assert!(out.contains(&cp_service), "the service copy: {out}");
+        let out = rig.out();
         assert!(
-            out.contains(&format!(
-                "sudo systemctl daemon-reload && sudo systemctl enable --now {WAKE_TIMER_UNIT}"
-            )),
-            "the enable-by-name command: {out}"
+            out.contains(
+                "timers    : slots 07:20, 12:20 — hold+ping user timers enabled, wake timer \
+                 staged; pings run once the ping schedule is turned on"
+            ),
+            "{out}"
         );
-        assert!(
-            out.contains("NOT fully up"),
-            "the summary carries it: {out}"
-        );
-        assert!(report.wake_manual.len() == 3, "{:?}", report.wake_manual);
     }
 
-    /// The link succeeds but the enable is refused: the wake is still
-    /// reported down, with every manual command, not half-done.
+    /// The slots are the dashboard's to change, so a re-run keeps the ones
+    /// installed rather than putting the default back.
     #[tokio::test]
-    async fn a_refused_wake_enable_after_the_link_prints_manual_commands() {
+    async fn a_run_keeps_the_installed_ping_slots() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
-            "timers-enable-refused",
-            {
-                let mut answers = answers_fresh(port);
-                answers.splice(10..11, [confirm(true), text("09:00")]); // one slot
-                answers
-            },
-            with_picker(vec![
-                inactive(),
-                ok_empty(), // daemon-reload (units)
-                ok_empty(), // enable --now socket
-                ok_empty(), // daemon-reload (timers)
-                ok_empty(), // enable --now toker-hold.timer
-                ok_empty(), // enable --now toker-ping-0900.timer
-            ]),
+            "timers-kept",
+            answers_fresh(port),
+            with_timers_and_picker(vec![inactive(), ok_empty(), ok_empty()]),
         )
-        .with_system(vec![
-            ok_empty(),
-            outcome(false, "", "Failed to enable unit: Unit file is masked.\n"),
-        ]);
+        .with_keys(FRESH_KEYS);
+        seed_units(
+            &rig,
+            &[
+                HOLD_TIMER_UNIT,
+                HOLD_SERVICE_UNIT,
+                "toker-ping-0730.timer",
+                "toker-ping-0730.service",
+                "toker-ping-1300.timer",
+                "toker-ping-1300.service",
+            ],
+        );
         seed_claude(&rig.root);
         seed_opencode(&rig.root);
         seed_rc(&rig.root);
 
-        let report = rig
-            .run(VERIFY_TIMEOUT)
-            .await
-            .expect("a refused wake enable is non-fatal");
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
 
-        assert!(!report.wake_enabled);
-        assert_eq!(rig.runner.system_calls().len(), 2);
-        let out = rig.out();
+        let slots = ["07:30".to_owned(), "13:00".to_owned()];
+        assert_eq!(report.timer_slots, slots);
+        let calls = rig.runner.calls();
+        assert_eq!(calls[3..calls.len() - 3], timer_calls(&slots));
+        let exe = std::env::current_exe().expect("this test binary's path");
         assert!(
-            out.contains("enabling the wake system timer failed: Failed to enable unit"),
-            "{out}"
+            timers_installed(&rig, &exe, &slots)
+                .iter()
+                .all(|unit| rig.runner.installed().contains(unit)),
+            "the units were rewritten at the installed slots"
         );
-        assert_eq!(report.wake_manual.len(), 3, "{:?}", report.wake_manual);
         assert!(
-            report.wake_manual[0].ends_with(&format!("/etc/systemd/system/{WAKE_SERVICE_UNIT}")),
-            "{:?}",
-            report.wake_manual
+            rig.runner
+                .installed()
+                .contains(&(WAKE_TIMER_UNIT.to_owned(), wake_system_unit(&slots)))
         );
+    }
+
+    /// The timers do not depend on the subscription: the marker does, so a
+    /// machine without it gets them all the same, and they stay idle.
+    #[tokio::test]
+    async fn the_timers_are_installed_without_the_subscription() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "timers-no-anchor",
+            vec![text(&port.to_string())], // the listener port
+            with_timers(vec![inactive(), ok_empty(), ok_empty()]),
+        )
+        .with_keys(&["openrouter"]);
+
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+
+        assert_eq!(report.timer_slots, default_slots());
+        assert!(report.timers_ok);
+        let calls = rig.runner.calls();
+        assert_eq!(calls[3..], timer_calls(&default_slots()));
     }
 
     /// The user-timers-failure leg: a failed daemon-reload after the
     /// timer installs leaves the enables unrun, the manual commands
-    /// printed — and the wake attempt still happens (independent
-    /// pieces, independent failures).
+    /// printed — and the wake pair is still written.
     #[tokio::test]
-    async fn a_failed_user_timer_step_still_attempts_the_wake_timer() {
+    async fn a_failed_user_timer_step_still_writes_the_wake_pair() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "timers-user-fail",
-            {
-                let mut answers = answers_fresh(port);
-                answers.splice(10..11, [confirm(true), text("09:00")]); // one slot
-                answers
-            },
-            with_picker(vec![
+            answers_fresh(port),
+            vec![
                 inactive(),
                 ok_empty(),     // daemon-reload (units)
                 ok_empty(),     // enable --now socket
                 reload_fails(), // daemon-reload (timers) — the user manager is gone
-            ]),
+                ok_empty(),     // daemon-reload (picker)
+                ok_empty(),     // enable --now toker-picker.timer
+                ok_empty(),     // start toker-picker.service
+            ],
         )
-        .with_system(vec![ok_empty(), ok_empty()]);
+        .with_keys(FRESH_KEYS);
         seed_claude(&rig.root);
         seed_opencode(&rig.root);
         seed_rc(&rig.root);
@@ -6127,31 +5015,30 @@ default_backend_anthropic = "codex_sub"
         );
         transcript_snapshot("failed_user_timers_transcript", &rig, port, &rig.out());
         assert!(
-            rig.out().contains("wake timer is still attempted"),
-            "{}",
-            rig.out()
+            report
+                .timers_installed
+                .iter()
+                .any(|name| name == WAKE_TIMER_UNIT),
+            "the wake pair was still written: {:?}",
+            report.timers_installed
         );
-        // The wake attempt still ran, and succeeded.
-        assert!(report.wake_enabled);
-        assert_eq!(rig.runner.system_calls().len(), 2);
+        assert!(rig.out().contains("NOT fully up"), "{}", rig.out());
     }
 
     /// The picker is Claude publication, not an OpenRouter feature: with
-    /// claude as a frontend its units go in whatever backends are ticked.
+    /// claude as a frontend its units go in whatever providers are enabled.
     #[tokio::test]
     async fn claude_gets_the_picker_units_without_an_openrouter_backend() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "picker-no-openrouter",
             vec![
-                multi(&[0]),             // backends: anthropic_sub only
-                confirm(true),           // awake
                 text(&port.to_string()), // the listener port
                 confirm(true),           // claude
-                confirm(false),          // wake/hold/ping timers: no
             ],
-            with_picker(vec![inactive(), ok_empty(), ok_empty()]),
-        );
+            with_timers_and_picker(vec![inactive(), ok_empty(), ok_empty()]),
+        )
+        .with_keys(&["anthropic_sub"]);
         let exe = std::env::current_exe().expect("the test binary");
         seed_claude(&rig.root);
 
@@ -6177,15 +5064,10 @@ default_backend_anthropic = "codex_sub"
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "picker-no-claude",
-            vec![
-                multi(&[3]),             // backends: openrouter only
-                select(2),               // openrouter key: an env var
-                text(""),                // the default env var
-                confirm(true),           // awake
-                text(&port.to_string()), // the listener port
-            ],
-            vec![inactive(), ok_empty(), ok_empty()],
-        );
+            vec![text(&port.to_string())], // the listener port
+            with_timers(vec![inactive(), ok_empty(), ok_empty()]),
+        )
+        .with_keys(&["openrouter"]);
 
         let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
 
@@ -6224,6 +5106,49 @@ default_backend_anthropic = "codex_sub"
         ])
     }
 
+    /// The default slots, parsed.
+    fn default_slots() -> Vec<String> {
+        timers::parse_slot_list(DEFAULT_SLOTS).expect("the default slots parse")
+    }
+
+    /// The timers step's user-manager calls at `slots`.
+    fn timer_calls(slots: &[String]) -> Vec<Vec<String>> {
+        let mut calls = strings(vec![
+            vec!["daemon-reload"],
+            vec!["enable", "--now", HOLD_TIMER_UNIT],
+        ]);
+        for slot in slots {
+            calls.push(
+                strings(vec![vec![
+                    "enable",
+                    "--now",
+                    &format!("{}.timer", ping_unit_stem(slot)),
+                ]])
+                .remove(0),
+            );
+        }
+        calls
+    }
+
+    /// The timers step's units at `slots`, as the rig's paths generate
+    /// them: the hold pair, a ping pair per slot, then the staged wake
+    /// pair.
+    fn timers_installed(rig: &Rig, exe: &Path, slots: &[String]) -> Vec<(String, String)> {
+        let state_dir = rig.paths().state_dir;
+        let (hold_timer, hold_service) = hold_user_units(slots, exe, &state_dir);
+        let mut units = vec![
+            (HOLD_TIMER_UNIT.to_owned(), hold_timer),
+            (HOLD_SERVICE_UNIT.to_owned(), hold_service),
+        ];
+        for pair in ping_user_units(slots, exe, &state_dir) {
+            units.push((pair.timer_name, pair.timer));
+            units.push((pair.service_name, pair.service));
+        }
+        units.push((WAKE_SERVICE_UNIT.to_owned(), wake_system_service()));
+        units.push((WAKE_TIMER_UNIT.to_owned(), wake_system_unit(slots)));
+        units
+    }
+
     /// The picker step's two units, as the rig's paths generate them.
     fn picker_installed(rig: &Rig, exe: &Path) -> Vec<(String, String)> {
         let paths = rig.paths();
@@ -6233,349 +5158,5 @@ default_backend_anthropic = "codex_sub"
             (PICKER_TIMER_UNIT.to_owned(), timer),
             (PICKER_SERVICE_UNIT.to_owned(), service),
         ]
-    }
-
-    /// A yes with an empty slot answer takes the default slots — the
-    /// predecessor's schedule — rather than meaning none.
-    #[tokio::test]
-    async fn accepting_with_an_empty_answer_installs_the_default_slots() {
-        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
-        let mut rig = Rig::new(
-            "timers-default-slots",
-            {
-                let mut answers = answers_fresh(port);
-                answers.splice(10..11, [confirm(true), text("")]);
-                answers
-            },
-            with_picker(vec![
-                inactive(),
-                ok_empty(), // daemon-reload (units)
-                ok_empty(), // enable --now socket
-                ok_empty(), // daemon-reload (timers)
-                ok_empty(), // enable --now toker-hold.timer
-                ok_empty(), // enable --now toker-ping-0720.timer
-                ok_empty(), // enable --now toker-ping-1220.timer
-            ]),
-        )
-        .with_system(vec![ok_empty(), ok_empty()]);
-        seed_claude(&rig.root);
-        seed_opencode(&rig.root);
-        seed_rc(&rig.root);
-
-        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
-
-        assert_eq!(report.timer_slots, ["07:20", "12:20"]);
-        assert!(report.timers_ok && report.wake_enabled);
-        let asked = rig.prompt.asked();
-        let n = asked.len();
-        assert_eq!(asked[n - 2].kind, "confirm");
-        assert_eq!(
-            asked[n - 2].default.as_deref(),
-            Some("false"),
-            "none installed"
-        );
-        assert_eq!(asked[n - 1].kind, "text");
-        assert_eq!(asked[n - 1].default.as_deref(), Some(DEFAULT_SLOTS));
-        assert!(
-            !asked[n - 1].message.contains("clear"),
-            "an empty answer is the default, so the prompt must not offer it as none"
-        );
-        let calls = rig.runner.calls();
-        assert_eq!(
-            calls[calls.len() - 5..calls.len() - 3],
-            strings(vec![
-                vec!["enable", "--now", "toker-ping-0720.timer"],
-                vec!["enable", "--now", "toker-ping-1220.timer"],
-            ])
-        );
-        assert_eq!(calls[calls.len() - 3..], picker_calls());
-        assert!(rig.runner.removed().is_empty());
-    }
-
-    /// With the subscription not among the providers, nothing anchors a
-    /// window to the request that opens it, so the timers are not offered
-    /// and none are installed.
-    #[tokio::test]
-    async fn the_timers_are_not_offered_without_the_subscription() {
-        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
-        let mut rig = Rig::new(
-            "timers-no-anchor",
-            vec![
-                multi(&[3]),             // backends: openrouter only
-                select(2),               // openrouter key: an env var
-                text(""),                // the default env var
-                confirm(true),           // awake
-                text(&port.to_string()), // the listener port
-            ],
-            vec![inactive(), ok_empty(), ok_empty()],
-        );
-
-        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
-
-        assert!(
-            rig.prompt
-                .asked()
-                .iter()
-                .all(|asked| !asked.message.contains("wake/hold/ping timers")),
-            "{:?}",
-            rig.prompt.asked()
-        );
-        assert!(report.timer_slots.is_empty());
-        assert!(report.timers_installed.is_empty() && report.timers_removed.is_empty());
-        assert!(rig.runner.system_calls().is_empty());
-    }
-
-    /// Timers an earlier run installed are retired, unasked, once the
-    /// subscription has left the config.
-    #[tokio::test]
-    async fn dropping_the_subscription_retires_the_installed_timers() {
-        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
-        let mut rig = Rig::new(
-            "timers-retire-no-anchor",
-            vec![
-                multi(&[3]),             // backends: openrouter only
-                select(2),               // openrouter key: an env var
-                text(""),                // the default env var
-                confirm(true),           // awake
-                text(&port.to_string()), // the listener port
-            ],
-            vec![
-                inactive(),
-                ok_empty(), // daemon-reload (units)
-                ok_empty(), // enable --now socket
-                ok_empty(), // disable --now toker-hold.timer
-                ok_empty(), // disable --now toker-ping-0730.timer
-                ok_empty(), // daemon-reload (removal)
-            ],
-        )
-        .with_system(vec![ok_empty()]);
-        seed_units(
-            &rig,
-            &[
-                HOLD_TIMER_UNIT,
-                HOLD_SERVICE_UNIT,
-                "toker-ping-0730.timer",
-                "toker-ping-0730.service",
-                WAKE_TIMER_UNIT,
-            ],
-        );
-
-        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
-
-        assert!(
-            rig.prompt
-                .asked()
-                .iter()
-                .all(|asked| !asked.message.contains("wake/hold/ping timers")),
-            "{:?}",
-            rig.prompt.asked()
-        );
-        assert!(report.timer_slots.is_empty());
-        assert_eq!(
-            report.timers_removed,
-            [
-                HOLD_TIMER_UNIT,
-                HOLD_SERVICE_UNIT,
-                "toker-ping-0730.timer",
-                "toker-ping-0730.service",
-                WAKE_TIMER_UNIT,
-            ]
-        );
-        assert_eq!(
-            rig.runner.system_calls(),
-            strings(vec![vec!["disable", "--now", WAKE_TIMER_UNIT]])
-        );
-        assert!(report.timers_ok);
-    }
-
-    /// A no while an earlier run's timers are installed takes them all
-    /// out: the user pairs through the user manager, the wake timer
-    /// through sudo — here an install from before the wake service
-    /// existed, so only the timer is named to systemd.
-    #[tokio::test]
-    async fn declining_removes_the_timers_an_earlier_run_installed() {
-        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
-        let mut rig = Rig::new(
-            "timers-decline-installed",
-            answers_fresh(port),
-            with_picker(vec![
-                inactive(),
-                ok_empty(), // daemon-reload (units)
-                ok_empty(), // enable --now socket
-                ok_empty(), // disable --now toker-hold.timer
-                ok_empty(), // disable --now toker-ping-0730.timer
-                ok_empty(), // daemon-reload (removal)
-            ]),
-        )
-        .with_system(vec![ok_empty()]);
-        seed_units(
-            &rig,
-            &[
-                HOLD_TIMER_UNIT,
-                HOLD_SERVICE_UNIT,
-                "toker-ping-0730.timer",
-                "toker-ping-0730.service",
-                WAKE_TIMER_UNIT,
-            ],
-        );
-        seed_claude(&rig.root);
-        seed_opencode(&rig.root);
-        seed_rc(&rig.root);
-
-        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
-
-        let asked = rig.prompt.asked();
-        assert_eq!(
-            asked.last().and_then(|asked| asked.default.as_deref()),
-            Some("true"),
-            "installed timers make yes the default"
-        );
-        assert!(report.timer_slots.is_empty());
-        let calls = rig.runner.calls();
-        assert_eq!(
-            calls[3..calls.len() - 3],
-            strings(vec![
-                vec!["disable", "--now", HOLD_TIMER_UNIT],
-                vec!["disable", "--now", "toker-ping-0730.timer"],
-                vec!["daemon-reload"],
-            ])
-        );
-        assert_eq!(calls[calls.len() - 3..], picker_calls());
-        assert_eq!(
-            rig.runner.system_calls(),
-            strings(vec![vec!["disable", "--now", WAKE_TIMER_UNIT]])
-        );
-        assert_eq!(
-            report.timers_removed,
-            [
-                HOLD_TIMER_UNIT,
-                HOLD_SERVICE_UNIT,
-                "toker-ping-0730.timer",
-                "toker-ping-0730.service",
-                WAKE_TIMER_UNIT,
-            ]
-        );
-        let left: Vec<_> = std::fs::read_dir(rig.paths().units_dir)
-            .expect("the units dir")
-            .flatten()
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| {
-                name.starts_with("toker-")
-                    && name != SOCKET_UNIT
-                    && name != SERVICE_UNIT
-                    && !name.starts_with("toker-picker.")
-            })
-            .collect();
-        assert!(left.is_empty(), "nothing of the timers is left: {left:?}");
-        let out = rig.out();
-        assert!(
-            out.contains("timers    : none; removed toker-hold.timer"),
-            "{out}"
-        );
-    }
-
-    /// A refused sudo on the decline leaves the wake pair staged, since
-    /// the system manager may still link to it, and says how to finish.
-    #[tokio::test]
-    async fn a_refused_wake_disable_keeps_the_staged_pair_and_says_so() {
-        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
-        let mut rig = Rig::new(
-            "timers-decline-sudo-fail",
-            answers_fresh(port),
-            with_picker(vec![inactive(), ok_empty(), ok_empty()]),
-        )
-        .with_system(vec![Err(anyhow::anyhow!("sudo: a password is required"))]);
-        seed_units(&rig, &[WAKE_TIMER_UNIT, WAKE_SERVICE_UNIT]);
-        seed_claude(&rig.root);
-        seed_opencode(&rig.root);
-        seed_rc(&rig.root);
-
-        let report = rig.run(VERIFY_TIMEOUT).await.expect("non-fatal");
-
-        assert_eq!(
-            rig.runner.system_calls(),
-            strings(vec![vec![
-                "disable",
-                "--now",
-                WAKE_TIMER_UNIT,
-                WAKE_SERVICE_UNIT
-            ]])
-        );
-        assert!(rig.runner.removed().is_empty(), "the staged pair stays");
-        assert!(rig.paths().units_dir.join(WAKE_TIMER_UNIT).exists());
-        assert_eq!(report.wake_manual.len(), 2, "{:?}", report.wake_manual);
-        let out = rig.out();
-        transcript_snapshot("refused_wake_disable_transcript", &rig, port, &out);
-        assert!(out.contains("wake timer is still enabled"), "{out}");
-        assert!(out.contains("NOT fully removed"), "{out}");
-    }
-
-    /// A yes with a different slot list retires the ping pairs of the
-    /// slots it dropped — the old default's 07:30 here — and offers
-    /// the installed slots as the default.
-    #[tokio::test]
-    async fn a_changed_slot_list_retires_the_dropped_ping_timers() {
-        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
-        let mut rig = Rig::new(
-            "timers-retire-stale",
-            {
-                let mut answers = answers_fresh(port);
-                answers.splice(10..11, [confirm(true), text("07:20, 12:20")]);
-                answers
-            },
-            with_picker(vec![
-                inactive(),
-                ok_empty(), // daemon-reload (units)
-                ok_empty(), // enable --now socket
-                ok_empty(), // disable --now toker-ping-0730.timer
-                ok_empty(), // daemon-reload (timers)
-                ok_empty(), // enable --now toker-hold.timer
-                ok_empty(), // enable --now toker-ping-0720.timer
-                ok_empty(), // enable --now toker-ping-1220.timer
-            ]),
-        )
-        .with_system(vec![ok_empty(), ok_empty()]);
-        seed_units(
-            &rig,
-            &[
-                HOLD_TIMER_UNIT,
-                HOLD_SERVICE_UNIT,
-                "toker-ping-0730.timer",
-                "toker-ping-0730.service",
-                "toker-ping-1220.timer",
-                "toker-ping-1220.service",
-            ],
-        );
-        seed_claude(&rig.root);
-        seed_opencode(&rig.root);
-        seed_rc(&rig.root);
-
-        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
-
-        let asked = rig.prompt.asked();
-        let n = asked.len();
-        assert_eq!(asked[n - 2].default.as_deref(), Some("true"));
-        assert_eq!(
-            asked[n - 1].default.as_deref(),
-            Some("07:30, 12:20"),
-            "the installed slots are the default"
-        );
-        assert_eq!(
-            rig.runner.calls()[3],
-            ["disable", "--now", "toker-ping-0730.timer"]
-        );
-        assert_eq!(
-            report.timers_removed,
-            ["toker-ping-0730.timer", "toker-ping-0730.service"]
-        );
-        assert!(!rig.paths().units_dir.join("toker-ping-0730.timer").exists());
-        assert!(rig.paths().units_dir.join("toker-ping-1220.timer").exists());
-        assert!(report.timers_ok && report.wake_enabled);
-        transcript_snapshot("changed_slots_transcript", &rig, port, &rig.out());
-        assert!(
-            rig.out().contains("removed toker-ping-0730.timer"),
-            "{}",
-            rig.out()
-        );
     }
 }

@@ -155,6 +155,7 @@ fn test_config(upstream: reqwest::Url) -> Config {
         // On over the fake spawner only: the real one would take a real
         // idle-sleep lock on the machine running the suite.
         awake: true,
+        ping_schedule: false,
         transcript_roots: Vec::new(),
     }
 }

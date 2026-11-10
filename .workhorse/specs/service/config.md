@@ -44,6 +44,7 @@ Everything else is held in the store as typed rows:
 - the notice style for each frontend profile, and the default for a profile with none
 - the session and ping header names
 - whether the idle-sleep lock is held
+- whether the [ping schedule](../gates/pinging.md#scope) is on
 - the extra transcript roots the dashboard searches for session labels
 
 Toker MUST hold a row for every provider it knows, whether or not that provider is enabled.
@@ -83,6 +84,12 @@ The control surface MUST refuse a value it cannot use, naming the setting it ref
 
 > [!NOTE]
 > Refusing at the edit is refusing where there is someone to tell.
+
+Enabling a provider MUST, in the same operation, give each protocol that provider serves a default route to it where the active revision has none for that protocol, and MUST [save](../routing/revisions.md#saving-an-edit) that as a revision.
+A protocol that already has a default MUST keep it.
+
+> [!NOTE]
+> A machine set up before any provider was found then serves once one is turned on, without a trip to the routing page.
 
 ### Configuration never refuses a start
 
@@ -132,8 +139,11 @@ Toker MUST write anything new it keeps into the state directory.
 
 Refreshing a login that Toker shares with another program on the same machine rewrites that program's own credential file, which lies outside the state directory.
 
-Where such a provider is enabled, setup MUST add the directory it discovered to the paths the service may write.
-Where such a provider is enabled, setup MUST add nothing else.
+Setup MUST add the directory where it discovers that login to the paths the service may write, whether or not the provider is enabled and whether or not the directory exists yet.
+Setup MUST add nothing else outside the state directory.
+
+> [!NOTE]
+> A provider is turned on from the dashboard long after setup ran, and setup is not meant to be run again for it.
 
 The refresh MUST re-read the file immediately before writing and MUST adopt the other program's tokens where they moved.
 

@@ -324,16 +324,18 @@ pub fn sync(
             config.db_path.display()
         )
     };
-    let store = if dry_run {
-        match Store::open_read_only(&config.db_path) {
-            Ok(store) => store,
-            Err(crate::store::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(no_revision());
-            }
-            Err(error) => return Err(error.into()),
-        }
+    // Neither creates nor migrates the store (spec: STORE#opening-the-store):
+    // the picker timer runs this unattended, so a store directory gone from
+    // under the service must not come back empty from here.
+    let opened = if dry_run {
+        Store::open_read_only(&config.db_path)
     } else {
-        Store::open(&config.db_path)?
+        Store::open_existing(&config.db_path)
+    };
+    let store = match opened {
+        Ok(store) => store,
+        Err(error) if error.is_missing_store() => return Err(no_revision()),
+        Err(error) => return Err(error.into()),
     };
     if store
         .load_routing_policy_state()?

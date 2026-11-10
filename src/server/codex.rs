@@ -40,8 +40,8 @@ use crate::providers::codex::{ResponseError, ResponseEvent, ResponsesSse, TurnCa
 use crate::routing::ProtocolId;
 use crate::server::InFlightGuard;
 use crate::server::proxy::{
-    ErrorWire, MAX_ERROR_BODY, MAX_REQUEST_BODY, buffer_up_to, is_compressed, is_event_stream,
-    plain_status, session_id, transport_failure, truncated_body, upstream_failure,
+    ErrorWire, MAX_ERROR_BODY, MAX_REQUEST_BODY, answers_stream_request, buffer_up_to,
+    is_compressed, plain_status, session_id, transport_failure, truncated_body, upstream_failure,
 };
 use crate::server::record::{now_ms, record_unroutable};
 use crate::server::record_anthropic::AnthropicRecordCtx;
@@ -863,13 +863,16 @@ async fn forward(ready: ReadyAttempt, _server: Server, upstream: reqwest::Respon
         return frontend_error_response(frontend_wire, status, kind, &message, !client_wants_json);
     }
 
-    if !is_event_stream(&headers) {
+    if !answers_stream_request(&headers) {
         if let Some(ctx) = record.as_ref() {
             record_codex_error(
                 ctx,
                 status.as_u16(),
                 "response_protocol",
-                "upstream Responses response used the wrong streaming mode",
+                &format!(
+                    "upstream Responses response used the wrong streaming mode ({})",
+                    super::proxy::content_type_detail(&headers)
+                ),
                 None,
                 frontend_wire.protocol(),
             );

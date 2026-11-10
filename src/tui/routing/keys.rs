@@ -7,13 +7,14 @@ use ratatui::{Frame, layout::Rect};
 use crate::tui::chrome::{self, Section};
 
 /// Keys that apply on a tab's table and on a route's page alike.
-pub(super) const ANYWHERE: [(&str, &str); 16] = [
+pub(super) const ANYWHERE: [(&str, &str); 17] = [
     ("↑/↓ j/k", "select a row; at a panel's edge, the next"),
     ("←/→ h/l", "previous or next tab, route or catalogue"),
     ("1–6", "jump to a tab"),
     ("pgup/pgdn", "move a page of rows"),
     ("e", "edit the row, or the candidate, in place"),
     ("n", "new row below; on a route, a fallback"),
+    ("y", "duplicate the row into a new one"),
     ("m", "lift a rewrite or candidate; ↑/↓ moves it"),
     ("", "enter drops it, esc puts it back"),
     ("d", "delete; ctrl+s confirms, esc keeps"),
@@ -37,10 +38,11 @@ pub(super) const IN_A_TRACE: [(&str, &str); 2] = [
     ("t", "trace another"),
 ];
 
-pub(super) const IN_AN_EDIT: [(&str, &str); 8] = [
+pub(super) const IN_AN_EDIT: [(&str, &str); 9] = [
     ("↑/↓", "move between fields"),
     ("←/→", "change the value"),
     ("tab", "complete a name"),
+    ("↓ enter", "pick a record from a field's list"),
     ("space", "toggle"),
     ("alt+↑/↓", "move a list item or candidate"),
     ("ctrl+d", "remove a list item"),

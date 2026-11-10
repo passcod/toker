@@ -40,13 +40,21 @@ Where a configuration file exists, setup MUST report what it read from that file
 
 The order in which setup writes the store and removes the file is specified by [RMIG](../routing/migration.md#migrating-the-file-and-the-store-together).
 
-Setup MUST ask only what the dashboard cannot later change, and what the machine needs in order to serve.
-
-That is the listener port and the schedule slots, which reach the units rather than the store, and the providers the machine serves with where each one's credential comes from.
+Setup MUST ask only what the dashboard cannot later change.
+That is the listener port, which reaches the socket unit rather than the store.
 
 > [!NOTE]
 > A setting the dashboard can change is a setting setup asking for is a second surface to keep agreeing with the first.
 > The port is not one of those: the socket unit is what listens, so a port the dashboard could change would disagree with the unit it was installed with.
+
+On a store with no provider configured, setup MUST enable the providers whose credential it finds without asking: a provider whose keyring entry exists, and the codex subscription where the codex CLI's login is present.
+Setup MUST NOT ask for a credential, and MUST NOT read a keyring entry's value to find out whether it exists.
+A store that already configures a provider MUST keep its providers as they are.
+
+Setup MUST complete whether or not it found a provider: it writes the configuration, installs the units and points the clients at the proxy all the same.
+
+> [!NOTE]
+> Everything else about providers is edited on the dashboard's providers page, which setup hands off to, so a machine set up once never needs setup again for a provider to be added.
 
 Where setup found an active listener on the configured port, it MUST replace the running instance by the path [DLIFE](../service/lifecycle.md#replacing-the-running-instance) specifies.
 
@@ -66,7 +74,13 @@ Setup MUST run the settings reconciliation once itself, through the unit the sch
 > [!NOTE]
 > Setup then exercises the sandboxed path rather than a path only it takes.
 
-Setup MUST retire the units of any schedule slot the operator dropped.
+Setup MUST install and enable the ping and hold timers without asking, conditioned on the marker [GPING](../gates/pinging.md#scope) specifies, whether or not the schedule is on.
+Setup MUST write the wake timer where the operator's units are kept without placing it in the system manager.
+The timers MUST carry the slots already installed, or a default schedule where none are.
+
+> [!NOTE]
+> Turning the schedule on and choosing its slots are made on the dashboard, which asks the platform for elevation where the wake timer needs the system manager.
+> Setup itself never reaches the system manager.
 
 ## Handing off
 

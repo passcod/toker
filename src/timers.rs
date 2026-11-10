@@ -8,8 +8,9 @@
 //!   rtcwake's job, not this one's). Root-level because the user
 //!   manager lacks `CAP_WAKE_ALARM`; it is the only root-level piece
 //!   toker has ([`crate::setup::wizard::wake_system_unit`] generates
-//!   it and the `/bin/true` service it starts, the wizard enables them
-//!   through sudo).
+//!   it and the `/bin/true` service it starts; setup only writes them,
+//!   and the dashboard places them in the system manager, which needs
+//!   elevation, when the ping schedule is turned on).
 //! - **hold** — USER timers at the same slots running `toker hold
 //!   --for=15m`: a timer that elapses while the machine is suspended
 //!   fires on resume, and the hold then keeps the machine up those 15
@@ -57,13 +58,14 @@
 //! so tests poll instantly.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use jiff::tz::TimeZone;
 
+use crate::config::Config;
 use crate::middleware::awake::{InhibitCommand, LockSpawner};
 use crate::setup::patchers::anthropic_base_url;
 use crate::store::{PingAction, PingRecord, Store};
@@ -104,9 +106,10 @@ pub const HOLD_WHY: &str = "wake hold timer";
 /// wake is owned by the system timer, and the wizard never installs
 /// anything for the verb itself.
 pub const WAKE_ARM_NOTE: &str = "nothing to arm: wake is owned by the systemd \
-     system timer toker-wake.timer (WakeSystem=true), installed and enabled by \
-     `toker setup`. This verb was the predecessor's macOS one-shot \
-     (pmset schedule wake); on Linux the timer replaces it.";
+     system timer toker-wake.timer (WakeSystem=true), written by `toker setup` \
+     and placed in the system manager when the ping schedule is turned on. \
+     This verb was the predecessor's macOS one-shot (pmset schedule wake); \
+     on Linux the timer replaces it.";
 
 /// How many times the readback checks the ledger for the ping row: the
 /// row lands when the response completes server-side, which can be a
@@ -135,6 +138,52 @@ pub const PING_TIMEOUT: Duration = Duration::from_secs(120);
 /// ping routed to any other backend opens nothing, so its rows must not
 /// read as the window opening.
 const SUB_PROVIDER: &str = "anthropic_sub";
+
+// ── the marker ─────────────────────────────────────────────────────────
+
+/// The marker in the state dir the ping and hold jobs are conditioned on
+/// (spec: GPING#scope).
+pub const PING_MARKER: &str = "pings-enabled";
+
+/// Where the marker lives for a store in `state_dir`.
+pub fn ping_marker(state_dir: &Path) -> PathBuf {
+    state_dir.join(PING_MARKER)
+}
+
+/// Bring the marker in line with `config`: present exactly while the
+/// schedule is on and the anthropic subscription, the one provider that
+/// anchors a window to its opening request, is enabled. The jobs are
+/// installed once and switched by this file, so the dashboard starts and
+/// stops pinging without asking the platform for elevation.
+///
+/// A store with no directory of its own (`:memory:`, whose parent is empty)
+/// has no state dir to keep a marker in, and is left alone rather than
+/// writing into whatever directory the process happens to run in.
+// spec: GPING#scope
+pub fn sync_ping_marker(config: &Config) -> std::io::Result<()> {
+    let Some(state_dir) = config
+        .db_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+    let marker = ping_marker(state_dir);
+    if config.ping_schedule && config.anthropic_sub.is_some() {
+        // Only its presence is read, so an existing marker is left as is.
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&marker)
+            .map(drop)
+    } else {
+        match std::fs::remove_file(&marker) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
+    }
+}
 
 // ── the slot clock ─────────────────────────────────────────────────────
 
@@ -185,10 +234,10 @@ pub fn parse_hold_minutes(text: &str) -> Option<f64> {
     minutes.is_finite().then_some(minutes).filter(|m| *m > 0.0)
 }
 
-/// Parse a free-form slot list for the wizard: tokens separated by
-/// commas and/or whitespace, each a strict `hh:mm`; duplicates collapse
-/// (first wins, input order kept); an empty answer is no slots.
-/// `Err` carries the first offending token, for the re-ask.
+/// Parse a free-form slot list: tokens separated by commas and/or
+/// whitespace, each a strict `hh:mm`; duplicates collapse (first wins,
+/// input order kept); an empty answer is no slots. `Err` carries the
+/// first offending token, so the caller can name it.
 pub fn parse_slot_list(text: &str) -> std::result::Result<Vec<String>, String> {
     let mut slots: Vec<String> = Vec::new();
     for token in text.split(|c: char| c == ',' || c.is_whitespace()) {
@@ -841,8 +890,10 @@ mod tests {
     use super::{
         ANCHOR_STEP_MS, CommandRunner, HOLD_UNIT_FOR, LATENESS_LIMIT_MINUTES, PING_DELAY_MINUTES,
         WAKE_ARM_NOTE, WINDOW_MS, hold_lock, last_occurrence_ms, parse_hold_minutes, parse_slot,
-        parse_slot_list, scheduled_fire_ms, slot_plus_minutes, window_boundary_ms,
+        parse_slot_list, ping_marker, scheduled_fire_ms, slot_plus_minutes, sync_ping_marker,
+        window_boundary_ms,
     };
+    use crate::config::{AnthropicSubConfig, Config};
     use crate::middleware::awake::{InhibitCommand, InhibitLock, LockSpawner};
     use crate::setup::test_dir;
     use crate::store::{PingAction, PingRecord, RequestRow, Store};
@@ -852,6 +903,69 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// A configuration whose store is in `dir`, with nothing enabled and
+    /// the schedule off: every default.
+    fn config_in(dir: &std::path::Path) -> Config {
+        let mut config =
+            Config::resolve(&crate::store::Configuration::default()).expect("the defaults resolve");
+        config.db_path = dir.join("toker.db");
+        config
+    }
+
+    #[test]
+    fn the_marker_is_absent_until_the_schedule_and_the_subscription_are_both_on() {
+        let dir = test_dir("ping-marker");
+        let marker = ping_marker(&dir);
+        let mut config = config_in(&dir);
+        assert!(!config.ping_schedule, "the schedule is off by default");
+        sync_ping_marker(&config).expect("sync");
+        assert!(!marker.exists(), "off by default");
+
+        // Either alone is not enough: the schedule with nothing that
+        // anchors a window would ping for no effect.
+        config.ping_schedule = true;
+        sync_ping_marker(&config).expect("sync");
+        assert!(!marker.exists(), "the schedule alone");
+        config.ping_schedule = false;
+        config.anthropic_sub = Some(AnthropicSubConfig::default());
+        sync_ping_marker(&config).expect("sync");
+        assert!(!marker.exists(), "the subscription alone");
+
+        config.ping_schedule = true;
+        sync_ping_marker(&config).expect("sync");
+        assert!(marker.is_file(), "both on");
+        sync_ping_marker(&config).expect("sync again");
+        assert!(marker.is_file(), "an existing marker is kept");
+
+        // Either going takes the marker with it.
+        config.anthropic_sub = None;
+        sync_ping_marker(&config).expect("sync");
+        assert!(!marker.exists(), "the subscription went");
+        config.anthropic_sub = Some(AnthropicSubConfig::default());
+        sync_ping_marker(&config).expect("sync");
+        assert!(marker.is_file());
+        config.ping_schedule = false;
+        sync_ping_marker(&config).expect("sync");
+        assert!(!marker.exists(), "the schedule went");
+        sync_ping_marker(&config).expect("an absent marker is already off");
+    }
+
+    #[test]
+    fn a_store_without_a_directory_keeps_no_marker() {
+        let dir = test_dir("ping-marker-memory");
+        let mut config = config_in(&dir);
+        config.db_path = std::path::PathBuf::from(":memory:");
+        config.ping_schedule = true;
+        config.anthropic_sub = Some(AnthropicSubConfig::default());
+        sync_ping_marker(&config).expect("nothing to do");
+        // The parent of ":memory:" is the empty path, which would resolve
+        // against the working directory.
+        assert!(
+            !std::path::Path::new(super::PING_MARKER).exists(),
+            "nothing was written into the working directory"
+        );
+    }
 
     fn utc() -> TimeZone {
         TimeZone::get("UTC").expect("UTC is always present in the tzdb")
@@ -917,7 +1031,7 @@ mod tests {
             parse_slot_list("12:30, 09:00, 12:30").expect("dedupe"),
             vec!["12:30".to_owned(), "09:00".to_owned()]
         );
-        // Empty — however padded — is no slots (the wizard's silent skip).
+        // Empty — however padded — is no slots.
         for empty in ["", "  ", " , "] {
             assert_eq!(parse_slot_list(empty).expect("empty"), Vec::<String>::new());
         }

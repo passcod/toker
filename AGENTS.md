@@ -49,7 +49,7 @@ Config is `~/.config/toker/toker.toml` (`$XDG_CONFIG_HOME`, or `TOKER_CONFIG`), 
 It holds providers, credential sources and the listener; model routing lives in the store and is edited from `toker tui`.
 
 Anything new the service writes goes in the state dir, and tests get a temp directory, never the real store.
-The one write outside it is the codex login refresh, which rewrites the codex CLI's own `~/.codex/auth.json`; setup makes that directory writable in the unit only when `codex_sub` is enabled.
+The one write outside it is the codex login refresh, which rewrites the codex CLI's own `~/.codex/auth.json`; setup makes that directory writable in the unit whether or not `codex_sub` is enabled.
 
 ## Changing the proxy
 

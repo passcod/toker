@@ -32,10 +32,10 @@ pub mod wizard;
 /// skeleton the interactive unit fills; every step is re-runnable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
-    /// Pick backends and authenticate each (paste key / reuse CLI
-    /// tokens / keyring with fallback). First because nothing after it
-    /// can be verified without a backend wired.
-    ChooseBackends,
+    /// Enable the providers whose credential is on the machine, where the
+    /// configuration names none, and ask the listener port. First because
+    /// nothing after it can be verified without a provider wired.
+    Providers,
     /// Write `toker.toml`
     /// — the resolved configuration with
     /// the wizard's choices applied, atomically, once the database owns
@@ -68,7 +68,7 @@ impl Step {
     /// A short human label, for the wizard's display.
     pub fn label(self) -> &'static str {
         match self {
-            Step::ChooseBackends => "choose backends",
+            Step::Providers => "providers and the port",
             Step::WriteConfig => "write the configuration",
             Step::InstallUnits => "install + start the units",
             Step::VerifyService => "verify the service answers",
@@ -98,12 +98,12 @@ impl Step {
 /// not "the same edit" again.
 ///
 /// The plan's wizard list, in plan order, maps onto these steps as:
-/// backends → defaults → toggles ([`Step::ChooseBackends`] +
+/// providers and the port ([`Step::Providers`] +
 /// [`Step::WriteConfig`]), units ([`Step::InstallUnits`]), verify
 /// ([`Step::VerifyService`]), wire frontends ([`Step::PatchFrontends`]).
 pub fn plan() -> &'static [Step] {
     &[
-        Step::ChooseBackends,
+        Step::Providers,
         Step::WriteConfig,
         Step::InstallUnits,
         Step::VerifyService,
@@ -131,7 +131,7 @@ mod tests {
         assert_eq!(
             steps,
             &[
-                Step::ChooseBackends,
+                Step::Providers,
                 Step::WriteConfig,
                 Step::InstallUnits,
                 Step::VerifyService,

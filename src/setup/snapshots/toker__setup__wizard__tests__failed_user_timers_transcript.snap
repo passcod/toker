@@ -15,14 +15,16 @@ toker setup — the state of this machine
   codex login : [ROOT]/.codex/auth.json — not found
   predecessor history : none
 
-[1/6] choose backends
-  note: toker runs as a socket-activated systemd user service, so it sees only the user manager's environment, not your shell's. Put OPENROUTER_API_KEY in ~/.config/environment.d/*.conf (read at login), or run `systemctl --user set-environment OPENROUTER_API_KEY=…`; then `toker restart` for a running service to pick it up
+[1/6] providers and the port
+  anthropic_sub: found in the keyring (toker/anthropic_sub)
+  openrouter: found in the keyring (toker/openrouter)
+  other providers are configured on the providers page of `toker tui`
 
 [2/6] write the configuration
 wrote the configuration into the store
   port [PORT], awake on, backends anthropic_sub, openrouter
   routing: activated revision 1 from these choices — edit it in `toker tui`
-  openrouter key: env OPENROUTER_API_KEY (systemd user environment) when set, else the frontend's own key
+  openrouter key: env OPENROUTER_API_KEY (systemd user environment) when set, else the OS keyring
 
 [3/6] install + start the units
 installed toker.socket ([ROOT]/.config/systemd/user/toker.socket)
@@ -46,19 +48,18 @@ optional toggles
   awake (idle-sleep lock while sessions are live): on
 installed toker-hold.timer ([ROOT]/.config/systemd/user/toker-hold.timer)
 installed toker-hold.service ([ROOT]/.config/systemd/user/toker-hold.service)
-installed toker-ping-0900.timer ([ROOT]/.config/systemd/user/toker-ping-0900.timer)
-installed toker-ping-0900.service ([ROOT]/.config/systemd/user/toker-ping-0900.service)
+installed toker-ping-0720.timer ([ROOT]/.config/systemd/user/toker-ping-0720.timer)
+installed toker-ping-0720.service ([ROOT]/.config/systemd/user/toker-ping-0720.service)
+installed toker-ping-1220.timer ([ROOT]/.config/systemd/user/toker-ping-1220.timer)
+installed toker-ping-1220.service ([ROOT]/.config/systemd/user/toker-ping-1220.service)
 systemctl --user daemon-reload failed: Failed to connect to bus: No medium found
-the user timers did not all come up — the wake timer is still attempted
-finish the user timers by hand:
-  systemctl --user daemon-reload
-  systemctl --user enable --now toker-hold.timer
-  systemctl --user enable --now toker-ping-0900.timer
 staged toker-wake.service ([ROOT]/.config/systemd/user/toker-wake.service)
 staged toker-wake.timer ([ROOT]/.config/systemd/user/toker-wake.timer)
-enabling the wake system timer — sudo will be asked (WakeSystem=true needs the system manager: the user manager lacks CAP_WAKE_ALARM)
-sudo systemctl link [ROOT]/.config/systemd/user/toker-wake.service — ok
-sudo systemctl enable --now [ROOT]/.config/systemd/user/toker-wake.timer — ok
+the timers did not all come up; finish by hand:
+  systemctl --user daemon-reload
+  systemctl --user enable --now toker-hold.timer
+  systemctl --user enable --now toker-ping-0720.timer
+  systemctl --user enable --now toker-ping-1220.timer
   predecessor history: none to import
 installed toker-picker.timer ([ROOT]/.config/systemd/user/toker-picker.timer)
 installed toker-picker.service ([ROOT]/.config/systemd/user/toker-picker.service)
@@ -76,6 +77,6 @@ systemctl --user start toker-picker.service — ok
     patched: opencode ([ROOT]/.config/opencode/opencode.json)
     patched: shell rc ([ROOT]/.bashrc)
   ledger    : not imported
-  timers    : slots 09:00 — NOT fully up — finish by hand: systemctl --user daemon-reload && systemctl --user enable --now toker-hold.timer && systemctl --user enable --now toker-ping-0900.timer
+  timers    : slots 07:20, 12:20 — NOT fully up — finish by hand: systemctl --user daemon-reload && systemctl --user enable --now toker-hold.timer && systemctl --user enable --now toker-ping-0720.timer && systemctl --user enable --now toker-ping-1220.timer
   picker    : Claude /model rows synced; toker-picker.timer refreshes them daily
 re-run `toker setup` any time to change anything.

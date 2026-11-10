@@ -503,6 +503,22 @@ fn an_unset_setting_toggles_off_its_default_rather_than_to_it() {
 }
 
 #[test]
+fn a_settings_edit_carries_the_ping_schedule_back() {
+    let mut body = snapshot_body();
+    body["settings"]["ping_schedule"] = json!(true);
+    let mut state = State::default();
+    state.receive(Reply::Command(
+        Command::snapshot("config-snapshot"),
+        ok(body),
+    ));
+    state.set_view(View::Settings);
+    // No page shows the schedule, but the edit replaces the whole row, so
+    // toggling anything else must not turn it off.
+    let command = press(&mut state, KeyCode::Char(' ')).expect("a request");
+    assert_eq!(command.body.expect("a body")["ping_schedule"], json!(true));
+}
+
+#[test]
 fn an_unset_value_says_what_it_falls_back_to() {
     let mut body = snapshot_body();
     for name in ["ping_header", "session_headers", "cold_min_tokens", "awake"] {

@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{Map, Value, json};
 
+use crate::policy::REQUESTED_MODEL_PARAMETER;
+
 /// What a field holds and how it is edited.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Node {
@@ -62,6 +64,9 @@ pub(super) struct Variant {
     name: &'static str,
     fields: &'static [Field],
 }
+
+/// The most records a reference's list shows at once.
+const PICKS: usize = 8;
 
 const fn field(key: &'static str, label: &'static str, node: Node) -> Field {
     Field { key, label, node }
@@ -361,8 +366,10 @@ const DEFAULT: &[Field] = &[
     field("target", "route", ROUTE_REFERENCE),
 ];
 
+/// A rewrite is shown by what it matches and the route it picks, so its form
+/// does not ask for the identifier it has: a new one is made one
+/// (`Form::name_rewrite`), and an existing one keeps its own.
 const REWRITE: &[Field] = &[
-    field("id", "id", Node::Text),
     field("scope", "scope", SCOPE),
     field("priority", "priority", Node::Int),
     field("model_matcher", "matches", MATCHER),
@@ -611,9 +618,12 @@ pub(super) struct Context {
     pub(super) offers: Vec<(String, String)>,
     /// Record ids in the policy, by collection.
     pub(super) ids: BTreeMap<&'static str, Vec<String>>,
-    /// What each route is, in a few words, by its id: what a field naming a
-    /// route says beside itself once it is accepted.
-    pub(super) routes: BTreeMap<String, String>,
+    /// What each record is, in a few words, by collection and id: what tells
+    /// the records a field can name apart in its list, and what a field
+    /// naming a route says beside itself once it is accepted.
+    pub(super) about: BTreeMap<&'static str, BTreeMap<String, String>>,
+    /// The parameters each route declares, by its id.
+    pub(super) parameters: BTreeMap<String, Vec<String>>,
 }
 
 /// One step into a value.
@@ -745,6 +755,12 @@ pub(super) struct Form {
     cursor: usize,
     /// While Tab cycles completions: what was typed, and the one showing.
     completing: Option<(String, usize)>,
+    /// Whether the focused input was typed into since it was focused: until
+    /// it is, a reference offers every record rather than those matching
+    /// the id it already holds.
+    typed: bool,
+    /// The record picked out of a reference's list, not yet chosen.
+    pick: Option<usize>,
     context: Context,
     note: Option<String>,
     /// What the last check found, placed beside the fields it concerns.
@@ -760,12 +776,98 @@ impl Form {
             buffer: String::new(),
             cursor: 0,
             completing: None,
+            typed: false,
+            pick: None,
             context,
             note: None,
             findings: Vec::new(),
         };
+        for (path, _) in form.route_choices() {
+            form.fill_arguments(&path);
+        }
+        form.name_rewrite();
         form.focus_first();
         form
+    }
+
+    /// Name a new rewrite after what it matches and the route it sends to,
+    /// again as either changes (spec: UTUI#editing). A rewrite that exists
+    /// keeps its identifier through an edit: its provenance and its count
+    /// of catches are kept by it.
+    fn name_rewrite(&mut self) {
+        if self.purpose
+            != (Purpose::Record {
+                kind: "rewrites",
+                adding: true,
+            })
+        {
+            return;
+        }
+        let taken: Vec<&str> = self
+            .context
+            .ids
+            .get("rewrites")
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let id = super::template::rewrite_id(
+            &self.value["model_matcher"],
+            self.value["target"]["route_id"].as_str().unwrap_or(""),
+            &taken,
+        );
+        self.value["id"] = Value::from(id);
+    }
+
+    /// Each field naming the route a reference sends to, by its path, with
+    /// the route it names.
+    fn route_choices(&self) -> Vec<(Vec<Seg>, String)> {
+        self.rows()
+            .into_iter()
+            .filter(|row| {
+                matches!(row.op, Op::Input(Input::Ref { kind: "routes", .. }))
+                    && row.path.last() == Some(&key("route_id"))
+            })
+            .map(|row| {
+                let route = get(&self.value, &row.path).as_str().unwrap_or("");
+                (row.path.clone(), route.to_owned())
+            })
+            .collect()
+    }
+
+    /// Give the reference whose route field is at `path` one argument for
+    /// each parameter its route declares and no other, leaving only the
+    /// values to choose (spec: UTUI#editing). An argument the route still
+    /// declares keeps its value. A route the policy does not hold, as while
+    /// its name is being typed, leaves the arguments as they are. What a
+    /// reference must supply is RDOC's (spec: RDOC#routes-and-candidates).
+    fn fill_arguments(&mut self, path: &[Seg]) {
+        let route = get(&self.value, path).as_str().unwrap_or("");
+        let Some(declared) = self.context.parameters.get(route).cloned() else {
+            return;
+        };
+        let mut owner = path[..path.len() - 1].to_vec();
+        owner.push(key("parameters"));
+        let current = get(&self.value, &owner);
+        let old = current.as_object().cloned().unwrap_or_default();
+        let same =
+            old.len() == declared.len() && declared.iter().all(|name| old.contains_key(name));
+        // A reference that leaves the map out supplies none, which is
+        // what a route declaring none wants.
+        if same || (declared.is_empty() && current.is_null()) {
+            return;
+        }
+        let arguments: Map<String, Value> = declared
+            .into_iter()
+            .map(|name| {
+                let argument = old
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(|| argument_for(&name));
+                (name, argument)
+            })
+            .collect();
+        *get_mut(&mut self.value, &owner) = Value::Object(arguments);
     }
 
     pub(super) fn purpose(&self) -> Purpose {
@@ -813,6 +915,8 @@ impl Form {
     /// Put the focused input's current value in the edit buffer.
     fn load_buffer(&mut self, rows: &[Row]) {
         self.completing = None;
+        self.typed = false;
+        self.pick = None;
         self.buffer = match rows.get(self.focus) {
             Some(row) => match &row.op {
                 Op::Input(Input::MapKey) => match &row.item {
@@ -902,7 +1006,9 @@ impl Form {
                 row: row.focusable().then_some(index),
                 notes: self.notes_for(&rows, index),
             });
-            if focused && let Some(text) = self.suggestion_line() {
+            if focused && let Some(picks) = self.pick_lines(row) {
+                lines.extend(picks);
+            } else if focused && let Some(text) = self.suggestion_line() {
                 lines.push(FormLine {
                     text: format!("    {text}"),
                     focused: false,
@@ -1054,9 +1160,9 @@ impl Form {
                 notes.push((Note::Warning, "the catalogues do not offer this".to_owned()));
             } else if let Input::Ref { kind: "routes", .. } = input
                 && let Some(text) = get(&self.value, &row.path).as_str()
-                && let Some(said) = self.context.routes.get(text)
+                && let Some(said) = self.about("routes", text)
             {
-                notes.push((Note::Reading, said.clone()));
+                notes.push((Note::Reading, said.to_owned()));
             }
         }
         notes
@@ -1095,6 +1201,127 @@ impl Form {
         self.focus
     }
 
+    /// What a record is, in a few words.
+    fn about(&self, kind: &str, id: &str) -> Option<&str> {
+        self.context
+            .about
+            .get(kind)
+            .and_then(|about| about.get(id))
+            .map(String::as_str)
+    }
+
+    /// What the focused input's completions are narrowed by: what was typed
+    /// into it. A reference starts out holding a whole id, a new record's
+    /// prefill or the record's own, and narrowed by that it would offer
+    /// nothing but itself.
+    fn narrowed_by(&self, input: Input) -> String {
+        if let Some((base, _)) = &self.completing {
+            return base.clone();
+        }
+        if matches!(input, Input::Ref { .. }) && !self.typed {
+            return String::new();
+        }
+        self.buffer.clone()
+    }
+
+    /// The records a reference field can name, narrowed by what was typed.
+    fn picks(&self, row: &Row) -> Vec<String> {
+        match row.op {
+            Op::Input(input @ Input::Ref { .. }) => {
+                self.matches(row, input, &self.narrowed_by(input))
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// A reference field's list under it: the records it can name, each
+    /// with what it is, the picked one marked (spec: UTUI#editing).
+    fn pick_lines(&self, row: &Row) -> Option<Vec<FormLine>> {
+        let Op::Input(Input::Ref { kind, .. }) = row.op else {
+            return None;
+        };
+        let picks = self.picks(row);
+        let indent = "  ".repeat(row.depth + 2);
+        let line = |text: String, focused: bool, notes: Vec<(Note, String)>| FormLine {
+            text,
+            focused,
+            row: None,
+            notes,
+        };
+        if picks.is_empty() {
+            let noun = super::words::record_noun(kind);
+            let said = if self.context.ids.get(kind).is_none_or(Vec::is_empty) {
+                format!("no {noun} to name yet")
+            } else {
+                format!("no {noun} matches")
+            };
+            return Some(vec![line(format!("{indent}{said}"), false, Vec::new())]);
+        }
+        let start = self
+            .pick
+            .unwrap_or(0)
+            .saturating_sub(PICKS / 2)
+            .min(picks.len().saturating_sub(PICKS));
+        let mut lines = Vec::new();
+        if start > 0 {
+            lines.push(line(
+                format!("{indent}  … {start} above"),
+                false,
+                Vec::new(),
+            ));
+        }
+        for (at, id) in picks.iter().enumerate().skip(start).take(PICKS) {
+            let picked = self.pick == Some(at);
+            let notes = self
+                .about(kind, id)
+                .map(|said| vec![(Note::Reading, said.to_owned())])
+                .unwrap_or_default();
+            let mark = if picked { "▸" } else { " " };
+            lines.push(line(format!("{indent}{mark} {id}"), picked, notes));
+        }
+        let below = picks.len().saturating_sub(start + PICKS);
+        if below > 0 {
+            lines.push(line(format!("{indent}  … {below} more"), false, Vec::new()));
+        }
+        Some(lines)
+    }
+
+    /// The arrows walk a reference's list as rows under it: down from the
+    /// field into the list and on out of its end, up back to the field.
+    /// Enter chooses the record picked, and Esc puts the pick down. Returns
+    /// whether the key was the list's.
+    fn pick_key(&mut self, row: &Row, event: &KeyEvent) -> bool {
+        if !matches!(row.op, Op::Input(Input::Ref { .. }))
+            || event
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return false;
+        }
+        let picks = self.picks(row);
+        match (event.code, self.pick) {
+            (KeyCode::Down, None) if !picks.is_empty() => self.pick = Some(0),
+            (KeyCode::Down, Some(at)) if at + 1 < picks.len() => self.pick = Some(at + 1),
+            (KeyCode::Down, Some(_)) => self.step_focus(1),
+            (KeyCode::Up, Some(0)) => self.pick = None,
+            (KeyCode::Up, Some(at)) => self.pick = Some(at - 1),
+            (KeyCode::Enter, Some(at)) => {
+                if let Some(id) = picks.get(at) {
+                    self.buffer = id.clone();
+                    self.cursor = self.buffer.chars().count();
+                    self.write_buffer(row);
+                }
+                // Once chosen, the list offers every record again.
+                self.completing = None;
+                self.typed = false;
+                self.pick = None;
+            }
+            (KeyCode::Esc, Some(_)) => self.pick = None,
+            _ => return false,
+        }
+        true
+    }
+
     /// The completions for the focused input, on one line.
     fn suggestion_line(&self) -> Option<String> {
         let rows = self.rows();
@@ -1102,10 +1329,8 @@ impl Form {
         let Op::Input(input) = &row.op else {
             return None;
         };
-        let (base, selected) = self
-            .completing
-            .clone()
-            .map_or((self.buffer.clone(), None), |(base, at)| (base, Some(at)));
+        let base = self.narrowed_by(*input);
+        let selected = self.completing.as_ref().map(|(_, at)| *at);
         let matches = self.matches(row, *input, &base);
         if matches.is_empty() {
             return None;
@@ -1301,6 +1526,18 @@ impl Form {
     }
 
     pub(super) fn key(&mut self, event: KeyEvent) -> Outcome {
+        let before = self.route_choices();
+        let outcome = self.handle(event);
+        for (path, route) in self.route_choices() {
+            if !before.contains(&(path.clone(), route)) {
+                self.fill_arguments(&path);
+            }
+        }
+        self.name_rewrite();
+        outcome
+    }
+
+    fn handle(&mut self, event: KeyEvent) -> Outcome {
         self.note = None;
         let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
         let alt = event.modifiers.contains(KeyModifiers::ALT);
@@ -1316,6 +1553,9 @@ impl Form {
         };
         if self.locked(&row) && edits(&event, &row) {
             self.note = Some("fixed once added: add a new record to change it".to_owned());
+            return Outcome::Keep;
+        }
+        if self.pick_key(&row, &event) {
             return Outcome::Keep;
         }
         match event.code {
@@ -1379,10 +1619,7 @@ impl Form {
             self.step_focus(1);
             return;
         };
-        let typed = self
-            .completing
-            .as_ref()
-            .map_or(self.buffer.clone(), |(base, _)| base.clone());
+        let typed = self.narrowed_by(input);
         let matches = self.matches(row, input, &typed);
         if matches.is_empty() {
             self.step_focus(1);
@@ -1395,6 +1632,10 @@ impl Form {
         self.buffer = matches[next].clone();
         self.cursor = self.buffer.chars().count();
         self.completing = Some((typed, next));
+        // A reference's list follows the completion.
+        if matches!(input, Input::Ref { .. }) {
+            self.pick = Some(next);
+        }
         self.write_buffer(row);
     }
 
@@ -1406,6 +1647,8 @@ impl Form {
             return;
         }
         self.completing = None;
+        self.typed = true;
+        self.pick = None;
         let at = byte_index(&self.buffer, self.cursor);
         self.buffer.insert(at, character);
         self.cursor += 1;
@@ -1414,6 +1657,8 @@ impl Form {
 
     fn erase(&mut self, row: &Row, backwards: bool) {
         self.completing = None;
+        self.typed = true;
+        self.pick = None;
         if backwards {
             if self.cursor == 0 {
                 return;
@@ -1863,6 +2108,16 @@ fn default_for(node: &Node, present: bool) -> Value {
     }
 }
 
+/// The argument a parameter starts with: the model the client asked for,
+/// for the parameter reserved for it, and otherwise a value to fill in.
+fn argument_for(parameter: &str) -> Value {
+    if parameter == REQUESTED_MODEL_PARAMETER {
+        json!({ "kind": "requested_model" })
+    } else {
+        json!({ "kind": "literal", "value": "" })
+    }
+}
+
 fn object_of(fields: &[Field]) -> Value {
     let mut map = Map::new();
     for field in fields {
@@ -2232,6 +2487,10 @@ mod tests {
             let form = record(kind);
             let rows = form.rows();
             for name in form.value().as_object().expect("an object").keys() {
+                // A rewrite's id is made for it, not asked for.
+                if (kind, name.as_str()) == ("rewrites", "id") {
+                    continue;
+                }
                 assert!(
                     rows.iter().any(|row| row.path.first() == Some(&key(name))),
                     "{kind}: no field for {name}"
@@ -2260,17 +2519,69 @@ mod tests {
 
     #[test]
     fn typing_edits_the_focused_text_and_the_cursor_moves() {
-        let mut form = record("rewrites");
+        let mut form = record("classifiers");
         focus_label(&mut form, "id");
-        // The cursor starts at the end of "new-rewrite".
+        // The cursor starts at the end of "new-classifier".
         type_text(&mut form, "-x");
-        assert_eq!(form.value()["id"], "new-rewrite-x");
+        assert_eq!(form.value()["id"], "new-classifier-x");
         press(&mut form, KeyCode::Home);
         press(&mut form, KeyCode::Delete);
-        assert_eq!(form.value()["id"], "ew-rewrite-x");
+        assert_eq!(form.value()["id"], "ew-classifier-x");
         press(&mut form, KeyCode::End);
         press(&mut form, KeyCode::Backspace);
-        assert_eq!(form.value()["id"], "ew-rewrite-");
+        assert_eq!(form.value()["id"], "ew-classifier-");
+    }
+
+    /// A rewrite's form has no id to fill in: a new one is named after what
+    /// it matches and where it sends, as those change, unlike any other.
+    #[test]
+    fn a_new_rewrite_is_named_for_it() {
+        let mut context = Context::default();
+        context
+            .ids
+            .insert("rewrites", vec!["model-name-to-fast".to_owned()]);
+        let mut form = Form::new(
+            Purpose::Record {
+                kind: "rewrites",
+                adding: true,
+            },
+            template("rewrites", Some("fast")),
+            context,
+        );
+        assert!(form.rows().iter().all(|row| row.label != "id"));
+        assert_eq!(form.value()["id"], "model-name-to-fast-2");
+        focus_label(&mut form, "value");
+        for _ in 0.."model-name".len() {
+            press(&mut form, KeyCode::Backspace);
+        }
+        type_text(&mut form, "claude-opus");
+        assert_eq!(form.value()["id"], "claude-opus-to-fast");
+        focus_label(&mut form, "route");
+        type_text(&mut form, "er");
+        assert_eq!(form.value()["id"], "claude-opus-to-faster");
+    }
+
+    /// Provenance and catch counts are kept by a rewrite's id, so an edit
+    /// never changes it, whatever else does.
+    #[test]
+    fn an_edited_rewrite_keeps_its_id() {
+        let mut value = template("rewrites", Some("fast"));
+        value["id"] = Value::from("chosen-long-ago");
+        let mut form = Form::new(
+            Purpose::Record {
+                kind: "rewrites",
+                adding: false,
+            },
+            value,
+            Context::default(),
+        );
+        assert_eq!(form.value()["id"], "chosen-long-ago");
+        focus_label(&mut form, "value");
+        type_text(&mut form, "-2");
+        focus_label(&mut form, "route");
+        type_text(&mut form, "er");
+        assert_eq!(form.value()["model_matcher"]["value"], "model-name-2");
+        assert_eq!(form.value()["id"], "chosen-long-ago");
     }
 
     #[test]
@@ -2581,6 +2892,274 @@ mod tests {
         assert_eq!(form.value()["target"]["route_id"], "slow");
     }
 
+    /// Two routes, each said in a few words.
+    fn two_routes() -> Context {
+        let mut context = Context::default();
+        context
+            .ids
+            .insert("routes", vec!["fast".to_owned(), "slow".to_owned()]);
+        context.about.insert(
+            "routes",
+            [
+                ("fast".to_owned(), "1 candidate · sub".to_owned()),
+                ("slow".to_owned(), "2 candidates · sub → api".to_owned()),
+            ]
+            .into(),
+        );
+        context
+    }
+
+    fn a_default(context: Context) -> Form {
+        Form::new(
+            Purpose::Record {
+                kind: "defaults",
+                adding: true,
+            },
+            template("defaults", Some("fast")),
+            context,
+        )
+    }
+
+    /// The lines under the focused field that list what it can name.
+    fn listed(form: &Form) -> Vec<FormLine> {
+        form.lines()
+            .into_iter()
+            .skip_while(|line| !line.focused)
+            .skip(1)
+            // The list sits deeper than the heading of the field after it.
+            .take_while(|line| line.row.is_none() && line.text.starts_with("      "))
+            .collect()
+    }
+
+    /// A field naming a route lists every route with what it is, though it
+    /// already holds one whole id, and a pick from the list is chosen with
+    /// enter.
+    #[test]
+    fn a_reference_lists_the_records_it_can_name_and_one_is_picked() {
+        let mut form = a_default(two_routes());
+        focus_label(&mut form, "route");
+        let list = listed(&form);
+        assert_eq!(list.len(), 2, "{list:?}");
+        assert!(list[0].text.ends_with("  fast"), "{list:?}");
+        assert_eq!(
+            list[1].notes,
+            [(Note::Reading, "2 candidates · sub → api".to_owned())]
+        );
+        assert!(list.iter().all(|line| !line.focused), "nothing picked yet");
+        press(&mut form, KeyCode::Down);
+        press(&mut form, KeyCode::Down);
+        let list = listed(&form);
+        assert!(
+            list[1].focused && list[1].text.contains("▸ slow"),
+            "{list:?}"
+        );
+        // Picking is not choosing: the field holds what it held.
+        assert_eq!(form.value()["target"]["route_id"], "fast");
+        press(&mut form, KeyCode::Enter);
+        assert_eq!(form.value()["target"]["route_id"], "slow");
+        assert_eq!(form.rows()[form.focus()].label, "route", "it stays");
+        assert_eq!(listed(&form).len(), 2, "and lists every route again");
+    }
+
+    #[test]
+    fn typing_narrows_a_references_list() {
+        let mut form = a_default(two_routes());
+        focus_label(&mut form, "route");
+        for _ in 0.."fast".len() {
+            press(&mut form, KeyCode::Backspace);
+        }
+        type_text(&mut form, "sl");
+        let list = listed(&form);
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert!(list[0].text.ends_with("slow"));
+        press(&mut form, KeyCode::Down);
+        press(&mut form, KeyCode::Enter);
+        assert_eq!(form.value()["target"]["route_id"], "slow");
+        // A name no route has is kept as typed, and the list says so.
+        type_text(&mut form, "er");
+        assert_eq!(form.value()["target"]["route_id"], "slower");
+        assert!(listed(&form)[0].text.contains("no route matches"));
+    }
+
+    /// The list is rows under the field: up from it is back on the field,
+    /// up again the field before, and esc puts a pick down rather than
+    /// abandoning the form.
+    #[test]
+    fn the_arrows_walk_through_a_references_list() {
+        let mut form = a_default(two_routes());
+        focus_label(&mut form, "route");
+        let at = form.focus();
+        press(&mut form, KeyCode::Down);
+        assert_eq!(press(&mut form, KeyCode::Esc), Outcome::Keep);
+        assert!(listed(&form).iter().all(|line| !line.focused));
+        press(&mut form, KeyCode::Down);
+        press(&mut form, KeyCode::Up);
+        assert_eq!(form.focus(), at, "back on the field");
+        press(&mut form, KeyCode::Up);
+        assert!(form.focus() < at, "the field before");
+        // Down off the end of the list is the field after.
+        form.set_focus(at);
+        for _ in 0..3 {
+            press(&mut form, KeyCode::Down);
+        }
+        assert!(form.focus() > at);
+        assert_eq!(form.value()["target"]["route_id"], "fast", "nothing chosen");
+    }
+
+    #[test]
+    fn a_reference_with_nothing_to_name_says_so() {
+        let mut form = a_default(Context::default());
+        focus_label(&mut form, "route");
+        let list = listed(&form);
+        assert_eq!(list.len(), 1);
+        assert!(list[0].text.contains("no route to name yet"), "{list:?}");
+    }
+
+    /// Three routes: one taking the requested model and a tier, one taking
+    /// only a tier, and one taking nothing.
+    fn routes_with_parameters() -> Context {
+        let mut context = Context::default();
+        let routes = [
+            ("fast", &["requested_model", "tier"][..]),
+            ("slow", &["tier"]),
+            ("bare", &[]),
+        ];
+        context.ids.insert(
+            "routes",
+            routes.iter().map(|(id, _)| (*id).to_owned()).collect(),
+        );
+        context.parameters = routes
+            .iter()
+            .map(|(id, declared)| {
+                let declared = declared.iter().map(|name| (*name).to_owned()).collect();
+                ((*id).to_owned(), declared)
+            })
+            .collect();
+        context
+    }
+
+    /// Choose the `nth` route of a reference's list.
+    fn choose(form: &mut Form, nth: usize) {
+        focus_label(form, "route");
+        for _ in 0..=nth {
+            press(form, KeyCode::Down);
+        }
+        press(form, KeyCode::Enter);
+    }
+
+    /// A form that opens on a route has an argument for each of its
+    /// parameters, the requested model passed through and the rest to fill.
+    #[test]
+    fn a_reference_opens_with_an_argument_per_parameter_of_its_route() {
+        let form = a_default(routes_with_parameters());
+        assert_eq!(
+            form.value()["target"]["parameters"],
+            json!({
+                "requested_model": {"kind": "requested_model"},
+                "tier": {"kind": "literal", "value": ""},
+            })
+        );
+    }
+
+    /// Choosing another route keeps the arguments it shares with the last
+    /// one and drops those it does not declare.
+    #[test]
+    fn choosing_a_route_fills_its_arguments_and_keeps_the_shared_ones() {
+        let mut form = a_default(routes_with_parameters());
+        form.value["target"]["parameters"]["tier"]["value"] = Value::from("gold");
+        choose(&mut form, 1);
+        assert_eq!(form.value()["target"]["route_id"], "slow");
+        assert_eq!(
+            form.value()["target"]["parameters"],
+            json!({"tier": {"kind": "literal", "value": "gold"}})
+        );
+        choose(&mut form, 2);
+        assert_eq!(form.value()["target"]["parameters"], json!({}));
+        choose(&mut form, 0);
+        assert_eq!(
+            form.value()["target"]["parameters"],
+            json!({
+                "requested_model": {"kind": "requested_model"},
+                "tier": {"kind": "literal", "value": ""},
+            })
+        );
+    }
+
+    /// A route being typed is not one yet: its arguments stay until it
+    /// names one, and an argument added by hand stays while the route is
+    /// the same.
+    #[test]
+    fn arguments_change_only_when_the_route_does() {
+        let mut form = a_default(routes_with_parameters());
+        focus_label(&mut form, "route");
+        for _ in 0.."fast".len() {
+            press(&mut form, KeyCode::Backspace);
+        }
+        type_text(&mut form, "slo");
+        assert_eq!(
+            form.value()["target"]["parameters"]["requested_model"]["kind"],
+            "requested_model"
+        );
+        type_text(&mut form, "w");
+        assert_eq!(
+            form.value()["target"]["parameters"],
+            json!({"tier": {"kind": "literal", "value": ""}})
+        );
+        focus_label(&mut form, "argument");
+        press(&mut form, KeyCode::Enter);
+        assert_eq!(
+            form.value()["target"]["parameters"]
+                .as_object()
+                .map(Map::len),
+            Some(2),
+            "an argument added by hand is kept"
+        );
+    }
+
+    /// A rewrite and a presentation's route fill their arguments the same.
+    #[test]
+    fn every_reference_fills_its_arguments() {
+        let rewrite = Form::new(
+            Purpose::Record {
+                kind: "rewrites",
+                adding: true,
+            },
+            template("rewrites", Some("slow")),
+            routes_with_parameters(),
+        );
+        assert_eq!(
+            rewrite.value()["target"]["parameters"],
+            json!({"tier": {"kind": "literal", "value": ""}})
+        );
+        let mut presentation = Form::new(
+            Purpose::Record {
+                kind: "presentations",
+                adding: true,
+            },
+            template("presentations", None),
+            routes_with_parameters(),
+        );
+        let rows = presentation.rows();
+        let kind = rows
+            .iter()
+            .position(|row| matches!(&row.op, Op::Tag { .. }) && row.path == vec![key("source")])
+            .expect("a source kind row");
+        presentation.set_focus(kind);
+        press(&mut presentation, KeyCode::Left);
+        assert_eq!(presentation.value()["source"]["kind"], "virtual");
+        choose(&mut presentation, 2);
+        assert_eq!(presentation.value()["source"]["target"]["route_id"], "bare");
+        assert_eq!(
+            presentation.value()["source"]["target"]["parameters"],
+            json!({})
+        );
+        choose(&mut presentation, 0);
+        assert_eq!(
+            presentation.value()["source"]["target"]["parameters"]["requested_model"],
+            json!({"kind": "requested_model"})
+        );
+    }
+
     #[test]
     fn a_map_of_arguments_adds_renames_and_removes_entries() {
         let mut form = record("defaults");
@@ -2642,18 +3221,18 @@ mod tests {
     fn the_id_of_an_existing_record_is_fixed() {
         let mut form = Form::new(
             Purpose::Record {
-                kind: "rewrites",
+                kind: "classifiers",
                 adding: false,
             },
-            template("rewrites", Some("route-id")),
+            template("classifiers", None),
             Context::default(),
         );
         focus_label(&mut form, "id");
         type_text(&mut form, "x");
-        assert_eq!(form.value()["id"], "new-rewrite");
+        assert_eq!(form.value()["id"], "new-classifier");
         assert!(form.note().is_some_and(|note| note.contains("fixed")));
         press(&mut form, KeyCode::Backspace);
-        assert_eq!(form.value()["id"], "new-rewrite");
+        assert_eq!(form.value()["id"], "new-classifier");
         // Moving the cursor is not an edit.
         press(&mut form, KeyCode::Left);
         assert!(form.note().is_none());
@@ -2677,7 +3256,7 @@ mod tests {
 
     #[test]
     fn a_blank_id_is_not_submitted() {
-        let mut form = record("rewrites");
+        let mut form = record("classifiers");
         focus_label(&mut form, "id");
         for _ in 0..20 {
             press(&mut form, KeyCode::Backspace);
@@ -2768,7 +3347,7 @@ mod tests {
         let mut promote = Form::new(Purpose::Promote, json!({}), offered());
         assert_eq!(press(&mut promote, KeyCode::Enter), Outcome::Submit);
         let mut record = record("rewrites");
-        focus_label(&mut record, "id");
+        focus_label(&mut record, "priority");
         assert_eq!(press(&mut record, KeyCode::Enter), Outcome::Keep);
         assert_eq!(record.rows()[record.focus()].label, "kind");
     }

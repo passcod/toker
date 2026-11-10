@@ -18,6 +18,24 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::{MAX_CONTROL_BODY, control_token_ok, forbidden, json_content_type, store_error};
+
+/// A refusal for a write made once the store was replaced, named as the
+/// `store` setting so the configuration page says why.
+fn refused_store_replaced(server: &Server, operation: &str) -> Option<Response> {
+    let why = super::store_replaced(server)?;
+    Some(
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({
+                "toker": operation,
+                "ok": false,
+                "setting": "store",
+                "error": why,
+            })),
+        )
+            .into_response(),
+    )
+}
 use crate::config::{Config, is_frontend_name};
 use crate::routing::{CapabilityEvidence, DialectId};
 use crate::server::Server;
@@ -189,6 +207,7 @@ fn settings_body(settings: &SettingsConfigRow) -> serde_json::Value {
         "session_headers": settings.session_headers,
         "ping_header": settings.ping_header,
         "awake": settings.awake,
+        "ping_schedule": settings.ping_schedule,
         "transcript_roots": settings.transcript_roots,
         "quota_enabled": settings.quota_enabled,
         "cold_enabled": settings.cold_enabled,
@@ -228,6 +247,8 @@ struct SettingsEdit {
     ping_header: Option<String>,
     #[serde(default)]
     awake: Option<bool>,
+    #[serde(default)]
+    ping_schedule: Option<bool>,
     #[serde(default)]
     transcript_roots: Option<Vec<String>>,
     #[serde(default)]
@@ -284,7 +305,7 @@ where
 fn commit<T>(
     server: &Server,
     change: impl FnOnce(&mut Configuration) -> Result<T, (String, String)>,
-    write: impl FnOnce(&T) -> crate::store::Result<()>,
+    write: impl FnOnce(&T, &Config) -> Result<(), Box<Response>>,
 ) -> Response {
     let mut candidate = match server.store.load_configuration() {
         Ok(stored) => stored,
@@ -310,8 +331,11 @@ fn commit<T>(
         Ok(resolved) => resolved,
         Err(error) => return refused("configuration", &format!("{error:#}")),
     };
-    if let Err(error) = write(&written) {
-        return store_error(error);
+    if let Some(response) = refused_store_replaced(server, "config-edit") {
+        return response;
+    }
+    if let Err(response) = write(&written, &resolved) {
+        return *response;
     }
     server.replace_config(resolved);
     (
@@ -388,6 +412,7 @@ pub(crate) async fn provider(State(server): State<Server>, request: Request) -> 
         Err(error) => return refused("provider", &error.to_string()),
     };
 
+    let was_enabled = std::cell::Cell::new(false);
     commit(
         &server,
         |candidate| {
@@ -406,6 +431,7 @@ pub(crate) async fn provider(State(server): State<Server>, request: Request) -> 
                     provider: edit.provider.clone(),
                     ..ProviderConfigRow::default()
                 });
+            was_enabled.set(existing.enabled);
             // The credential stays exactly as it was: it moves only through
             // the credential operation.
             let row = ProviderConfigRow {
@@ -425,8 +451,59 @@ pub(crate) async fn provider(State(server): State<Server>, request: Request) -> 
                 .sort_by(|a, b| a.provider.cmp(&b.provider));
             Ok(row)
         },
-        |row| server.store.put_config_provider(row),
+        |row, resolved| {
+            // spec: DCONF#editing
+            // The revision is saved before the row is written. A save that
+            // fails (the live revision moved, say) then leaves the provider
+            // off and the routing as it was. The other order would leave it
+            // on with no default to reach it, which is the state this exists
+            // to end. A row write failing after the save leaves a default to a
+            // provider still off, which answers as nothing configured, as the
+            // protocol did before it had one.
+            if row.enabled && !was_enabled.get() {
+                server
+                    .default_routes_for_enabled_provider(resolved, &row.provider)
+                    .map_err(|error| Box::new(routing_refused(&row.provider, error)))?;
+            }
+            server
+                .store
+                .put_config_provider(row)
+                .map_err(|error| Box::new(store_error(error)))
+        },
     )
+}
+
+/// A provider not enabled because the routing revision its enabling saves
+/// could not be saved. Nothing was changed.
+fn routing_refused(provider: &str, error: crate::server::RoutingControlError) -> Response {
+    let (status, why) = match error {
+        crate::server::RoutingControlError::StaleRevision { .. } => (
+            StatusCode::CONFLICT,
+            format!(
+                "the routing revision changed while {provider} was being enabled, \
+                 so it was not; try again"
+            ),
+        ),
+        error => {
+            tracing::error!(%error, provider, "enabling a provider could not save its defaults");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "could not give {provider} a default route ({error}), so it was not enabled"
+                ),
+            )
+        }
+    };
+    (
+        status,
+        axum::Json(json!({
+            "toker": "config-edit",
+            "ok": false,
+            "setting": "provider",
+            "error": why,
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -454,6 +531,9 @@ pub(crate) async fn clear_safeguards_mark(
         Ok(clear) => clear,
         Err(_) => return refused("safeguards", "the request does not parse"),
     };
+    if let Some(response) = refused_store_replaced(&server, "safeguards-mark-clear") {
+        return response;
+    }
     let cleared = server.clear_safeguards_marks([&clear.binding_id]);
     (
         StatusCode::OK,
@@ -484,6 +564,7 @@ pub(crate) async fn settings(State(server): State<Server>, request: Request) -> 
         session_headers: edit.session_headers,
         ping_header: edit.ping_header,
         awake: edit.awake,
+        ping_schedule: edit.ping_schedule,
         transcript_roots: edit.transcript_roots,
         quota_enabled: edit.quota_enabled,
         cold_enabled: edit.cold_enabled,
@@ -499,7 +580,12 @@ pub(crate) async fn settings(State(server): State<Server>, request: Request) -> 
             candidate.settings = row;
             Ok(())
         },
-        |()| server.store.put_config_settings(&stored),
+        |(), _| {
+            server
+                .store
+                .put_config_settings(&stored)
+                .map_err(|error| Box::new(store_error(error)))
+        },
     )
 }
 
@@ -544,9 +630,12 @@ pub(crate) async fn notice(State(server): State<Server>, request: Request) -> Re
             }
             Ok(())
         },
-        |()| match &style {
-            Some(style) => server.store.put_config_notice(&profile, style),
-            None => server.store.delete_config_notice(&profile),
+        |(), _| {
+            match &style {
+                Some(style) => server.store.put_config_notice(&profile, style),
+                None => server.store.delete_config_notice(&profile),
+            }
+            .map_err(|error| Box::new(store_error(error)))
         },
     )
 }
@@ -605,7 +694,12 @@ pub(crate) async fn credential(State(server): State<Server>, request: Request) -
                 .sort_by(|a, b| a.provider.cmp(&b.provider));
             Ok(row)
         },
-        |row| server.store.put_config_provider(row),
+        |row, _| {
+            server
+                .store
+                .put_config_provider(row)
+                .map_err(|error| Box::new(store_error(error)))
+        },
     );
     // A new credential may be enrolled where the old one was not, so the
     // provider's refused asks are worth trying again

@@ -300,7 +300,7 @@ pub(crate) async fn precommit_responses(
             },
         });
     }
-    if super::proxy::is_event_stream(&headers) {
+    if super::proxy::answers_stream_request(&headers) {
         let (buffered, event, evidence) = precommit_sse(response).await?;
         let parsed = event.as_ref().and_then(|event| {
             let mut parser = ResponsesSse::new();
@@ -757,6 +757,33 @@ mod tests {
             };
             assert_eq!(response.bytes().await.unwrap(), frame.as_bytes());
         }
+    }
+
+    /// The codex backend has streamed a turn with no content type at all.
+    #[tokio::test]
+    async fn responses_precommit_reads_an_unlabelled_answer_as_the_stream() {
+        let unlabelled = |bytes: &'static [u8]| {
+            let response = axum::http::Response::builder()
+                .status(StatusCode::OK)
+                .body(reqwest::Body::from(bytes))
+                .unwrap();
+            reqwest::Response::from(response)
+        };
+        let frame = b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n";
+        let outcome = precommit_responses(unlabelled(frame)).await.unwrap();
+        let PrecommitOutcome::Accepted { response, evidence } = outcome else {
+            panic!("an unlabelled stream was refused: {outcome:?}");
+        };
+        assert_eq!(evidence, CommitEvidence::CanonicalEvent);
+        assert_eq!(response.bytes().await.unwrap(), &frame[..]);
+
+        let outcome = precommit_responses(unlabelled(b"{\"id\":\"resp-1\"}"))
+            .await
+            .unwrap();
+        let PrecommitOutcome::Failure { failure, .. } = outcome else {
+            panic!("an unlabelled body that is not a stream was accepted: {outcome:?}");
+        };
+        assert_eq!(failure.mechanism, FailureMechanism::ResponseProtocol);
     }
 
     #[tokio::test]

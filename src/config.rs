@@ -145,6 +145,11 @@ pub struct Config {
     /// (see [`crate::middleware::awake`]). Off → never hold, never
     /// spawn, never write awake rows.
     pub awake: bool,
+    /// Whether the scheduled pings, and the holds that keep the machine up
+    /// for them, run. Off until the operator turns it on; even on, they run
+    /// only while a provider that anchors its windows is enabled
+    /// (spec: GPING#scope).
+    pub ping_schedule: bool,
     /// Extra transcript roots for the dashboard's session labels
     /// (a colon-separated list, like a PATH entry): `~/.claude` and
     /// `$CLAUDE_CONFIG_DIR` are always searched, and these add
@@ -915,6 +920,7 @@ impl Config {
                 force_newest: true,
             },
             awake: settings.awake.unwrap_or(true),
+            ping_schedule: settings.ping_schedule.unwrap_or(false),
             transcript_roots: settings
                 .transcript_roots
                 .as_deref()
@@ -1071,6 +1077,7 @@ impl Config {
                     DEFAULT_PING_HEADER.to_owned(),
                 ),
                 awake: set(self.awake, true),
+                ping_schedule: set(self.ping_schedule, false),
                 transcript_roots: set(
                     self.transcript_roots
                         .iter()
@@ -1096,19 +1103,46 @@ impl Config {
     ///
     /// Opens the store at the path the environment resolves to, because the
     /// store's own path is one of the two things that cannot be read from
-    /// it. Every command reaches configuration through here, and every
-    /// command but setup has already refused if a configuration file is
-    /// still present, so there is no second source to layer over.
+    /// it. Every command but the service reaches configuration through here,
+    /// and every command but setup has already refused if a configuration
+    /// file is still present, so there is no second source to layer over.
+    ///
+    /// The store is opened read-only (spec: STORE#opening-the-store). A
+    /// command run with the store directory gone once created an empty store
+    /// where the service looked, and another raced the service's own
+    /// migration. A store that is not there yet is every default, as the
+    /// service will read it once it has created it, so the dashboard and
+    /// `status` work before the first start.
     pub fn load() -> anyhow::Result<Config> {
+        let environment = ProcessEnvironment;
+        let db_path = resolve_db_path(&environment)?;
+        let configuration = match crate::store::Store::open_read_only(&db_path) {
+            Ok(store) => stored_configuration(&store, &db_path)?,
+            Err(error) if error.is_missing_store() => crate::store::Configuration::default(),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("opening the store at {}", db_path.display()));
+            }
+        };
+        Self::loaded(&configuration, &environment)
+    }
+
+    /// The service's configuration and its store, which it alone creates and
+    /// migrates: every other command opens the store without doing either.
+    pub fn open_for_service() -> anyhow::Result<(Config, crate::store::Store)> {
         let environment = ProcessEnvironment;
         let db_path = resolve_db_path(&environment)?;
         let store = crate::store::Store::open(&db_path)
             .with_context(|| format!("opening the store at {}", db_path.display()))?;
-        let config = Self::from_configuration(
-            &store.load_configuration()?,
-            &environment,
-            Strictness::Degrade,
-        )?;
+        let config = Self::loaded(&store.load_configuration()?, &environment)?;
+        Ok((config, store))
+    }
+
+    fn loaded(
+        configuration: &crate::store::Configuration,
+        environment: &impl Environment,
+    ) -> anyhow::Result<Config> {
+        let config = Self::from_configuration(configuration, environment, Strictness::Degrade)?;
         config.validate_retained()?;
         Ok(config)
     }
@@ -1459,6 +1493,9 @@ impl Config {
             },
             // On unless disabled.
             awake: file.awake.unwrap_or(true),
+            // Not a file setting: the schedule was never in the file, and
+            // is off until turned on.
+            ping_schedule: false,
             transcript_roots: file
                 .transcript_roots
                 .map(|roots| roots.into_iter().map(PathBuf::from).collect())
@@ -1960,6 +1997,37 @@ pub fn store_path() -> anyhow::Result<PathBuf> {
     resolve_db_path(&ProcessEnvironment)
 }
 
+/// The listener port (spec: DCONF#before-the-store), for a command that
+/// needs nothing else. `toker restart` reads only this, so the upgrade it
+/// finishes works while the store still has the schema of the binary being
+/// replaced.
+pub fn listener_port() -> anyhow::Result<u16> {
+    resolve_port(&ProcessEnvironment)
+}
+
+/// The configuration a store holds, read by a command that does not migrate
+/// it. A store older than this binary may lack what the read needs; the
+/// service migrates it once it runs this binary, so that is what to say.
+fn stored_configuration(
+    store: &crate::store::Store,
+    db_path: &Path,
+) -> anyhow::Result<crate::store::Configuration> {
+    match store.load_configuration() {
+        Ok(configuration) => Ok(configuration),
+        Err(error) if !store.schema_is_current().unwrap_or(false) => {
+            Err(anyhow::Error::from(error).context(format!(
+                "the store at {} is from an older toker, and only the service \
+                 migrates it: run `toker restart` so the service runs this \
+                 binary, then try again",
+                db_path.display()
+            )))
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("reading configuration from {}", db_path.display()))
+        }
+    }
+}
+
 fn config_path_with_env(environment: &impl Environment) -> anyhow::Result<PathBuf> {
     if let Some(path) = environment.var_os("TOKER_CONFIG") {
         return Ok(PathBuf::from(path));
@@ -2011,7 +2079,7 @@ fn expand_tilde(path: &str) -> PathBuf {
 /// installed rather than from what toker was told, and the two cannot be
 /// configured into disagreeing. The service does not share the operator's
 /// shell, so setup carries `CODEX_HOME` into the unit for them to agree.
-fn default_codex_auth_path() -> PathBuf {
+pub fn default_codex_auth_path() -> PathBuf {
     codex_auth_path_in(&ProcessEnvironment)
 }
 

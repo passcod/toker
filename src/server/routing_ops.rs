@@ -281,6 +281,53 @@ impl Server {
         )
     }
 
+    /// Give each protocol `provider` serves a default route to it where the
+    /// active revision has none, saved as a revision the way a routing save
+    /// is (spec: DCONF#editing, spec: RREV#saving-an-edit). `None` where every
+    /// protocol it serves has a default already, and nothing is saved.
+    pub(crate) fn default_routes_for_enabled_provider(
+        &self,
+        config: &crate::config::Config,
+        provider: &str,
+    ) -> Result<Option<RoutingActivation>, RoutingControlError> {
+        let _control = self
+            .routing_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let basis = self.control_basis_locked()?;
+        let defaults = crate::policy::legacy::defaults_for_enabled_provider(
+            config,
+            basis.active_revision.document.document(),
+            provider,
+        )?;
+        if defaults.edit.operations.is_empty() {
+            return Ok(None);
+        }
+        let document = defaults
+            .edit
+            .apply_validated(&basis.active_revision.document)?;
+        let description = format!(
+            "default for {}, on enabling {provider}",
+            defaults
+                .protocols
+                .iter()
+                .map(|protocol| format!(
+                    "{} → {provider}",
+                    crate::policy::facts::protocol_name(*protocol)
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        self.activate_document_locked(
+            &basis,
+            &document,
+            Some(&description),
+            PolicyRevisionSource::Save,
+            None,
+        )
+        .map(Some)
+    }
+
     /// Copy a kept revision into a new active one, for new and cold lanes
     /// (spec: RREV#history-and-reactivation).
     pub(crate) fn reactivate_routing_policy(
