@@ -26,6 +26,9 @@ pub async fn serve() -> anyhow::Result<()> {
     init_tracing();
     let (config, store) = Config::open_for_service()?;
     let store = Arc::new(store);
+    // spec: GPING#scope — the service brings the marker in line when it
+    // starts, so a store edited while it was down still switches the jobs.
+    crate::server::sync_ping_marker(&config);
     tracing::info!(db = %config.db_path.display(), "serving");
     Server::new(config, store)?.serve().await
 }

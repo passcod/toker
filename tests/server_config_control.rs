@@ -852,3 +852,52 @@ async fn enabling_a_provider_again_leaves_the_defaults_alone() {
         enabled.document.document().defaults
     );
 }
+
+#[tokio::test]
+async fn the_ping_marker_follows_the_schedule_and_the_subscription() {
+    // spec: GPING#scope
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("toker.db");
+    let marker = toker::timers::ping_marker(dir.path());
+    let config = Config {
+        db_path: db.clone(),
+        ..config()
+    };
+    let store = Arc::new(Store::open(&db).unwrap());
+    let server =
+        Server::with_seams(config, store, toker::server::Seams::isolated()).expect("server");
+    let app = server.router();
+
+    // The subscription alone: the schedule is off until turned on.
+    set_enabled(&app, "anthropic_sub", true).await;
+    assert!(!marker.exists(), "the schedule is off by default");
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            "PUT",
+            "/_toker/config/settings",
+            Some("config-edit"),
+            Some(json!({ "ping_schedule": true })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(server.config().ping_schedule);
+    assert!(
+        marker.is_file(),
+        "turning the schedule on switches the jobs"
+    );
+    assert_eq!(snapshot(&app).await["settings"]["ping_schedule"], true);
+    assert_eq!(
+        server.config().db_path,
+        db,
+        "an edit keeps the store's path"
+    );
+
+    // Nothing else anchors a window, so the subscription going takes the
+    // marker with it while the schedule stays on.
+    set_enabled(&app, "anthropic_sub", false).await;
+    assert!(server.config().ping_schedule);
+    assert!(!marker.exists(), "no provider anchors a window");
+}

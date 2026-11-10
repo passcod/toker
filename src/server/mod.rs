@@ -892,7 +892,18 @@ impl Server {
 
     /// Adopt an edited configuration. Called by the control surface inside
     /// the operation that wrote the row (spec: DCONF#editing).
-    pub(crate) fn replace_config(&self, config: Config) {
+    pub(crate) fn replace_config(&self, mut config: Config) {
+        // The store's path and the port were settled before the store was
+        // opened (spec: DCONF#before-the-store), and an edit cannot move
+        // them; the edit resolves them from the environment again, which in
+        // a test is not the store the server has open. The marker below
+        // must land beside the store actually in use.
+        let running = self.config();
+        config.db_path = running.db_path.clone();
+        config.port = running.port;
+        // Every edit comes through here, so turning the schedule or a
+        // provider on or off switches the jobs in the same call.
+        sync_ping_marker(&config);
         self.config.replace(config);
     }
 
@@ -2859,6 +2870,15 @@ fn cache_temperature(
         CacheTemperature::Cold
     } else {
         CacheTemperature::Warm
+    }
+}
+
+/// Bring the ping marker in line with `config` (spec: GPING#scope). A
+/// failure is logged rather than refused: a stale marker costs a skipped or a
+/// needless ping, never a request.
+pub(crate) fn sync_ping_marker(config: &Config) {
+    if let Err(error) = crate::timers::sync_ping_marker(config) {
+        tracing::warn!(%error, "the ping marker could not be brought in line");
     }
 }
 
