@@ -10,9 +10,9 @@ Several keys per provider is left for a card of its own.
 
 ## Store and service
 
-- [ ] Commands other than `serve` and `setup` load configuration from a store opened read-only, so the dashboard, `status` and `restart` never create or migrate a store (STORE#opening-the-store). A missing store reads as the configuration defaults.
-- [ ] The service checks that the store path still names the file it opened (device and inode) before each control write and on a timer, and stops when it does not, refusing the write (DLIFE#keeping-to-its-store).
-- [ ] A 2xx Responses answer refused for its content type records the content type it carried (or its absence) in the error detail.
+- [x] Commands other than `serve` and `setup` load configuration from a store opened read-only, so the dashboard, `status` and `restart` never create or migrate a store (STORE#opening-the-store). A missing store reads as the configuration defaults.
+- [x] The service checks that the store path still names the file it opened (device and inode) before each control write and on a timer, and stops when it does not, refusing the write (DLIFE#keeping-to-its-store).
+- [x] A 2xx Responses answer refused for its content type records the content type it carried (or its absence) in the error detail.
 
 ## Setup
 
