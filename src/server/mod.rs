@@ -1001,8 +1001,14 @@ impl Server {
         Ok((by_route, by_revision, at_risk))
     }
 
-    pub(crate) fn routing_revisions(&self) -> Result<Vec<PolicyRevision>, crate::store::Error> {
-        self.store.load_policy_revisions()
+    /// One page of the revision history, newest first. Nothing prunes the
+    /// table, so the history tab reads a page of it rather than all of it.
+    pub(crate) fn routing_revisions(
+        &self,
+        before: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<PolicyRevision>, crate::store::Error> {
+        self.store.load_policy_revisions_page(before, limit)
     }
 
     pub(crate) fn promote_routing_learning(

@@ -39,6 +39,11 @@ const MAX_ROUTING_EDIT_BODY: usize = crate::policy::MAX_DOCUMENT_BYTES + 16 * 10
 const DEFAULT_RECENT_REQUESTS: u32 = 50;
 const MAX_RECENT_REQUESTS: u32 = 200;
 
+/// The revisions one page of the history returns when it names no limit, and
+/// the most it will. Nothing prunes the table.
+const DEFAULT_REVISIONS: u32 = 50;
+const MAX_REVISIONS: u32 = 200;
+
 pub(crate) async fn snapshot(State(server): State<Server>, request: Request) -> Response {
     if !control_token_ok(request.headers(), "routing-snapshot") || request.method() != Method::GET {
         return forbidden();
@@ -55,18 +60,53 @@ pub(crate) async fn revisions(State(server): State<Server>, request: Request) ->
     {
         return forbidden();
     }
-    match server.routing_revisions() {
-        Ok(revisions) => (
-            StatusCode::OK,
-            axum::Json(json!({
-                "toker": "routing-revisions",
-                "ok": true,
-                "revisions": revision_summaries(revisions),
-            })),
-        )
-            .into_response(),
+    let query = request.uri().query().unwrap_or_default();
+    let before = match query_number(query, "before") {
+        Ok(before) => before,
+        Err(()) => return invalid_request("routing-revisions"),
+    };
+    let limit = match query_number(query, "limit") {
+        Ok(limit) => limit
+            .and_then(|limit| u32::try_from(limit).ok())
+            .unwrap_or(DEFAULT_REVISIONS)
+            .clamp(1, MAX_REVISIONS),
+        Err(()) => return invalid_request("routing-revisions"),
+    };
+    // One more than the page: the extra, older revision is what the oldest
+    // in the page is diffed against, and says there is another page.
+    match server.routing_revisions(before, limit.saturating_add(1)) {
+        Ok(mut revisions) => {
+            let more = revisions.len() > limit as usize;
+            let baseline = more.then(|| revisions.pop()).flatten();
+            let next_before = revisions.last().map(|revision| revision.revision_id);
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "toker": "routing-revisions",
+                    "ok": true,
+                    "revisions": revision_summaries(revisions, baseline.as_ref()),
+                    "has_more": more,
+                    "next_before": next_before,
+                })),
+            )
+                .into_response()
+        }
         Err(error) => store_error(error),
     }
+}
+
+/// One numeric query parameter, or `Err` where it is present and is not a
+/// number: a mistyped parameter fails rather than being ignored.
+fn query_number(query: &str, name: &str) -> Result<Option<i64>, ()> {
+    let Some(value) = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == name)
+        .map(|(_, value)| value)
+    else {
+        return Ok(None);
+    };
+    value.parse().map(Some).map_err(|_| ())
 }
 
 /// An edit and the revision it was made against. The edit is the policy
@@ -861,10 +901,15 @@ fn revision_body(revision: &PolicyRevision) -> Value {
 /// one with the next lower number: the active pointer never moves backwards,
 /// so that is what was live when it was made. A revision's own `parent` is
 /// what it was made from, which for a reactivation is the one copied.
-fn revision_summaries(mut revisions: Vec<PolicyRevision>) -> Vec<Value> {
+fn revision_summaries(
+    mut revisions: Vec<PolicyRevision>,
+    baseline: Option<&PolicyRevision>,
+) -> Vec<Value> {
     revisions.sort_by_key(|revision| revision.revision_id);
     let mut bodies = Vec::with_capacity(revisions.len());
-    let mut before: Option<&PolicyRevision> = None;
+    // The page's oldest is diffed against the revision below it, which is
+    // outside the page; without one, it is the first revision there is.
+    let mut before: Option<&PolicyRevision> = baseline;
     for revision in &revisions {
         let after = revision.document.document();
         let changes =

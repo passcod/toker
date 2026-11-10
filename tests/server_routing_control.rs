@@ -1212,6 +1212,71 @@ async fn each_revision_says_what_it_changed_from_the_one_before_it() {
     assert_eq!(at(3)["changes"][0]["kind"], "policy");
 }
 
+/// The history is never pruned, so it is read a page at a time.
+#[tokio::test]
+async fn the_revision_history_is_read_a_page_at_a_time() {
+    let (server, _store) = server();
+    let app = server.router();
+    for revision in 1..=3 {
+        let (status, _) = post(
+            &app,
+            "save",
+            "routing-save",
+            json!({"expected_revision_id": revision, "edit": describe(&format!("r{revision}"))}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let page = |query: &str| {
+        let app = app.clone();
+        let uri = format!("/_toker/routing/revisions{query}");
+        async move {
+            let response = app
+                .oneshot(request("GET", &uri, Some("routing-revisions"), None))
+                .await
+                .unwrap();
+            let status = response.status();
+            (status, body_of(response).await)
+        }
+    };
+
+    let (status, all) = page("").await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    assert_eq!(all["revisions"].as_array().unwrap().len(), 4);
+    assert_eq!(all["has_more"], false);
+
+    let (status, newest) = page("?limit=2").await;
+    assert_eq!(status, StatusCode::OK, "{newest}");
+    let listed = newest["revisions"].as_array().unwrap();
+    assert_eq!(listed.len(), 2, "{newest}");
+    assert_eq!(listed[0]["revision_id"], 3);
+    assert_eq!(listed[1]["revision_id"], 4);
+    assert_eq!(newest["has_more"], true);
+    assert_eq!(newest["next_before"], 3);
+    // The page's oldest is still diffed against the revision below it,
+    // which is outside the page.
+    assert_eq!(listed[0]["summary"], "describe the policy");
+
+    let (status, older) = page("?limit=2&before=3").await;
+    assert_eq!(status, StatusCode::OK, "{older}");
+    let listed = older["revisions"].as_array().unwrap();
+    assert_eq!(listed.len(), 2, "{older}");
+    assert_eq!(listed[0]["revision_id"], 1);
+    assert_eq!(listed[1]["revision_id"], 2);
+    assert_eq!(older["has_more"], false);
+    // Nothing is before the first, so it is counted, not diffed.
+    assert!(
+        listed[0]["summary"]
+            .as_str()
+            .unwrap()
+            .starts_with("setup: ")
+    );
+
+    let (status, refused) = page("?limit=soon").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+}
+
 fn snapshot_policy_description(store: &Store, revision: i64) -> Value {
     let revision = store.load_policy_revision(revision).unwrap().unwrap();
     let bytes = toker::policy::policy_bytes(&revision.document).unwrap();

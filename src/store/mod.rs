@@ -586,6 +586,16 @@ impl Store {
         state::load_policy_revisions(&*self.conn()?)
     }
 
+    /// One page of the revision history, newest first: the revisions below
+    /// `before` where it is given, at most `limit`.
+    pub fn load_policy_revisions_page(
+        &self,
+        before: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<PolicyRevision>> {
+        state::load_policy_revisions_page(&*self.conn()?, before, limit)
+    }
+
     /// Whether the ledger's schema has every migration applied. A reader that
     /// opened it read-only uses this to tell an older ledger, which has no
     /// routing ownership yet, from one it cannot read.

@@ -1198,6 +1198,26 @@ pub(super) fn load_policy_revision(
     )
 }
 
+/// One page of the revision history, newest first: the revisions below
+/// `before` where it is given, at most `limit`. The history is never pruned,
+/// so a reader asks for a page rather than the whole of it.
+pub(super) fn load_policy_revisions_page(
+    conn: &Connection,
+    before: Option<i64>,
+    limit: u32,
+) -> Result<Vec<PolicyRevision>> {
+    rows_of(
+        conn,
+        "SELECT revision_id, created_ms, activated_ms, description, activation_scope,
+                forced_cache_transition, source, parent_revision_id, document_json, fingerprint
+         FROM routing_policy_revisions
+         WHERE ?1 IS NULL OR revision_id < ?1
+         ORDER BY revision_id DESC LIMIT ?2",
+        rusqlite::params![before, limit],
+        read_policy_revision,
+    )
+}
+
 pub(super) fn load_policy_revisions(conn: &Connection) -> Result<Vec<PolicyRevision>> {
     rows_of(
         conn,
