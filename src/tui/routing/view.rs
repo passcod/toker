@@ -16,7 +16,7 @@ use super::editing::{Editing, What};
 use super::form::Form;
 use super::model::{Modal, Mode, State, Tab};
 use super::rules::{self, Entry};
-use super::table::{self, BodyLine, Table};
+use super::table::{self, BodyLine, Detail, Table};
 use super::{history, keys, models_tab, routes, status};
 use crate::tui::chrome::{self, Chrome, RowHit};
 
@@ -204,23 +204,25 @@ fn lookup_tab(
     let entries = rules::entries(active, tab);
     let selected = state.selected_in(tab);
     let entry = entries.get(selected).copied();
-    let (mut table, mut detail, title): (Table, Vec<Line<'static>>, &str) = match tab {
+    let (mut table, mut detail, title): (Table, Detail, &str) = match tab {
         Tab::Presentations => (
             rules::presentations_table(active, width),
-            match entry {
+            Detail::whole(match entry {
                 Some(Entry::Presentation(record)) => rules::presentation_detail(active, record),
                 _ => Vec::new(),
-            },
+            }),
             "PRESENTATION",
         ),
         Tab::Rewrites => (
             rules::rewrites_table(active, width),
             match entry {
-                Some(Entry::Rewrite(rule)) => {
-                    rules::rule_detail(active, rule, &rules::rules_before(active, rule))
-                }
-                Some(Entry::Default(default)) => rules::default_detail(active, default),
-                _ => Vec::new(),
+                Some(Entry::Rewrite(rule)) => rules::with_reading(
+                    rules::rule_detail(active, rule, &rules::rules_before(active, rule)),
+                    rule.get("reach").unwrap_or(&Value::Null),
+                    "[enter] open route",
+                ),
+                Some(Entry::Default(default)) => default_reading(active, default),
+                _ => Detail::whole(Vec::new()),
             },
             if matches!(entry, Some(Entry::Default(_))) {
                 "DEFAULT"
@@ -231,18 +233,20 @@ fn lookup_tab(
         Tab::Defaults => (
             rules::defaults_table(active, width),
             match entry {
-                Some(Entry::Default(default)) => rules::default_detail(active, default),
-                _ => Vec::new(),
+                Some(Entry::Default(default)) => default_reading(active, default),
+                _ => Detail::whole(Vec::new()),
             },
             "DEFAULT",
         ),
         Tab::Routes => (
             // A trace marks the route it walked, which takes a gutter.
             routes::routes_table(active, width - 2 * usize::from(state.trace().is_some())),
-            array(active, "routes")
-                .get(selected)
-                .map(|route| routes::route_detail(snapshot, route))
-                .unwrap_or_default(),
+            Detail::whole(
+                array(active, "routes")
+                    .get(selected)
+                    .map(|route| routes::route_detail(snapshot, route, width))
+                    .unwrap_or_default(),
+            ),
             "ROUTE",
         ),
         Tab::Models | Tab::History => unreachable!("drawn by their own tabs"),
@@ -253,7 +257,7 @@ fn lookup_tab(
         let marks = trace.marks(active, tab, live);
         table::mark_rows(&mut table, &marks, tab == Tab::Routes);
         if editing.is_none() {
-            detail = trace.lines(snapshot, live, width);
+            detail = Detail::whole(trace.lines(snapshot, live, width));
             title = "TRACE";
         }
     }
@@ -267,7 +271,7 @@ fn lookup_tab(
             .map_or(table.body.len(), |at| at + 1);
         let form = edit_view::block(editing, width);
         table.body.splice(at..at, form);
-        detail = edit_view::preview(editing, active, width);
+        detail = Detail::whole(edit_view::preview(editing, active, width));
         title = "PREVIEW";
     }
     // A rule or a default sends to a route, so with none there is nothing to
@@ -277,12 +281,18 @@ fn lookup_tab(
         && array(active, "routes").is_empty()
     {
         table.body.push(rules::needs_a_route());
-        detail = Vec::new();
+        detail = Detail::whole(Vec::new());
     }
     if table.body.is_empty() {
-        detail = Vec::new();
+        detail = Detail::whole(Vec::new());
     }
-    let split = table::split(body, 1 + table.body.len().max(1), detail.len());
+    let need = 1 + table.body.len().max(1);
+    // A detail with a reading gives up its lines to keep the table whole.
+    let split = if detail.has_reading() && editing.is_none() && state.trace().is_none() {
+        table::split_reading(body, need, detail.len())
+    } else {
+        table::split(body, need, detail.len())
+    };
     drawn.entries = split.table;
     drawn.detail = split.detail;
     if table.body.is_empty() {
@@ -313,8 +323,28 @@ fn lookup_tab(
         });
     }
     if split.detail.height > 0 {
-        table::draw_detail(frame, split.detail, title, split.chrome, detail);
+        let lines = detail.shed(split.detail_rows, content_width(split.detail));
+        if split.bare {
+            table::draw_bare(frame, split.detail, lines);
+        } else {
+            table::draw_detail(frame, split.detail, title, split.chrome, lines);
+        }
     }
+}
+
+/// A default's detail, its reach the reading: a default that is not there
+/// is added from the same place.
+fn default_reading(active: &Value, default: &Value) -> Detail {
+    let hint = if default.get("exists") == Some(&Value::Bool(true)) {
+        "[enter] open route"
+    } else {
+        "[n] new"
+    };
+    rules::with_reading(
+        rules::default_detail(active, default),
+        default.get("reach").unwrap_or(&Value::Null),
+        hint,
+    )
 }
 
 /// One route, whole; with a candidate being edited, the candidates and the
@@ -344,7 +374,11 @@ fn route_page(
     };
     let top = routes::route_top(snapshot, route, at, routes.len(), width);
     // The selected candidate is the one the edit keys act on.
-    let selected_line = routes::CANDIDATES_AT + 2 * state.candidate();
+    let selected_line = routes::CANDIDATES_AT
+        + routes::candidate_rows(route, width)
+            .get(state.candidate())
+            .copied()
+            .unwrap_or(0);
     let mut lines: Vec<BodyLine> = top
         .into_iter()
         .enumerate()
@@ -357,7 +391,11 @@ fn route_page(
         })
         .collect();
     let Some(editing) = editing else {
-        lines.extend(routes::route_rest(route).into_iter().map(BodyLine::plain));
+        lines.extend(
+            routes::route_rest(route, width)
+                .into_iter()
+                .map(BodyLine::plain),
+        );
         if let Some(trace) = state.trace() {
             let trace = trace.lines(snapshot, state.active_revision_id(), width);
             let split = table::split(body, lines.len(), trace.len());

@@ -207,6 +207,11 @@ pub(super) struct Split {
     pub(super) table: Rect,
     pub(super) detail: Rect,
     pub(super) chrome: Chrome,
+    /// How many of the detail's lines its area holds, the framing aside.
+    pub(super) detail_rows: usize,
+    /// Whether the detail is drawn without a frame of its own, as the one
+    /// line of a reading is.
+    pub(super) bare: bool,
 }
 
 /// The least rows of table content, the column heading and a row, worth a
@@ -245,6 +250,147 @@ pub(super) fn split(body: Rect, table: usize, detail: usize) -> Split {
         table: table_area,
         detail: detail_area,
         chrome: framing,
+        detail_rows: usize::from(detail_area.height).saturating_sub(cost),
+        bare: false,
+    }
+}
+
+/// Share `body` between a table and a detail with a reading in it, the
+/// table keeping its rows and the detail giving up its own: first its
+/// frame, then its lines down to the reading, which is all that is left of
+/// it in the last row (spec: UTUI#what-is-shed-first). Where even that leaves
+/// the table too few rows, the table is cut instead.
+pub(super) fn split_reading(body: Rect, table: usize, detail: usize) -> Split {
+    let whole = split(body, table, detail);
+    let height = usize::from(body.height);
+    let ruled = usize::from(Chrome::Ruled.cost());
+    if detail == 0 || usize::from(whole.table.height) >= table + usize::from(whole.chrome.cost()) {
+        return whole;
+    }
+    let rest = height.saturating_sub(table + ruled);
+    if rest >= 2 {
+        return Split {
+            table: Rect {
+                height: (table + ruled) as u16,
+                ..body
+            },
+            detail: Rect {
+                y: body.y + (table + ruled) as u16,
+                height: rest as u16,
+                ..body
+            },
+            chrome: Chrome::Ruled,
+            detail_rows: rest - ruled,
+            bare: false,
+        };
+    }
+    // The reading alone, in the last row; with no room for it beside the
+    // least table worth a panel, the detail goes.
+    let reading = usize::from(height > TABLE_FLOOR + ruled);
+    Split {
+        table: Rect {
+            height: (height - reading) as u16,
+            ..body
+        },
+        detail: Rect {
+            y: body.y + (height - reading) as u16,
+            height: reading as u16,
+            ..body
+        },
+        chrome: Chrome::Ruled,
+        detail_rows: reading,
+        bare: true,
+    }
+}
+
+/// A detail that can be cut to the room it is given: its lines, and the one
+/// of them that is the reading the panel exists to give.
+pub(super) struct Detail {
+    pub(super) lines: Vec<Line<'static>>,
+    reading: Option<Reading>,
+}
+
+/// The reading of a detail: its line, said in full, in less and in its
+/// fewest words, and the keys to close the line with where it is all that is
+/// shown.
+struct Reading {
+    at: usize,
+    /// From the fullest to the briefest; the last always fits something.
+    forms: Vec<Vec<Span<'static>>>,
+    hint: &'static str,
+}
+
+impl Detail {
+    /// A detail with nothing in it to prefer: it is cut from the bottom.
+    pub(super) fn whole(lines: Vec<Line<'static>>) -> Self {
+        Detail {
+            lines,
+            reading: None,
+        }
+    }
+
+    /// A detail whose line `at` is its reading, in the `forms` it can be
+    /// said in from the fullest to the briefest, with `hint` after it.
+    pub(super) fn reading(
+        lines: Vec<Line<'static>>,
+        at: usize,
+        forms: Vec<Vec<Span<'static>>>,
+        hint: &'static str,
+    ) -> Self {
+        Detail {
+            lines,
+            reading: Some(Reading { at, forms, hint }),
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub(super) fn has_reading(&self) -> bool {
+        self.reading.is_some()
+    }
+
+    /// The lines that fit in `rows` of `width` cells. The reading goes last
+    /// of all: the controls, then the title, then the rest, from the top.
+    pub(super) fn shed(self, rows: usize, width: usize) -> Vec<Line<'static>> {
+        if rows >= self.lines.len() {
+            return self.lines;
+        }
+        let Some(reading) = self.reading else {
+            return self.lines.into_iter().take(rows).collect();
+        };
+        if rows == 1 {
+            let keys = format!("   {}", reading.hint);
+            let room = width.saturating_sub(keys.width() + 2);
+            let mut forms = reading.forms;
+            let at = forms
+                .iter()
+                .position(|form| width_of(form) <= room)
+                .unwrap_or(forms.len().saturating_sub(1));
+            let mut spans = if forms.is_empty() {
+                Vec::new()
+            } else {
+                forms.swap_remove(at)
+            };
+            spans.push(span(keys, dim()));
+            return vec![Line::from(spans)];
+        }
+        let last = self.lines.len() - 1;
+        let mut order: Vec<usize> = Vec::new();
+        for at in [reading.at, last, 0].into_iter().chain(1..last) {
+            if !order.contains(&at) {
+                order.push(at);
+            }
+        }
+        let mut kept: Vec<usize> = order.into_iter().take(rows).collect();
+        kept.sort_unstable();
+        self.lines
+            .into_iter()
+            .enumerate()
+            .filter(|(at, _)| kept.contains(at))
+            .map(|(_, line)| line)
+            .collect()
     }
 }
 
@@ -370,6 +516,31 @@ pub(super) fn draw_detail(
     }
 }
 
+/// Draw lines with no frame of their own, where a panel has shed it: each in
+/// a row, with the cell of air a panel's content has.
+pub(super) fn draw_bare(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
+    let inner = Rect {
+        x: area.x + 1.min(area.width),
+        width: area.width.saturating_sub(2),
+        ..area
+    };
+    let width = usize::from(inner.width);
+    for (row, line) in lines
+        .into_iter()
+        .take(usize::from(inner.height))
+        .enumerate()
+    {
+        frame.render_widget(
+            Paragraph::new(padded(line, width)),
+            Rect {
+                y: inner.y + row as u16,
+                height: 1,
+                ..inner
+            },
+        );
+    }
+}
+
 /// Draw a panel of lines that may hold an open form: the lines from the top,
 /// scrolled only as far as keeps the focused field in view. Returns where
 /// each field landed.
@@ -434,6 +605,23 @@ pub(super) fn controls(items: &[(&str, &str)]) -> Line<'static> {
             .collect::<Vec<_>>()
             .join("   "),
     )
+}
+
+/// The controls laid in lines of at most `width` cells: as one line where
+/// they fit, and otherwise as many as they take, each control whole.
+pub(super) fn controls_in(items: &[(&str, &str)], width: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<String> = Vec::new();
+    for (key, what) in items {
+        let control = format!("[{key}] {what}");
+        match lines.last_mut() {
+            Some(line) if line.width() + 3 + control.width() <= width => {
+                line.push_str("   ");
+                line.push_str(&control);
+            }
+            _ => lines.push(control),
+        }
+    }
+    lines.into_iter().map(Line::raw).collect()
 }
 
 /// The width of `spans` in cells.

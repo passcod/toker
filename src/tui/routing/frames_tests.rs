@@ -174,7 +174,10 @@ fn the_overlay_explains_every_mark_the_page_draws_and_no_other() {
         ("ok", &["  ok  "]),
         ("no cred", &["no cred"]),
         ("off", &["  off  "]),
-        ("billed fallback", &["billed fallback"]),
+        (
+            "billed (fallback)",
+            &["billed fallback", "no cred · billed "],
+        ),
         ("refused", &["refused"]),
         ("refused · no route", &["refused · no route"]),
         ("- ≥N", &["  - ", "≥1"]),
@@ -197,7 +200,7 @@ fn the_overlay_explains_every_mark_the_page_draws_and_no_other() {
         ("→ ·", &["→ 2 rewrites", "· 5 models"]),
         ("‹ ›", &["‹"]),
         // The rest are read off the vocabulary rather than a frame.
-        ("unbilled fallback", &[]),
+        ("unbilled (fallback)", &[]),
     ];
     let mut explained: Vec<&str> = [
         &keys::ROWS[..],
@@ -244,13 +247,13 @@ fn the_overlay_explains_every_mark_the_page_draws_and_no_other() {
 /// The reach words an overlay explains are the ones the vocabulary writes.
 #[test]
 fn the_reach_words_the_overlay_explains_are_the_ones_the_page_writes() {
-    use super::words::reach_text;
+    use super::words::reach_text_in;
     use serde_json::json;
     let later = |billed| {
         json!({"outcome": "served_later", "serving": {"billed": billed},
             "skipped": [{"reason": "no_credential", "provider": "p"}]})
     };
-    let said = |reach| reach_text(&reach);
+    let said = |reach| reach_text_in(&reach, false);
     assert_eq!(said(json!({"outcome": "served_first"})), "ok");
     assert_eq!(said(later(true)), "no cred · billed fallback");
     assert_eq!(said(later(false)), "no cred · unbilled fallback");
@@ -267,4 +270,53 @@ fn the_reach_words_the_overlay_explains_are_the_ones_the_page_writes() {
         said(json!({"outcome": "refused_no_route", "cause": "no_default"})),
         "refused · no route"
     );
+}
+
+/// The rewrites at 100×24: the columns shared by every row of a group are
+/// stated in its head, the tabs give way to their numbers, and the detail
+/// is cut to what is left (spec: UTUI#what-is-shed-first).
+#[test]
+fn rewrites_100x24() {
+    let state = page(World::AT_REST, Tab::Rewrites);
+    insta::assert_snapshot!(frame(&state, 100, 24, false));
+}
+
+/// The same at 80×24.
+#[test]
+fn rewrites_80x24() {
+    let state = page(World::AT_REST, Tab::Rewrites);
+    insta::assert_snapshot!(frame(&state, 80, 24, false));
+}
+
+/// A route page at 100×24, the candidates, what handles them and what
+/// matches into them all in view.
+#[test]
+fn the_route_page_100x24() {
+    let mut state = page(World::AT_REST, Tab::Routes);
+    state.open();
+    insta::assert_snapshot!(frame(&state, 100, 24, false));
+}
+
+/// Every page draws in any room a terminal can be, with the overlay open and
+/// over a policy with nothing in it: a frame too small for a table is cut,
+/// never a panic (spec: UTUI#what-is-shed-first).
+#[test]
+fn every_frame_draws_in_any_size() {
+    for world in [World::EMPTY, World::PROFILED] {
+        for tab in Tab::ALL {
+            let mut state = page(world, tab);
+            for width in [1, 3, 10, 40, 70, 80, 100, 120, 200] {
+                for height in [1, 2, 3, 4, 6, 10, 16, 24, 40] {
+                    frame(&state, width, height, false);
+                    frame(&state, width, height, true);
+                }
+            }
+            if tab == Tab::Routes {
+                state.open();
+                for (width, height) in [(80, 24), (100, 24), (60, 12), (30, 5)] {
+                    frame(&state, width, height, false);
+                }
+            }
+        }
+    }
 }

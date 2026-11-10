@@ -1,0 +1,28 @@
+---
+source: src/tui/routing/frames_tests.rs
+expression: "frame(&state, 100, 24, false)"
+---
+ ?   dashboard   routing   config   accounts   ‹ 3 defaults → 4 routes 7 · 5 models ›     rev 9 live
+┌ROUTE─────────────────────────────────────────────────────────────────────────────────────────────┐
+│ claude-sub                                                                                1 of 7 │
+│                                                                                                  │
+│ sent to  2 candidates                                                                            │
+│ 1  anthropic_sub.anthropic_messages  subscription  as asked                             no cred  │
+│    ↓ when unavailable before send · overloaded · 5xx                                             │
+│      billed: allow   ambiguous retry: deny   cache: preserve warm                                │
+│ 2  openrouter.openrouter_messages    billed        alias claude-* → anthropic/claude-*  ok       │
+│                                                                                                  │
+│ handled by  4 on · 3 off: server safeguards · required capabilities · health circuits            │
+│   upgrade          newest on claude-sub · claude-opus-4-7 → claude-opus-5                        │
+│   lane transition  moves when cold · 2 warm · 5 cold                                             │
+│   compaction       cold compactions → sonnet · cache allowed when cold                           │
+│   alias            claude-* → anthropic/claude-* · on openrouter                                 │
+│                                                                                                  │
+│ matched by  4 rules · 1 default                                                                  │
+│   rewrite  anthropic_messages 1   anthropic/${model}                                             │
+│   rewrite  anthropic_messages 2   anthropic_sub/${model}                                         │
+│   rewrite  openai_chat 5          anthropic_sub/${model}                                         │
+│   rewrite  openai_responses 3     anthropic_sub/${model}                                         │
+│   default  anthropic_messages                                                                    │
+│ [e] edit   [n] add   [m] move   [d] remove   [t] trace   [←/→] routes   [esc] back               │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘

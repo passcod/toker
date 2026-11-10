@@ -8,11 +8,12 @@ use ratatui::text::{Line, Span};
 use serde_json::Value;
 
 use super::data::{self, array, counted, flag, text};
-use super::table::{BodyLine, Cells, Table, controls, field, heading, span, widest};
+use super::table::{BodyLine, Cells, Table, controls, controls_in, field, heading, span, widest};
 use super::words::{
-    Tone, bold, cache_words, cost_word, dim, edge_line, label, lane_words, lanes_phrase,
-    matched_by_phrase, matcher_text, reach_spans, reason_word, toned,
+    Tone, bold, cache_words, cost_word, dim, edge_parts, label, lane_words, lanes_phrase,
+    matched_by_phrase, matcher_text, reach_spans, reach_text_in, reason_word, toned,
 };
+use unicode_width::UnicodeWidthStr;
 
 /// The route at `id`'s place in the routes tab.
 pub(super) fn position(active: &Value, id: &str) -> Option<usize> {
@@ -35,13 +36,13 @@ pub(super) fn routes_table(active: &Value, width: usize) -> Table {
     let matched =
         |route: &Value| matched_by_phrase(route.get("matched_by_counts").unwrap_or(&Value::Null));
     let lanes = |route: &Value| lanes_phrase(route.get("pinned_lanes").unwrap_or(&Value::Null));
-    let widths = [
+    let natural = [
         widest(
             routes
                 .iter()
                 .map(|route| text(route, "id"))
                 .chain(["route"]),
-        ) + 2,
+        ),
         widest(
             routes
                 .iter()
@@ -50,7 +51,7 @@ pub(super) fn routes_table(active: &Value, width: usize) -> Table {
                 .iter()
                 .map(String::as_str)
                 .chain(["sent to"]),
-        ) + 2,
+        ),
         widest(
             routes
                 .iter()
@@ -59,7 +60,7 @@ pub(super) fn routes_table(active: &Value, width: usize) -> Table {
                 .iter()
                 .map(String::as_str)
                 .chain(["matched by"]),
-        ) + 2,
+        ),
         widest(
             routes
                 .iter()
@@ -68,35 +69,77 @@ pub(super) fn routes_table(active: &Value, width: usize) -> Table {
                 .iter()
                 .map(String::as_str)
                 .chain(["lanes"]),
-        ) + 2,
+        ),
     ];
-    let header = Cells::new()
-        .cell(heading("route"), widths[0])
-        .cell(heading("sent to"), widths[1])
-        .cell(heading("matched by"), widths[2])
-        .cell(heading("lanes"), widths[3])
-        .cell(heading("reach"), width.saturating_sub(widths.iter().sum()))
-        .line();
+    let reach_nat = widest(
+        routes
+            .iter()
+            .map(|route| reach_text_in(route.get("reach").unwrap_or(&Value::Null), false))
+            .collect::<Vec<_>>()
+            .iter()
+            .map(String::as_str)
+            .chain(["reach"]),
+    );
+    // Two cells between columns; one where that is too much, and then the
+    // columns the detail says again go, what refers to the route first and
+    // the providers it reaches after (spec: UTUI#what-is-shed-first).
+    let shown = [
+        ([true; 4], 2),
+        ([true; 4], 1),
+        ([true, true, false, true], 1),
+        ([true, false, false, true], 1),
+    ];
+    let (keep, gap) = shown
+        .into_iter()
+        .find(|(keep, gap)| {
+            let used: usize = natural
+                .iter()
+                .zip(keep)
+                .filter(|(_, keep)| **keep)
+                .map(|(width, _)| width + gap)
+                .sum();
+            used + reach_nat <= width
+        })
+        .unwrap_or(([true, false, false, true], 1));
+    let widths: Vec<usize> = natural
+        .iter()
+        .zip(keep)
+        .map(|(width, keep)| if keep { width + gap } else { 0 })
+        .collect();
+    let reach_w = width.saturating_sub(widths.iter().sum());
+    let heads = ["route", "sent to", "matched by", "lanes"];
+    let mut header = Cells::new();
+    for (head, width) in heads.iter().zip(&widths) {
+        if *width > 0 {
+            header = header.cell(heading(head), *width);
+        }
+    }
+    let header = header.cell(heading("reach"), reach_w).line();
     let body = routes
         .iter()
         .enumerate()
         .map(|(entry, route)| {
             let lanes = lanes(route);
-            let line = Cells::new()
-                .cell(vec![Span::raw(text(route, "id").to_owned())], widths[0])
-                .cell(vec![Span::raw(sent_to(route))], widths[1])
-                .cell(vec![Span::raw(matched(route))], widths[2])
-                .cell(
-                    vec![if lanes == "none" {
-                        toned(lanes, Tone::Dim)
-                    } else {
-                        Span::raw(lanes)
-                    }],
-                    widths[3],
-                )
+            let said = [
+                vec![Span::raw(text(route, "id").to_owned())],
+                vec![Span::raw(sent_to(route))],
+                vec![Span::raw(matched(route))],
+                vec![if lanes == "none" {
+                    toned(lanes, Tone::Dim)
+                } else {
+                    Span::raw(lanes)
+                }],
+            ];
+            let mut line = Cells::new();
+            for (said, width) in said.into_iter().zip(&widths) {
+                if *width > 0 {
+                    line = line.cell(said, *width);
+                }
+            }
+            let line = line
                 .cell(
                     reach_spans(route.get("reach").unwrap_or(&Value::Null)),
-                    width.saturating_sub(widths.iter().sum()),
+                    reach_w,
                 )
                 .line();
             BodyLine::of(line, entry)
@@ -199,7 +242,14 @@ fn candidate_state(snapshot: &Value, route: &Value, candidate: &Value) -> (Strin
 /// The candidates of a route, each a line and then the edge to the next
 /// drawn under it, in the direction a request travels. `indent` is how far
 /// in the lines start.
-pub(super) fn candidate_lines(snapshot: &Value, route: &Value) -> Vec<Line<'static>> {
+///
+/// An edge too long for `width` says what it consents to on a line of its own
+/// under when it falls back; with no width to keep to, it is one line.
+pub(super) fn candidate_lines(
+    snapshot: &Value,
+    route: &Value,
+    width: Option<usize>,
+) -> Vec<Line<'static>> {
     let candidates = array(route, "candidates");
     let document = document_route(snapshot, text(route, "id"));
     let handled = route.get("handled_by");
@@ -207,16 +257,34 @@ pub(super) fn candidate_lines(snapshot: &Value, route: &Value) -> Vec<Line<'stat
         .iter()
         .map(|candidate| model_reading(candidate, document, handled))
         .collect();
-    let binding_w = widest(
+    let states: Vec<(String, Tone)> = candidates
+        .iter()
+        .map(|candidate| candidate_state(snapshot, route, candidate))
+        .collect();
+    let binding_nat = widest(
         candidates
             .iter()
             .map(|candidate| text(candidate, "binding_id")),
-    ) + 2;
-    let cost_w = 16;
-    let model_w = widest(readings.iter().map(String::as_str)) + 5;
+    );
+    let cost_nat = widest(
+        candidates
+            .iter()
+            .map(|candidate| cost_word(text(candidate, "cost_class"))),
+    );
+    let model_nat = widest(readings.iter().map(String::as_str));
+    let state_nat = widest(states.iter().map(|(state, _)| state.as_str()));
+    // The widths read from the room there is: roomy, then tighter, then as
+    // tight as a cell between columns allows, before anything is cut.
+    let (binding_w, cost_w, model_w) = [(2, 16, 5), (2, cost_nat + 2, 2), (1, cost_nat + 1, 1)]
+        .into_iter()
+        .map(|(binding, cost, model)| (binding_nat + binding, cost, model_nat + model))
+        .find(|(binding, cost, model)| {
+            width.is_none_or(|width| 3 + binding + cost + model + state_nat <= width)
+        })
+        .unwrap_or((binding_nat + 1, cost_nat + 1, model_nat + 1));
     let mut lines = Vec::new();
     for (index, candidate) in candidates.iter().enumerate() {
-        let (state, tone) = candidate_state(snapshot, route, candidate);
+        let (state, tone) = states[index].clone();
         let cost = cost_word(text(candidate, "cost_class")).to_owned();
         lines.push(
             Cells::new()
@@ -231,13 +299,39 @@ pub(super) fn candidate_lines(snapshot: &Value, route: &Value) -> Vec<Line<'stat
                 .line(),
         );
         if let Some(edge) = array(route, "edges").get(index) {
-            lines.push(Line::from(vec![
-                Span::raw("   "),
-                Span::raw(edge_line(edge)),
-            ]));
+            for (at, said) in edge_lines(edge, width).into_iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::raw(if at == 0 { "   " } else { "     " }),
+                    Span::raw(said),
+                ]));
+            }
         }
     }
     lines
+}
+
+/// The lines an edge is said in: one where it fits `width`, otherwise when
+/// it falls back and what it consents to, one under the other.
+fn edge_lines(edge: &Value, width: Option<usize>) -> Vec<String> {
+    let (when, consents) = edge_parts(edge);
+    match width {
+        Some(width) if 3 + when.width() + 3 + consents.width() > width => vec![when, consents],
+        _ => vec![format!("{when}   {consents}")],
+    }
+}
+
+/// Where each candidate's line is, counted from the first's: an edge between
+/// them takes the lines it is said in.
+pub(super) fn candidate_rows(route: &Value, width: usize) -> Vec<usize> {
+    let mut rows = Vec::new();
+    let mut at = 0;
+    for index in 0..array(route, "candidates").len() {
+        rows.push(at);
+        at += 1 + array(route, "edges")
+            .get(index)
+            .map_or(0, |edge| edge_lines(edge, Some(width)).len());
+    }
+    rows
 }
 
 const ROUTE_CONTROLS: [(&str, &str); 5] = [
@@ -250,9 +344,9 @@ const ROUTE_CONTROLS: [(&str, &str); 5] = [
 
 /// The detail beneath the routes table: the route's candidates with the
 /// conditions on each edge between them.
-pub(super) fn route_detail(snapshot: &Value, route: &Value) -> Vec<Line<'static>> {
+pub(super) fn route_detail(snapshot: &Value, route: &Value, width: usize) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(span(text(route, "id").to_owned(), bold()))];
-    lines.extend(candidate_lines(snapshot, route));
+    lines.extend(candidate_lines(snapshot, route, Some(width)));
     lines.push(controls(&ROUTE_CONTROLS));
     lines
 }
@@ -269,6 +363,17 @@ const PAGE_CONTROLS: [(&str, &str); 7] = [
     ("esc", "back"),
 ];
 
+/// The same in fewer words, for where the full ones do not fit a line.
+const PAGE_CONTROLS_BRIEF: [(&str, &str); 7] = [
+    ("e", "edit"),
+    ("n", "add"),
+    ("m", "move"),
+    ("d", "remove"),
+    ("t", "trace"),
+    ("←/→", "routes"),
+    ("esc", "back"),
+];
+
 /// The blocks that handle a request on a route, in the order the page names
 /// them: each with whether it is on.
 const BLOCKS: [(&str, &str); 7] = [
@@ -282,9 +387,9 @@ const BLOCKS: [(&str, &str); 7] = [
 ];
 
 /// The top of the route page: its name and place, and the candidates it is
-/// sent to, which is where a candidate is edited. Candidate `n` is the
-/// line `2 * n` past [`CANDIDATES_AT`], the edge to the next being the one
-/// between.
+/// sent to, which is where a candidate is edited. Each candidate's line is
+/// where [`candidate_rows`] puts it past [`CANDIDATES_AT`], the edge to the
+/// next being said between them.
 pub(super) fn route_top(
     snapshot: &Value,
     route: &Value,
@@ -309,7 +414,7 @@ pub(super) fn route_top(
         "sent to".len() + 2,
         vec![Span::raw(counted(candidates, "candidate", "candidates"))],
     ));
-    lines.extend(candidate_lines(snapshot, route));
+    lines.extend(candidate_lines(snapshot, route, Some(width)));
     lines
 }
 
@@ -333,7 +438,7 @@ pub(super) const CANDIDATES_AT: usize = 3;
 
 /// The rest of the route page: what handles a request on the route and what
 /// sends one to it, with the controls.
-pub(super) fn route_rest(route: &Value) -> Vec<Line<'static>> {
+pub(super) fn route_rest(route: &Value, width: usize) -> Vec<Line<'static>> {
     let mut lines = vec![Line::raw("")];
     let handled = route.get("handled_by").unwrap_or(&Value::Null);
     let on = |key: &str| handled.get(key).is_some_and(|block| flag(block, "enabled"));
@@ -396,7 +501,12 @@ pub(super) fn route_rest(route: &Value) -> Vec<Line<'static>> {
         };
         lines.push(cells.line());
     }
-    lines.push(controls(&PAGE_CONTROLS));
+    let whole = controls_in(&PAGE_CONTROLS, width);
+    lines.extend(if whole.len() == 1 {
+        whole
+    } else {
+        controls_in(&PAGE_CONTROLS_BRIEF, width)
+    });
     lines
 }
 

@@ -103,22 +103,50 @@ pub(super) fn reach_clauses(reach: &Value) -> Vec<(String, Tone)> {
     }
 }
 
+/// A clause in its fewest words, for where the room is short: what is billed
+/// is billed whichever way it came to be served.
+fn briefly(clause: &str) -> &str {
+    match clause {
+        "billed fallback" => "billed",
+        "unbilled fallback" => "unbilled",
+        "fallback, cost unknown" => "cost unknown",
+        other => other,
+    }
+}
+
 /// The reach as spans, its clauses a `·` apart.
 pub(super) fn reach_spans(reach: &Value) -> Vec<Span<'static>> {
+    reach_spans_in(reach, false)
+}
+
+/// The reach as spans, in its fewest words where `brief`.
+pub(super) fn reach_spans_in(reach: &Value, brief: bool) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (index, (clause, tone)) in reach_clauses(reach).into_iter().enumerate() {
         if index > 0 {
             spans.push(Span::raw(" · "));
         }
+        let clause = if brief {
+            briefly(&clause).to_owned()
+        } else {
+            clause
+        };
         spans.push(toned(clause, tone));
     }
     spans
 }
 
-pub(super) fn reach_text(reach: &Value) -> String {
+/// The reach as text, in its fewest words where `brief`.
+pub(super) fn reach_text_in(reach: &Value, brief: bool) -> String {
     reach_clauses(reach)
         .into_iter()
-        .map(|(clause, _)| clause)
+        .map(|(clause, _)| {
+            if brief {
+                briefly(&clause).to_owned()
+            } else {
+                clause
+            }
+        })
         .collect::<Vec<_>>()
         .join(" · ")
 }
@@ -319,9 +347,8 @@ fn failure_words(code: &str) -> &'static str {
     }
 }
 
-/// An edge between two candidates, as the line drawn between them: when it
-/// falls back, then what it consents to.
-pub(super) fn edge_line(edge: &Value) -> String {
+/// The edge's two halves: when it falls back, and what it consents to.
+pub(super) fn edge_parts(edge: &Value) -> (String, String) {
     let mut when: Vec<&str> = Vec::new();
     if text(edge, "preflight") == "enabled" {
         when.push("unavailable before send");
@@ -337,11 +364,14 @@ pub(super) fn edge_line(edge: &Value) -> String {
     } else {
         format!("when {}", when.join(" · "))
     };
-    format!(
-        "↓ {when}   billed: {}   ambiguous retry: {}   cache: {}",
-        text(edge, "billed_boundary"),
-        text(edge, "ambiguous_transport"),
-        cache_words(text(edge, "cache_transition")),
+    (
+        format!("↓ {when}"),
+        format!(
+            "billed: {}   ambiguous retry: {}   cache: {}",
+            text(edge, "billed_boundary"),
+            text(edge, "ambiguous_transport"),
+            cache_words(text(edge, "cache_transition")),
+        ),
     )
 }
 
