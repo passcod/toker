@@ -2309,7 +2309,7 @@ mod tests {
 }
 
 /// The window the routing page counts and replays over: the last 24 hours
-/// (spec: UTUI#rules).
+/// (spec: UTUI#reading-a-table).
 pub const ROUTING_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// What a window's rows can say about which rule caught a request.
@@ -2333,7 +2333,7 @@ pub struct DefaultHits {
 
 /// The last 24 hours' requests counted by the record that decided their
 /// route, by the record's identifier across every revision the window
-/// spans (spec: UTUI#rules). A request is its first attempt, or its
+/// spans (spec: UTUI#reading-a-table). A request is its first attempt, or its
 /// terminal where nothing was sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HitCounts {
