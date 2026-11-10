@@ -48,7 +48,7 @@ The README's routing paragraph describes the draft, validate and activate flow, 
 
 - [x] `tui/config/model.rs`: carry `session_headers` and `transcript_roots` in `Settings`, and `refresh_url` in `Provider`, from `parse_snapshot` through `settings_body` and `provider_body`.
 - [x] `server/control/config.rs`: test that a settings edit and a provider edit leave the fields they carry unchanged, round-tripped through the snapshot.
-- [ ] Record the two triaged issues as fixed against their commits.
+- [x] Record the two triaged issues as fixed against their commits.
 
 ### Store
 
