@@ -28,6 +28,7 @@ fn config() -> Config {
         gates: toker::config::GatesConfig::default(),
         notices: toker::config::NoticesConfig::default(),
         awake: false,
+        ping_schedule: false,
         transcript_roots: Vec::new(),
     }
 }

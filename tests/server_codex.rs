@@ -646,6 +646,7 @@ fn test_config(tag: &str, codex_upstream: reqwest::Url, family_map: bool) -> Tes
         gates: toker::config::GatesConfig::default(),
         notices: toker::config::NoticesConfig::default(),
         awake: false,
+        ping_schedule: false,
         transcript_roots: Vec::new(),
     };
     TestConfig { config, dir }

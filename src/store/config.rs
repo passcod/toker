@@ -46,6 +46,8 @@ pub struct SettingsConfigRow {
     pub session_headers: Option<Vec<String>>,
     pub ping_header: Option<String>,
     pub awake: Option<bool>,
+    /// Whether the scheduled pings run; `None` is off (spec: GPING#scope).
+    pub ping_schedule: Option<bool>,
     pub transcript_roots: Option<Vec<String>>,
     pub quota_enabled: Option<bool>,
     pub cold_enabled: Option<bool>,
@@ -107,7 +109,8 @@ pub(super) fn load_configuration(conn: &Connection) -> Result<Configuration> {
     let settings = row_of(
         conn,
         "SELECT session_headers, ping_header, awake, transcript_roots, quota_enabled,
-                cold_enabled, cold_outlook, cold_min_tokens, cold_idle_min, notice_default
+                cold_enabled, cold_outlook, cold_min_tokens, cold_idle_min, notice_default,
+                ping_schedule
            FROM config_settings WHERE id = 1",
         [],
         |row| {
@@ -122,6 +125,7 @@ pub(super) fn load_configuration(conn: &Connection) -> Result<Configuration> {
                 cold_min_tokens: row.get::<_, Option<i64>>(7)?.map(|count| count as u64),
                 cold_idle_min: row.get(8)?,
                 notice_default: row.get(9)?,
+                ping_schedule: row.get::<_, Option<i64>>(10)?.map(|flag| flag != 0),
             })
         },
     )?
@@ -176,14 +180,16 @@ pub(super) fn put_settings(conn: &Connection, row: &SettingsConfigRow) -> Result
     conn.execute(
         "INSERT INTO config_settings
              (id, session_headers, ping_header, awake, transcript_roots, quota_enabled,
-              cold_enabled, cold_outlook, cold_min_tokens, cold_idle_min, notice_default)
-         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+              cold_enabled, cold_outlook, cold_min_tokens, cold_idle_min, notice_default,
+              ping_schedule)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(id) DO UPDATE SET
              session_headers = excluded.session_headers, ping_header = excluded.ping_header,
              awake = excluded.awake, transcript_roots = excluded.transcript_roots,
              quota_enabled = excluded.quota_enabled, cold_enabled = excluded.cold_enabled,
              cold_outlook = excluded.cold_outlook, cold_min_tokens = excluded.cold_min_tokens,
-             cold_idle_min = excluded.cold_idle_min, notice_default = excluded.notice_default",
+             cold_idle_min = excluded.cold_idle_min, notice_default = excluded.notice_default,
+             ping_schedule = excluded.ping_schedule",
         rusqlite::params![
             list_json(row.session_headers.as_ref())?,
             row.ping_header,
@@ -195,6 +201,7 @@ pub(super) fn put_settings(conn: &Connection, row: &SettingsConfigRow) -> Result
             row.cold_min_tokens.map(|count| count as i64),
             row.cold_idle_min,
             row.notice_default,
+            row.ping_schedule.map(|flag| flag as i64),
         ],
     )?;
     Ok(())
@@ -269,6 +276,7 @@ mod tests {
         // pins today's default.
         assert_eq!(configuration.settings.cold_min_tokens, None);
         assert_eq!(configuration.settings.awake, None);
+        assert_eq!(configuration.settings.ping_schedule, None);
     }
 
     #[test]
@@ -308,6 +316,7 @@ mod tests {
             session_headers: Some(vec!["x-one".to_owned(), "x-two".to_owned()]),
             ping_header: Some("x-ping".to_owned()),
             awake: Some(false),
+            ping_schedule: Some(true),
             transcript_roots: Some(vec!["~/elsewhere".to_owned()]),
             quota_enabled: Some(false),
             cold_enabled: Some(true),

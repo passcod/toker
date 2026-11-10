@@ -1416,6 +1416,13 @@ pub(super) const MIGRATIONS: &[&str] = &[
 
     ALTER TABLE requests ADD COLUMN started_ms INTEGER;
     "#,
+    // v27 — whether the ping schedule is on (spec: GPING#scope). NULL is
+    // not set, which reads as off: the schedule is off until the operator
+    // turns it on, so a store from before this column pings nothing.
+    r#"
+    ALTER TABLE config_settings ADD COLUMN ping_schedule INTEGER
+        CHECK (ping_schedule IS NULL OR ping_schedule IN (0, 1));
+    "#,
 ];
 
 fn validate_v10_history(conn: &Connection) -> Result<()> {

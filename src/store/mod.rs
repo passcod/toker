@@ -4728,14 +4728,15 @@ mod tests {
     fn the_in_flight_migration_keeps_every_row_and_leaves_started_ms_absent() {
         let dir = test_dir("in-flight-upgrade");
         let db = dir.join("toker.db");
-        let last = schema::MIGRATIONS.len();
+        // v26 adds the in-flight table: a store at v25 is the one before it.
+        let before = 25;
         std::fs::create_dir_all(&dir).expect("create the db parent dir");
         {
             let conn = Connection::open(&db).expect("open raw db");
-            for script in &schema::MIGRATIONS[..last - 1] {
+            for script in &schema::MIGRATIONS[..before] {
                 conn.execute_batch(script).expect("apply a migration");
             }
-            conn.pragma_update(None, "user_version", last as i64 - 1)
+            conn.pragma_update(None, "user_version", before as i64)
                 .expect("stamp the version before");
             for ts in [1_000, 2_000, 3_000] {
                 conn.execute(
@@ -4746,7 +4747,7 @@ mod tests {
             }
         }
         let store = Store::open(&db).expect("the database migrates");
-        assert_eq!(user_version(&store), last as i64);
+        assert_eq!(user_version(&store), schema::MIGRATIONS.len() as i64);
         let rows = store.requests_since(0, 10).expect("rows");
         assert_eq!(rows.len(), 3, "no row was lost");
         assert!(
@@ -4760,6 +4761,36 @@ mod tests {
         store.record_request(&row).expect("record");
         let newest = store.requests_since(4_000, 10).expect("rows");
         assert_eq!(newest[0].started_ms, Some(3_500));
+    }
+
+    #[test]
+    fn the_ping_schedule_migration_keeps_the_settings_and_reads_as_off() {
+        let dir = test_dir("ping-schedule-upgrade");
+        let db = dir.join("toker.db");
+        // v27 adds the column: a store at v26 is the one before it.
+        let before = 26;
+        std::fs::create_dir_all(&dir).expect("create the db parent dir");
+        {
+            let conn = Connection::open(&db).expect("open raw db");
+            for script in &schema::MIGRATIONS[..before] {
+                conn.execute_batch(script).expect("apply a migration");
+            }
+            conn.pragma_update(None, "user_version", before as i64)
+                .expect("stamp the version before");
+            conn.execute(
+                "INSERT INTO config_settings (id, awake, ping_header) VALUES (1, 0, 'x-ping')",
+                [],
+            )
+            .expect("insert the settings from before");
+        }
+        let store = Store::open(&db).expect("the database migrates");
+        assert_eq!(user_version(&store), schema::MIGRATIONS.len() as i64);
+        let settings = store.load_configuration().expect("load").settings;
+        assert_eq!(settings.awake, Some(false), "the row was kept");
+        assert_eq!(settings.ping_header.as_deref(), Some("x-ping"));
+        // Not set, which is off: a machine from before the switch pings
+        // nothing until the operator turns it on (spec: GPING#scope).
+        assert_eq!(settings.ping_schedule, None);
     }
 
     #[test]

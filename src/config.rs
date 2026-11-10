@@ -145,6 +145,11 @@ pub struct Config {
     /// (see [`crate::middleware::awake`]). Off → never hold, never
     /// spawn, never write awake rows.
     pub awake: bool,
+    /// Whether the scheduled pings, and the holds that keep the machine up
+    /// for them, run. Off until the operator turns it on; even on, they run
+    /// only while a provider that anchors its windows is enabled
+    /// (spec: GPING#scope).
+    pub ping_schedule: bool,
     /// Extra transcript roots for the dashboard's session labels
     /// (a colon-separated list, like a PATH entry): `~/.claude` and
     /// `$CLAUDE_CONFIG_DIR` are always searched, and these add
@@ -915,6 +920,7 @@ impl Config {
                 force_newest: true,
             },
             awake: settings.awake.unwrap_or(true),
+            ping_schedule: settings.ping_schedule.unwrap_or(false),
             transcript_roots: settings
                 .transcript_roots
                 .as_deref()
@@ -1071,6 +1077,7 @@ impl Config {
                     DEFAULT_PING_HEADER.to_owned(),
                 ),
                 awake: set(self.awake, true),
+                ping_schedule: set(self.ping_schedule, false),
                 transcript_roots: set(
                     self.transcript_roots
                         .iter()
@@ -1486,6 +1493,9 @@ impl Config {
             },
             // On unless disabled.
             awake: file.awake.unwrap_or(true),
+            // Not a file setting: the schedule was never in the file, and
+            // is off until turned on.
+            ping_schedule: false,
             transcript_roots: file
                 .transcript_roots
                 .map(|roots| roots.into_iter().map(PathBuf::from).collect())

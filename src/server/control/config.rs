@@ -207,6 +207,7 @@ fn settings_body(settings: &SettingsConfigRow) -> serde_json::Value {
         "session_headers": settings.session_headers,
         "ping_header": settings.ping_header,
         "awake": settings.awake,
+        "ping_schedule": settings.ping_schedule,
         "transcript_roots": settings.transcript_roots,
         "quota_enabled": settings.quota_enabled,
         "cold_enabled": settings.cold_enabled,
@@ -246,6 +247,8 @@ struct SettingsEdit {
     ping_header: Option<String>,
     #[serde(default)]
     awake: Option<bool>,
+    #[serde(default)]
+    ping_schedule: Option<bool>,
     #[serde(default)]
     transcript_roots: Option<Vec<String>>,
     #[serde(default)]
@@ -561,6 +564,7 @@ pub(crate) async fn settings(State(server): State<Server>, request: Request) -> 
         session_headers: edit.session_headers,
         ping_header: edit.ping_header,
         awake: edit.awake,
+        ping_schedule: edit.ping_schedule,
         transcript_roots: edit.transcript_roots,
         quota_enabled: edit.quota_enabled,
         cold_enabled: edit.cold_enabled,

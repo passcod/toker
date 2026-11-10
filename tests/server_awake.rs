@@ -263,6 +263,7 @@ fn test_config(upstream: reqwest::Url, awake: bool) -> Config {
         gates: GatesConfig::default(),
         notices: toker::config::NoticesConfig::default(),
         awake,
+        ping_schedule: false,
         transcript_roots: Vec::new(),
     }
 }
