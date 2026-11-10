@@ -1225,6 +1225,14 @@ pub(crate) fn is_event_stream(headers: &HeaderMap) -> bool {
         .is_some_and(|content_type| content_type.starts_with("text/event-stream"))
 }
 
+/// Whether a success answering a request that always asks for a stream is
+/// that stream. The codex backend has answered a streamed turn with no
+/// content type at all, so only a type naming something else refuses it; the
+/// first event is still checked before the response is committed.
+pub(crate) fn answers_stream_request(headers: &HeaderMap) -> bool {
+    headers.get(header::CONTENT_TYPE).is_none() || is_event_stream(headers)
+}
+
 /// A partial buffer of a response body: `rest` is `Some` when the cap
 /// overflowed and the response (positioned after `bytes`) remains, so the
 /// caller can forward the remainder verbatim.
