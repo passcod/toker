@@ -1209,6 +1209,32 @@ mod tests {
         assert!(text.contains("candidate 1 → 2 of 2"), "{text}");
     }
 
+    /// A refresh can leave the route with fewer candidates than the one the
+    /// page had selected; the selection follows it in rather than editing an
+    /// edge that is no longer there.
+    #[test]
+    fn a_refresh_that_shortens_the_open_route_keeps_the_selected_candidate_in_it() {
+        let mut state = page(World::AT_REST, Tab::Routes);
+        send(&mut state, KeyCode::Enter);
+        state.move_selection(1);
+        assert_eq!(state.candidate(), 1);
+        let mut snapshot = testing::snapshot(World::AT_REST);
+        snapshot["derived"]["active"]["routes"][0]["candidates"]
+            .as_array_mut()
+            .expect("the route's candidates")
+            .truncate(1);
+        let mut command = Command::snapshot("routing-snapshot");
+        command.name = "snapshot";
+        state.receive(Reply::Command(
+            command,
+            Ok(Response {
+                status: 200,
+                body: snapshot,
+            }),
+        ));
+        assert_eq!(state.candidate(), 0);
+    }
+
     /// A click on a form line focuses that field, and a click on a line that
     /// is only a heading or a completion focuses nothing.
     #[test]

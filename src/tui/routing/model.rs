@@ -1089,6 +1089,9 @@ impl State {
         self.models.offers_binding = self.models.offers_binding.min(bindings.saturating_sub(1));
         let offers = self.offers_shown().len();
         self.models.offers_at = self.models.offers_at.min(offers.saturating_sub(1));
+        self.candidate = self
+            .candidate
+            .min(self.route_candidates().saturating_sub(1));
     }
 
     /// Handle a routing-page key.  Returned commands must be sent by the page's
