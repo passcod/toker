@@ -21,12 +21,14 @@ Several keys per provider is left for a card of its own.
 
 ## Routing form
 
-- [ ] Duplicate a record from its table, opening the add form filled from it with a fresh id and, for a rewrite, the next free priority in its scope.
-- [ ] Reference fields offer the records they can name as a pick list, each with enough to tell them apart, and still accept typing; the prefilled id no longer blocks completion.
-- [ ] Choosing a route fills one argument per parameter it declares, `requested_model` included.
-- [ ] The rewrite form generates the rewrite's id instead of asking for it.
+- [x] Duplicate a record from its table, opening the add form filled from it with a fresh id and, for a rewrite, the next free priority in its scope.
+- [x] Reference fields offer the records they can name as a pick list, each with enough to tell them apart, and still accept typing; the prefilled id no longer blocks completion.
+- [x] Choosing a route fills one argument per parameter it declares, `requested_model` included.
+- [x] The rewrite form generates the rewrite's id instead of asking for it.
 
 ## Verification
+
+- [ ] Review and accept the routing snapshots the form changes alter: the keys overlay (two new rows, may overflow its 44-row frame), and the three rewrite-form views that lose the id row and gain a `requested_model` argument.
 
 - [ ] `cargo fmt --check` and `cargo clippy --all-targets` at the end of the batch; tests left to CI.
 - [ ] On chenini: delete nothing; install, restart, run `toker setup`, and check it enables codex_sub and openrouter from the login and keyring without prompting.
