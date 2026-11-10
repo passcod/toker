@@ -217,6 +217,7 @@ The routes tab MUST show each route with the providers its candidates reach in o
 Opening a route MUST show it whole, reading in the direction a request travels:
 
 - the candidates it is sent to, in order, with the failures and consents on each edge between them
+- how the route moves its lanes, which every route sets, so it MUST NOT be shown as a block that could be off
 - the blocks that handle it, naming each one that is enabled with its setting, and naming the ones that are not
 - every rewrite, presentation and default that sends a request to it
 

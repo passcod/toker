@@ -498,15 +498,6 @@ fn route_json(route: &Route, world: World) -> Value {
     };
     let on_claude_sub = route.id == "claude-sub";
     let compacts = matches!(route.id, "claude-sub" | "claude-api");
-    let upgrades = match route.id {
-        "claude-sub" => json!([{
-            "policy_id": "newest", "candidate_id": "sub", "enabled": true,
-            "bar": {"kind": "scaled", "active_days": 4, "needs_days": 3},
-            "moves": [{"family": "opus", "from": "claude-opus-4-7", "to": "claude-opus-5"}],
-            "held_back": [],
-        }]),
-        _ => json!([]),
-    };
     let alias = if on_claude_sub {
         json!({"enabled": true, "candidates": [{
             "candidate_id": "billed", "binding_id": OR_MESSAGES, "provider": "openrouter",
@@ -540,9 +531,7 @@ fn route_json(route: &Route, world: World) -> Value {
                 } else {
                     json!([])
                 },
-                "moves": upgrades,
             },
-            "lane_transition": {"enabled": true, "value": "move_when_cold"},
             "compaction": if compacts {
                 json!({"enabled": true, "kind": "substitution",
                        "model": {"kind": "family", "value": "sonnet"},

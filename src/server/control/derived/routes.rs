@@ -5,7 +5,6 @@
 
 use serde_json::{Value, json};
 
-use super::models::Upgrades;
 use super::rules::{Referrer, Rules};
 use super::{Context, Inputs, cost_name, lanes_body, matcher_body, reach_body, rejection_name};
 use crate::policy::{
@@ -18,7 +17,6 @@ pub(super) fn route_body<L: LearningView>(
     route: &CompiledRoute,
     inputs: &Inputs<'_, L>,
     rules: &Rules,
-    upgrades: &Upgrades,
 ) -> Value {
     let policy = ctx.policy;
     let candidates: Vec<Value> = route
@@ -121,7 +119,7 @@ pub(super) fn route_body<L: LearningView>(
             "rewrites": count(matched_by, "rewrite"),
             "defaults": count(matched_by, "default"),
         },
-        "handled_by": handled_by(ctx, route, upgrades),
+        "handled_by": handled_by(ctx, route),
     })
 }
 
@@ -138,7 +136,7 @@ fn count(referrers: &[Referrer], kind: &str) -> usize {
 ///
 /// Read from the document, since it holds what compilation closes over: the
 /// alias rules as written, and the circuits.
-fn handled_by(ctx: &Context<'_>, route: &CompiledRoute, upgrades: &Upgrades) -> Value {
+fn handled_by(ctx: &Context<'_>, route: &CompiledRoute) -> Value {
     let Some(document) = ctx
         .document
         .routes
@@ -224,10 +222,7 @@ fn handled_by(ctx: &Context<'_>, route: &CompiledRoute, upgrades: &Upgrades) -> 
         "upgrade": {
             "enabled": upgrade_candidates.iter().any(|candidate| candidate["enabled"] == json!(true)),
             "candidates": upgrade_candidates,
-            "moves": upgrades.moves_for(route.id()),
         },
-        // Always set: every route says how its lanes move.
-        "lane_transition": {"enabled": true, "value": document.lane_transition},
         "compaction": compaction_on(ctx, route),
         "alias": {"enabled": !alias.is_empty(), "candidates": alias},
         "server_safeguards": {

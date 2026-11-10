@@ -12,9 +12,9 @@ expression: "frame(&state, 100, 24, false)"
 │      billed: allow   ambiguous retry: deny   cache: preserve warm                                │
 │ 2  openrouter.openrouter_messages    billed        alias claude-* → anthropic/claude-*  ok       │
 │                                                                                                  │
-│ handled by  4 on · 3 off: server safeguards · required capabilities · health circuits            │
+│ lane moves  moves when cold · 2 warm · 5 cold                                                    │
+│ handled by  3 on · 3 off: server safeguards · required capabilities · health circuits            │
 │   upgrade          newest on claude-sub · claude-opus-4-7 → claude-opus-5                        │
-│   lane transition  moves when cold · 2 warm · 5 cold                                             │
 │   compaction       cold compactions → sonnet · cache allowed when cold                           │
 │   alias            claude-* → anthropic/claude-* · on openrouter                                 │
 │                                                                                                  │

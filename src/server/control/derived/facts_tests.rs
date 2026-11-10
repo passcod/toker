@@ -858,10 +858,16 @@ fn an_upgrade_says_the_bar_it_asks_and_the_move_it_would_make_now() {
     );
     assert_eq!(used["held_back"], json!([]));
 
-    // The route page reads the same from the route.
+    // The route names the policy and candidate the move is filed under,
+    // rather than shipping a second copy of it.
     let on_route = &find(&active["routes"], "claude-sub")["handled_by"]["upgrade"];
     assert_eq!(on_route["enabled"], true);
-    assert_eq!(on_route["moves"][0]["moves"], used["moves"]);
+    assert_eq!(on_route["candidates"][0]["policy_id"], "newest");
+    assert_eq!(
+        on_route["candidates"][0]["candidate_id"],
+        used["candidate_id"]
+    );
+    assert_eq!(on_route.get("moves"), None, "{on_route}");
 }
 
 #[test]

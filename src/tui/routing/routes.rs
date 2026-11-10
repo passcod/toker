@@ -373,10 +373,10 @@ const PAGE_CONTROLS_BRIEF: [(&str, &str); 7] = [
 ];
 
 /// The blocks that handle a request on a route, in the order the page names
-/// them: each with whether it is on.
-const BLOCKS: [(&str, &str); 7] = [
+/// them: each with whether it is on. The lane transition is not among them:
+/// it is a setting every route has, with no off to count.
+const BLOCKS: [(&str, &str); 6] = [
     ("upgrade", "upgrade"),
-    ("lane transition", "lane_transition"),
     ("compaction", "compaction"),
     ("alias", "alias"),
     ("server safeguards", "server_safeguards"),
@@ -436,8 +436,13 @@ pub(super) const CANDIDATES_AT: usize = 3;
 
 /// The rest of the route page: what handles a request on the route and what
 /// sends one to it, with the controls.
-pub(super) fn route_rest(route: &Value, width: usize) -> Vec<Line<'static>> {
+pub(super) fn route_rest(active: &Value, route: &Value, width: usize) -> Vec<Line<'static>> {
     let mut lines = vec![Line::raw("")];
+    lines.push(field(
+        "lane moves",
+        "lane moves".len() + 2,
+        vec![Span::raw(lane_transition_text(route))],
+    ));
     let handled = route.get("handled_by").unwrap_or(&Value::Null);
     let on = |key: &str| handled.get(key).is_some_and(|block| flag(block, "enabled"));
     let (enabled, disabled): (Vec<_>, Vec<_>) = BLOCKS.iter().partition(|(_, key)| on(key));
@@ -461,7 +466,7 @@ pub(super) fn route_rest(route: &Value, width: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(vec![
             Span::raw("  "),
             span(format!("{name:<name_w$}"), dim()),
-            Span::raw(block_text(route, handled, key)),
+            Span::raw(block_text(active, route, handled, key)),
         ]));
     }
     lines.push(Line::raw(""));
@@ -517,17 +522,59 @@ fn referrer_name(referrer: &Value) -> String {
 }
 
 /// What an enabled block says on the route page.
-fn block_text(route: &Value, handled: &Value, key: &str) -> String {
+/// How the route's lanes move, with how many are pinned to it. Every route
+/// has one, so it is a setting line rather than a block that could be off.
+fn lane_transition_text(route: &Value) -> String {
+    let words = lane_words(text(route, "lane_transition"));
+    let lanes = lanes_phrase(route.get("pinned_lanes").unwrap_or(&Value::Null));
+    if lanes == "none" {
+        words.to_owned()
+    } else {
+        format!("{words} · {lanes}")
+    }
+}
+
+/// The use of `policy` by `candidate` on `route`, as the upgrade row carries
+/// it.
+fn upgrade_usage<'a>(
+    active: &'a Value,
+    policy_id: &str,
+    route_id: &str,
+    candidate_id: &str,
+) -> Option<&'a Value> {
+    array(active, "upgrades")
+        .iter()
+        .find(|policy| text(policy, "id") == policy_id)
+        .and_then(|policy| {
+            array(policy, "used_by").iter().find(|usage| {
+                text(usage, "route_id") == route_id && text(usage, "candidate_id") == candidate_id
+            })
+        })
+}
+
+fn block_text(active: &Value, route: &Value, handled: &Value, key: &str) -> String {
     let block = handled.get(key).unwrap_or(&Value::Null);
     match key {
         "upgrade" => {
-            let policies: Vec<&str> = array(block, "candidates")
+            let on: Vec<&Value> = array(block, "candidates")
                 .iter()
                 .filter(|candidate| flag(candidate, "enabled"))
+                .collect();
+            let policies: Vec<&str> = on
+                .iter()
                 .map(|candidate| text(candidate, "policy_id"))
                 .collect();
             let mut said = format!("{} on {}", policies.join(" · "), text(route, "id"));
-            let first = array(block, "moves").iter().find_map(|usage| {
+            // The moves are on the upgrade row's own `used_by`, which the
+            // models tab reads; the route block names the policy and
+            // candidate to find them by rather than carrying a copy.
+            let first = on.iter().find_map(|candidate| {
+                let usage = upgrade_usage(
+                    active,
+                    text(candidate, "policy_id"),
+                    text(route, "id"),
+                    text(candidate, "candidate_id"),
+                )?;
                 array(usage, "moves")
                     .first()
                     .or_else(|| array(usage, "held_back").first())
@@ -543,15 +590,6 @@ fn block_text(route: &Value, handled: &Value, key: &str) -> String {
                 }
             }
             said
-        }
-        "lane_transition" => {
-            let lanes = lanes_phrase(route.get("pinned_lanes").unwrap_or(&Value::Null));
-            let words = lane_words(text(block, "value"));
-            if lanes == "none" {
-                words.to_owned()
-            } else {
-                format!("{words} · {lanes}")
-            }
         }
         "compaction" => compaction_text(block),
         "alias" => array(block, "candidates")
@@ -651,5 +689,50 @@ mod tests {
         route["id"] = serde_json::json!("路由路由路由");
         let lines = route_top(&snapshot, &route, 0, 7, 40);
         assert_eq!(lines[0].width(), 40);
+    }
+
+    fn rest(snapshot: &serde_json::Value) -> Vec<String> {
+        let active = &snapshot["derived"]["active"];
+        route_rest(active, &active["routes"][0], 120)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// Every route moves its lanes some way, so there is no off state to
+    /// count: the lane transition is a setting line, outside the blocks.
+    #[test]
+    fn the_lane_transition_is_a_setting_line_and_is_not_counted_among_the_blocks() {
+        let snapshot = snapshot(World::AT_REST);
+        let lines = rest(&snapshot);
+        let counted = lines
+            .iter()
+            .find(|line| line.contains("handled by"))
+            .expect("the handled-by line");
+        assert!(counted.contains("3 on · 3 off"), "{counted}");
+        assert!(!counted.contains("lane"), "{counted}");
+        let setting = lines
+            .iter()
+            .find(|line| line.contains("lane moves"))
+            .expect("the lane transition line");
+        assert!(setting.contains("moves when cold"), "{setting}");
+    }
+
+    /// The route block names the upgrade policy and candidate; the move it
+    /// would make is read from that upgrade's own row, not copied beside it.
+    #[test]
+    fn the_upgrade_block_reads_its_move_from_the_upgrade_row() {
+        let mut snapshot = snapshot(World::AT_REST);
+        let upgrade = |line: &&String| line.contains("upgrade");
+        let before = rest(&snapshot);
+        let said = before.iter().find(upgrade).expect("an upgrade block");
+        assert!(said.contains("claude-opus-4-7 → claude-opus-5"), "{said}");
+
+        // Change the row the models tab reads, and the route block follows.
+        snapshot["derived"]["active"]["upgrades"][0]["used_by"][0]["moves"] =
+            serde_json::json!([{"family": "opus", "from": "old", "to": "new"}]);
+        let after = rest(&snapshot);
+        let said = after.iter().find(upgrade).expect("an upgrade block");
+        assert!(said.contains("old → new"), "{said}");
     }
 }

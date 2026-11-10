@@ -197,7 +197,7 @@ fn policy_body<L: LearningView>(active: ActivePolicy<'_>, inputs: &Inputs<'_, L>
     let upgrades = models::upgrades(&ctx, inputs);
     let routes: Vec<Value> = policy
         .routes()
-        .map(|route| routes::route_body(&ctx, route, inputs, &rules, &upgrades))
+        .map(|route| routes::route_body(&ctx, route, inputs, &rules))
         .collect();
     let first_refused_tab = first_refused_tab(&rules, &routes);
     json!({

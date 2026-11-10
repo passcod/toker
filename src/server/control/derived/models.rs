@@ -9,30 +9,22 @@ use serde_json::{Value, json};
 use super::{Context, Inputs, reach_body};
 use crate::policy::{
     BindingId, CompactionTarget, CompiledCandidate, InventorySource, LearningView, MinimumLearning,
-    RouteId, SubstituteModel, UpgradePolicy, UpgradeRejection, upgrade_standing,
+    SubstituteModel, UpgradePolicy, UpgradeRejection, upgrade_standing,
 };
 
-/// The upgrade policies, with where each is used, and the uses by route.
+/// The upgrade policies, each with where it is used.
 pub(super) struct Upgrades {
     rows: Vec<Value>,
-    by_route: BTreeMap<RouteId, Vec<Value>>,
 }
 
 impl Upgrades {
     pub(super) fn body(&self) -> Value {
         Value::Array(self.rows.clone())
     }
-
-    /// The uses of an upgrade policy by the candidates of one route, each with
-    /// the moves it would make now.
-    pub(super) fn moves_for(&self, route: &RouteId) -> Vec<Value> {
-        self.by_route.get(route).cloned().unwrap_or_default()
-    }
 }
 
 pub(super) fn upgrades<L: LearningView>(ctx: &Context<'_>, inputs: &Inputs<'_, L>) -> Upgrades {
     let mut rows = Vec::new();
-    let mut by_route: BTreeMap<RouteId, Vec<Value>> = BTreeMap::new();
     for compiled in ctx.policy.upgrades() {
         let upgrade = compiled.policy();
         let mut used_by = Vec::new();
@@ -57,14 +49,6 @@ pub(super) fn upgrades<L: LearningView>(ctx: &Context<'_>, inputs: &Inputs<'_, L
                     "moves": moves,
                     "held_back": held_back,
                 });
-                by_route.entry(route.id().clone()).or_default().push(json!({
-                    "policy_id": upgrade.id,
-                    "candidate_id": candidate.id(),
-                    "enabled": upgrade.enabled && candidate.enabled(),
-                    "bar": usage["bar"],
-                    "moves": usage["moves"],
-                    "held_back": usage["held_back"],
-                }));
                 used_by.push(usage);
             }
         }
@@ -79,7 +63,7 @@ pub(super) fn upgrades<L: LearningView>(ctx: &Context<'_>, inputs: &Inputs<'_, L
             "used_by": used_by,
         }));
     }
-    Upgrades { rows, by_route }
+    Upgrades { rows }
 }
 
 /// What a policy asks of a model before it may be moved to.

@@ -393,7 +393,7 @@ fn route_page(
         .collect();
     let Some(editing) = editing else {
         lines.extend(
-            routes::route_rest(route, width)
+            routes::route_rest(active, route, width)
                 .into_iter()
                 .map(BodyLine::plain),
         );
