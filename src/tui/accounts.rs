@@ -128,7 +128,7 @@ impl Page {
     /// loop knows the key was swallowed rather than ignored.
     pub(super) fn key(&mut self, key: KeyEvent, store: &Store) -> bool {
         let Some(typed) = self.naming.as_mut() else {
-            if key.code == KeyCode::Char('n') && !self.entries.is_empty() {
+            if key.code == KeyCode::Char('n') && self.selected_credential().is_some() {
                 self.naming = Some(String::new());
                 return true;
             }
@@ -149,44 +149,39 @@ impl Page {
         true
     }
 
-    /// Record the operator's name for the selected entry. Naming a
-    /// credential no source could place is what gives it an account, so
-    /// the same call serves both kinds of row.
+    /// The selected entry, where it is a credential no source has named:
+    /// the only kind the operator may name. An account Toker already
+    /// resolved is not renamed here, since naming an address Toker does not
+    /// hold for it would open a second account rather than label the first
+    /// (spec: ACCT#the-operator-naming-one).
+    fn selected_credential(&self) -> Option<&CredentialAccount> {
+        match self.entries.get(self.selected)? {
+            Entry::Unresolved(credential) => Some(credential),
+            Entry::Known(_) => None,
+        }
+    }
+
+    /// Record the operator's name for the selected credential, which is
+    /// what gives it an account.
     fn name(&mut self, store: &Store, address: &str) {
+        let Some(credential) = self.selected_credential() else {
+            return;
+        };
         if address.is_empty() {
             return;
         }
-        let Some(entry) = self.entries.get(self.selected) else {
-            return;
-        };
         let identity = AccountIdentity {
             upstream_id: None,
             email: Some(address.to_owned()),
             named_by: AccountNameSource::Operator,
         };
         let now = jiff::Timestamp::now().as_millisecond();
-        let result = match entry {
-            Entry::Unresolved(credential) => store.observe_credential(
-                &credential.provider,
-                &credential.digest,
-                now,
-                Some(&identity),
-            ),
-            // A known account is renamed through the credential that
-            // reached it, because an account is only ever named by way
-            // of a credential it served.
-            Entry::Known(account) => match store.credential_of(account.number) {
-                Ok(Some(digest)) => {
-                    store.observe_credential(&account.provider, &digest, now, Some(&identity))
-                }
-                Ok(None) => {
-                    self.error =
-                        Some("that account has no credential on record to name it by".to_owned());
-                    return;
-                }
-                Err(error) => Err(error),
-            },
-        };
+        let result = store.observe_credential(
+            &credential.provider,
+            &credential.digest,
+            now,
+            Some(&identity),
+        );
         match result {
             Ok(_) => self.refresh(store),
             Err(error) => self.error = Some(format!("naming it failed: {error}")),
@@ -366,7 +361,7 @@ const NOUN: Noun = Noun {
 /// The page's keys, in its `?` overlay.
 const KEYS: [(&str, &str); 5] = [
     ("↑/↓ j/k", "select"),
-    ("n", "name the selected account"),
+    ("n", "name the selected credential, where it has no account"),
     ("r", "refresh"),
     ("esc", "back to the dashboard"),
     ("q", "quit"),
@@ -478,7 +473,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(text.contains("KEYS"), "{text}");
-        assert!(text.contains("name the selected account"), "{text}");
+        assert!(text.contains("name the selected credential"), "{text}");
         assert!(text.contains("? or esc close"), "{text}");
     }
 
@@ -549,6 +544,19 @@ mod tests {
             matches!(page.entries[0], Entry::Known(_)),
             "the page re-reads what it just wrote"
         );
+    }
+
+    #[test]
+    fn an_account_already_known_is_not_renamed() {
+        let store = store();
+        observe(&store, "ana-token", Some("ana@example.net"), NOW - 120_000);
+        let mut page = Page::new(&store);
+        assert!(matches!(page.entries[0], Entry::Known(_)));
+        let key =
+            |code| crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+        assert!(!page.key(key(KeyCode::Char('n')), &store), "nothing opens");
+        assert!(!page.naming());
+        assert_eq!(store.load_accounts().expect("accounts").len(), 1);
     }
 
     #[test]
