@@ -1,7 +1,7 @@
 //! Routing policy page.
 
 mod data;
-mod edit_view;
+pub(in crate::tui) mod edit_view;
 mod editing;
 mod form;
 #[cfg(test)]
@@ -16,7 +16,7 @@ mod reconcile;
 mod routes;
 mod rules;
 mod status;
-mod table;
+pub(in crate::tui) mod table;
 mod template;
 #[cfg(test)]
 mod testing;
@@ -24,7 +24,7 @@ mod trace;
 #[cfg(test)]
 mod trace_tests;
 mod view;
-mod words;
+pub(in crate::tui) mod words;
 
 use crate::tui::control::{Client, Command, Reply};
 use crossterm::event::KeyEvent;
@@ -116,6 +116,11 @@ impl Page {
         while let Some(note) = self.reconciler.poll() {
             self.state.set_settings_note(note);
         }
+    }
+
+    /// Open the route named `id` on its own page.
+    pub(super) fn open_route(&mut self, id: &str) {
+        self.state.open_route_named(id);
     }
 
     pub(super) fn move_view(&mut self, delta: isize) {

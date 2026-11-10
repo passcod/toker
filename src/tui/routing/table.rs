@@ -19,21 +19,21 @@ use crate::tui::chrome::{self, Chrome, Noun, RowHit};
 
 /// A line of a table's body, and the entry it belongs to where it is one a
 /// selection can rest on: a group's head or a pass-through row is not.
-pub(super) struct BodyLine {
-    pub(super) line: Line<'static>,
-    pub(super) entry: Option<usize>,
+pub(in crate::tui) struct BodyLine {
+    pub(in crate::tui) line: Line<'static>,
+    pub(in crate::tui) entry: Option<usize>,
     /// The field of an open form this line is, which a click on it focuses.
-    pub(super) field: Option<usize>,
+    pub(in crate::tui) field: Option<usize>,
     /// Whether the line is the focused field of an open form: the one the
     /// window follows, and the one drawn reversed.
-    pub(super) focused: bool,
+    pub(in crate::tui) focused: bool,
     /// A line that must stay in view, as an open form's save control: drawn
     /// in the panel's last row when the window has scrolled past it.
-    pub(super) pinned: bool,
+    pub(in crate::tui) pinned: bool,
 }
 
 impl BodyLine {
-    pub(super) fn plain(line: Line<'static>) -> Self {
+    pub(in crate::tui) fn plain(line: Line<'static>) -> Self {
         BodyLine {
             line,
             entry: None,
@@ -43,7 +43,7 @@ impl BodyLine {
         }
     }
 
-    pub(super) fn of(line: Line<'static>, entry: usize) -> Self {
+    pub(in crate::tui) fn of(line: Line<'static>, entry: usize) -> Self {
         BodyLine {
             line,
             entry: Some(entry),
@@ -54,13 +54,13 @@ impl BodyLine {
     }
 
     /// A line that stays in view whatever the window.
-    pub(super) fn pinned(mut self) -> Self {
+    pub(in crate::tui) fn pinned(mut self) -> Self {
         self.pinned = true;
         self
     }
 
     /// A line of an open form, a field or what sits with one.
-    pub(super) fn form(line: Line<'static>, field: Option<usize>, focused: bool) -> Self {
+    pub(in crate::tui) fn form(line: Line<'static>, field: Option<usize>, focused: bool) -> Self {
         BodyLine {
             line,
             entry: None,
@@ -74,19 +74,19 @@ impl BodyLine {
 /// Where a drawn table put its lines: those a selection can rest on, and the
 /// fields of an open form.
 #[derive(Debug, Default)]
-pub(super) struct Hits {
-    pub(super) rows: Vec<RowHit>,
-    pub(super) fields: Vec<(Rect, usize)>,
+pub(in crate::tui) struct Hits {
+    pub(in crate::tui) rows: Vec<RowHit>,
+    pub(in crate::tui) fields: Vec<(Rect, usize)>,
 }
 
 /// A table's column heading and its lines.
-pub(super) struct Table {
-    pub(super) header: Line<'static>,
-    pub(super) body: Vec<BodyLine>,
+pub(in crate::tui) struct Table {
+    pub(in crate::tui) header: Line<'static>,
+    pub(in crate::tui) body: Vec<BodyLine>,
 }
 
 /// What a table's rows are called in the count it leaves where it was cut.
-pub(super) const NOUN: Noun = Noun {
+pub(in crate::tui) const NOUN: Noun = Noun {
     one: "record",
     many: "records",
 };
@@ -114,7 +114,7 @@ fn hidden(body: &[BodyLine], range: std::ops::Range<usize>) -> (usize, Noun) {
 
 /// `spans` as exactly `width` cells: clipped with an ellipsis where too long,
 /// padded where short.
-pub(super) fn fit(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+pub(in crate::tui) fn fit(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
     let mut spans = chrome::clip_spans(spans, width);
     let used: usize = spans.iter().map(Span::width).sum();
     if used < width {
@@ -124,7 +124,7 @@ pub(super) fn fit(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>>
 }
 
 /// `spans` as exactly `width` cells, right-aligned.
-pub(super) fn fit_right(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+pub(in crate::tui) fn fit_right(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
     let spans = chrome::clip_spans(spans, width);
     let used: usize = spans.iter().map(Span::width).sum();
     let mut out = vec![Span::raw(" ".repeat(width.saturating_sub(used)))];
@@ -134,51 +134,51 @@ pub(super) fn fit_right(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'st
 
 /// A line made of cells laid end to end.
 #[derive(Default)]
-pub(super) struct Cells {
+pub(in crate::tui) struct Cells {
     spans: Vec<Span<'static>>,
 }
 
 impl Cells {
-    pub(super) fn new() -> Self {
+    pub(in crate::tui) fn new() -> Self {
         Self::default()
     }
 
     /// A cell of exactly `width`.
-    pub(super) fn cell(mut self, spans: Vec<Span<'static>>, width: usize) -> Self {
+    pub(in crate::tui) fn cell(mut self, spans: Vec<Span<'static>>, width: usize) -> Self {
         self.spans.extend(fit(spans, width));
         self
     }
 
     /// A right-aligned cell of exactly `width`.
-    pub(super) fn right(mut self, spans: Vec<Span<'static>>, width: usize) -> Self {
+    pub(in crate::tui) fn right(mut self, spans: Vec<Span<'static>>, width: usize) -> Self {
         self.spans.extend(fit_right(spans, width));
         self
     }
 
     /// Spans as they are, taking what room they take.
-    pub(super) fn raw(mut self, spans: Vec<Span<'static>>) -> Self {
+    pub(in crate::tui) fn raw(mut self, spans: Vec<Span<'static>>) -> Self {
         self.spans.extend(spans);
         self
     }
 
-    pub(super) fn line(self) -> Line<'static> {
+    pub(in crate::tui) fn line(self) -> Line<'static> {
         Line::from(self.spans)
     }
 }
 
 /// A heading cell: dim.
-pub(super) fn heading(text: &str) -> Vec<Span<'static>> {
+pub(in crate::tui) fn heading(text: &str) -> Vec<Span<'static>> {
     vec![label(text.to_owned())]
 }
 
 /// Spans from a string and a style.
-pub(super) fn span(text: impl Into<String>, style: Style) -> Span<'static> {
+pub(in crate::tui) fn span(text: impl Into<String>, style: Style) -> Span<'static> {
     Span::styled(text.into(), style)
 }
 
 /// A line with every colour and emphasis taken off and reversed across
 /// `width`: the selected row. What colour said is still said in words.
-pub(super) fn reversed(line: Line<'static>, width: usize) -> Line<'static> {
+pub(in crate::tui) fn reversed(line: Line<'static>, width: usize) -> Line<'static> {
     let used = line.width();
     let mut spans: Vec<Span<'static>> = line
         .spans
@@ -203,15 +203,15 @@ fn padded(line: Line<'static>, inner: usize) -> Line<'static> {
 
 /// How a pair of panels, a table over its detail, shares the body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Split {
-    pub(super) table: Rect,
-    pub(super) detail: Rect,
-    pub(super) chrome: Chrome,
+pub(in crate::tui) struct Split {
+    pub(in crate::tui) table: Rect,
+    pub(in crate::tui) detail: Rect,
+    pub(in crate::tui) chrome: Chrome,
     /// How many of the detail's lines its area holds, the framing aside.
-    pub(super) detail_rows: usize,
+    pub(in crate::tui) detail_rows: usize,
     /// Whether the detail is drawn without a frame of its own, as the one
     /// line of a reading is.
-    pub(super) bare: bool,
+    pub(in crate::tui) bare: bool,
 }
 
 /// The least rows of table content, the column heading and a row, worth a
@@ -223,7 +223,7 @@ const TABLE_FLOOR: usize = 2;
 /// boxed while neither loses content to its border, ruled when they would,
 /// and the table gives up rows before the detail does
 /// (spec: UTUI#what-is-shed-first).
-pub(super) fn split(body: Rect, table: usize, detail: usize) -> Split {
+pub(in crate::tui) fn split(body: Rect, table: usize, detail: usize) -> Split {
     let height = usize::from(body.height);
     let framing = if table + detail + 2 * usize::from(Chrome::Boxed.cost()) <= height {
         Chrome::Boxed
@@ -260,7 +260,7 @@ pub(super) fn split(body: Rect, table: usize, detail: usize) -> Split {
 /// frame, then its lines down to the reading, which is all that is left of
 /// it in the last row (spec: UTUI#what-is-shed-first). Where even that leaves
 /// the table too few rows, the table is cut instead.
-pub(super) fn split_reading(body: Rect, table: usize, detail: usize) -> Split {
+pub(in crate::tui) fn split_reading(body: Rect, table: usize, detail: usize) -> Split {
     let whole = split(body, table, detail);
     let height = usize::from(body.height);
     let ruled = usize::from(Chrome::Ruled.cost());
@@ -305,8 +305,8 @@ pub(super) fn split_reading(body: Rect, table: usize, detail: usize) -> Split {
 
 /// A detail that can be cut to the room it is given: its lines, and the one
 /// of them that is the reading the panel exists to give.
-pub(super) struct Detail {
-    pub(super) lines: Vec<Line<'static>>,
+pub(in crate::tui) struct Detail {
+    pub(in crate::tui) lines: Vec<Line<'static>>,
     reading: Option<Reading>,
 }
 
@@ -322,7 +322,7 @@ struct Reading {
 
 impl Detail {
     /// A detail with nothing in it to prefer: it is cut from the bottom.
-    pub(super) fn whole(lines: Vec<Line<'static>>) -> Self {
+    pub(in crate::tui) fn whole(lines: Vec<Line<'static>>) -> Self {
         Detail {
             lines,
             reading: None,
@@ -331,7 +331,7 @@ impl Detail {
 
     /// A detail whose line `at` is its reading, in the `forms` it can be
     /// said in from the fullest to the briefest, with `hint` after it.
-    pub(super) fn reading(
+    pub(in crate::tui) fn reading(
         lines: Vec<Line<'static>>,
         at: usize,
         forms: Vec<Vec<Span<'static>>>,
@@ -343,17 +343,17 @@ impl Detail {
         }
     }
 
-    pub(super) fn len(&self) -> usize {
+    pub(in crate::tui) fn len(&self) -> usize {
         self.lines.len()
     }
 
-    pub(super) fn has_reading(&self) -> bool {
+    pub(in crate::tui) fn has_reading(&self) -> bool {
         self.reading.is_some()
     }
 
     /// The lines that fit in `rows` of `width` cells. The reading goes last
     /// of all: the controls, then the title, then the rest, from the top.
-    pub(super) fn shed(self, rows: usize, width: usize) -> Vec<Line<'static>> {
+    pub(in crate::tui) fn shed(self, rows: usize, width: usize) -> Vec<Line<'static>> {
         if rows >= self.lines.len() {
             return self.lines;
         }
@@ -397,7 +397,7 @@ impl Detail {
 /// Draw a table into `area`: its heading, then its lines windowed around the
 /// selected entry with a count of what was cut on each side. Returns where
 /// each entry's row landed.
-pub(super) fn draw_table(
+pub(in crate::tui) fn draw_table(
     frame: &mut Frame,
     area: Rect,
     title: &str,
@@ -491,7 +491,7 @@ pub(super) fn draw_table(
 
 /// Draw a detail panel: its lines, each with a cell of air, the last of
 /// them the controls.
-pub(super) fn draw_detail(
+pub(in crate::tui) fn draw_detail(
     frame: &mut Frame,
     area: Rect,
     title: &str,
@@ -518,7 +518,7 @@ pub(super) fn draw_detail(
 
 /// Draw lines with no frame of their own, where a panel has shed it: each in
 /// a row, with the cell of air a panel's content has.
-pub(super) fn draw_bare(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
+pub(in crate::tui) fn draw_bare(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
     let inner = Rect {
         x: area.x + 1.min(area.width),
         width: area.width.saturating_sub(2),
@@ -544,7 +544,7 @@ pub(super) fn draw_bare(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>
 /// Draw a panel of lines that may hold an open form: the lines from the top,
 /// scrolled only as far as keeps the focused field in view. Returns where
 /// each field landed.
-pub(super) fn draw_page(
+pub(in crate::tui) fn draw_page(
     frame: &mut Frame,
     area: Rect,
     title: &str,
@@ -590,14 +590,18 @@ pub(super) fn draw_page(
 
 /// A label and value row of a detail: the label dim in a column of
 /// `label_width`, then the value's spans.
-pub(super) fn field(name: &str, label_width: usize, value: Vec<Span<'static>>) -> Line<'static> {
+pub(in crate::tui) fn field(
+    name: &str,
+    label_width: usize,
+    value: Vec<Span<'static>>,
+) -> Line<'static> {
     let mut spans = vec![span(format!("{name:<label_width$}"), dim())];
     spans.extend(value);
     Line::from(spans)
 }
 
 /// A detail's controls, written `[key] label`, three spaces apart.
-pub(super) fn controls(items: &[(&str, &str)]) -> Line<'static> {
+pub(in crate::tui) fn controls(items: &[(&str, &str)]) -> Line<'static> {
     Line::raw(
         items
             .iter()
@@ -609,7 +613,7 @@ pub(super) fn controls(items: &[(&str, &str)]) -> Line<'static> {
 
 /// The controls laid in lines of at most `width` cells: as one line where
 /// they fit, and otherwise as many as they take, each control whole.
-pub(super) fn controls_in(items: &[(&str, &str)], width: usize) -> Vec<Line<'static>> {
+pub(in crate::tui) fn controls_in(items: &[(&str, &str)], width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<String> = Vec::new();
     for (key, what) in items {
         let control = format!("[{key}] {what}");
@@ -625,12 +629,12 @@ pub(super) fn controls_in(items: &[(&str, &str)], width: usize) -> Vec<Line<'sta
 }
 
 /// The width of `spans` in cells.
-pub(super) fn width_of(spans: &[Span<'static>]) -> usize {
+pub(in crate::tui) fn width_of(spans: &[Span<'static>]) -> usize {
     spans.iter().map(Span::width).sum()
 }
 
 /// The width of the widest of `texts`.
-pub(super) fn widest<'a>(texts: impl IntoIterator<Item = &'a str>) -> usize {
+pub(in crate::tui) fn widest<'a>(texts: impl IntoIterator<Item = &'a str>) -> usize {
     texts
         .into_iter()
         .map(UnicodeWidthStr::width)
@@ -641,7 +645,7 @@ pub(super) fn widest<'a>(texts: impl IntoIterator<Item = &'a str>) -> usize {
 /// Mark the rows a trace passed through, in the gutter each draws at its
 /// left: the catching row `>`, the rows fallen past `↓`. A table with no
 /// gutter of its own is given one, where `gutter` says so.
-pub(super) fn mark_rows(
+pub(in crate::tui) fn mark_rows(
     table: &mut Table,
     marks: &std::collections::BTreeMap<usize, char>,
     gutter: bool,

@@ -14,7 +14,7 @@ use super::data::{array, text};
 /// healthy is plain, what is merely off is dim, and a refusal is red
 /// (spec: UTUI#distinguishing-a-reading; it never carries a reading alone).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Tone {
+pub(in crate::tui) enum Tone {
     Plain,
     Dim,
     Warn,
@@ -22,7 +22,7 @@ pub(super) enum Tone {
 }
 
 impl Tone {
-    pub(super) fn style(self) -> Style {
+    pub(in crate::tui) fn style(self) -> Style {
         match self {
             Tone::Plain => Style::new(),
             Tone::Dim => Style::new().dim(),
@@ -32,28 +32,28 @@ impl Tone {
     }
 }
 
-pub(super) fn dim() -> Style {
+pub(in crate::tui) fn dim() -> Style {
     Style::new().dim()
 }
 
-pub(super) fn bold() -> Style {
+pub(in crate::tui) fn bold() -> Style {
     Style::new().bold()
 }
 
 /// A span in a tone.
-pub(super) fn toned(content: impl Into<String>, tone: Tone) -> Span<'static> {
+pub(in crate::tui) fn toned(content: impl Into<String>, tone: Tone) -> Span<'static> {
     Span::styled(content.into(), tone.style())
 }
 
 /// A dim label, for the left of a label and value row.
-pub(super) fn label(content: impl Into<String>) -> Span<'static> {
+pub(in crate::tui) fn label(content: impl Into<String>) -> Span<'static> {
     Span::styled(content.into(), dim())
 }
 
 /// The reach of a record as the clauses it reads in, each with its tone.
 /// `ok` where the route's first candidate serves; otherwise why not, and
 /// what serves instead (spec: UTUI#reading-a-table).
-pub(super) fn reach_clauses(reach: &Value) -> Vec<(String, Tone)> {
+pub(in crate::tui) fn reach_clauses(reach: &Value) -> Vec<(String, Tone)> {
     match text(reach, "outcome") {
         "served_first" => vec![("ok".to_owned(), Tone::Plain)],
         "served_later" => {
@@ -115,12 +115,12 @@ fn briefly(clause: &str) -> &str {
 }
 
 /// The reach as spans, its clauses a `·` apart.
-pub(super) fn reach_spans(reach: &Value) -> Vec<Span<'static>> {
+pub(in crate::tui) fn reach_spans(reach: &Value) -> Vec<Span<'static>> {
     reach_spans_in(reach, false)
 }
 
 /// The reach as spans, in its fewest words where `brief`.
-pub(super) fn reach_spans_in(reach: &Value, brief: bool) -> Vec<Span<'static>> {
+pub(in crate::tui) fn reach_spans_in(reach: &Value, brief: bool) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (index, (clause, tone)) in reach_clauses(reach).into_iter().enumerate() {
         if index > 0 {
@@ -137,7 +137,7 @@ pub(super) fn reach_spans_in(reach: &Value, brief: bool) -> Vec<Span<'static>> {
 }
 
 /// The reach as text, in its fewest words where `brief`.
-pub(super) fn reach_text_in(reach: &Value, brief: bool) -> String {
+pub(in crate::tui) fn reach_text_in(reach: &Value, brief: bool) -> String {
     reach_clauses(reach)
         .into_iter()
         .map(|(clause, _)| {
@@ -153,7 +153,7 @@ pub(super) fn reach_text_in(reach: &Value, brief: bool) -> String {
 
 /// A reach where the record has none to show: a presentation that is off, or
 /// a profile with no default of its own.
-pub(super) fn no_reach() -> Vec<Span<'static>> {
+pub(in crate::tui) fn no_reach() -> Vec<Span<'static>> {
     vec![toned("-", Tone::Dim)]
 }
 
@@ -169,7 +169,7 @@ fn edge_stop_word(reach: &Value) -> &'static str {
 }
 
 /// A skip reason in a word or two, for a table cell.
-pub(super) fn reason_word(code: &str) -> &'static str {
+pub(in crate::tui) fn reason_word(code: &str) -> &'static str {
     match code {
         "candidate_disabled" => "disabled",
         "binding_unknown" => "unknown binding",
@@ -216,7 +216,7 @@ fn reason_phrase(code: &str) -> &'static str {
 
 /// Why a reach is what it is, as a sentence: `anthropic_sub has no
 /// credential, so openrouter serves it, billed`.
-pub(super) fn reach_reason(reach: &Value) -> String {
+pub(in crate::tui) fn reach_reason(reach: &Value) -> String {
     let serving = reach.get("serving").unwrap_or(&Value::Null);
     let skipped = array(reach, "skipped");
     let passed = |skip: &Value| {
@@ -274,7 +274,7 @@ pub(super) fn reach_reason(reach: &Value) -> String {
 /// The hit count of a record as a table cell: a figure, a floor `≥n`, or a
 /// dim dash where it was not recorded. A floor of nothing says nothing, so
 /// it is a dash too (spec: UTUI#reading-a-table).
-pub(super) fn hits_span(hits: Option<&Value>) -> Span<'static> {
+pub(in crate::tui) fn hits_span(hits: Option<&Value>) -> Span<'static> {
     match hits_figure(hits) {
         Some(figure) => Span::raw(figure),
         None => toned("-", Tone::Dim),
@@ -293,7 +293,7 @@ fn hits_figure(hits: Option<&Value>) -> Option<String> {
 }
 
 /// The same as a phrase: `≥3 in 24h`, or a dash.
-pub(super) fn hits_phrase(hits: Option<&Value>) -> String {
+pub(in crate::tui) fn hits_phrase(hits: Option<&Value>) -> String {
     match hits_figure(hits) {
         Some(figure) if figure == "0" => "none in 24h".to_owned(),
         Some(figure) => format!("{figure} in 24h"),
@@ -304,16 +304,16 @@ pub(super) fn hits_phrase(hits: Option<&Value>) -> String {
 /// A matcher in the notation it is written in, as the daemon spelled it: a
 /// prefix with the part it captures, a glob, an exact name, and a regular
 /// expression only for one.
-pub(super) fn matcher_text(matcher: &Value) -> String {
+pub(in crate::tui) fn matcher_text(matcher: &Value) -> String {
     text(matcher, "text").to_owned()
 }
 
-pub(super) fn matcher_kind(matcher: &Value) -> &str {
+pub(in crate::tui) fn matcher_kind(matcher: &Value) -> &str {
     text(matcher, "kind")
 }
 
 /// A lane transition in words.
-pub(super) fn lane_words(code: &str) -> &'static str {
+pub(in crate::tui) fn lane_words(code: &str) -> &'static str {
     match code {
         "preserve_pinned" => "stays pinned",
         "move_when_cold" => "moves when cold",
@@ -323,7 +323,7 @@ pub(super) fn lane_words(code: &str) -> &'static str {
 }
 
 /// A cache transition in words.
-pub(super) fn cache_words(code: &str) -> &'static str {
+pub(in crate::tui) fn cache_words(code: &str) -> &'static str {
     match code {
         "preserve_warm" => "preserve warm",
         "allow_when_cold" => "allowed when cold",
@@ -348,7 +348,7 @@ fn failure_words(code: &str) -> &'static str {
 }
 
 /// The edge's two halves: when it falls back, and what it consents to.
-pub(super) fn edge_parts(edge: &Value) -> (String, String) {
+pub(in crate::tui) fn edge_parts(edge: &Value) -> (String, String) {
     let mut when: Vec<&str> = Vec::new();
     if text(edge, "preflight") == "enabled" {
         when.push("unavailable before send");
@@ -376,7 +376,7 @@ pub(super) fn edge_parts(edge: &Value) -> (String, String) {
 }
 
 /// A cost class as the route page writes it.
-pub(super) fn cost_word(cost: &str) -> &str {
+pub(in crate::tui) fn cost_word(cost: &str) -> &str {
     match cost {
         "subscription" | "billed" => cost,
         _ => "cost unknown",
@@ -384,7 +384,7 @@ pub(super) fn cost_word(cost: &str) -> &str {
 }
 
 /// Lanes held, as `2 warm · 5 cold`; `none` where there are none.
-pub(super) fn lanes_phrase(lanes: &Value) -> String {
+pub(in crate::tui) fn lanes_phrase(lanes: &Value) -> String {
     let mut parts = Vec::new();
     for (key, word) in [("warm", "warm"), ("cold", "cold"), ("unknown", "unknown")] {
         let count = super::data::count(lanes, key);
@@ -401,7 +401,7 @@ pub(super) fn lanes_phrase(lanes: &Value) -> String {
 
 /// How many of each kind of record send to a route: `4 rules · 2 defaults`,
 /// leaving out a kind with none.
-pub(super) fn matched_by_phrase(counts: &Value) -> String {
+pub(in crate::tui) fn matched_by_phrase(counts: &Value) -> String {
     let mut parts = Vec::new();
     for (key, one, many) in [
         ("presentations", "presentation", "presentations"),
@@ -422,7 +422,7 @@ pub(super) fn matched_by_phrase(counts: &Value) -> String {
 
 /// A moment as the history and the recent requests write it: `Tue 10 Nov
 /// 14:41`, in the operator's time zone.
-pub(super) fn when(ms: i64) -> String {
+pub(in crate::tui) fn when(ms: i64) -> String {
     let Ok(at) = jiff::Timestamp::from_millisecond(ms) else {
         return "-".to_owned();
     };

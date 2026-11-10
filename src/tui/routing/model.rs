@@ -470,6 +470,21 @@ impl State {
         }
     }
 
+    /// Open the route named `id`, where the live revision holds one, as a
+    /// provider's detail on the config page asks to.
+    pub(super) fn open_route_named(&mut self, id: &str) {
+        let Some(route) = self
+            .active()
+            .and_then(|active| routes::position(active, id))
+        else {
+            return;
+        };
+        self.selected[Tab::Routes.index()] = route;
+        self.candidate = 0;
+        self.tab = Tab::Routes;
+        self.mode = Mode::Route;
+    }
+
     /// Leave the route page for the table, the selection where it was.
     /// Returns whether there was a page to leave.
     pub(super) fn close(&mut self) -> bool {

@@ -90,7 +90,7 @@ fn tone_of(note: Note) -> Tone {
 }
 
 /// `text` broken into lines of at most `width` cells, at spaces.
-pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
+pub(in crate::tui) fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
     let mut line = String::new();
