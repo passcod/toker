@@ -76,6 +76,9 @@ A modal or a text entry that takes every key MUST say the keys it acts on itself
 
 Every page MUST be able to move to the next page by the same key.
 
+The header of every page MUST carry a control for each page, marking the current one, that goes to that page when clicked.
+Those controls MUST keep their labels at every terminal size, and a page's own tabs MUST be shed before them.
+
 ## The views
 
 The dashboard MUST show the sessions active within its window, the cache rebuilds within it, spend, and the state of each meter.
@@ -271,7 +274,7 @@ A move that would lose a warm cache MUST ask for a second confirmation, and the 
 
 ### Models
 
-The models tab MUST show the classifiers, the upgrade policies with the move each would make now, the compaction target, and the offers in each binding's catalogue.
+The models tab MUST show the classifiers, the upgrade policies with the evidence bar each requires and the move each would make now, where cold compactions go and on which bindings, and the offers in each binding's catalogue.
 
 It MUST be able to [promote](../routing/models.md#promotion) a learned model.
 

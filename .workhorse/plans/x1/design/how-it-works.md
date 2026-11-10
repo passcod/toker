@@ -4,7 +4,7 @@ This is a walkthrough of the converged design for Toker's settings and routing s
 Each section links to the mockup frame that shows it.
 The mockups are HTML drawings of the TUI at real terminal sizes, mostly 120×40; open them in a browser.
 
-The area is two pages, **routing** and **config**, and `tab` (or the `⇄` mark in the top-left corner) switches between them.
+The area is two pages, **routing** and **config**. The header's buttons go to any page (`dashboard`, `routing`, `config`, `accounts`), and `tab` cycles through them.
 Routing is everything that decides where a request goes.
 Config is the providers you have and the handful of settings that sit outside routing.
 
@@ -104,8 +104,8 @@ It reads top to bottom as three questions:
 
 [The models tab](../../../design/mockups/x1/converged-03-tables.html#models) stacks four small panels.
 **Families** say how a model name is read (`claude-sonnet-4-5` reads as `sonnet · 4.5`), which is what makes "newest" meaningful.
-**Upgrades** say which routes move a request to the newest model in its family, with what each would currently upgrade from and to; `p` promotes a model so it's trusted at once rather than after evidence builds up.
-**Compaction** is one line on where cold compaction requests go.
+**Upgrades** say which routes move a request to the newest model in its family, with what each would currently upgrade from and to, and the evidence a new model needs first (none, a number of days served, a scaled number of days, or a promotion); `p` promotes a model so it's trusted at once.
+**Compaction** is one line on where cold compaction requests go, and on which routes: it changes the model and keeps the provider the request was already on.
 **Offers** is the provider catalogue, scrolled as a window over hundreds of models.
 `↑/↓` past the edge of a panel moves the focus into the next one, as [the same tab with focus in families](../../../design/mockups/x1/converged-03-tables.html#models-families) shows; only the focused panel shows a selection.
 
@@ -182,8 +182,8 @@ The redesign is mostly presentation, but a few changes to how Toker works make i
 - **Consent only where something is lost.**
   The one confirmation is moving warm lanes, which costs their cache.
 - **Authored names everywhere.**
-  The generated `legacy-…` records and the semantics behind them are retired.
-  Routes, rules, families and upgrades carry short names someone would choose (`claude-sub`, `openrouter-chat`, `claude-sonnet`, `newest on claude-sub`), and nothing is marked as generated.
+  The generated semantics are already retired, and the first revision is written in authored vocabulary.
+  The mockups go one step further and give its records short names someone would choose (`claude-sub`, `openrouter-chat`, `claude-sonnet`, `newest on claude-sub`) in place of the generated `route-…` ones.
 - **History lives with routing.**
   Revisions are a routing concept, so the history tab moved off the config page.
 - **No JSON.**
