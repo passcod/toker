@@ -1,5 +1,6 @@
 //! Drawing the form that opens under a row: its field, with what the check
-//! says beside it, and the save control under it (spec: UTUI#the-configuration-pages).
+//! says beside it, and the save control under it
+//! (spec: UTUI#the-configuration-pages).
 
 use ratatui::{
     style::{Modifier, Style},
