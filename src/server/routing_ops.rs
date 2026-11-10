@@ -365,18 +365,10 @@ impl Server {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let basis = self.control_basis_locked()?;
         Self::expect_active_revision(&basis, Some(expected_revision_id))?;
-        let (current_scope, current_forced) =
-            basis.state.effective_activation(&basis.active_revision);
-        if !crate::store::is_widening(
-            (current_scope, current_forced),
-            (scope, forced_cache_transition),
-        ) {
-            return Err(RoutingControlError::NotAWidening {
-                scope: current_scope,
-                forced_cache_transition: current_forced,
-            });
-        }
-        let impacts = self.routing_lane_impacts_locked(&basis.state, now_ms())?;
+        // Whether this is a widening is the store's answer, decided inside
+        // the transaction that applies it; a check out here would only lose
+        // the race it appears to guard.
+        let impacts = self.routing_lane_impacts_locked(now_ms())?;
         require_cache_consent(&impacts, scope, forced_cache_transition)?;
         match self.store.widen_activation(
             expected_revision_id,
