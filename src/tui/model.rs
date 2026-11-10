@@ -3336,7 +3336,10 @@ mod tests {
             "ses-m",
         );
         let marked = |rows: &[DisplayRow]| session(&agg(rows, 3), "ses-m").failed;
-        assert!(marked(&[first_failed.clone()]), "a failure sets it");
+        assert!(
+            marked(std::slice::from_ref(&first_failed)),
+            "a failure sets it"
+        );
         assert!(
             !marked(&[first_failed.clone(), then_served.clone()]),
             "a later success clears it"
