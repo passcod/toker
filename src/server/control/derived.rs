@@ -193,7 +193,7 @@ fn policy_body<L: LearningView>(
         "routes": routes,
         "classifiers": policy
             .classifiers()
-            .map(|classifier| classifier_body(classifier, inputs.inventory))
+            .map(|classifier| classifier_body(classifier, document, inputs.inventory))
             .collect::<Vec<_>>(),
         "presentations": slugs,
         "scopes": rules.scopes,
@@ -439,7 +439,11 @@ fn rejection_name(reason: crate::policy::UpgradeRejection) -> &'static str {
     }
 }
 
-fn classifier_body(classifier: &CompiledClassifier, inventory: &OfferInventory) -> Value {
+fn classifier_body(
+    classifier: &CompiledClassifier,
+    document: &PolicyDocument,
+    inventory: &OfferInventory,
+) -> Value {
     let mut parsed = Vec::new();
     let mut unparsed = Vec::new();
     let mut models: Vec<&str> = inventory
@@ -470,9 +474,17 @@ fn classifier_body(classifier: &CompiledClassifier, inventory: &OfferInventory) 
             Ok(None) | Err(_) => {}
         }
     }
+    // The matcher as written, in its own notation: the compiled one holds only
+    // the expression it became (spec: UTUI#models).
+    let matcher = document
+        .classifiers
+        .iter()
+        .find(|written| written.id == *classifier.id())
+        .map_or(Value::Null, |written| matcher_body(&written.model_matcher));
     json!({
         "id": classifier.id(),
         "binding_id": classifier.binding_id(),
+        "matcher": matcher,
         "parsed": parsed,
         "unparsed": unparsed,
     })
@@ -684,11 +696,15 @@ mod tests {
         .expect("document");
         let topology =
             RouteRegistry::new(std::iter::empty::<Arc<dyn crate::providers::Provider>>());
-        let policy = compile(document.validate().expect("valid"), &topology, &inventory)
-            .into_policy()
-            .expect("compiles");
+        let policy = compile(
+            document.clone().validate().expect("valid"),
+            &topology,
+            &inventory,
+        )
+        .into_policy()
+        .expect("compiles");
 
-        let body = classifier_body(policy.classifiers().next().unwrap(), &inventory);
+        let body = classifier_body(policy.classifiers().next().unwrap(), &document, &inventory);
 
         assert_eq!(
             body["parsed"],
@@ -698,5 +714,6 @@ mod tests {
             ])
         );
         assert_eq!(body["unparsed"], json!([{"model": "claude-opus-x"}]));
+        assert_eq!(body["matcher"]["kind"], "regex");
     }
 }
