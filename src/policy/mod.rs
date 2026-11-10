@@ -34,7 +34,8 @@ pub use compile::{
     CompiledUpgradePolicy, PresentationRoute, compile,
 };
 pub use diagnostic::{
-    Diagnostic, DiagnosticCode, DiagnosticField, DiagnosticPath, DiagnosticPathError, Severity,
+    Diagnostic, DiagnosticCode, DiagnosticField, DiagnosticPath, DiagnosticPathError, Explanation,
+    Severity, explain,
 };
 pub use document::*;
 pub use edit::{

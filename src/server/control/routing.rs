@@ -804,11 +804,16 @@ fn diagnostics_body(diagnostics: Vec<crate::policy::Diagnostic>) -> Vec<Value> {
     diagnostics
         .into_iter()
         .map(|diagnostic| {
+            // A sentence and a fix for the form to show beside the field the
+            // path names (spec: UTUI#editing).
+            let explanation = crate::policy::explain(diagnostic.code.0.as_str());
             json!({
                 "code": diagnostic.code,
                 "severity": diagnostic.severity,
                 "record_id": diagnostic.record_id,
                 "path": diagnostic.path.as_str(),
+                "sentence": explanation.map(|explanation| explanation.sentence),
+                "fix": explanation.map(|explanation| explanation.fix),
             })
         })
         .collect()

@@ -414,9 +414,12 @@ async fn validation_reports_diagnostics_with_their_paths_and_changes_nothing() {
         "a policy that compiles still reports its notes: {valid}"
     );
     for diagnostic in diagnostics {
-        for key in ["code", "severity", "record_id", "path"] {
+        for key in ["code", "severity", "record_id", "path", "sentence", "fix"] {
             assert!(diagnostic.get(key).is_some(), "{key}: {diagnostic}");
         }
+        // Every code the compiler raises explains itself for the form.
+        assert!(diagnostic["sentence"].is_string(), "{diagnostic}");
+        assert!(diagnostic["fix"].is_string(), "{diagnostic}");
     }
 
     // A document that does not compile is a report, not an HTTP failure.
@@ -443,7 +446,10 @@ async fn validation_reports_diagnostics_with_their_paths_and_changes_nothing() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|diagnostic| diagnostic["severity"] == "error"),
+            .any(|diagnostic| diagnostic["severity"] == "error"
+                && diagnostic["code"] == "missing-route"
+                && diagnostic["sentence"].is_string()
+                && diagnostic["fix"].is_string()),
         "{invalid}"
     );
 
