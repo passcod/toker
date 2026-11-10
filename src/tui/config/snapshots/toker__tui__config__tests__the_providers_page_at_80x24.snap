@@ -16,7 +16,8 @@ expression: "frame(&loaded_with_routing(), 80, 24, false)"
 │ state       on, not configured                                               │
 │ credential  none · env TOKER_ANTHROPIC_SUB_TOKEN is unset                    │
 │ endpoint    built-in                                                         │
-│ bindings    anthropic_sub.anthropic_messages · subscription · safeguards su… │
+│ bindings    anthropic_sub.anthropic_messages · subscription                  │
+│             safeguards supported                                             │
 │ rewrites    4  anthropic_messages 2 · openai_chat 1 · openai_responses 1     │
 │ defaults    2  anthropic_messages · unprefixed/anthropic_messages            │
 │ routes      1  claude-sub                                                    │

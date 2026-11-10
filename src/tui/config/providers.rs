@@ -250,11 +250,14 @@ fn safeguards_spans(binding: &Safeguards) -> Vec<Span<'static>> {
 }
 
 /// Each of a provider's bindings, with how it bills where routing said, and
-/// the safeguards support of the Messages ones.
+/// the safeguards support of the Messages ones. The support goes on a line
+/// of its own where it would not fit beside the binding, so it is never the
+/// part cut off.
 fn binding_lines(
     provider: &Provider,
     snapshot: &Snapshot,
     dependents: Option<&Dependents>,
+    room: usize,
 ) -> Vec<Vec<Span<'static>>> {
     let mut ids: Vec<(String, Option<String>)> = dependents
         .map(|found| {
@@ -275,7 +278,7 @@ fn binding_lines(
         }
     }
     ids.into_iter()
-        .map(|(id, cost)| {
+        .flat_map(|(id, cost)| {
             let mut spans = vec![Span::raw(id.clone())];
             if let Some(cost) = cost.filter(|cost| !cost.is_empty()) {
                 spans.push(Span::raw(" · "));
@@ -290,10 +293,16 @@ fn binding_lines(
                 .iter()
                 .find(|binding| binding.binding_id == id)
             {
-                spans.push(Span::raw(" · "));
-                spans.extend(safeguards_spans(binding));
+                let support = safeguards_spans(binding);
+                let width = |spans: &[Span<'static>]| spans.iter().map(Span::width).sum::<usize>();
+                if width(&spans) + 3 + width(&support) <= room {
+                    spans.push(Span::raw(" · "));
+                    spans.extend(support);
+                } else {
+                    return vec![spans, support];
+                }
             }
-            spans
+            vec![spans]
         })
         .collect()
 }
@@ -380,7 +389,12 @@ fn detail(provider: &Provider, snapshot: &Snapshot, state: &State, width: usize)
         ));
     }
 
-    let bindings = binding_lines(provider, snapshot, dependents.as_ref());
+    let bindings = binding_lines(
+        provider,
+        snapshot,
+        dependents.as_ref(),
+        width.saturating_sub(label_width),
+    );
     if bindings.is_empty() {
         lines.push(field("bindings", label_width, vec![toned("-", Tone::Dim)]));
     }

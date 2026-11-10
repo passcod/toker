@@ -118,9 +118,9 @@ The README's routing paragraph describes the draft, validate and activate flow, 
 
 ### Config pages
 
-- [ ] Providers (`converged-05` providers, `converged-06` providers-80x24): enabled or not, endpoint, credential source, endpoints count, routing dependents; open on an enabled provider that is not configured; detail with the fix on its last line; safeguards support and rejection mark per Messages binding, with clearing.
-- [ ] Settings (`converged-05` settings): gates, notice style per profile, session and ping header names, idle-sleep lock, transcript roots; unset values say their fallback; port and store path shown, not editable.
-- [ ] Edits in a small form under the row, checked as they change; token counts accept full figures and the `175k`/`1M` shorthand; a refusal beside the field.
+- [x] Providers (`converged-05` providers, `converged-06` providers-80x24): enabled or not, endpoint, credential source, endpoints count, routing dependents; open on an enabled provider that is not configured; detail with the fix on its last line; safeguards support and rejection mark per Messages binding, with clearing.
+- [x] Settings (`converged-05` settings): gates, notice style per profile, session and ping header names, idle-sleep lock, transcript roots; unset values say their fallback; port and store path shown, not editable.
+- [x] Edits in a small form under the row, checked as they change; token counts accept full figures and the `175k`/`1M` shorthand; a refusal beside the field.
 
 ### Accounts page
 

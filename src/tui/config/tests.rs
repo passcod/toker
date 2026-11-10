@@ -1025,3 +1025,13 @@ fn switching_views_puts_the_selection_back_at_the_top() {
     assert_eq!(state.view(), View::Settings);
     assert_eq!(state.selected(), 0);
 }
+
+/// Cut short, the detail gives up its lines before the fix for what is
+/// wrong, which is the reading it exists to give
+/// (spec: UTUI#what-is-shed-first).
+#[test]
+fn a_cut_detail_keeps_the_fix_for_what_is_wrong() {
+    let text = frame(&loaded_with_routing(), 80, 15, false);
+    assert!(text.contains("[e] enter key"), "{text}");
+    assert!(text.contains("anthropic_sub"), "{text}");
+}
