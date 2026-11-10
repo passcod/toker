@@ -187,6 +187,55 @@ async fn routing_controls_are_local_operation_gated_and_snapshot_is_content_free
             .await
             .unwrap();
         assert_eq!(own_name.status(), StatusCode::BAD_REQUEST, "{path}");
+
+        // The right operation with the wrong method is refused, as is a
+        // mutating body that does not say it is JSON (spec: DCTRL).
+        let wrong_method = app
+            .clone()
+            .oneshot(request("GET", &uri, Some(own), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            wrong_method.status(),
+            StatusCode::FORBIDDEN,
+            "{path} by GET"
+        );
+        let untyped = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("x-toker-control", own)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            untyped.status(),
+            StatusCode::FORBIDDEN,
+            "{path} without a JSON content type"
+        );
+    }
+
+    // The reads are GETs, and refuse every other method under their own
+    // operation name.
+    for (path, own) in [
+        ("snapshot", "routing-snapshot"),
+        ("revisions", "routing-revisions"),
+    ] {
+        let uri = format!("/_toker/routing/{path}");
+        let wrong_method = app
+            .clone()
+            .oneshot(request("POST", &uri, Some(own), Some(json!({}))))
+            .await
+            .unwrap();
+        assert_eq!(
+            wrong_method.status(),
+            StatusCode::FORBIDDEN,
+            "{path} by POST"
+        );
     }
 
     let snapshot = snapshot(&app).await;
