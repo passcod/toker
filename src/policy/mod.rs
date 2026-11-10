@@ -15,9 +15,11 @@ pub mod learning;
 pub mod legacy;
 pub mod matcher;
 pub mod pinning;
+pub mod reach;
 pub mod resolve;
 pub mod runtime;
 mod selector;
+pub mod shadow;
 pub mod transition;
 pub mod version;
 
@@ -48,6 +50,9 @@ pub use matcher::{
     MatcherCaptures, MatcherError, MatcherSpec, Template, TemplateError,
 };
 pub use pinning::{PinPersistence, persist_transition};
+pub use reach::{
+    EdgeSetting, EdgeStop, NoRoute, Reach, Serving, Skipped, offer_reach, route_reach,
+};
 pub use resolve::{
     AttemptPlan, AvailabilitySnapshot, BindingAvailability, CandidateEvidence,
     CatalogueAvailability, CircuitSnapshot, CompactionEvidence, CredentialSnapshot, Evidence,

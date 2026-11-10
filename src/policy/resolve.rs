@@ -249,6 +249,30 @@ pub enum SkipReason {
     WarmLaneTransitionDenied,
 }
 
+impl SkipReason {
+    /// A stable snake-case name for the reason, for the control surface.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Disabled => "candidate_disabled",
+            Self::BindingUnknown => "binding_unknown",
+            Self::ProviderUnconfigured => "provider_unconfigured",
+            Self::BindingDisabled => "provider_off",
+            Self::CredentialUnavailable => "no_credential",
+            Self::MissingRequiredCapability => "missing_capability",
+            Self::LacksServerSafeguards => "lacks_server_safeguards",
+            Self::BindingAffinity => "binding_affinity",
+            Self::ModelMissingFromFreshCatalogue => "model_not_offered",
+            Self::ModelUnknown => "model_unknown",
+            Self::SelectorUnresolved => "selector_unresolved",
+            Self::HealthCircuitOpen => "health_circuit_open",
+            Self::PreflightFallbackDisabled => "fallback_disabled",
+            Self::BilledBoundaryDenied => "billed_boundary_denied",
+            Self::WarmCacheTransitionDenied => "warm_cache_transition_denied",
+            Self::WarmLaneTransitionDenied => "warm_lane_transition_denied",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateEvidence {
     pub candidate_id: CandidateId,
@@ -1233,7 +1257,7 @@ fn from_reference<'a>(
     })
 }
 
-fn materialize_candidate(
+pub(super) fn materialize_candidate(
     candidate: &CompiledCandidate,
     parameters: &BTreeMap<StableId, String>,
     inventory: &OfferInventory,
@@ -1274,7 +1298,7 @@ fn empty_captures() -> Result<MatcherCaptures<'static>, ResolveFailure> {
         .ok_or(ResolveFailure::InvalidTemplate)
 }
 
-fn candidate_evidence(
+pub(super) fn candidate_evidence(
     candidate: &CompiledCandidate,
     model: Option<&str>,
     live: Option<&BindingAvailability>,
@@ -1344,7 +1368,7 @@ fn target_has_open_circuit(
     })
 }
 
-fn exact_evidence(
+pub(super) fn exact_evidence(
     candidate_id: &CandidateId,
     binding: &BindingId,
     model: &str,
@@ -1417,7 +1441,7 @@ fn model_availability(
     }
 }
 
-fn edge_denial(
+pub(super) fn edge_denial(
     edge: &CandidateEdge,
     from: Option<&BindingAvailability>,
     to: Option<&BindingAvailability>,
