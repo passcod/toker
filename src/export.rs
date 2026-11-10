@@ -404,7 +404,7 @@ mod tests {
                 }),
             }),
             lineage: Some(SessionLineage::codex_guardian("guardian:parent-session").unwrap()),
-            started_ms: None,
+            started_ms: Some(ts_ms - 1_000),
         }
     }
 

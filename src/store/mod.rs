@@ -2328,10 +2328,10 @@ mod tests {
                 compact_generations: Some(1),
                 forced_to: Some("z-ai/glm-5.3".to_string()),
                 started_ms: None,
-                requested_model: None,
-                effective_model: None,
+                requested_model: Some("openrouter/z-ai/glm-5.3".to_string()),
+                effective_model: Some("z-ai/glm-5.3".to_string()),
             },
-            "the eighteen display columns round-trip; the rest never cross"
+            "the display columns round-trip; the rest never cross"
         );
 
         // A bare row's absence stays absence on every one of the ten.
