@@ -112,6 +112,9 @@ pub(super) struct Snapshot {
     /// which a cold-gate minimum is checked against; absent where none
     /// does.
     pub(super) largest_context_window: Option<u64>,
+    /// The daemon's word that the cold-gate minimum in force is larger than
+    /// every window those models resolve, so no request could reach it.
+    pub(super) cold_min_unreachable: bool,
     pub(super) db_path: String,
     pub(super) port: u64,
 }
@@ -1180,6 +1183,7 @@ fn parse_snapshot(body: &Value) -> Snapshot {
             })
             .unwrap_or_default(),
         largest_context_window: body.get("largest_context_window").and_then(Value::as_u64),
+        cold_min_unreachable: body.get("cold_min_unreachable") == Some(&Value::Bool(true)),
         db_path: body
             .get("db_path")
             .and_then(Value::as_str)

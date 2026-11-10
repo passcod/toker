@@ -1097,3 +1097,33 @@ fn a_cut_detail_keeps_the_fix_for_what_is_wrong() {
     assert!(text.contains("[e] enter key"), "{text}");
     assert!(text.contains("anthropic_sub"), "{text}");
 }
+
+/// A minimum no window can reach switches the cold gate off without saying
+/// so, and turning off the provider that supplied the largest window does
+/// that with no edit to refuse. The daemon judges it; the page says it
+/// beside the minimum.
+#[test]
+fn a_cold_minimum_no_window_can_reach_is_warned_about_beside_it() {
+    let settings = |unreachable: bool| {
+        let mut body = snapshot_body();
+        body["settings"]["cold_min_tokens"] = json!(2_000_000);
+        body["cold_min_unreachable"] = json!(unreachable);
+        let mut state = State::default();
+        state.receive(Reply::Command(
+            Command::snapshot("config-snapshot"),
+            ok(body),
+        ));
+        state.set_view(View::Settings);
+        frame(&state, 160, 40, false)
+    };
+    let text = settings(true);
+    assert!(text.contains("the gate never fires"), "{text}");
+    assert!(
+        text.contains("more than any model's context, 1M"),
+        "the largest window is named: {text}"
+    );
+
+    // The same minimum where the daemon does not say it is out of reach.
+    let text = settings(false);
+    assert!(!text.contains("the gate never fires"), "{text}");
+}

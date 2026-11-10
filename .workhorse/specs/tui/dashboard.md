@@ -325,6 +325,8 @@ A token count MUST be accepted in full, and in the same shorthand the dashboard 
 
 A setting left unset MUST say what it falls back to.
 
+The page MUST warn beside the cold-gate minimum where the minimum in force is out of every resolvable window's reach, as [GCOLD](../gates/cold.md#only-a-request-that-could-be-the-re-read) specifies.
+
 The page MUST show where the store is and which port the listener answers on, and MUST NOT offer to edit either, those being settled before the store is opened as [DCONF](../service/config.md#before-the-store) specifies.
 
 ## The accounts page

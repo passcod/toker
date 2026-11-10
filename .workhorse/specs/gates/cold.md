@@ -25,8 +25,12 @@ The lane must still be both cold and large.
 A configured minimum larger than every context window the enabled bindings resolve, as [RMODEL](../routing/models.md#resolving-a-declared-window) specifies, MUST be refused, naming the largest of those windows.
 Where no window resolves, the minimum MUST be accepted.
 
+A minimum already in force that is larger than every window those bindings resolve MUST be reported, and MUST NOT be reported by refusing an edit that does not change it.
+The minimum in force is the configured one, or the built-in default where none is configured.
+
 > [!NOTE]
 > No request could reach such a minimum, so the gate would be switched off without saying so.
+> A minimum reachable when it was typed is stranded by turning off the provider that supplied the largest window, and the default is never typed at all, so refusing as it is typed does not catch every way of arriving there.
 
 ## Staying quiet
 

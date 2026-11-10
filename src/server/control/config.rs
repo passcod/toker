@@ -142,6 +142,20 @@ pub(crate) async fn snapshot(State(server): State<Server>, request: Request) -> 
             // save would
             // (spec: GCOLD#only-a-request-that-could-be-the-re-read).
             "largest_context_window": largest_window,
+            // Whether the minimum in force — the stored one, or the built-in
+            // where none is stored — is larger than every window the enabled
+            // bindings resolve, so no request could reach it and the gate is
+            // off without saying so. Turning off the provider that supplied
+            // the largest window does that with no edit to refuse, so the
+            // settings page says it rather than refusing an unrelated edit
+            // (spec: GCOLD#only-a-request-that-could-be-the-re-read).
+            "cold_min_unreachable": largest_window.is_some_and(|largest| {
+                stored
+                    .settings
+                    .cold_min_tokens
+                    .unwrap_or(crate::middleware::cold::DEFAULT_MIN_TOKENS)
+                    > largest
+            }),
             // Shown but not editable: settled before the store is opened
             // (spec: DCONF#before-the-store).
             "db_path": config.db_path.display().to_string(),

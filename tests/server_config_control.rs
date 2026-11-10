@@ -652,4 +652,35 @@ async fn an_edit_that_leaves_the_cold_minimum_alone_is_not_refused_for_it() {
         store.load_configuration().unwrap().settings.cold_min_tokens,
         Some(900_000)
     );
+    // The edit is not refused for it, but the condition is not silent: the
+    // snapshot says the minimum in force is out of every window's reach.
+    assert_eq!(snapshot(&app).await["cold_min_unreachable"], true);
+}
+
+/// A minimum is only refused as it is typed, so one that was reachable when
+/// it was stored is stranded by turning off the provider that supplied the
+/// largest window, and an unset one defaults to a figure never checked at
+/// all. Both are said on the snapshot the settings page reads.
+#[tokio::test]
+async fn a_stranded_cold_minimum_is_said_on_the_snapshot_without_refusing_anything() {
+    // The built-in default is larger than this listing's only window, and
+    // nothing ever typed it.
+    let (server, store) = server_listing(Some(128_000), true);
+    let app = server.router();
+    assert_eq!(
+        store.load_configuration().unwrap().settings.cold_min_tokens,
+        None
+    );
+    assert_eq!(snapshot(&app).await["cold_min_unreachable"], true);
+
+    // A minimum the largest window reaches is not out of reach.
+    let (status, accepted) = set_cold_minimum(&app, 128_000).await;
+    assert_eq!(status, StatusCode::OK, "{accepted}");
+    assert_eq!(snapshot(&app).await["cold_min_unreachable"], false);
+
+    // With no window resolving there is nothing to be out of reach of.
+    let (server, _) = server_listing(None, true);
+    let snapshot = snapshot(&server.router()).await;
+    assert_eq!(snapshot["largest_context_window"], Value::Null);
+    assert_eq!(snapshot["cold_min_unreachable"], false);
 }

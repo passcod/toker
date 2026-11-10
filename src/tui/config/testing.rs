@@ -69,6 +69,7 @@ pub(super) fn snapshot_body() -> Value {
         },
         "notices": {},
         "largest_context_window": 1000000,
+        "cold_min_unreachable": false,
         "db_path": "/home/example/.local/share/toker/toker.db",
         "port": 18123
     })

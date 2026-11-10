@@ -72,13 +72,30 @@ fn value(row: Row, snapshot: &Snapshot) -> Vec<Span<'static>> {
         Row::Cold => flag(settings.cold_enabled),
         Row::ColdOutlook => flag(settings.cold_outlook),
         Row::Awake => flag(settings.awake),
-        Row::ColdMinTokens => match settings.cold_min_tokens {
-            Some(tokens) => set(check::tokens_shown(tokens)),
-            None => fallback(
-                check::tokens_shown(crate::middleware::cold::DEFAULT_MIN_TOKENS),
-                "built-in",
-            ),
-        },
+        Row::ColdMinTokens => {
+            let mut spans = match settings.cold_min_tokens {
+                Some(tokens) => set(check::tokens_shown(tokens)),
+                None => fallback(
+                    check::tokens_shown(crate::middleware::cold::DEFAULT_MIN_TOKENS),
+                    "built-in",
+                ),
+            };
+            // Turning off the provider that supplied the largest window
+            // strands a minimum typed when it was reachable, and an unset
+            // one is never typed at all, so the page says it here rather
+            // than waiting for an edit to refuse.
+            if snapshot.cold_min_unreachable {
+                let largest = snapshot
+                    .largest_context_window
+                    .map(check::tokens_shown)
+                    .unwrap_or_else(|| "none".to_owned());
+                spans.push(toned(
+                    format!("  more than any model's context, {largest}: the gate never fires"),
+                    Tone::Warn,
+                ));
+            }
+            spans
+        }
         Row::ColdIdleMin => match settings.cold_idle_min {
             Some(minutes) => set(minutes.to_string()),
             None => vec![toned("follows lane TTL", Tone::Dim)],
