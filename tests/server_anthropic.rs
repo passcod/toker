@@ -1461,6 +1461,14 @@ async fn the_openrouter_prefix_without_its_block_is_answered_locally() {
     );
     let rows = wait_for_rows(&store, 1).await;
     assert_eq!(rows[0].kind, Some(RowKind::RouteUnavailable));
+    // Nothing was routed, so there is no model it was routed to; and the
+    // request is no longer in flight once its row is there.
+    assert_eq!(
+        rows[0].requested_model.as_deref(),
+        Some("openrouter/moonshotai/kimi-k3")
+    );
+    assert_eq!(rows[0].effective_model, None);
+    assert!(store.in_flight_rows().expect("in flight").is_empty());
 }
 
 #[tokio::test]

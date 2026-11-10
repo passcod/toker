@@ -16,8 +16,8 @@ Scenarios that show a request on the dashboard from its arrival, and give sessio
 - [x] A fallback moves the record to the next attempt, and a clone of the guard holds it until the last drops.
 - [x] A record a crash left behind is cleared when the service starts.
 - [x] A gate row carries the requested and effective model, and when handling began (verifies spec: SLEDGR#fields-that-need-care).
-- [ ] The cold, cold-recap and cold-quiet rows carry both models.
-- [ ] A request the policy cannot route is in flight until its route-unavailable row lands.
+- [x] The cold, cold-recap and cold-quiet rows carry both models.
+- [x] A request the policy cannot route has its requested model and no effective one, and is not in flight once its row lands.
 
 ## Dashboard
 
