@@ -27,20 +27,30 @@ pub(super) struct World {
     /// revision 10 live, two warm lanes still on revision 9 and the claude
     /// settings not yet written.
     pub(super) saved: bool,
+    /// A fresh install: a live revision holding no record at all.
+    pub(super) empty: bool,
 }
 
 impl World {
     pub(super) const AT_REST: World = World {
         profile_defaults: false,
         saved: false,
+        empty: false,
     };
     pub(super) const FULL: World = World {
         profile_defaults: true,
         saved: false,
+        empty: false,
     };
     pub(super) const SAVED: World = World {
         profile_defaults: false,
         saved: true,
+        empty: false,
+    };
+    pub(super) const EMPTY: World = World {
+        profile_defaults: false,
+        saved: false,
+        empty: true,
     };
 }
 
@@ -1093,6 +1103,64 @@ fn document(world: World) -> Value {
 
 /// The snapshot `routing-snapshot` answers with, for `world`.
 pub(super) fn snapshot(world: World) -> Value {
+    let snapshot = built(world);
+    if world.empty {
+        emptied(snapshot)
+    } else {
+        snapshot
+    }
+}
+
+/// `snapshot` as a fresh install has it: the live revision holds no record,
+/// and every protocol still has its scope and the default row that says it
+/// refuses.
+fn emptied(mut snapshot: Value) -> Value {
+    let policy = &mut snapshot["active_revision"]["policy"];
+    for table in [
+        "presentations",
+        "routes",
+        "defaults",
+        "rewrites",
+        "classifiers",
+        "upgrades",
+    ] {
+        policy[table] = json!([]);
+    }
+    policy["compaction"] = Value::Null;
+    let active = &mut snapshot["derived"]["active"];
+    for table in [
+        "routes",
+        "classifiers",
+        "presentation_records",
+        "rewrites",
+        "upgrades",
+    ] {
+        active[table] = json!([]);
+    }
+    active["compaction"] = Value::Null;
+    let protocols = ["anthropic_messages", "openai_chat", "openai_responses"];
+    active["scopes"] = protocols
+        .iter()
+        .map(|protocol| {
+            merge(
+                scope_fields(protocol),
+                json!({"presentations": 0, "rewrites": 0, "has_default": false, "else": "refused"}),
+            )
+        })
+        .collect();
+    active["defaults"] = protocols
+        .iter()
+        .map(|protocol| {
+            merge(
+                scope_fields(protocol),
+                json!({"exists": false, "route_id": null, "reach": no_route(), "hits": null}),
+            )
+        })
+        .collect();
+    snapshot
+}
+
+fn built(world: World) -> Value {
     let revision = if world.saved { 10 } else { 9 };
     let routes: Vec<Value> = routes()
         .iter()

@@ -4,6 +4,8 @@ mod data;
 mod edit_view;
 mod editing;
 mod form;
+#[cfg(test)]
+mod frames_tests;
 mod history;
 #[cfg(test)]
 mod history_tests;

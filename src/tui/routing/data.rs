@@ -44,6 +44,24 @@ pub(super) fn policy(snapshot: &Value) -> Option<&Value> {
         .filter(|policy| !policy.is_null())
 }
 
+/// Whether the live revision holds no record at all, as a fresh install's
+/// does. A snapshot with no policy in it says nothing either way.
+pub(super) fn holds_nothing(snapshot: &Value) -> bool {
+    policy(snapshot).is_some_and(|policy| {
+        [
+            "presentations",
+            "routes",
+            "defaults",
+            "rewrites",
+            "classifiers",
+            "upgrades",
+        ]
+        .iter()
+        .all(|table| array(policy, table).is_empty())
+            && policy.get("compaction").is_none_or(Value::is_null)
+    })
+}
+
 pub(super) fn revision_id(snapshot: &Value) -> Option<i64> {
     snapshot
         .get("active_revision")

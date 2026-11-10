@@ -273,6 +273,15 @@ fn lookup_tab(
         detail = edit_view::preview(editing, active, width);
         title = "PREVIEW";
     }
+    // A rule or a default sends to a route, so with none there is nothing to
+    // add and nothing to read about what exists: the table says where to go.
+    if editing.is_none()
+        && matches!(tab, Tab::Rewrites | Tab::Defaults)
+        && array(active, "routes").is_empty()
+    {
+        table.body.push(rules::needs_a_route());
+        detail = Vec::new();
+    }
     if table.body.is_empty() {
         detail = Vec::new();
     }

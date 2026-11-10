@@ -83,7 +83,11 @@ pub(super) fn text_of(
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     parts.extend(lead.map(str::to_owned));
-    if let Some(revision) = revision {
+    // A live revision with nothing in it is a fresh install, whatever number
+    // it carries, so the header says what is missing rather than what is live.
+    if snapshot.is_some_and(data::holds_nothing) {
+        parts.push("no policy yet".to_owned());
+    } else if let Some(revision) = revision {
         parts.push(format!("rev {revision} live"));
     }
     if let Some(snapshot) = snapshot {

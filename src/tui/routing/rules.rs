@@ -359,11 +359,7 @@ pub(super) fn rewrites_table(active: &Value, width: usize) -> Table {
     for group in &groups {
         let scope = text(group.scope, "scope_label");
         let rules = group.rules.len();
-        let mut clauses = if rules == 0 {
-            "no rules".to_owned()
-        } else {
-            counted(rules, "rule", "rules")
-        };
+        let mut clauses = counted(rules, "rule", "rules");
         if !kind_col
             && rules > 0
             && let Some(kind) = kinds.iter().next()
@@ -459,6 +455,18 @@ fn default_end_row(
             .right(no_reach(), HITS)
             .line()
     }
+}
+
+/// The line that stands where a table's add control would be while there is
+/// no route for a record to send to: the control with what is in its way, and
+/// the key that goes there. It is a line of the table, not a sentence under it
+/// (spec: UTUI#editing).
+pub(super) fn needs_a_route() -> BodyLine {
+    BodyLine::plain(Line::from(vec![
+        span("[n] needs a route first", dim()),
+        Span::raw("   [4] go to routes"),
+    ]))
+    .pinned()
 }
 
 /// What the `?` overlay and the controls line call a rule's controls.
