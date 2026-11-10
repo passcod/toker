@@ -89,10 +89,10 @@ The README's routing paragraph describes the draft, validate and activate flow, 
 
 ### Header (every page)
 
-- [ ] `tui/chrome.rs`: replace the `⇄` chip with a button per page, padded and spaced a cell, current page bold blue, others dark grey, each with a click rectangle; `Header` returns them.
-- [ ] `tui/chrome.rs` tabs: drop counts, then scroll around the current tab with `‹` and `›`, then numbers, then the current tab alone; the buttons never shorten.
-- [ ] `tui/mod.rs`: route a click on a page button to that page; `Tab` still cycles; drop `tab or ⇄` from every page's `KEYS`.
-- [ ] Dashboard and accounts headers use the same buttons; snapshots at 120, 100 and 80 columns.
+- [x] `tui/chrome.rs`: replace the `⇄` chip with a button per page, padded and spaced a cell, current page bold blue, others dark grey, each with a click rectangle; `Header` returns them.
+- [x] `tui/chrome.rs` tabs: drop counts, then scroll around the current tab with `‹` and `›`, then numbers, then the current tab alone; the buttons never shorten.
+- [x] `tui/mod.rs`: route a click on a page button to that page; `Tab` still cycles; drop `tab or ⇄` from every page's `KEYS`.
+- [x] Dashboard and accounts headers use the same buttons; snapshots at 120, 100 and 80 columns.
 
 ### Routing page
 
@@ -124,7 +124,7 @@ The README's routing paragraph describes the draft, validate and activate flow, 
 
 ### Accounts page
 
-- [ ] Check against UTUI's accounts section: every known account with number, email and last seen; unresolved credentials as their own entry; naming one; which accounts were named by the operator.
+- [x] Check against UTUI's accounts section: every known account with number, email and last seen; unresolved credentials as their own entry; naming one; which accounts were named by the operator.
 
 ### Docs
 
