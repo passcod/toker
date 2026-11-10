@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Value, json};
 
 use super::{Context, hits_body, matcher_body, reach_body, scope_fields};
-use crate::policy::shadow::{Basis, Catches, Earlier, Shape, compare};
+use crate::policy::shadow::{Basis, Catches, Earlier, Shadowing, Shape};
 use crate::policy::{
     AdapterMetadata, ArgumentBinding, BindingId, CompiledRewrite, FrontendProtocol, FrontendScope,
     MatcherSpec, NoRoute, PolicyDocument, PresentationId, PresentationRoute, PresentationSource,
@@ -72,6 +72,17 @@ struct Published {
     ranked: Vec<(usize, String)>,
 }
 
+/// What building the tables looks things up in, made once per build.
+struct Tables<'a> {
+    ctx: &'a Context<'a>,
+    /// Scopes in the order the tables are drawn.
+    order: Vec<FrontendScope>,
+    rewrite_rules: BTreeMap<&'a RewriteId, &'a RewriteRule>,
+    published: BTreeMap<PresentationId, Published>,
+    /// Every rewrite matcher, compiled and run over the catalogue once.
+    shadowing: Shadowing<'a>,
+}
+
 /// Scopes in the order the tables are drawn: for each protocol in turn, each
 /// profile that has any record, then the protocol itself, since what a
 /// profile's rules miss is tried against its protocol's
@@ -114,8 +125,6 @@ fn protocol_of(scope: &FrontendScope) -> FrontendProtocol {
 }
 
 pub(super) fn build(ctx: &Context<'_>, slug_rows: &[Value]) -> Rules {
-    let order = scope_order(ctx.document);
-
     // What each presentation publishes and where those names go.
     let mut published: BTreeMap<PresentationId, Published> = BTreeMap::new();
     for (scope, slug, presentation) in ctx.policy.all_presentations() {
@@ -153,6 +162,22 @@ pub(super) fn build(ctx: &Context<'_>, slug_rows: &[Value]) -> Rules {
         .iter()
         .map(|rule| (&rule.id, rule))
         .collect();
+    let tables = Tables {
+        ctx,
+        order: scope_order(ctx.document),
+        shadowing: Shadowing::new(
+            &ctx.names,
+            ctx.document.rewrites.iter().map(|rule| &rule.model_matcher),
+        ),
+        rewrite_rules,
+        published,
+    };
+    let Tables {
+        order,
+        rewrite_rules,
+        published,
+        ..
+    } = &tables;
 
     let mut rules = Rules {
         scopes: Vec::new(),
@@ -163,7 +188,7 @@ pub(super) fn build(ctx: &Context<'_>, slug_rows: &[Value]) -> Rules {
         to_offer: Vec::new(),
     };
 
-    for scope in &order {
+    for scope in order {
         let documented: Vec<_> = ctx
             .document
             .presentations
@@ -179,7 +204,7 @@ pub(super) fn build(ctx: &Context<'_>, slug_rows: &[Value]) -> Rules {
                 presentation,
                 index + 1,
                 published.get(&presentation.id),
-                &published,
+                published,
                 slug_rows,
             );
             let referrer = Referrer {
@@ -218,16 +243,7 @@ pub(super) fn build(ctx: &Context<'_>, slug_rows: &[Value]) -> Rules {
                 continue;
             };
             let position = index + 1;
-            let record = rewrite_record(
-                ctx,
-                scope,
-                position,
-                rewrite,
-                rule,
-                &order,
-                &rewrite_rules,
-                &published,
-            );
+            let record = rewrite_record(&tables, scope, position, rewrite, rule);
             rules
                 .to_route
                 .entry(rewrite.target().route_id().clone())
@@ -365,17 +381,14 @@ fn example(ctx: &Context<'_>, rewrite: &CompiledRewrite, rule: &RewriteRule) -> 
     json!({"in": input, "out": output, "invented": invented})
 }
 
-#[allow(clippy::too_many_arguments)]
 fn rewrite_record(
-    ctx: &Context<'_>,
+    tables: &Tables<'_>,
     scope: &FrontendScope,
     position: usize,
     rewrite: &CompiledRewrite,
     rule: &RewriteRule,
-    order: &[FrontendScope],
-    rewrite_rules: &BTreeMap<&RewriteId, &RewriteRule>,
-    published: &BTreeMap<PresentationId, Published>,
 ) -> Value {
+    let ctx = tables.ctx;
     let route_id = rewrite.target().route_id();
     let mut record = scope_fields(scope);
     record["id"] = json!(rewrite.id());
@@ -394,13 +407,10 @@ fn rewrite_record(
         ctx.hits.rewrites.get(rewrite.id()).copied().unwrap_or(0),
     );
     record["shadowed_by"] = json!(rewrite_shadows(
-        ctx,
+        tables,
         scope,
         position,
         &rule.model_matcher,
-        order,
-        rewrite_rules,
-        published,
     ));
     record
 }
@@ -411,15 +421,19 @@ fn rewrite_record(
 ///
 /// A record of a profile ahead of a protocol's rule catches only that
 /// profile's requests, which the entry says with `scope_limited`.
-fn rewrite_shadows(
-    ctx: &Context<'_>,
+fn rewrite_shadows<'a>(
+    tables: &Tables<'a>,
     scope: &FrontendScope,
     position: usize,
-    spec: &MatcherSpec,
-    order: &[FrontendScope],
-    rewrite_rules: &BTreeMap<&RewriteId, &RewriteRule>,
-    published: &BTreeMap<PresentationId, Published>,
+    spec: &'a MatcherSpec,
 ) -> Vec<Value> {
+    let Tables {
+        ctx,
+        order,
+        rewrite_rules,
+        published,
+        shadowing,
+    } = tables;
     let protocol = protocol_of(scope);
     let in_protocol_scope = matches!(scope, FrontendScope::Protocol { .. });
     let mut found = Vec::new();
@@ -450,16 +464,18 @@ fn rewrite_shadows(
         .into_iter()
         .chain(presentations(&protocol_wanted))
     {
-        let Some((catches, basis)) = compare(&Earlier::Names(&published.slugs), spec, &ctx.names)
+        let Some((catches, basis)) = shadowing.compare(&Earlier::Names(&published.slugs), spec)
         else {
             continue;
         };
         found.push(shadow_entry(
-            "presentation",
-            Some(presentation.id.as_str()),
-            &presentation.scope,
-            None,
-            None,
+            &Catcher {
+                by: "presentation",
+                id: Some(presentation.id.as_str()),
+                scope: &presentation.scope,
+                position: None,
+                matcher: None,
+            },
             catches,
             &basis,
             in_protocol_scope && matches!(presentation.scope, FrontendScope::Profile { .. }),
@@ -476,14 +492,16 @@ fn rewrite_shadows(
                     continue;
                 };
                 if let Some((catches, basis)) =
-                    compare(&Earlier::Matcher(&rule.model_matcher), spec, &ctx.names)
+                    shadowing.compare(&Earlier::Matcher(&rule.model_matcher), spec)
                 {
                     found.push(shadow_entry(
-                        "profile_rule",
-                        Some(earlier.id().as_str()),
-                        profile_scope,
-                        Some(index + 1),
-                        Some(&rule.model_matcher),
+                        &Catcher {
+                            by: "profile_rule",
+                            id: Some(earlier.id().as_str()),
+                            scope: profile_scope,
+                            position: Some(index + 1),
+                            matcher: Some(&rule.model_matcher),
+                        },
                         catches,
                         &basis,
                         true,
@@ -505,14 +523,16 @@ fn rewrite_shadows(
             continue;
         };
         if let Some((catches, basis)) =
-            compare(&Earlier::Matcher(&rule.model_matcher), spec, &ctx.names)
+            shadowing.compare(&Earlier::Matcher(&rule.model_matcher), spec)
         {
             found.push(shadow_entry(
-                "earlier_rule",
-                Some(earlier.id().as_str()),
-                scope,
-                Some(index + 1),
-                Some(&rule.model_matcher),
+                &Catcher {
+                    by: "earlier_rule",
+                    id: Some(earlier.id().as_str()),
+                    scope,
+                    position: Some(index + 1),
+                    matcher: Some(&rule.model_matcher),
+                },
                 catches,
                 &basis,
                 false,
@@ -522,22 +542,26 @@ fn rewrite_shadows(
     found
 }
 
-#[allow(clippy::too_many_arguments)]
-fn shadow_entry(
-    by: &str,
-    id: Option<&str>,
-    scope: &FrontendScope,
+/// The earlier record that catches some of a rewrite's matches.
+struct Catcher<'a> {
+    by: &'a str,
+    id: Option<&'a str>,
+    scope: &'a FrontendScope,
     position: Option<usize>,
-    matcher: Option<&MatcherSpec>,
+    matcher: Option<&'a MatcherSpec>,
+}
+
+fn shadow_entry(
+    catcher: &Catcher<'_>,
     catches: Catches,
     basis: &Basis,
     scope_limited: bool,
 ) -> Value {
-    let mut entry = scope_fields(scope);
-    entry["by"] = json!(by);
-    entry["id"] = json!(id);
-    entry["position"] = json!(position);
-    entry["matcher"] = matcher.map_or(Value::Null, matcher_body);
+    let mut entry = scope_fields(catcher.scope);
+    entry["by"] = json!(catcher.by);
+    entry["id"] = json!(catcher.id);
+    entry["position"] = json!(catcher.position);
+    entry["matcher"] = catcher.matcher.map_or(Value::Null, matcher_body);
     entry["catches"] = json!(catches.code());
     match basis {
         Basis::Comparison => {
@@ -707,11 +731,13 @@ fn presentation_shadows(
             Catches::Part
         };
         found.push(shadow_entry(
-            "presentation",
-            Some(id.as_str()),
-            &other.scope,
-            None,
-            None,
+            &Catcher {
+                by: "presentation",
+                id: Some(id.as_str()),
+                scope: &other.scope,
+                position: None,
+                matcher: None,
+            },
             catches,
             &Basis::Names {
                 compared: published.slugs.len(),

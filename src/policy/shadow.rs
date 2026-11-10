@@ -8,7 +8,7 @@
 //! regular expression cannot, so those are compared against the names a client
 //! could send, which are the offers the catalogues list.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{CompiledMatcher, MatcherSpec};
 
@@ -160,91 +160,184 @@ pub enum Earlier<'a> {
 
 const EXAMPLES: usize = 3;
 
+/// Matchers prepared once for comparison against the names a client could
+/// send.
+///
+/// Each distinct matcher is compiled once and run over the names once, so
+/// comparing any two of them is a set intersection, however many pairs a
+/// table holds.
+///
+/// `names` are the ones a glob or a regular expression is judged against:
+/// none of them is not a refusal to compare but an absence of anything to
+/// compare, and reads as catching nothing.
+pub struct Shadowing<'a> {
+    names: &'a BTreeSet<String>,
+    prepared: BTreeMap<(u8, &'a str), Prepared<'a>>,
+}
+
+/// One matcher, compiled, with the names it catches.
+struct Prepared<'a> {
+    /// Absent where the matcher does not compile, which compares as catching
+    /// nothing.
+    compiled: Option<CompiledMatcher>,
+    caught: BTreeSet<&'a str>,
+}
+
+impl<'a> Prepared<'a> {
+    fn new(spec: &'a MatcherSpec, names: &'a BTreeSet<String>) -> Self {
+        let compiled = spec.compile().ok();
+        let mut caught = BTreeSet::new();
+        if let Some(compiled) = &compiled {
+            let mut judge = |name: &'a str| {
+                if compiled.is_match(name).unwrap_or(false) {
+                    caught.insert(name);
+                }
+            };
+            names.iter().map(String::as_str).for_each(&mut judge);
+            // A matcher naming one thing is judged on that thing even where
+            // no catalogue lists it.
+            if let MatcherSpec::Exact(name) = spec {
+                judge(name);
+            }
+        }
+        Self { compiled, caught }
+    }
+}
+
+enum Held<'s, 'a> {
+    Shared(&'s Prepared<'a>),
+    Own(Prepared<'a>),
+}
+
+impl<'a> std::ops::Deref for Held<'_, 'a> {
+    type Target = Prepared<'a>;
+
+    fn deref(&self) -> &Prepared<'a> {
+        match self {
+            Self::Shared(prepared) => prepared,
+            Self::Own(prepared) => prepared,
+        }
+    }
+}
+
+fn key(spec: &MatcherSpec) -> (u8, &str) {
+    match spec {
+        MatcherSpec::Exact(value) => (0, value),
+        MatcherSpec::Glob(value) => (1, value),
+        MatcherSpec::Regex(value) => (2, value),
+    }
+}
+
+impl<'a> Shadowing<'a> {
+    /// Prepare every matcher that will be compared.
+    pub fn new(
+        names: &'a BTreeSet<String>,
+        specs: impl IntoIterator<Item = &'a MatcherSpec>,
+    ) -> Self {
+        let mut prepared = BTreeMap::new();
+        for spec in specs {
+            prepared
+                .entry(key(spec))
+                .or_insert_with(|| Prepared::new(spec, names));
+        }
+        Self { names, prepared }
+    }
+
+    /// The matcher as prepared, or prepared now where it was not named up
+    /// front.
+    fn prepared(&self, spec: &'a MatcherSpec) -> Held<'_, 'a> {
+        match self.prepared.get(&key(spec)) {
+            Some(prepared) => Held::Shared(prepared),
+            None => Held::Own(Prepared::new(spec, self.names)),
+        }
+    }
+
+    /// What `earlier` catches of what `later` matches, where it catches any.
+    pub fn compare(
+        &self,
+        earlier: &Earlier<'a>,
+        later: &'a MatcherSpec,
+    ) -> Option<(Catches, Basis)> {
+        let later_shape = Shape::of(later);
+        match (earlier, &later_shape) {
+            (Earlier::Matcher(earlier), Shape::Exact(_) | Shape::Prefix { .. })
+                if matches!(Shape::of(earlier), Shape::Exact(_) | Shape::Prefix { .. }) =>
+            {
+                structural(&Shape::of(earlier), &later_shape)
+                    .map(|catches| (catches, Basis::Comparison))
+            }
+            (Earlier::Names(set), Shape::Exact(name)) => set
+                .contains(name)
+                .then_some((Catches::All, Basis::Comparison)),
+            (Earlier::Names(set), _) => {
+                // A closed set cannot cover a matcher that accepts unboundedly
+                // many names, so it catches part where it catches any.
+                let later = self.prepared(later);
+                let later = later.compiled.as_ref()?;
+                let caught: Vec<String> = set
+                    .iter()
+                    .filter(|name| later.is_match(name).unwrap_or(false))
+                    .cloned()
+                    .collect();
+                (!caught.is_empty()).then(|| {
+                    (
+                        Catches::Part,
+                        Basis::Names {
+                            compared: caught.len(),
+                            examples: caught.into_iter().take(EXAMPLES).collect(),
+                        },
+                    )
+                })
+            }
+            (Earlier::Matcher(earlier), _) => {
+                let (earlier, later) = (self.prepared(earlier), self.prepared(later));
+                if earlier.compiled.is_none() || later.compiled.is_none() {
+                    return None;
+                }
+                let compared = later.caught.len();
+                let overlap: Vec<&str> = later
+                    .caught
+                    .intersection(&earlier.caught)
+                    .copied()
+                    .collect();
+                if overlap.is_empty() {
+                    return None;
+                }
+                let catches = if overlap.len() == compared {
+                    Catches::All
+                } else {
+                    Catches::Part
+                };
+                Some((
+                    catches,
+                    Basis::Names {
+                        compared,
+                        examples: overlap
+                            .into_iter()
+                            .take(EXAMPLES)
+                            .map(str::to_owned)
+                            .collect(),
+                    },
+                ))
+            }
+        }
+    }
+}
+
 /// What `earlier` catches of what `later` matches, where it catches any.
 ///
-/// `names` are the ones a client could send, which a glob or a regular
-/// expression is judged against: none for them is not a refusal to compare but
-/// an absence of anything to compare, and reads as catching nothing.
+/// For one comparison; a table of them prepares its matchers once with
+/// [`Shadowing`].
 pub fn compare(
     earlier: &Earlier<'_>,
     later: &MatcherSpec,
     names: &BTreeSet<String>,
 ) -> Option<(Catches, Basis)> {
-    let later_shape = Shape::of(later);
-    match (earlier, &later_shape) {
-        (Earlier::Matcher(earlier), Shape::Exact(_) | Shape::Prefix { .. })
-            if matches!(Shape::of(earlier), Shape::Exact(_) | Shape::Prefix { .. }) =>
-        {
-            structural(&Shape::of(earlier), &later_shape)
-                .map(|catches| (catches, Basis::Comparison))
-        }
-        (Earlier::Names(set), Shape::Exact(name)) => set
-            .contains(name)
-            .then_some((Catches::All, Basis::Comparison)),
-        (Earlier::Names(set), _) => {
-            // A closed set cannot cover a matcher that accepts unboundedly
-            // many names, so it catches part where it catches any.
-            let later = later.compile().ok()?;
-            let caught: Vec<String> = set
-                .iter()
-                .filter(|name| later.is_match(name).unwrap_or(false))
-                .cloned()
-                .collect();
-            (!caught.is_empty()).then(|| {
-                (
-                    Catches::Part,
-                    Basis::Names {
-                        compared: caught.len(),
-                        examples: caught.into_iter().take(EXAMPLES).collect(),
-                    },
-                )
-            })
-        }
-        (Earlier::Matcher(earlier), _) => {
-            let (earlier, later_compiled) = (earlier.compile().ok()?, later.compile().ok()?);
-            let mut universe: BTreeSet<&str> = names.iter().map(String::as_str).collect();
-            // A later matcher naming one thing is judged on that thing even
-            // where no catalogue lists it.
-            if let Shape::Exact(name) = &later_shape {
-                universe.insert(name);
-            }
-            names_comparison(&earlier, &later_compiled, universe)
-        }
-    }
-}
-
-/// Judge an earlier matcher on the names the later one catches.
-fn names_comparison(
-    earlier: &CompiledMatcher,
-    later: &CompiledMatcher,
-    universe: BTreeSet<&str>,
-) -> Option<(Catches, Basis)> {
-    let mut compared = 0;
-    let mut overlap = Vec::new();
-    for name in universe {
-        if !later.is_match(name).unwrap_or(false) {
-            continue;
-        }
-        compared += 1;
-        if earlier.is_match(name).unwrap_or(false) {
-            overlap.push(name.to_owned());
-        }
-    }
-    if overlap.is_empty() {
-        return None;
-    }
-    let catches = if overlap.len() == compared {
-        Catches::All
-    } else {
-        Catches::Part
+    let specs = match earlier {
+        Earlier::Matcher(earlier) => vec![*earlier, later],
+        Earlier::Names(_) => vec![later],
     };
-    Some((
-        catches,
-        Basis::Names {
-            compared,
-            examples: overlap.into_iter().take(EXAMPLES).collect(),
-        },
-    ))
+    Shadowing::new(names, specs).compare(earlier, later)
 }
 
 /// Compare two matchers each an exact name or a prefix.
@@ -437,5 +530,47 @@ mod tests {
         assert_eq!((catches, basis), (Catches::All, Basis::Comparison));
         let elsewhere = MatcherSpec::Exact("codex_sub/x".to_owned());
         assert!(compare(&Earlier::Names(&slugs), &elsewhere, &names(&[])).is_none());
+    }
+
+    #[test]
+    fn a_table_prepared_once_judges_each_pair_as_a_lone_comparison_does() {
+        let known = names(&["gpt-5", "gpt-5-mini", "claude-opus", "o/claude-opus"]);
+        let specs = [
+            MatcherSpec::Glob("gpt-*".to_owned()),
+            regex("^gpt-5.*$"),
+            regex("claude"),
+            MatcherSpec::Exact("claude-opus".to_owned()),
+            MatcherSpec::Exact("unlisted".to_owned()),
+            regex("("),
+        ];
+        let shadowing = Shadowing::new(&known, specs.iter());
+        let mut caught = 0;
+        for earlier in &specs {
+            for later in &specs {
+                let lone = compare(&Earlier::Matcher(earlier), later, &known);
+                caught += usize::from(lone.is_some());
+                assert_eq!(
+                    shadowing.compare(&Earlier::Matcher(earlier), later),
+                    lone,
+                    "{earlier:?} over {later:?}"
+                );
+            }
+        }
+        assert!(caught > 0, "the fixture should shadow something");
+        assert_eq!(
+            shadowing.compare(&Earlier::Matcher(&specs[0]), &specs[1]),
+            Some((
+                Catches::All,
+                Basis::Names {
+                    compared: 2,
+                    examples: vec!["gpt-5".to_owned(), "gpt-5-mini".to_owned()],
+                }
+            ))
+        );
+        // A matcher that does not compile catches and is caught by nothing.
+        assert_eq!(
+            shadowing.compare(&Earlier::Matcher(&specs[5]), &specs[0]),
+            None
+        );
     }
 }
