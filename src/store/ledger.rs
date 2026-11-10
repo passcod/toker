@@ -1417,6 +1417,11 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
     let facts_capabilities = facts
         .map(|facts| serde_json::to_string(&facts.required_capabilities))
         .transpose()?;
+    let lane_state = facts.and_then(|facts| match &facts.lane {
+        crate::policy::facts::RecordedLane::Read(lane) => Some(lane),
+        _ => None,
+    });
+    let lane_pin = lane_state.and_then(|lane| lane.pin.as_ref());
 
     let mut stmt = conn.prepare_cached(
         "INSERT INTO requests (
@@ -1442,7 +1447,10 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
             facts_recorded, facts_profile, facts_protocol, facts_requested_model,
             facts_prompt_bound, facts_message_count, facts_tool_count,
             facts_capabilities, facts_asks_safeguards, facts_binding_affinity,
-            facts_class, lookup_kind, lookup_scope
+            facts_class, lookup_kind, lookup_scope,
+            facts_lane, facts_lane_route_fingerprint, facts_lane_candidate_id,
+            facts_lane_binding_id, facts_lane_effective_model,
+            facts_lane_forced_from, facts_lane_forced_to
         ) VALUES (
             :ts_ms, :duration_ms, :kind, :frontend, :provider, :route, :session_id, :ping,
             :credential_digest, :account_number,
@@ -1466,7 +1474,10 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
             :facts_recorded, :facts_profile, :facts_protocol, :facts_requested_model,
             :facts_prompt_bound, :facts_message_count, :facts_tool_count,
             :facts_capabilities, :facts_asks_safeguards, :facts_binding_affinity,
-            :facts_class, :lookup_kind, :lookup_scope
+            :facts_class, :lookup_kind, :lookup_scope,
+            :facts_lane, :facts_lane_route_fingerprint, :facts_lane_candidate_id,
+            :facts_lane_binding_id, :facts_lane_effective_model,
+            :facts_lane_forced_from, :facts_lane_forced_to
         )",
     )?;
     stmt.execute(rusqlite::named_params! {
@@ -1565,6 +1576,13 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
         ":facts_class": facts.map(|facts| crate::policy::facts::class_name(facts.class)),
         ":lookup_kind": lookup.map(|(kind, _)| kind.as_str()),
         ":lookup_scope": lookup.and_then(|(_, scope)| scope).map(LookupScope::as_str),
+        ":facts_lane": facts.and_then(|facts| crate::policy::facts::lane_name(&facts.lane)),
+        ":facts_lane_route_fingerprint": lane_pin.map(|pin| pin.route_fingerprint.to_string()),
+        ":facts_lane_candidate_id": lane_pin.map(|pin| pin.candidate_id.to_string()),
+        ":facts_lane_binding_id": lane_pin.map(|pin| pin.binding_id.to_string()),
+        ":facts_lane_effective_model": lane_pin.map(|pin| pin.effective_model.as_str()),
+        ":facts_lane_forced_from": lane_state.and_then(|lane| lane.forced_from.as_deref()),
+        ":facts_lane_forced_to": lane_state.and_then(|lane| lane.forced_to.as_deref()),
     })?;
     Ok(())
 }
@@ -2880,6 +2898,56 @@ pub(super) fn read_recorded_facts(row: &rusqlite::Row<'_>) -> Result<Option<Reco
             crate::policy::facts::parse_class,
         )?
         .ok_or_else(|| missing("facts_class"))?,
+        lane: read_recorded_lane(row)?,
+    }))
+}
+
+/// The lane a row recorded, or `NotRecorded` where it predates it.
+fn read_recorded_lane(row: &rusqlite::Row<'_>) -> Result<crate::policy::facts::RecordedLane> {
+    use crate::policy::facts::{RecordedLane, RecordedLaneState, RecordedPin};
+    let Some(value) = row.get::<_, Option<String>>("facts_lane")? else {
+        return Ok(RecordedLane::NotRecorded);
+    };
+    let Some(temperature) = crate::policy::facts::parse_lane_temperature(&value) else {
+        return Err(Error::InvalidRoutingState(format!(
+            "invalid requests.facts_lane {value:?}"
+        )));
+    };
+    let Some(temperature) = temperature else {
+        return Ok(RecordedLane::New);
+    };
+    let pin = match parse_optional_id::<RouteFingerprint>(
+        "requests.facts_lane_route_fingerprint",
+        row.get("facts_lane_route_fingerprint")?,
+    )? {
+        None => None,
+        Some(route_fingerprint) => {
+            let missing = |column: &str| {
+                Error::InvalidRoutingState(format!("a row recording a lane pin lacks {column}"))
+            };
+            Some(RecordedPin {
+                route_fingerprint,
+                candidate_id: parse_optional_id(
+                    "requests.facts_lane_candidate_id",
+                    row.get("facts_lane_candidate_id")?,
+                )?
+                .ok_or_else(|| missing("facts_lane_candidate_id"))?,
+                binding_id: parse_optional_id(
+                    "requests.facts_lane_binding_id",
+                    row.get("facts_lane_binding_id")?,
+                )?
+                .ok_or_else(|| missing("facts_lane_binding_id"))?,
+                effective_model: row
+                    .get::<_, Option<String>>("facts_lane_effective_model")?
+                    .ok_or_else(|| missing("facts_lane_effective_model"))?,
+            })
+        }
+    };
+    Ok(RecordedLane::Read(RecordedLaneState {
+        temperature,
+        pin,
+        forced_from: row.get("facts_lane_forced_from")?,
+        forced_to: row.get("facts_lane_forced_to")?,
     }))
 }
 

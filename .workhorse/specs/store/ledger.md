@@ -131,7 +131,8 @@ Nothing backfills, so a reader meets every era in one table.
 | before policy routing, and every imported row | the policy, attempt and lineage columns |
 | after attempt identity but before policy routed everything | the policy columns, while carrying the attempt columns |
 | since policy routes everything, before the resolver's facts were recorded | the resolver's facts and the default that matched |
-| since the resolver's facts are recorded | nothing |
+| since the resolver's facts are recorded, before the lane was among them | the lane the resolver was given |
+| since the lane is recorded beside them | nothing |
 
 A reader MUST NOT require the policy columns where the attempt columns are present.
 

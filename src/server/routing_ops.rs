@@ -93,23 +93,7 @@ pub(crate) enum PreviewOutcome {
     NotReplayable { reason: NotReplayable },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NotReplayable {
-    /// The row predates the recording of the resolver's facts.
-    FactsNotRecorded,
-    /// A compaction's cold-lane evidence is read beside the facts and is not
-    /// recorded.
-    CompactionEvidenceNotRecorded,
-}
-
-impl NotReplayable {
-    pub(crate) fn code(self) -> &'static str {
-        match self {
-            Self::FactsNotRecorded => "facts_not_recorded",
-            Self::CompactionEvidenceNotRecorded => "compaction_evidence_not_recorded",
-        }
-    }
-}
+pub(crate) use crate::policy::facts::NotReplayable;
 
 #[derive(Debug)]
 pub(crate) struct RoutingValidation {
@@ -537,17 +521,33 @@ impl Server {
                     .map(|key| self.store.load_lane(key))
                     .transpose()?
                     .flatten();
-                let lane_facts = lane.as_ref().and_then(|lane| {
-                    self.lane_facts(
-                        Some(lane),
-                        lane.pin
-                            .as_ref()
-                            .and_then(|pin| self.registry.binding(&pin.binding_id)),
-                        &Default::default(),
-                        now,
-                        false,
-                    )
-                });
+                // Given to the resolver as the service gives it a live
+                // request's lane: an unpinned lane that is not proven cold
+                // resolves as new, and a pin carries the fingerprint of the
+                // policy resolving.
+                let lane_facts = lane
+                    .as_ref()
+                    .and_then(|lane| {
+                        self.lane_facts(
+                            Some(lane),
+                            lane.pin
+                                .as_ref()
+                                .and_then(|pin| self.registry.binding(&pin.binding_id)),
+                            &Default::default(),
+                            now,
+                            false,
+                        )
+                    })
+                    .filter(|lane| {
+                        lane.pinned.is_some()
+                            || lane.temperature == crate::policy::CacheTemperature::Cold
+                    })
+                    .map(|mut lane| {
+                        if let Some(pin) = lane.pinned.as_mut() {
+                            pin.policy_fingerprint = Some(policy.fingerprint().clone());
+                        }
+                        lane
+                    });
                 let facts = RequestFacts {
                     profile: invented.profile,
                     protocol: invented.protocol,
@@ -573,14 +573,7 @@ impl Server {
                     .store
                     .routed_request(request_id)?
                     .ok_or(RoutingControlError::RequestNotFound(request_id))?;
-                let reason = match &row.facts {
-                    None => Some(NotReplayable::FactsNotRecorded),
-                    Some(facts) if !facts.replayable() => {
-                        Some(NotReplayable::CompactionEvidenceNotRecorded)
-                    }
-                    Some(_) => None,
-                };
-                if let Some(reason) = reason {
+                if let Some(reason) = NotReplayable::of(row.facts.as_ref()) {
                     return Ok(RoutingPreview {
                         active_revision_id,
                         against_revision_id,
@@ -589,9 +582,10 @@ impl Server {
                     });
                 }
                 let facts = row.facts.expect("a replayable row carries its facts");
-                // The lane's pin at the time is not recorded, so a replay
-                // resolves as a new lane.
-                (facts.request_facts(now), None)
+                (
+                    facts.request_facts(now),
+                    facts.lane.lane_facts(policy.fingerprint()),
+                )
             }
         };
         let availability = basis
@@ -612,7 +606,8 @@ impl Server {
             against_revision_id,
             diagnostics,
             outcome: PreviewOutcome::Resolved {
-                facts: RecordedFacts::of(&facts),
+                facts: RecordedFacts::of(&facts)
+                    .with_lane(crate::policy::facts::RecordedLane::of(lane.as_ref())),
                 result: preview_result_body(result, &availability),
             },
         })
@@ -673,7 +668,7 @@ impl Server {
                 &active,
                 &basis.inventory,
                 &learning,
-                None,
+                recorded.lane.lane_facts(active.fingerprint()).as_ref(),
                 &availability,
                 &facts,
             ));
@@ -681,7 +676,7 @@ impl Server {
                 &edited,
                 &basis.inventory,
                 &learning,
-                None,
+                recorded.lane.lane_facts(edited.fingerprint()).as_ref(),
                 &availability,
                 &facts,
             ));

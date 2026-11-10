@@ -19,10 +19,16 @@ Each row of a policy-routed request MUST carry all of these.
 | the route's identifier and fingerprint |
 | the presentation, rewrite or default that matched, with the scope it matched in |
 | the facts the resolver was given, as [RSOLV](resolver.md#facts-in) lists them |
+| the lane's state as the resolver read it: its cache temperature, its pin's route fingerprint, candidate, binding and effective model, and the upgrade it holds |
 | the candidate and the binding |
 | the model at each stage of its shaping |
 | the [served model](models.md#served-model) |
 | the attempt group, the index within it, and the reason for the attempt |
+
+A request the resolver was given no lane for MUST record that it was given none, distinctly from a row written before the lane was recorded.
+
+> [!NOTE]
+> The resolver starts its walk at the lane's pinned candidate, so a replay that read a pinned lane as a new one could reach a candidate the request never could.
 
 > [!NOTE]
 > Those facts are what let a recorded request be replayed against another revision, as [RREV](revisions.md#preview) specifies, and they are content-free by the same rule the resolver's inputs are.

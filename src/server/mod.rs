@@ -135,6 +135,13 @@ const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 /// of silence is a dead stream, not a slow one.
 pub const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// A plan resolved without a lane, as a new lane's is: that is the lane its
+/// row records.
+fn new_lane_plan(mut plan: crate::policy::AttemptPlan) -> crate::policy::AttemptPlan {
+    plan.facts.lane = crate::policy::facts::RecordedLane::New;
+    plan
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PolicyAttemptError {
     #[error(transparent)]
@@ -143,6 +150,8 @@ pub(crate) enum PolicyAttemptError {
     Resolve {
         revision_id: i64,
         failure: crate::policy::ResolveFailure,
+        /// The lane the resolver was given, for the ledger to record.
+        lane: crate::policy::facts::RecordedLane,
     },
     #[error("policy revision {revision_id} could not safely transition the lane: {reason:?}")]
     Transition {
@@ -151,6 +160,8 @@ pub(crate) enum PolicyAttemptError {
         /// What the resolver chose before the pin refused it. A lane pinned
         /// to a revision newer than the one running never got that far.
         route: Option<Box<DeniedRoute>>,
+        /// The lane the resolver was or would have been given.
+        lane: crate::policy::facts::RecordedLane,
     },
     /// The caller built lane facts for a lane it had not loaded, or the other
     /// way round. That is a handler bug, and routing on half a lane would
@@ -213,6 +224,7 @@ impl PolicyAttemptError {
                         provenance,
                         trace,
                     },
+                lane,
             } => Some(PolicyRouteProvenance::from_route_unavailable(
                 *revision_id,
                 route_id.clone(),
@@ -220,20 +232,22 @@ impl PolicyAttemptError {
                 provenance,
                 trace,
                 group,
-                facts,
+                facts.with_lane(lane.clone()),
             )),
             Self::Resolve {
                 revision_id,
                 failure: crate::policy::ResolveFailure::NoRoute,
+                lane,
             } => Some(PolicyRouteProvenance::from_no_route(
                 *revision_id,
                 group,
-                facts,
+                facts.with_lane(lane.clone()),
             )),
             Self::Transition {
                 revision_id,
                 reason,
                 route,
+                lane,
             } => Some(PolicyRouteProvenance::from_transition_denied(
                 *revision_id,
                 route.as_deref().map(|route| {
@@ -246,7 +260,7 @@ impl PolicyAttemptError {
                 }),
                 *reason,
                 group,
-                facts,
+                facts.with_lane(lane.clone()),
             )),
             _ => None,
         }
@@ -1058,10 +1072,11 @@ impl Server {
             &circuits,
             facts,
         )
-        .map(|plan| plan.with_policy_revision(revision_id))
+        .map(|plan| new_lane_plan(plan.with_policy_revision(revision_id)))
         .map_err(|failure| PolicyAttemptError::Resolve {
             revision_id,
             failure,
+            lane: crate::policy::facts::RecordedLane::New,
         })
     }
 
@@ -1083,6 +1098,7 @@ impl Server {
             |failure| PolicyAttemptError::Resolve {
                 revision_id,
                 failure,
+                lane: crate::policy::facts::RecordedLane::New,
             },
         )
     }
@@ -1112,10 +1128,11 @@ impl Server {
                 &circuits,
                 facts,
             )
-            .map(|plan| plan.with_policy_revision(revision_id))
+            .map(|plan| new_lane_plan(plan.with_policy_revision(revision_id)))
             .map_err(|failure| PolicyAttemptError::Resolve {
                 revision_id,
                 failure,
+                lane: crate::policy::facts::RecordedLane::New,
             })?;
             plans.push(plan);
         }
@@ -1163,6 +1180,7 @@ impl Server {
                     revision_id: revision,
                     reason: crate::policy::TransitionDenied::StaleRevision,
                     route: None,
+                    lane: crate::policy::facts::RecordedLane::of(lane),
                 });
             }
             (Some(revision), _) if revision == current_revision_id => true,
@@ -1237,6 +1255,7 @@ impl Server {
                     .expect("a resolved plan carries its revision"),
                 reason,
                 route: DeniedRoute::of(&resolved.plan),
+                lane: resolved.plan.facts.lane.clone(),
             });
         }
         let continuation = PolicyContinuation {
@@ -1351,10 +1370,14 @@ impl Server {
         .map_err(|failure| PolicyAttemptError::Resolve {
             revision_id,
             failure,
+            lane: failed.plan.facts.lane.clone(),
         })?;
         let Some(mut plan) = plan else {
             return Ok(None);
         };
+        // The fallback resolves from the same lane the failed attempt was
+        // given.
+        plan.facts.lane = failed.plan.facts.lane.clone();
         // The request's own credential for the provider it fell back to
         // names the account, or none does.
         Self::attach_plan_account(&mut plan, &failed.continuation.accounts);
@@ -1369,6 +1392,7 @@ impl Server {
                 revision_id,
                 reason,
                 route: DeniedRoute::of(&plan),
+                lane: plan.facts.lane.clone(),
             });
         }
         Ok(Some(PolicyAttempt {
@@ -1399,7 +1423,8 @@ impl Server {
             .with_safeguards_marks(&self.safeguards_marks());
         let learning = crate::policy::LearningView::snapshot(self.binding_learning.as_ref());
         let circuits = runtime.open_circuits(snapshot, facts.now_ms);
-        let plan = crate::policy::resolve::resolve_with_activation_cache_consent(
+        let recorded_lane = crate::policy::facts::RecordedLane::of(lane.as_ref());
+        let mut plan = crate::policy::resolve::resolve_with_activation_cache_consent(
             snapshot.policy(),
             snapshot.inventory(),
             &learning,
@@ -1413,7 +1438,9 @@ impl Server {
         .map_err(|failure| PolicyAttemptError::Resolve {
             revision_id,
             failure,
+            lane: recorded_lane.clone(),
         })?;
+        plan.facts.lane = recorded_lane;
         Ok(ResolvedPolicySnapshot {
             plan,
             snapshot: snapshot.clone(),
@@ -3867,6 +3894,7 @@ api_key = "sk-proj-test"
                 revision_id: 1,
                 reason: crate::policy::TransitionDenied::WarmCacheLoss,
                 route,
+                lane: crate::policy::facts::RecordedLane::New,
             };
             super::record::record_unroutable(
                 &server,
@@ -3886,7 +3914,10 @@ api_key = "sk-proj-test"
             let routing = row.policy_routing.as_ref().expect("provenance");
             assert_eq!(
                 routing.facts,
-                Some(crate::policy::RecordedFacts::of(&facts)),
+                Some(
+                    crate::policy::RecordedFacts::of(&facts)
+                        .with_lane(crate::policy::facts::RecordedLane::New)
+                ),
                 "a refusal records the facts it was resolved from"
             );
             assert_eq!(routing.route.is_some(), expect_route);
@@ -3910,6 +3941,7 @@ api_key = "sk-proj-test"
             &super::PolicyAttemptError::Resolve {
                 revision_id: 1,
                 failure: crate::policy::ResolveFailure::InvalidTemplate,
+                lane: crate::policy::facts::RecordedLane::New,
             },
             &facts,
         );

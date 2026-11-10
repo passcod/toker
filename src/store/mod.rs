@@ -1133,6 +1133,19 @@ mod tests {
             },
             asks_server_safeguards: true,
             binding_affinity: Some(BindingId::new("anthropic_sub.anthropic_messages").unwrap()),
+            lane: crate::policy::facts::RecordedLane::Read(
+                crate::policy::facts::RecordedLaneState {
+                    temperature: crate::policy::CacheTemperature::Warm,
+                    pin: Some(crate::policy::facts::RecordedPin {
+                        route_fingerprint: "33".repeat(32).parse().unwrap(),
+                        candidate_id: "second".parse().unwrap(),
+                        binding_id: BindingId::new("anthropic_sub.anthropic_messages").unwrap(),
+                        effective_model: "claude-opus-5".to_owned(),
+                    }),
+                    forced_from: Some("claude-sonnet-4".to_owned()),
+                    forced_to: Some("claude-opus-5".to_owned()),
+                },
+            ),
             class: crate::policy::RequestClass::Inference,
         }
     }
@@ -6043,6 +6056,48 @@ mod tests {
             [revision_id],
         );
         assert!(partial.is_err(), "a marker without its facts");
+        let loose_pin = conn.execute(
+            "INSERT INTO requests (ts_ms, facts_lane_candidate_id) VALUES (5, 'candidate')",
+            [],
+        );
+        assert!(loose_pin.is_err(), "a lane pin without its lane");
+    }
+
+    /// A row recording the facts but written before the lane was recorded
+    /// reads as lacking the lane, not as having been given a new one.
+    #[test]
+    fn a_row_from_before_the_lane_was_recorded_is_not_replayable() {
+        let store = mem_store();
+        let revision_id = revision(&store, "lane", None);
+        let mut facts = facts();
+        facts.lane = crate::policy::facts::RecordedLane::New;
+        let row = routed_row(
+            revision_id,
+            1_000,
+            1,
+            RequestLookupProvenance::ProtocolDefault,
+            Some(facts),
+        );
+        store.record_request(&row).unwrap();
+        store
+            .conn()
+            .unwrap()
+            .execute(
+                "UPDATE requests SET facts_lane = NULL WHERE ts_ms = 1000",
+                [],
+            )
+            .unwrap();
+        let rows = store.requests_since(0, 10).unwrap();
+        let read = rows[0]
+            .policy_routing
+            .as_ref()
+            .and_then(|routing| routing.facts.as_ref())
+            .expect("the facts are recorded");
+        assert_eq!(read.lane, crate::policy::facts::RecordedLane::NotRecorded);
+        assert_eq!(
+            read.not_replayable(),
+            Some(crate::policy::facts::NotReplayable::LaneNotRecorded)
+        );
     }
 
     #[test]

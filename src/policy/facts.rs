@@ -5,12 +5,13 @@
 //! (spec: RPROV#routing-provenance). They are content-free by the rule the
 //! resolver's own inputs follow: identities, counts and capability flags.
 //!
-//! The lane's state is not among them. It is evidence the resolver reads
-//! beside the facts, and the ledger does not hold what it was at the time, so
-//! a replay resolves as a new lane.
+//! The lane's state is among them, as the resolver read it: a replay that
+//! resolved a pinned lane as a new one could start its walk at a candidate
+//! the request would never have reached.
 
 use super::{
-    BindingId, CapabilityFlags, FrontendProtocol, ProfileId, RequestClass, RequestFacts,
+    BindingId, CacheTemperature, CandidateId, CapabilityFlags, FrontendProtocol, LaneFacts,
+    PolicyFingerprint, ProfileId, ProvisionalPin, RequestClass, RequestFacts, RouteFingerprint,
     resolve::CompactionEvidence,
 };
 
@@ -27,9 +28,118 @@ pub struct RecordedFacts {
     pub asks_server_safeguards: bool,
     pub binding_affinity: Option<BindingId>,
     pub class: RequestClass,
+    pub lane: RecordedLane,
+}
+
+/// The lane's state as the resolver was given it (spec: RSOLV#facts-in).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordedLane {
+    /// The row was written before the lane's state was recorded.
+    NotRecorded,
+    /// The resolver was given no lane: a new one, or one the service resolves
+    /// as new.
+    New,
+    Read(RecordedLaneState),
+}
+
+/// What the resolver reads of a lane it is given. The pin's revision and
+/// baseline model are not among it: the service sets the pin's policy
+/// fingerprint to that of the policy resolving, and the resolver reads
+/// nothing else of the pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedLaneState {
+    pub temperature: CacheTemperature,
+    pub pin: Option<RecordedPin>,
+    pub forced_from: Option<String>,
+    pub forced_to: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedPin {
+    pub route_fingerprint: RouteFingerprint,
+    pub candidate_id: CandidateId,
+    pub binding_id: BindingId,
+    pub effective_model: String,
+}
+
+impl RecordedLane {
+    pub fn of(lane: Option<&LaneFacts>) -> Self {
+        lane.map_or(Self::New, |lane| {
+            Self::Read(RecordedLaneState {
+                temperature: lane.temperature,
+                pin: lane.pinned.as_ref().map(|pin| RecordedPin {
+                    route_fingerprint: pin.route_fingerprint.clone(),
+                    candidate_id: pin.candidate_id.clone(),
+                    binding_id: pin.binding_id.clone(),
+                    effective_model: pin.effective_model.clone(),
+                }),
+                forced_from: lane.forced_from.clone(),
+                forced_to: lane.forced_to.clone(),
+            })
+        })
+    }
+
+    /// The lane to give the resolver again under the policy whose
+    /// fingerprint is `policy`, as the service gives it a pinned lane.
+    /// `None` for a new lane, and for one not recorded, which is not
+    /// replayable.
+    pub fn lane_facts(&self, policy: &PolicyFingerprint) -> Option<LaneFacts> {
+        let Self::Read(lane) = self else {
+            return None;
+        };
+        Some(LaneFacts {
+            temperature: lane.temperature,
+            pinned: lane.pin.as_ref().map(|pin| ProvisionalPin {
+                policy_revision_id: None,
+                policy_fingerprint: Some(policy.clone()),
+                route_fingerprint: pin.route_fingerprint.clone(),
+                candidate_id: pin.candidate_id.clone(),
+                binding_id: pin.binding_id.clone(),
+                // Not recorded, and the resolver reads only the effective
+                // model of a pin.
+                baseline_model: pin.effective_model.clone(),
+                effective_model: pin.effective_model.clone(),
+            }),
+            forced_from: lane.forced_from.clone(),
+            forced_to: lane.forced_to.clone(),
+        })
+    }
+}
+
+/// Why a recorded request cannot be resolved again without a fact assumed
+/// (spec: RREV#preview).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotReplayable {
+    /// The row predates the recording of the resolver's facts.
+    FactsNotRecorded,
+    /// A compaction's cold-lane evidence is read beside the facts and is not
+    /// recorded.
+    CompactionEvidenceNotRecorded,
+    /// The row predates the recording of the lane's state.
+    LaneNotRecorded,
+}
+
+impl NotReplayable {
+    pub fn of(facts: Option<&RecordedFacts>) -> Option<Self> {
+        match facts {
+            None => Some(Self::FactsNotRecorded),
+            Some(facts) => facts.not_replayable(),
+        }
+    }
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::FactsNotRecorded => "facts_not_recorded",
+            Self::CompactionEvidenceNotRecorded => "compaction_evidence_not_recorded",
+            Self::LaneNotRecorded => "lane_not_recorded",
+        }
+    }
 }
 
 impl RecordedFacts {
+    /// The facts as recorded, with the lane not yet among them: the service
+    /// records the lane it gave the resolver with [`Self::with_lane`], and a
+    /// plan it does not is read as lacking it rather than as a new lane.
     pub fn of(facts: &RequestFacts) -> Self {
         Self {
             profile: facts.profile.clone(),
@@ -42,18 +152,35 @@ impl RecordedFacts {
             asks_server_safeguards: facts.asks_server_safeguards,
             binding_affinity: facts.binding_affinity.clone(),
             class: facts.class,
+            lane: RecordedLane::NotRecorded,
         }
     }
 
-    /// Whether resolving these facts again would reproduce what the resolver
-    /// read at the time. A compaction's cold-lane evidence is read beside the
-    /// facts and is not recorded, so a compaction would be resolved with a
-    /// fact assumed in its place.
-    pub fn replayable(&self) -> bool {
-        self.class == RequestClass::Inference
+    pub fn with_lane(mut self, lane: RecordedLane) -> Self {
+        self.lane = lane;
+        self
     }
 
-    /// The facts to resolve again, as a new lane at `now_ms`.
+    /// Why resolving these facts again would not reproduce what the resolver
+    /// read at the time, if it would not. A compaction's cold-lane evidence
+    /// is read beside the facts and is not recorded, so a compaction would be
+    /// resolved with a fact assumed in its place.
+    pub fn not_replayable(&self) -> Option<NotReplayable> {
+        if self.class != RequestClass::Inference {
+            Some(NotReplayable::CompactionEvidenceNotRecorded)
+        } else if self.lane == RecordedLane::NotRecorded {
+            Some(NotReplayable::LaneNotRecorded)
+        } else {
+            None
+        }
+    }
+
+    pub fn replayable(&self) -> bool {
+        self.not_replayable().is_none()
+    }
+
+    /// The facts to resolve again at `now_ms`. The lane's state goes beside
+    /// them, from [`RecordedLane::lane_facts`].
     pub fn request_facts(&self, now_ms: i64) -> RequestFacts {
         RequestFacts {
             profile: self.profile.clone(),
@@ -109,5 +236,96 @@ pub fn parse_class(value: &str) -> Option<RequestClass> {
         "inference" => Some(RequestClass::Inference),
         "compaction" => Some(RequestClass::Compaction),
         _ => None,
+    }
+}
+
+/// The stored form of the lane as the resolver was given it: `new` for no
+/// lane, or the given lane's cache temperature.
+pub fn lane_name(lane: &RecordedLane) -> Option<&'static str> {
+    match lane {
+        RecordedLane::NotRecorded => None,
+        RecordedLane::New => Some("new"),
+        RecordedLane::Read(lane) => Some(match lane.temperature {
+            CacheTemperature::Warm => "warm",
+            CacheTemperature::Cold => "cold",
+            CacheTemperature::Unknown => "unknown",
+        }),
+    }
+}
+
+/// The temperature a stored lane value names, or `None` for `new`.
+pub fn parse_lane_temperature(value: &str) -> Option<Option<CacheTemperature>> {
+    match value {
+        "new" => Some(None),
+        "warm" => Some(Some(CacheTemperature::Warm)),
+        "cold" => Some(Some(CacheTemperature::Cold)),
+        "unknown" => Some(Some(CacheTemperature::Unknown)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pinned() -> LaneFacts {
+        LaneFacts {
+            temperature: CacheTemperature::Warm,
+            pinned: Some(ProvisionalPin {
+                policy_revision_id: Some(3),
+                policy_fingerprint: None,
+                route_fingerprint: "11".repeat(32).parse().unwrap(),
+                candidate_id: "second".parse().unwrap(),
+                binding_id: "openrouter.openai_chat".parse().unwrap(),
+                baseline_model: "base".to_owned(),
+                effective_model: "effective".to_owned(),
+            }),
+            forced_from: Some("from".to_owned()),
+            forced_to: Some("to".to_owned()),
+        }
+    }
+
+    #[test]
+    fn a_recorded_pinned_lane_is_given_back_under_the_replaying_policy() {
+        let fingerprint: PolicyFingerprint = "22".repeat(32).parse().unwrap();
+        let lane = RecordedLane::of(Some(&pinned()))
+            .lane_facts(&fingerprint)
+            .expect("a lane that was read is given back");
+        let pin = lane.pinned.expect("the pin is kept");
+        // The walk starts at the pinned candidate only where the pin's policy
+        // fingerprint is the resolving policy's, as the service sets it.
+        assert_eq!(pin.policy_fingerprint, Some(fingerprint));
+        assert_eq!(
+            pin.route_fingerprint,
+            pinned().pinned.unwrap().route_fingerprint
+        );
+        assert_eq!(pin.candidate_id.as_str(), "second");
+        assert_eq!(pin.binding_id.as_str(), "openrouter.openai_chat");
+        assert_eq!(pin.effective_model, "effective");
+        assert_eq!(lane.temperature, CacheTemperature::Warm);
+        assert_eq!(lane.forced_from.as_deref(), Some("from"));
+        assert_eq!(lane.forced_to.as_deref(), Some("to"));
+    }
+
+    #[test]
+    fn a_lane_not_recorded_is_not_replayable_and_a_new_one_is() {
+        let fingerprint: PolicyFingerprint = "22".repeat(32).parse().unwrap();
+        let facts = RecordedFacts {
+            profile: None,
+            protocol: FrontendProtocol::OpenaiChat,
+            requested_model: Some("m".to_owned()),
+            prompt_bound: 1,
+            message_count: Some(1),
+            tool_count: 0,
+            required_capabilities: CapabilityFlags::default(),
+            asks_server_safeguards: false,
+            binding_affinity: None,
+            class: RequestClass::Inference,
+            lane: RecordedLane::NotRecorded,
+        };
+        assert_eq!(facts.not_replayable(), Some(NotReplayable::LaneNotRecorded));
+        let new = facts.with_lane(RecordedLane::New);
+        assert_eq!(new.not_replayable(), None);
+        assert_eq!(new.lane.lane_facts(&fingerprint), None);
     }
 }

@@ -2499,7 +2499,10 @@ const RECENT_REQUEST_COLUMNS: &str = "id, ts_ms, policy_revision_id, kind, reque
     presentation_id, rewrite_id, lookup_kind, lookup_scope,
     facts_recorded, facts_profile, facts_protocol, facts_requested_model,
     facts_prompt_bound, facts_message_count, facts_tool_count, facts_capabilities,
-    facts_asks_safeguards, facts_binding_affinity, facts_class";
+    facts_asks_safeguards, facts_binding_affinity, facts_class,
+    facts_lane, facts_lane_route_fingerprint, facts_lane_candidate_id,
+    facts_lane_binding_id, facts_lane_effective_model,
+    facts_lane_forced_from, facts_lane_forced_to";
 
 fn read_recent_request(row: &rusqlite::Row<'_>) -> Result<RecentRequest> {
     let matched = match row.get::<_, Option<String>>("lookup_kind")? {

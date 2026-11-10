@@ -810,6 +810,75 @@ async fn a_recorded_request_replays_from_its_facts_and_an_old_row_is_not_replaya
     assert_eq!(missing["error"], "request_not_found");
 }
 
+/// Strip the lane from a recorded row, as a row written before the lane was
+/// recorded has it.
+fn clear_recorded_lane(db: &std::path::Path) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.execute("UPDATE requests SET facts_lane = NULL", [])
+        .unwrap();
+}
+
+/// The resolver reads the lane's state, so a row carries it and a replay is
+/// given it back. A row that lacks it says so rather than being replayed as
+/// a new lane (spec: RREV#preview).
+#[tokio::test]
+async fn a_recorded_request_replays_against_the_lane_it_was_resolved_on() {
+    let dir = common::tempdir("toker-routing-replay-lane-");
+    let (server, _, db) = file_server(&dir);
+    let app = server.router();
+    send_unservable(&app, "alpha").await;
+
+    let (status, listing) = post(
+        &app,
+        "preview",
+        "routing-preview",
+        json!({"mode": "recent_requests"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    let recorded = listing["requests"].as_array().unwrap()[0].clone();
+    assert_eq!(recorded["replayable"], true);
+    assert_eq!(recorded["request"]["lane"]["state"], "new");
+
+    clear_recorded_lane(&db);
+    let (status, listing) = post(
+        &app,
+        "preview",
+        "routing-preview",
+        json!({"mode": "recent_requests"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    let stripped = listing["requests"].as_array().unwrap()[0].clone();
+    assert_eq!(stripped["replayable"], false);
+    assert_eq!(stripped["not_replayable_reason"], "lane_not_recorded");
+    assert_eq!(stripped["request"]["lane"], Value::Null);
+
+    let (status, refused) = post(
+        &app,
+        "preview",
+        "routing-preview",
+        json!({"mode": "resolve",
+               "request": {"kind": "recorded", "request_id": stripped["id"]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{refused}");
+    assert_eq!(refused["result"]["outcome"], "not_replayable");
+    assert_eq!(refused["result"]["reason"], "lane_not_recorded");
+
+    // Replaying recent traffic counts it rather than resolving it as new.
+    let (status, replay) = post(
+        &app,
+        "preview",
+        "routing-preview",
+        json!({"mode": "replay_recent", "edit": describe("no effect")}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay["replayed"], 0);
+    assert_eq!(replay["unreplayable"], 1);
+}
+
 #[tokio::test]
 async fn replaying_recent_traffic_returns_the_requests_an_edit_changes_and_counts_the_rest() {
     let dir = common::tempdir("toker-routing-replay-recent-");

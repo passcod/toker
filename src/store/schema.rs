@@ -1337,6 +1337,59 @@ pub(super) const MIGRATIONS: &[&str] = &[
         SELECT RAISE(ABORT, 'invalid request resolver facts');
     END;
     "#,
+    // v25 — the lane the resolver was given, beside the rest of its facts
+    // (spec: RSOLV#facts-in). The resolver reads the lane's temperature, its
+    // pin and the upgrade the lane holds, and starts its walk at the pinned
+    // candidate: a replay that resolved a pinned lane as a new one would
+    // reach a candidate the request never could.
+    //
+    // `facts_lane` is the marker as well as the value: NULL on a row written
+    // before the lane was recorded, which therefore reads as lacking it
+    // rather than as having been given no lane, 'new' where the resolver was
+    // given none, and the lane's cache temperature where it was. The pin
+    // columns are the identities the resolver reads of a pin, and are absent
+    // together on an unpinned lane. The pin's revision and baseline model are
+    // not here: the resolver reads neither.
+    //
+    // The forced pair is repeated from `forced_from`/`forced_to`, which the
+    // row writes with their own per-kind rules; a replay must read what the
+    // resolver was given.
+    r#"
+    ALTER TABLE requests ADD COLUMN facts_lane TEXT
+        CHECK (facts_lane IN ('new', 'warm', 'cold', 'unknown'));
+    ALTER TABLE requests ADD COLUMN facts_lane_route_fingerprint TEXT;
+    ALTER TABLE requests ADD COLUMN facts_lane_candidate_id TEXT;
+    ALTER TABLE requests ADD COLUMN facts_lane_binding_id TEXT;
+    ALTER TABLE requests ADD COLUMN facts_lane_effective_model TEXT;
+    ALTER TABLE requests ADD COLUMN facts_lane_forced_from TEXT;
+    ALTER TABLE requests ADD COLUMN facts_lane_forced_to TEXT;
+
+    CREATE TRIGGER requests_facts_lane_shape_check
+    BEFORE INSERT ON requests
+    WHEN (NEW.facts_lane IS NULL AND (
+              NEW.facts_lane_route_fingerprint IS NOT NULL
+              OR NEW.facts_lane_candidate_id IS NOT NULL
+              OR NEW.facts_lane_binding_id IS NOT NULL
+              OR NEW.facts_lane_effective_model IS NOT NULL
+              OR NEW.facts_lane_forced_from IS NOT NULL
+              OR NEW.facts_lane_forced_to IS NOT NULL
+          ))
+       OR (NEW.facts_lane IS NOT NULL AND NEW.facts_recorded IS NULL)
+       OR (NEW.facts_lane = 'new' AND (
+              NEW.facts_lane_route_fingerprint IS NOT NULL
+              OR NEW.facts_lane_candidate_id IS NOT NULL
+              OR NEW.facts_lane_binding_id IS NOT NULL
+              OR NEW.facts_lane_effective_model IS NOT NULL
+              OR NEW.facts_lane_forced_from IS NOT NULL
+              OR NEW.facts_lane_forced_to IS NOT NULL
+          ))
+       OR ((NEW.facts_lane_route_fingerprint IS NULL) != (NEW.facts_lane_candidate_id IS NULL))
+       OR ((NEW.facts_lane_route_fingerprint IS NULL) != (NEW.facts_lane_binding_id IS NULL))
+       OR ((NEW.facts_lane_route_fingerprint IS NULL) != (NEW.facts_lane_effective_model IS NULL))
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid request resolver lane facts');
+    END;
+    "#,
 ];
 
 fn validate_v10_history(conn: &Connection) -> Result<()> {

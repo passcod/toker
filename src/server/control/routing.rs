@@ -734,6 +734,29 @@ fn facts_body(facts: &RecordedFacts) -> Value {
         "asks_server_safeguards": facts.asks_server_safeguards,
         "binding_affinity": facts.binding_affinity,
         "class": crate::policy::facts::class_name(facts.class),
+        "lane": lane_body(&facts.lane),
+    })
+}
+
+/// The lane's state as the resolver was given it; null where the row
+/// predates its recording.
+fn lane_body(lane: &crate::policy::facts::RecordedLane) -> Value {
+    let Some(state) = crate::policy::facts::lane_name(lane) else {
+        return Value::Null;
+    };
+    let crate::policy::facts::RecordedLane::Read(lane) = lane else {
+        return json!({ "state": state });
+    };
+    json!({
+        "state": state,
+        "pin": lane.pin.as_ref().map(|pin| json!({
+            "route_fingerprint": pin.route_fingerprint.to_string(),
+            "candidate_id": pin.candidate_id.to_string(),
+            "binding_id": pin.binding_id.to_string(),
+            "effective_model": pin.effective_model,
+        })),
+        "forced_from": lane.forced_from,
+        "forced_to": lane.forced_to,
     })
 }
 
@@ -760,11 +783,7 @@ fn replay_change_body(change: &ReplayChange) -> Value {
 }
 
 fn recent_request_body(request: &RecentRequest) -> Value {
-    let reason = match &request.facts {
-        None => Some(NotReplayable::FactsNotRecorded),
-        Some(facts) if !facts.replayable() => Some(NotReplayable::CompactionEvidenceNotRecorded),
-        Some(_) => None,
-    };
+    let reason = NotReplayable::of(request.facts.as_ref());
     json!({
         "id": request.id,
         "ts_ms": request.ts_ms,

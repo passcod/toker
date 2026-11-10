@@ -386,6 +386,7 @@ mod tests {
                         BindingId::new("openrouter.openrouter_messages").unwrap(),
                     ),
                     class: crate::policy::RequestClass::Inference,
+                    lane: crate::policy::facts::RecordedLane::New,
                 }),
             }),
             lineage: Some(SessionLineage::codex_guardian("guardian:parent-session").unwrap()),
