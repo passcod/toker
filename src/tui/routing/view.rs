@@ -82,7 +82,7 @@ pub(super) fn render(frame: &mut Frame, state: &State, overlay: bool) -> Drawn {
                 route_page(frame, body, snapshot, active, state, &mut drawn);
             }
             (Tab::Models, _) if state.editing().is_some() => {
-                edit_page(frame, body, state, &mut drawn);
+                edit_page(frame, body, state, active, &mut drawn);
             }
             (Tab::Models, _) => models_tab::render(frame, body, state, active),
             (Tab::History, _) => history_tab(frame, body, snapshot, state, &mut drawn),
@@ -243,7 +243,7 @@ fn lookup_tab(
             .map_or(table.body.len(), |at| at + 1);
         let form = edit_view::block(editing, width);
         table.body.splice(at..at, form);
-        detail = edit_view::preview(editing, width);
+        detail = edit_view::preview(editing, active, width);
         title = "PREVIEW";
     }
     if table.body.is_empty() {
@@ -334,7 +334,7 @@ fn route_page(
         return;
     };
     lines.extend(edit_view::block(editing, width));
-    let preview = edit_view::preview(editing, width);
+    let preview = edit_view::preview(editing, active, width);
     let split = table::split(body, lines.len(), preview.len());
     drawn.entries = split.table;
     drawn.detail = split.detail;
@@ -347,13 +347,13 @@ fn route_page(
 
 /// An edit on the models tab, whose records are not rows of a table: the
 /// form takes the page, with the preview under it.
-fn edit_page(frame: &mut Frame, body: Rect, state: &State, drawn: &mut Drawn) {
+fn edit_page(frame: &mut Frame, body: Rect, state: &State, active: &Value, drawn: &mut Drawn) {
     let Some(editing) = editing_here(state) else {
         return;
     };
     let width = content_width(body);
     let lines = edit_view::block(editing, width);
-    let preview = edit_view::preview(editing, width);
+    let preview = edit_view::preview(editing, active, width);
     let split = table::split(body, lines.len(), preview.len());
     drawn.entries = split.table;
     drawn.detail = split.detail;
@@ -1032,5 +1032,301 @@ mod tests {
         let mut state = page(World::AT_REST, Tab::Models);
         press(&mut state, crossterm::event::KeyCode::Char('p'));
         insta::assert_snapshot!("the_promotion_form", frame(&state, 120, 32));
+    }
+
+    // --- editing in place -------------------------------------------------
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn send(state: &mut State, code: KeyCode) {
+        state.key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    /// Answer `command` as the daemon would.
+    fn answer(state: &mut State, command: Command, status: u16, body: serde_json::Value) {
+        state.receive(Reply::Command(command, Ok(Response { status, body })));
+    }
+
+    /// Answer the check the open edit is due with `body`.
+    fn checked(state: &mut State, body: serde_json::Value) {
+        let check = state.next_check().expect("a check is due");
+        answer(state, check, 200, body);
+    }
+
+    fn fine() -> serde_json::Value {
+        serde_json::json!({"valid": true, "diagnostics": [], "refusal": null})
+    }
+
+    /// What replaying the last 24 hours under the edit came to.
+    fn replayed(state: &mut State) {
+        let replay = state.next_check().expect("the replay");
+        assert_eq!(replay.name, "preview");
+        let request = |model: &str, ts: i64| {
+            serde_json::json!({
+                "request_id": ts, "ts_ms": ts, "request": {"model": model},
+                "under_active": {"outcome": "selected", "route_id": "claude-sub",
+                    "matched": {"kind": "default", "scope": "protocol", "id": null}},
+                "under_edit": {"outcome": "selected", "route_id": "openrouter-messages",
+                    "matched": {"kind": "rewrite", "scope": "protocol", "id": "new-rewrite"}},
+            })
+        };
+        answer(
+            state,
+            replay,
+            200,
+            serde_json::json!({
+                "replayed": 5, "unreplayable": 2, "truncated": false, "changed_total": 3,
+                "window": {"since_ms": 0, "until_ms": 86_400_000},
+                "changed": [
+                    request("claude-sonnet-5", 86_340_000),
+                    request("claude-opus-5", 85_800_000),
+                    request("claude-haiku-4-5", 82_000_000),
+                ],
+            }),
+        );
+    }
+
+    /// A new rewrite under the second rule of the messages protocol, with
+    /// the daemon's answer on it.
+    fn adding_a_rewrite(answer_with: serde_json::Value) -> State {
+        let mut state = page(World::AT_REST, Tab::Rewrites);
+        state.move_selection(1);
+        send(&mut state, KeyCode::Char('n'));
+        checked(&mut state, answer_with);
+        state
+    }
+
+    #[test]
+    fn a_rewrite_being_added_opens_under_its_row_with_the_recent_traffic_under_it() {
+        let mut state = adding_a_rewrite(fine());
+        replayed(&mut state);
+        let text = frame(&state, 120, 50);
+        insta::assert_snapshot!(text);
+        assert!(text.contains("editing · rev 9 live"), "{text}");
+        assert!(text.contains("[ctrl+s] save   [esc] cancel"), "{text}");
+        assert!(
+            text.contains("3 of 5 recent requests would change route"),
+            "{text}"
+        );
+        assert!(text.contains("2 requests could not be replayed"), "{text}");
+    }
+
+    #[test]
+    fn a_refusal_is_said_in_red_beside_the_field_with_its_fix() {
+        let index = 14;
+        let mut state = adding_a_rewrite(serde_json::json!({
+            "valid": false, "refusal": null,
+            "diagnostics": [{
+                "code": "capture-binding-not-regex", "severity": "error",
+                "record_id": "new-rewrite", "path": format!("/rewrites/{index}/target"),
+                "sentence": "The route takes a capture from the match, and this match is not a regular expression.",
+                "fix": "Match with a regular expression, or give the route the requested model instead.",
+            }],
+        }));
+        let text = frame(&state, 120, 50);
+        insta::assert_snapshot!(text);
+        assert!(text.contains("[ctrl+s] fix route to save"), "{text}");
+        // The refusal is red: it is the one thing on the page that is.
+        let mut terminal = Terminal::new(TestBackend::new(120, 50)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &state, false);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let red = buffer
+            .content
+            .iter()
+            .filter(|cell| cell.fg == ratatui::style::Color::Red)
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(red.contains("The route takes a capture"), "{red}");
+        assert!(red.contains("Match with a regular expression"), "{red}");
+        // And nothing about it blocks reading the rest.
+        send(&mut state, KeyCode::Esc);
+    }
+
+    #[test]
+    fn a_warning_is_beside_the_field_and_the_save_stays_open() {
+        let mut state = page(World::AT_REST, Tab::Routes);
+        send(&mut state, KeyCode::Enter);
+        send(&mut state, KeyCode::Char('n'));
+        let (index, steps) = {
+            let route = state.document_route_for_tests();
+            (route.0, route.1)
+        };
+        checked(
+            &mut state,
+            serde_json::json!({"valid": true, "refusal": null, "diagnostics": [{
+                "code": "binding-unconfigured", "severity": "warning", "record_id": "claude-sub",
+                "path": format!("/routes/{index}/chain/steps/{steps}/candidate/binding_id"),
+                "sentence": "The provider is off: the candidate is skipped until it is on.",
+                "fix": "Turn the provider on, or leave it.",
+            }]}),
+        );
+        replayed(&mut state);
+        let text = frame(&state, 120, 50);
+        insta::assert_snapshot!(text);
+        assert!(text.contains("[ctrl+s] save"), "{text}");
+    }
+
+    #[test]
+    fn a_save_moved_past_names_the_live_revision_in_the_form() {
+        let mut state = adding_a_rewrite(fine());
+        state.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let mut save = Command::snapshot("routing-snapshot");
+        save.name = "save";
+        answer(
+            &mut state,
+            save,
+            409,
+            serde_json::json!({"error": "stale_revision", "live_revision_id": 12}),
+        );
+        let text = frame(&state, 120, 50);
+        insta::assert_snapshot!(text);
+        assert!(
+            text.contains("revision 12 is now live; your edit is kept as you entered it"),
+            "{text}"
+        );
+        assert!(text.contains("[ctrl+s] save onto rev 12"), "{text}");
+    }
+
+    #[test]
+    fn a_removal_the_rest_of_the_policy_refuses_names_the_records() {
+        let mut state = page(World::AT_REST, Tab::Routes);
+        send(&mut state, KeyCode::Char('d'));
+        checked(
+            &mut state,
+            serde_json::json!({
+                "valid": false, "refusal": null,
+                "diagnostics": [
+                    {"code": "missing-route", "severity": "error", "record_id": "anthropic-messages-1",
+                     "path": "/rewrites/0/target/route_id",
+                     "sentence": "The route it sends to is not in the policy.",
+                     "fix": "Send it to another route, or remove it too."},
+                    {"code": "missing-route", "severity": "error", "record_id": "anthropic-messages-2",
+                     "path": "/rewrites/1/target/route_id",
+                     "sentence": "The route it sends to is not in the policy.",
+                     "fix": "Send it to another route, or remove it too."},
+                ],
+            }),
+        );
+        let text = frame(&state, 120, 40);
+        insta::assert_snapshot!(text);
+        assert!(text.contains("rewrite anthropic-messages-1"), "{text}");
+        assert!(text.contains("rewrite anthropic-messages-2"), "{text}");
+        assert!(text.contains("[ctrl+s] fix 2 records to save"), "{text}");
+    }
+
+    #[test]
+    fn a_rewrite_being_moved_is_shown_where_it_would_land() {
+        let mut state = page(World::AT_REST, Tab::Rewrites);
+        state.move_selection(1);
+        send(&mut state, KeyCode::Char('m'));
+        send(&mut state, KeyCode::Down);
+        checked(&mut state, fine());
+        let text = frame(&state, 120, 40);
+        insta::assert_snapshot!(text);
+        assert!(text.contains("rule 2 → 3 of 5"), "{text}");
+    }
+
+    #[test]
+    fn a_fallback_added_to_a_route_is_a_form_among_its_candidates() {
+        let mut state = page(World::AT_REST, Tab::Routes);
+        send(&mut state, KeyCode::Enter);
+        send(&mut state, KeyCode::Char('n'));
+        checked(&mut state, fine());
+        replayed(&mut state);
+        let text = frame(&state, 120, 50);
+        insta::assert_snapshot!(text);
+        assert!(text.contains("add a fallback to claude-sub"), "{text}");
+    }
+
+    #[test]
+    fn a_candidate_being_reordered_is_shown_in_its_new_place() {
+        let mut state = page(World::AT_REST, Tab::Routes);
+        send(&mut state, KeyCode::Enter);
+        send(&mut state, KeyCode::Char('m'));
+        send(&mut state, KeyCode::Down);
+        checked(&mut state, fine());
+        let text = frame(&state, 120, 50);
+        insta::assert_snapshot!(text);
+        assert!(text.contains("candidate 1 → 2 of 2"), "{text}");
+    }
+
+    /// A click on a form line focuses that field, and a click on a line that
+    /// is only a heading or a completion focuses nothing.
+    #[test]
+    fn a_click_focuses_the_field_on_its_line() {
+        let mut state = page(World::AT_REST, Tab::Presentations);
+        send(&mut state, KeyCode::Char('n'));
+        let (text, drawn) = drawn_at(&state, 120, 50);
+        let hit = drawn.form.expect("a form is open");
+        let lines: Vec<&str> = text.lines().collect();
+        let on = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no line with {needle:?}: {text}"))
+        };
+        let at = |y: usize| {
+            hit.fields
+                .iter()
+                .find(|(area, _)| usize::from(area.y) == y)
+                .map(|(_, row)| *row)
+        };
+        let slug = at(on("slug:")).expect("the slug line is a field");
+        assert!(at(on("SCOPE")).is_none(), "a heading is not a field");
+        state.focus_form_row(slug);
+        let focused: Vec<String> = state
+            .editing()
+            .expect("editing")
+            .form
+            .lines()
+            .into_iter()
+            .filter(|line| line.focused)
+            .map(|line| line.text)
+            .collect();
+        assert_eq!(focused.len(), 1);
+        assert!(focused[0].contains("slug"), "{focused:?}");
+    }
+
+    /// An edit draws in any room a terminal can be.
+    #[test]
+    fn every_edit_draws_in_any_size() {
+        let edits: [(Tab, &[char]); 6] = [
+            (Tab::Rewrites, &['n']),
+            (Tab::Rewrites, &['e']),
+            (Tab::Rewrites, &['m']),
+            (Tab::Presentations, &['d']),
+            (Tab::Models, &['e']),
+            (Tab::Defaults, &['n']),
+        ];
+        for (tab, keys) in edits {
+            let mut state = page(World::FULL, tab);
+            for key in keys {
+                send(&mut state, KeyCode::Char(*key));
+            }
+            // A move that has not moved has nothing to check.
+            if let Some(check) = state.next_check() {
+                answer(&mut state, check, 200, fine());
+            }
+            for width in [1, 2, 8, 20, 50, 80, 135] {
+                for height in [1, 2, 3, 5, 8, 12, 24, 50] {
+                    drawn_at(&state, width, height);
+                }
+            }
+        }
+        let mut state = page(World::FULL, Tab::Routes);
+        send(&mut state, KeyCode::Enter);
+        for key in ['n', 'e', 'd', 'm'] {
+            send(&mut state, KeyCode::Char(key));
+            for width in [1, 20, 80, 135] {
+                for height in [1, 3, 12, 24, 50] {
+                    drawn_at(&state, width, height);
+                }
+            }
+            send(&mut state, KeyCode::Esc);
+        }
     }
 }

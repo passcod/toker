@@ -855,8 +855,24 @@ impl Form {
     /// input and each field's notes with it.
     pub(super) fn lines(&self) -> Vec<FormLine> {
         let rows = self.rows();
+        let collapsed = self.collapsed(&rows);
         let mut lines = Vec::new();
         for (index, row) in rows.iter().enumerate() {
+            if let Some((_, _, summary)) = collapsed.iter().find(|(start, _, _)| *start == index) {
+                lines.push(FormLine {
+                    text: summary.clone(),
+                    focused: false,
+                    row: None,
+                    notes: Vec::new(),
+                });
+                continue;
+            }
+            if collapsed
+                .iter()
+                .any(|(start, end, _)| index > *start && index < *end)
+            {
+                continue;
+            }
             let focused = index == self.focus;
             lines.push(FormLine {
                 text: self.row_text(row, focused),
@@ -874,6 +890,60 @@ impl Form {
             }
         }
         lines
+    }
+
+    /// The groups of switches that are drawn as one line while the focus is
+    /// not among them and nothing in them is refused: a form of many fields
+    /// is mostly such groups left as they are. Each is its first row, the row
+    /// after its last, and what it says of itself.
+    fn collapsed(&self, rows: &[Row]) -> Vec<(usize, usize, String)> {
+        let (placed, _) = self.placed(rows);
+        let mut groups = Vec::new();
+        let mut index = 0;
+        while index < rows.len() {
+            let row = &rows[index];
+            let end = index
+                + 1
+                + rows[index + 1..]
+                    .iter()
+                    .take_while(|child| child.depth > row.depth)
+                    .count();
+            let children = &rows[index + 1..end];
+            let switches = !children.is_empty()
+                && children
+                    .iter()
+                    .all(|child| matches!(child.op, Op::Flag(_) | Op::Toggle));
+            let quiet = !(index..end).contains(&self.focus)
+                && !placed.iter().any(|(at, _)| (index..end).contains(at));
+            if matches!(row.op, Op::Heading) && row.depth >= 1 && switches && quiet {
+                let on: Vec<String> = children
+                    .iter()
+                    .filter(|child| self.is_on(child))
+                    .map(|child| match &child.op {
+                        Op::Flag(option) => option.replace('_', " "),
+                        _ => child.label.clone(),
+                    })
+                    .collect();
+                let said = if on.is_empty() {
+                    "none".to_owned()
+                } else {
+                    on.join(", ")
+                };
+                groups.push((
+                    index,
+                    end,
+                    format!(
+                        "  {}{}: {said}",
+                        "  ".repeat(row.depth),
+                        row.label.to_uppercase()
+                    ),
+                ));
+                index = end;
+                continue;
+            }
+            index += 1;
+        }
+        groups
     }
 
     /// Hand the form what a check found. A finding goes beside the field
@@ -2462,10 +2532,7 @@ mod tests {
             .expect("the model row");
         assert_eq!(
             shown.notes,
-            [(
-                Note::Warning,
-                "the catalogues do not offer this".to_owned()
-            )]
+            [(Note::Warning, "the catalogues do not offer this".to_owned())]
         );
     }
 

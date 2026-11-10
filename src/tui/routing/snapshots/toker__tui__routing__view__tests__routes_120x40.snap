@@ -18,5 +18,5 @@ expression: "frame(&state, 120, 40)"
 │ 1  anthropic_sub.anthropic_messages  subscription    as asked                                no cred                 │
 │    ↓ when unavailable before send · overloaded · 5xx   billed: allow   ambiguous retry: deny   cache: preserve warm  │
 │ 2  openrouter.openrouter_messages    billed          alias claude-* → anthropic/claude-*     ok                      │
-│ [e] edit   [n] add fallback   [m] move   [t] trace   [enter] open route                                              │
+│ [e] edit   [n] new   [d] delete   [t] trace   [enter] open route                                                     │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

@@ -27,6 +27,9 @@ pub(super) struct BodyLine {
     /// Whether the line is the focused field of an open form: the one the
     /// window follows, and the one drawn reversed.
     pub(super) focused: bool,
+    /// A line that must stay in view, as an open form's save control: drawn
+    /// in the panel's last row when the window has scrolled past it.
+    pub(super) pinned: bool,
 }
 
 impl BodyLine {
@@ -36,6 +39,7 @@ impl BodyLine {
             entry: None,
             field: None,
             focused: false,
+            pinned: false,
         }
     }
 
@@ -45,7 +49,14 @@ impl BodyLine {
             entry: Some(entry),
             field: None,
             focused: false,
+            pinned: false,
         }
+    }
+
+    /// A line that stays in view whatever the window.
+    pub(super) fn pinned(mut self) -> Self {
+        self.pinned = true;
+        self
     }
 
     /// A line of an open form, a field or what sits with one.
@@ -55,6 +66,7 @@ impl BodyLine {
             entry: None,
             field,
             focused,
+            pinned: false,
         }
     }
 }
@@ -280,7 +292,17 @@ pub(super) fn draw_table(
         .below
         .map(|_| hidden(&table.body, last..table.body.len()));
     let shown = window.shown.clone();
+    let pinned_out = table
+        .body
+        .iter()
+        .position(|line| line.pinned)
+        .filter(|at| !shown.contains(at));
+    let mut pinned_line = None;
     for (index, body) in table.body.into_iter().enumerate() {
+        if Some(index) == pinned_out {
+            pinned_line = Some(body);
+            continue;
+        }
         if !shown.contains(&index) {
             continue;
         }
@@ -297,6 +319,11 @@ pub(super) fn draw_table(
             None,
             None,
         ));
+    }
+    // The save control stays in view: it takes the last row.
+    if let Some(pinned) = pinned_line {
+        rows.truncate(room.saturating_sub(1));
+        rows.push((padded(pinned.line, width), None, None));
     }
     let mut hits = Hits::default();
     for (row, (line, entry, field)) in rows.into_iter().take(room).enumerate() {
@@ -356,12 +383,22 @@ pub(super) fn draw_page(
     let inner = chrome::panel(frame, area, title, framing);
     let room = usize::from(inner.height);
     let width = usize::from(inner.width);
+    let mut lines = lines;
+    // Where the lines do not all fit, the pinned one takes the last row and
+    // the rest scroll only as far as keeps the focused field in view.
+    let pinned = (lines.len() > room)
+        .then(|| lines.iter().position(|line| line.pinned))
+        .flatten()
+        .map(|at| lines.remove(at));
+    let room_left = room.saturating_sub(usize::from(pinned.is_some()));
     let focus = lines.iter().position(|line| line.focused).unwrap_or(0);
     let start = (focus + 1)
-        .saturating_sub(room)
-        .min(lines.len().saturating_sub(room));
+        .saturating_sub(room_left)
+        .min(lines.len().saturating_sub(room_left));
     let mut fields = Vec::new();
-    for (row, body) in lines.into_iter().skip(start).take(room).enumerate() {
+    let mut shown: Vec<BodyLine> = lines.into_iter().skip(start).take(room_left).collect();
+    shown.extend(pinned);
+    for (row, body) in shown.into_iter().enumerate() {
         let at = Rect {
             y: inner.y + row as u16,
             height: 1,

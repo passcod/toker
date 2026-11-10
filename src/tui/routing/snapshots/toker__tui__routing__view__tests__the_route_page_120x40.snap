@@ -24,5 +24,5 @@ expression: "frame(&state, 120, 40)"
 │   rewrite  openai_responses 3              anthropic_sub/${model}                                                    │
 │   default  unprefixed/anthropic_messages                                                                             │
 │   default  anthropic_messages                                                                                        │
-│ [e] edit   [n] add fallback   [m] move   [t] trace   [←/→] other routes   [esc] back                                 │
+│ [e] edit   [n] add fallback   [m] move   [d] remove   [t] trace   [←/→] other routes   [esc] back                    │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

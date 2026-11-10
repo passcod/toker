@@ -9,7 +9,7 @@ use ratatui::{
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
-use super::data::text;
+use super::data::{array, text};
 use super::editing::{Editing, What};
 use super::form::{FormLine, Note};
 use super::table::{BodyLine, Cells, span};
@@ -210,7 +210,7 @@ pub(super) fn block(editing: &Editing, width: usize) -> Vec<BodyLine> {
     }
     footer.push(Span::raw(format!("[ctrl+s] {}", editing.save_label())));
     footer.push(Span::raw("   [esc] cancel"));
-    lines.push(BodyLine::form(Line::from(footer), None, false));
+    lines.push(BodyLine::form(Line::from(footer), None, false).pinned());
     lines
 }
 
@@ -262,12 +262,18 @@ fn age(until_ms: i64, ts_ms: i64) -> String {
     }
 }
 
-/// Where a request went, and what caught it.
-fn outcome(outcome: &Value) -> String {
+/// Where a request went, and what caught it: a rule by its place where the
+/// live policy has it, and by its id where it is new.
+fn outcome(active: &Value, outcome: &Value) -> String {
     let matched = outcome.get("matched").unwrap_or(&Value::Null);
     let caught = match (text(matched, "kind"), text(matched, "id")) {
         ("", _) => String::new(),
         (kind, "") => kind.to_owned(),
+        ("rewrite", id) => array(active, "rewrites")
+            .iter()
+            .find(|rule| text(rule, "id") == id)
+            .and_then(|rule| rule.get("position").and_then(Value::as_u64))
+            .map_or_else(|| format!("rewrite {id}"), |place| format!("rule {place}")),
         (kind, id) => format!("{kind} {id}"),
     };
     match text(outcome, "outcome") {
@@ -279,16 +285,22 @@ fn outcome(outcome: &Value) -> String {
 
 /// The preview panel's lines: the changed requests, now and with the edit,
 /// and how many could not be replayed.
-pub(super) fn preview(editing: &Editing, width: usize) -> Vec<Line<'static>> {
+pub(super) fn preview(editing: &Editing, active: &Value, width: usize) -> Vec<Line<'static>> {
+    let current = Value::Array(editing.operations());
     let Some(replay) = &editing.replay else {
-        let waiting = if editing.validating || editing.checked.is_none() {
-            "checking the edit, then replaying the last 24 hours of requests under it"
-        } else {
+        let waiting = if editing.accepted(&current) {
+            "replaying the last 24 hours of requests under the edit"
+        } else if editing
+            .checked
+            .as_ref()
+            .is_some_and(|checked| checked.ops == current)
+        {
             "recent requests are replayed once the edit is one the daemon accepts"
+        } else {
+            "checking the edit, then replaying the last 24 hours of requests under it"
         };
         return vec![Line::styled(waiting.to_owned(), dim())];
     };
-    let current = Value::Array(editing.operations());
     let mut lines = Vec::new();
     let mut head = if replay.changed_total == 0 {
         format!(
@@ -306,15 +318,17 @@ pub(super) fn preview(editing: &Editing, width: usize) -> Vec<Line<'static>> {
     }
     lines.push(Line::raw(head));
     if !replay.changed.is_empty() {
-        let request_w = 30.min(width / 4).max(12);
+        let request_w = 24.min(width / 4).max(12);
         let when_w = 9;
-        let side = width.saturating_sub(request_w + when_w + 2) / 2;
+        let rest = width.saturating_sub(request_w + when_w + 2);
+        let now_w = rest * 2 / 5;
+        let with_w = rest - now_w;
         lines.push(
             Cells::new()
                 .cell(vec![span("request", dim())], request_w)
                 .cell(vec![span("when", dim())], when_w)
-                .cell(vec![span("now", dim())], side)
-                .cell(vec![span("with this change", dim())], side)
+                .cell(vec![span("now", dim())], now_w)
+                .cell(vec![span("with this change", dim())], with_w)
                 .line(),
         );
         const SHOWN: usize = 6;
@@ -339,15 +353,17 @@ pub(super) fn preview(editing: &Editing, width: usize) -> Vec<Line<'static>> {
                     )
                     .cell(
                         vec![Span::raw(outcome(
+                            active,
                             change.get("under_active").unwrap_or(&Value::Null),
                         ))],
-                        side,
+                        now_w,
                     )
                     .cell(
                         vec![Span::raw(outcome(
+                            active,
                             change.get("under_edit").unwrap_or(&Value::Null),
                         ))],
-                        side,
+                        with_w,
                     )
                     .line(),
             );

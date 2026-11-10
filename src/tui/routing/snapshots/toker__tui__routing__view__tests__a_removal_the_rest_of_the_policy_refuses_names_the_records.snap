@@ -1,0 +1,25 @@
+---
+source: src/tui/routing/view.rs
+expression: text
+---
+ ?   dashboard   routing   config   accounts   ‹ 2 rewrites → 3 defaults → 4 routes 7 · 5 models ›  editing · rev 9 live
+┌ROUTES────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ route                 sent to                     matched by           lanes            reach                        │
+│ claude-sub            anthropic_sub → openrouter  4 rules · 1 default  2 warm · 5 cold  no cred · billed fallback    │
+│     ┌ remove route claude-sub                                                                                        │
+│     │ saving takes it out of the policy and makes a new revision live                                                │
+│     │ refused rewrite anthropic-messages-1: The route it sends to is not in the policy.                              │
+│     │         Send it to another route, or remove it too.                                                            │
+│     │ refused rewrite anthropic-messages-2: The route it sends to is not in the policy.                              │
+│     │         Send it to another route, or remove it too.                                                            │
+│     └ [ctrl+s] fix 2 records to save   [esc] cancel                                                                  │
+│ claude-api            anthropic_api               3 rules              none             off                          │
+│ openrouter-messages   openrouter                  1 rule               none             ok                           │
+│ openrouter-chat       openrouter                  1 rule · 1 default   3 cold           ok                           │
+│ openrouter-responses  openrouter                  1 rule               none             ok                           │
+│ openai-chat           openai_api                  1 rule               none             off                          │
+│ codex                 codex_sub → openrouter      3 rules              none             off · billed fallback        │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌PREVIEW───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ recent requests are replayed once the edit is one the daemon accepts                                                 │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

@@ -3,18 +3,18 @@ source: src/tui/routing/view.rs
 expression: "frame(&state, 120, 32)"
 ---
  ?   dashboard   routing   config   accounts   ‹ 2 rewrites → 3 defaults → 4 routes · 5 models 11 · 6 history rev 9 live
-┌FAMI┌PROMOTE LEARNED MODEL───────────────────────────────────────────────────────────────────────────────────────┐────┐
-│ fam│> binding: ▏                                                                                                │    │
+┌FAMILIES──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ family           matches                         example                       reads as                              │
+│ claude-opus      claude-opus-*                   claude-opus-4-7               opus · 4.7                            │
+│ claude-sonnet    claude-sonnet-*                 claude-sonnet-4-5             sonnet · 4.5                          │
+│ claude-haiku     claude-haiku-*                  claude-haiku-4-5              haiku · 4.5                           │
+│ gpt              gpt-*                           openai/gpt-5.6-sol            sol · 5.6                             │
+│ qwen             qwen/qwen*                      qwen/qwen3.5-max              max · 3.5                             │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌UPGR┌PROMOTE LEARNED MODEL───────────────────────────────────────────────────────────────────────────────────────┐────┐
+│ new│> binding: ▏                                                                                                │    │
 │ cla│    Tab: anthropic_sub.anthropic_messages | anthropic_api.anthropic_messages | openai_api.openai_chat_comple│    │
 │ cla│  model:                                                                                                    │    │
-│ cla│                                                                                                            │    │
-│ gpt│                                                                                                            │    │
-│ qwe│                                                                                                            │    │
-└────│                                                                                                            │────┘
-┌UPGR│                                                                                                            │────┐
-│ new│                                                                                                            │    │
-│ cla│                                                                                                            │    │
-│ cla│                                                                                                            │    │
 │ ope│                                                                                                            │    │
 │ ope│                                                                                                            │    │
 │ cod│                                                                                                            │    │
@@ -22,15 +22,15 @@ expression: "frame(&state, 120, 32)"
 └────│                                                                                                            │────┘
 ┌COMP│                                                                                                            │────┐
 │ col│                                                                                                            │    │
-└────│                                                                                                            │────┘
+└────│tab complete from a daemon offer · enter record · esc cancel                                                │────┘
 ┌OFFE│                                                                                                            │────┐
-│ ant│                                                                                                            │    │
-│ cla│                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │                                                                                                            │    │
-│    │tab complete from a daemon offer · enter record · esc cancel                                                │    │
-│    │                                                                                                            │    │
-│    └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
+│ ant└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘    │
+│ claude-sonnet-5                              200k   2025-08                                                          │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

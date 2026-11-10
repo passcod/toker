@@ -1176,6 +1176,14 @@ impl State {
             .find(|(_, route)| text(route, "id") == id)
     }
 
+    /// Where the open route is in the document, and how many steps its chain
+    /// has: where a candidate added to it would be, for a test.
+    #[cfg(test)]
+    pub(super) fn document_route_for_tests(&self) -> (usize, usize) {
+        let (index, route) = self.document_route().expect("a route is open");
+        (index, array(&route["chain"], "steps").len())
+    }
+
     /// Whether the open route page is the one in view.
     fn on_route_page(&self) -> bool {
         (self.tab, self.mode) == (Tab::Routes, Mode::Route)
@@ -1693,6 +1701,18 @@ fn control_error(command: &Command, response: &Response) -> String {
         })
         .collect::<Vec<_>>();
     let mut message = format!("{}: {code} (HTTP {})", command.name, response.status);
+    // A save or a check keeps its form and says this there; what else was
+    // made against the live revision says it here.
+    if code == "stale_revision"
+        && let Some(live) = response
+            .body
+            .get("live_revision_id")
+            .and_then(Value::as_i64)
+    {
+        message.push_str(&format!(
+            ": revision {live} is now live; reload, then save again"
+        ));
+    }
     if let Some(detail) = response.body.get("detail").and_then(Value::as_str) {
         message.push_str(&format!(": {detail}"));
     }
@@ -2301,7 +2321,9 @@ mod tests {
         let check = state.next_check().expect("check");
         state.command_refused(check.name);
         assert!(
-            state.error().is_some_and(|error| !error.contains("validate")),
+            state
+                .error()
+                .is_some_and(|error| !error.contains("validate")),
             "a check is not worth a banner: {:?}",
             state.error()
         );
@@ -3068,12 +3090,10 @@ mod tests {
         assert_eq!(form.value()["model_id"], "claude-sonnet-5");
     }
 
+    /// The keys of the pages this one replaced open nothing: there is no
+    /// preview popup to ask for and no import to start.
     #[test]
-    fn nothing_in_the_page_mentions_a_draft_or_the_old_preview() {
-        // The draft, its validation and its activation are gone, and so is
-        // the popup that showed a preview as a document.
-        let state = loaded(World::AT_REST);
-        let _ = &state;
+    fn the_keys_of_the_removed_popups_open_nothing() {
         for key in ['v', 'i'] {
             let mut state = loaded(World::AT_REST);
             assert!(press(&mut state, KeyCode::Char(key)).is_none());
