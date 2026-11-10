@@ -8,9 +8,8 @@
 //!   rtcwake's job, not this one's). Root-level because the user
 //!   manager lacks `CAP_WAKE_ALARM`; it is the only root-level piece
 //!   toker has ([`crate::schedule::wake_system_unit`] generates it and
-//!   the `/bin/true` service it starts; setup only writes them, and the
-//!   dashboard places them in the system manager, which needs elevation,
-//!   when the ping schedule is turned on).
+//!   the `/bin/true` service it starts, and the dashboard places them in
+//!   the system manager, which needs elevation).
 //! - **hold** — USER timers at the same slots running `toker hold
 //!   --for=15m`: a timer that elapses while the machine is suspended
 //!   fires on resume, and the hold then keeps the machine up those 15
@@ -106,8 +105,8 @@ pub const HOLD_WHY: &str = "wake hold timer";
 /// wake is owned by the system timer, and the wizard never installs
 /// anything for the verb itself.
 pub const WAKE_ARM_NOTE: &str = "nothing to arm: wake is owned by the systemd \
-     system timer toker-wake.timer (WakeSystem=true), written by `toker setup` \
-     and placed in the system manager when the ping schedule is turned on. \
+     system timer toker-wake.timer (WakeSystem=true), placed in the system \
+     manager from the dashboard's schedule page. \
      This verb was the predecessor's macOS one-shot (pmset schedule wake); \
      on Linux the timer replaces it.";
 

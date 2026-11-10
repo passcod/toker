@@ -44,12 +44,11 @@
 //! go through the ordinary user-manager path and are enabled at once: their
 //! services wait on the marker the service keeps
 //! ([`timers::sync_ping_marker`]), so nothing runs until the ping schedule
-//! is turned on. They carry the slots an earlier run installed, else
-//! [`DEFAULT_SLOTS`]. The wake SYSTEM timer and the do-nothing service it
-//! starts are written into the units dir and no further: placing them in
-//! the system manager needs elevation, which the dashboard asks for when
-//! the schedule is turned on, so setup never reaches the system manager.
-//! Every timers failure is non-fatal with manual commands printed.
+//! is turned on. They carry the slots and days an earlier run installed,
+//! else [`schedule::default_schedule`]. The wake is the dashboard's: placing
+//! it in the system manager needs elevation, so setup never reaches the
+//! system manager, and leaves whatever wake it finds there as it is. Every
+//! timers failure is non-fatal with manual commands printed.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -796,12 +795,12 @@ pub struct RunReport {
     pub plugin_installed: Option<PathBuf>,
     /// The plugin was offered and declined.
     pub plugin_declined: bool,
-    /// The wake/hold/ping slots the timers carry: the ones an earlier run
-    /// installed, else [`DEFAULT_SLOTS`]. Empty when the run did not reach
-    /// the timers.
+    /// The hold/ping slots the timers carry: the ones an earlier run
+    /// installed, else [`schedule::default_schedule`]. Empty when the run
+    /// did not reach the timers.
     pub timer_slots: Vec<ScheduledSlot>,
-    /// The timer units installed this run: the hold pair, the per-slot
-    /// ping pairs, and the staged wake pair.
+    /// The timer units installed this run: the hold pair and the per-slot
+    /// ping pairs.
     pub timers_installed: Vec<String>,
     /// Every timer install, the daemon-reload and each enable succeeded.
     pub timers_ok: bool,
@@ -2080,9 +2079,9 @@ impl<'a> Wizard<'a> {
     /// and per-slot ping units go through the ordinary user-manager path
     /// (`install_unit`, `daemon-reload`, `enable --now` per timer); their
     /// services wait on the ping marker, so enabling them starts nothing
-    /// the operator has not turned on. The wake pair is written beside them
-    /// and goes no further. Every failure here is non-fatal with the manual
-    /// commands printed.
+    /// the operator has not turned on. The wake is left to the dashboard;
+    /// a copy an earlier version staged among the user units is removed.
+    /// Every failure here is non-fatal with the manual commands printed.
     // spec: USETUP#installing-units
     fn timers_step(&mut self, report: &mut RunReport) -> Result<()> {
         let exe = std::env::current_exe().context("resolving the running binary's own path")?;
@@ -2093,6 +2092,16 @@ impl<'a> Wizard<'a> {
             slots = schedule::default_schedule();
         }
         report.timer_slots = slots.clone();
+
+        // An earlier setup staged the wake among the user units, where the
+        // user manager loaded a WakeSystem timer it could never arm. The
+        // wake lives in the system manager, placed by the dashboard; the
+        // daemon-reload below forgets the staged copy.
+        for name in [WAKE_TIMER_UNIT, WAKE_SERVICE_UNIT] {
+            if let Err(error) = self.runner.remove_unit(name) {
+                self.say(&format!("removing the staged {name} failed: {error:#}"))?;
+            }
+        }
 
         // The user units: one hold pair, plus one ping pair per slot.
         let (units, timer_names) = schedule::user_units(&slots, &exe, &self.paths.state_dir);
@@ -2139,22 +2148,7 @@ impl<'a> Wizard<'a> {
             }
         }
 
-        // The wake pair is only written: it belongs to the system manager,
-        // which needs elevation, and that is asked for on the dashboard when
-        // the schedule is turned on. Independent of the user timers' fate.
-        let wake = [
-            (
-                WAKE_SERVICE_UNIT.to_owned(),
-                schedule::wake_system_service(),
-            ),
-            (
-                WAKE_TIMER_UNIT.to_owned(),
-                schedule::wake_system_unit(&slots),
-            ),
-        ];
-        let staged = self.install_timer_units(&wake, "staged", report)?;
-
-        report.timers_ok = ok && staged;
+        report.timers_ok = ok;
         if !report.timers_ok {
             self.say("the timers did not all come up; finish by hand:")?;
             for command in &report.timers_manual {
@@ -2280,8 +2274,8 @@ impl<'a> Wizard<'a> {
             "not reached".to_owned()
         } else if report.timers_ok {
             format!(
-                "slots {slots} — hold+ping user timers enabled, wake timer staged; \
-                 pings run once the ping schedule is turned on"
+                "slots {slots} — hold+ping user timers enabled; pings run once the \
+                 ping schedule is turned on"
             )
         } else {
             format!(
@@ -4579,9 +4573,8 @@ default_backend_anthropic = "codex_sub"
     // ── the wake/hold/ping timers ─────────────────────────────────
 
     /// A fresh run installs and enables the hold and ping timers at the
-    /// default slots without asking, and writes the wake pair beside them
-    /// without placing it anywhere: the runner has no way to reach the
-    /// system manager, and the user manager is never asked to enable it.
+    /// default slots without asking, and writes no wake: the runner has no
+    /// way to reach the system manager, which is the dashboard's to ask.
     #[tokio::test]
     async fn a_fresh_run_installs_the_timers_at_the_default_slots_unasked() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
@@ -4604,7 +4597,7 @@ default_backend_anthropic = "codex_sub"
         assert!(report.timers_manual.is_empty());
 
         // The units installed, in order, byte-for-byte the generators'
-        // output, the wake pair last.
+        // output.
         let exe = std::env::current_exe().expect("this test binary's path");
         let installed = rig.runner.installed();
         assert_eq!(
@@ -4633,7 +4626,7 @@ default_backend_anthropic = "codex_sub"
                 .iter()
                 .flatten()
                 .all(|arg| !arg.contains("toker-wake")),
-            "the wake pair is only written: {calls:?}"
+            "the wake is never asked of a manager: {calls:?}"
         );
         assert_eq!(
             rig.prompt.asked().len(),
@@ -4645,9 +4638,15 @@ default_backend_anthropic = "codex_sub"
         assert!(
             out.contains(
                 "timers    : slots 07:20 Mon..Fri, 12:20 Mon..Fri — hold+ping user timers \
-                 enabled, wake timer staged; pings run once the ping schedule is turned on"
+                 enabled; pings run once the ping schedule is turned on"
             ),
             "{out}"
+        );
+        assert!(
+            installed
+                .iter()
+                .all(|(name, _)| !name.starts_with("toker-wake.")),
+            "setup writes no wake: {installed:?}"
         );
     }
 
@@ -4690,10 +4689,39 @@ default_backend_anthropic = "codex_sub"
                 .all(|unit| rig.runner.installed().contains(unit)),
             "the units were rewritten at the installed slots"
         );
+    }
+
+    /// An earlier setup staged the wake among the user units; a re-run
+    /// removes that copy and writes none of its own (spec:
+    /// USETUP#installing-units).
+    #[tokio::test]
+    async fn a_run_removes_the_wake_an_earlier_setup_staged() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "timers-staged-wake",
+            vec![text(&port.to_string())], // the listener port
+            with_timers(vec![inactive(), ok_empty(), ok_empty()]),
+        )
+        .with_keys(&["openrouter"]);
+        let units_dir = rig.paths().units_dir;
+        std::fs::create_dir_all(&units_dir).expect("create the scratch units dir");
+        let slots = default_slots();
+        std::fs::write(units_dir.join(WAKE_TIMER_UNIT), wake_system_unit(&slots))
+            .expect("seed the staged timer");
+        std::fs::write(units_dir.join(WAKE_SERVICE_UNIT), wake_system_service())
+            .expect("seed the staged service");
+
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+
+        assert!(report.timers_ok);
+        assert!(!units_dir.join(WAKE_TIMER_UNIT).exists());
+        assert!(!units_dir.join(WAKE_SERVICE_UNIT).exists());
         assert!(
             rig.runner
                 .installed()
-                .contains(&(WAKE_TIMER_UNIT.to_owned(), wake_system_unit(&slots)))
+                .iter()
+                .all(|(name, _)| !name.starts_with("toker-wake.")),
+            "nothing is staged in its place"
         );
     }
 
@@ -4718,10 +4746,10 @@ default_backend_anthropic = "codex_sub"
     }
 
     /// The user-timers-failure leg: a failed daemon-reload after the
-    /// timer installs leaves the enables unrun, the manual commands
-    /// printed — and the wake pair is still written.
+    /// timer installs leaves the enables unrun, and the manual commands
+    /// printed.
     #[tokio::test]
-    async fn a_failed_user_timer_step_still_writes_the_wake_pair() {
+    async fn a_failed_user_timer_step_prints_the_manual_commands() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "timers-user-fail",
@@ -4764,14 +4792,6 @@ default_backend_anthropic = "codex_sub"
             report.timers_manual
         );
         transcript_snapshot("failed_user_timers_transcript", &rig, port, &rig.out());
-        assert!(
-            report
-                .timers_installed
-                .iter()
-                .any(|name| name == WAKE_TIMER_UNIT),
-            "the wake pair was still written: {:?}",
-            report.timers_installed
-        );
         assert!(rig.out().contains("NOT fully up"), "{}", rig.out());
     }
 
@@ -4876,8 +4896,7 @@ default_backend_anthropic = "codex_sub"
     }
 
     /// The timers step's units at `slots`, as the rig's paths generate
-    /// them: the hold pair, a ping pair per slot, then the staged wake
-    /// pair.
+    /// them: the hold pair, then a ping pair per slot.
     fn timers_installed(rig: &Rig, exe: &Path, slots: &[ScheduledSlot]) -> Vec<(String, String)> {
         let state_dir = rig.paths().state_dir;
         let (hold_timer, hold_service) = hold_user_units(slots, exe, &state_dir);
@@ -4889,8 +4908,6 @@ default_backend_anthropic = "codex_sub"
             units.push((pair.timer_name, pair.timer));
             units.push((pair.service_name, pair.service));
         }
-        units.push((WAKE_SERVICE_UNIT.to_owned(), wake_system_service()));
-        units.push((WAKE_TIMER_UNIT.to_owned(), wake_system_unit(slots)));
         units
     }
 

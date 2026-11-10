@@ -53,8 +53,6 @@ installed toker-ping-0720.service ([ROOT]/.config/systemd/user/toker-ping-0720.s
 installed toker-ping-1220.timer ([ROOT]/.config/systemd/user/toker-ping-1220.timer)
 installed toker-ping-1220.service ([ROOT]/.config/systemd/user/toker-ping-1220.service)
 systemctl --user daemon-reload failed: Failed to connect to bus: No medium found
-staged toker-wake.service ([ROOT]/.config/systemd/user/toker-wake.service)
-staged toker-wake.timer ([ROOT]/.config/systemd/user/toker-wake.timer)
 the timers did not all come up; finish by hand:
   systemctl --user daemon-reload
   systemctl --user enable --now toker-hold.timer

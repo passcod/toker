@@ -32,6 +32,6 @@ Specs: GPING#the-schedule, UTUI#schedule, USETUP#installing-units.
 - [ ] Slot rules: at least one day, unique times, the five-hour overlap refusal, no turning on with no slots
 - [ ] Schedule tab: position row, slots table with last runs, add/edit/remove slot forms, the orphan-wake flag
 - [ ] The elevated wake step via pkexec, with the TUI suspended around it
-- [ ] Setup: stop staging the wake; remove a `toker-wake.timer` / `toker-wake.service` an earlier setup left in the user units dir; carry installed days
-- [ ] Update the `wake-arm` note and the timers module doc, which say setup writes the wake
+- [x] Setup: stop staging the wake; remove a `toker-wake.timer` / `toker-wake.service` an earlier setup left in the user units dir; carry installed days
+- [x] Update the `wake-arm` note and the timers module doc, which say setup writes the wake
 - [ ] Snapshots for the schedule tab at 80x24 and 120x40, and the keys overlay
