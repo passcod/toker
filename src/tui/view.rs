@@ -3388,7 +3388,7 @@ mod tests {
             523,
         );
         let snap = with_latest(snap, Some(NOW - 2 * 3_600_000));
-        let (row, fg) = header_fg(&snap, 100, "120m ago");
+        let (row, fg) = header_fg(&snap, 120, "120m ago");
         assert_eq!(fg, Color::Red, "in {row:?}");
         assert!(row.contains("no requests in window"), "{row:?}");
     }
