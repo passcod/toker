@@ -201,39 +201,12 @@ impl<'a> LegacyBuilder<'a> {
 
     fn add_backend_routes(&mut self) -> anyhow::Result<()> {
         for binding in self.topology.bindings() {
-            let route_id = backend_route_id(binding)?;
-            let alias_policy = model_map_for(self.config, binding.provider())
-                .map(alias_policy)
-                .transpose()?;
-            let upgrade_policy_id = serves_anthropic_identities(binding)
-                .then(|| upgrade_id(binding))
-                .transpose()?;
-            self.policy.routes.push(Route {
-                honours_server_safeguards: false,
-                id: route_id,
-                display_name: format!("{} route", binding.provider()),
-                description: None,
-                parameters: vec![parameter(REQUESTED_ROUTE_PARAMETER)?],
-                chain: RouteChain {
-                    first: Candidate {
-                        id: candidate_id(binding)?,
-                        binding_id: binding.id().clone(),
-                        model: CandidateModel::RequestedModel,
-                        upgrade_policy_id,
-                        alias_policy,
-                        required_capabilities: Default::default(),
-                        enabled: self.topology.binding_is_configured(binding),
-                        health_circuits: vec![],
-                    },
-                    steps: vec![],
-                },
-                // A pinned lane may move once its cache is gone, which is
-                // what the force-newest upgrade and the compaction retarget
-                // need. The combination with their own policies is the
-                // stricter of the two, so PreservePinned here would deny
-                // both for every pinned lane however long it idled.
-                lane_transition: LaneTransitionPolicy::MoveWhenCold,
-            });
+            let route = backend_route(
+                self.config,
+                binding,
+                self.topology.binding_is_configured(binding),
+            )?;
+            self.policy.routes.push(route);
         }
         Ok(())
     }
@@ -261,18 +234,9 @@ impl<'a> LegacyBuilder<'a> {
         let Some(binding) = binding_for(self.topology, protocol.into(), provider) else {
             return Ok(());
         };
-        let target = requested_reference(backend_route_id(binding)?)?;
-        self.policy.defaults.push(DefaultRoute {
-            scope: FrontendScope::Protocol { protocol },
-            target: target.clone(),
-        });
-        self.policy.defaults.push(DefaultRoute {
-            scope: FrontendScope::Profile {
-                profile: ProfileId::new("unprefixed")?,
-                protocol,
-            },
-            target,
-        });
+        self.policy
+            .defaults
+            .extend(default_routes(protocol, binding)?);
         Ok(())
     }
 
@@ -481,6 +445,173 @@ fn model_map_for<'a>(config: &'a Config, provider: &str) -> Option<&'a ModelMap>
     }
 }
 
+/// The generated route to `binding`: one candidate on it, sending the
+/// requested model.
+fn backend_route(
+    config: &Config,
+    binding: &BackendBinding,
+    enabled: bool,
+) -> anyhow::Result<Route> {
+    let alias_policy = model_map_for(config, binding.provider())
+        .map(alias_policy)
+        .transpose()?;
+    let upgrade_policy_id = serves_anthropic_identities(binding)
+        .then(|| upgrade_id(binding))
+        .transpose()?;
+    Ok(Route {
+        honours_server_safeguards: false,
+        id: backend_route_id(binding)?,
+        display_name: format!("{} route", binding.provider()),
+        description: None,
+        parameters: vec![parameter(REQUESTED_ROUTE_PARAMETER)?],
+        chain: RouteChain {
+            first: Candidate {
+                id: candidate_id(binding)?,
+                binding_id: binding.id().clone(),
+                model: CandidateModel::RequestedModel,
+                upgrade_policy_id,
+                alias_policy,
+                required_capabilities: Default::default(),
+                enabled,
+                health_circuits: vec![],
+            },
+            steps: vec![],
+        },
+        // A pinned lane may move once its cache is gone, which is what the
+        // force-newest upgrade and the compaction retarget need. The
+        // combination with their own policies is the stricter of the two, so
+        // PreservePinned here would deny both for every pinned lane however
+        // long it idled.
+        lane_transition: LaneTransitionPolicy::MoveWhenCold,
+    })
+}
+
+/// The defaults that send `protocol` to the generated route to `binding`: the
+/// protocol's own, and the unprefixed profile's.
+fn default_routes(
+    protocol: FrontendProtocol,
+    binding: &BackendBinding,
+) -> anyhow::Result<[DefaultRoute; 2]> {
+    let target = requested_reference(backend_route_id(binding)?)?;
+    Ok([
+        DefaultRoute {
+            scope: FrontendScope::Protocol { protocol },
+            target: target.clone(),
+        },
+        DefaultRoute {
+            scope: unprefixed(protocol)?,
+            target,
+        },
+    ])
+}
+
+fn unprefixed(protocol: FrontendProtocol) -> anyhow::Result<FrontendScope> {
+    Ok(FrontendScope::Profile {
+        profile: ProfileId::new("unprefixed")?,
+        protocol,
+    })
+}
+
+/// What enabling a provider adds to the active revision: the edit, and the
+/// protocols it gives a default.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderDefaults {
+    pub edit: super::PolicyEdit,
+    pub protocols: Vec<FrontendProtocol>,
+}
+
+/// The edit that gives each protocol `provider` serves a default route to it,
+/// where `document` has no default for that protocol (spec: DCONF#editing).
+/// The edit is empty where every protocol it serves has one already.
+///
+/// Only a protocol-scoped default counts as the protocol having one: that is
+/// what a request reaches when no profile names a default of its own. The
+/// route each default points at is the generated route to the provider's
+/// binding for that protocol, as revision one builds it. It is added where
+/// the document lacks it, and its candidate on that binding enabled where it
+/// is not: a revision generated before the provider was on has the route with
+/// the candidate off, and a default to it would serve nothing. An unprefixed
+/// profile default already there is the operator's and stays.
+pub fn defaults_for_enabled_provider(
+    config: &Config,
+    document: &PolicyDocument,
+    provider: &str,
+) -> anyhow::Result<ProviderDefaults> {
+    use super::PolicyEditOperation;
+
+    let has_default = |scope: &FrontendScope| {
+        document
+            .defaults
+            .iter()
+            .any(|default| &default.scope == scope)
+    };
+    let mut operations = Vec::new();
+    let mut protocols = Vec::new();
+    let mut routes_done = std::collections::BTreeSet::new();
+    for protocol in [
+        FrontendProtocol::AnthropicMessages,
+        FrontendProtocol::OpenaiChat,
+        FrontendProtocol::OpenaiResponses,
+    ] {
+        let Some(binding) = crate::routing::ROUTES
+            .iter()
+            .find(|route| {
+                FrontendProtocol::from(route.frontend()) == protocol
+                    && route.binding().provider() == provider
+            })
+            .map(|route| route.binding())
+        else {
+            continue;
+        };
+        if has_default(&FrontendScope::Protocol { protocol }) {
+            continue;
+        }
+        let route_id = backend_route_id(binding)?;
+        // One binding can serve several protocols (codex's serves all
+        // three), and its route is edited once.
+        if routes_done.insert(route_id.clone()) {
+            match document.routes.iter().find(|route| route.id == route_id) {
+                Some(route) => {
+                    let first = &route.chain.first;
+                    if &first.binding_id == binding.id() && !first.enabled {
+                        operations.push(PolicyEditOperation::ReplaceCandidate {
+                            route_id: route_id.clone(),
+                            candidate_id: first.id.clone(),
+                            candidate: Candidate {
+                                enabled: true,
+                                ..first.clone()
+                            },
+                        });
+                    }
+                }
+                None => {
+                    let mut route = backend_route(config, binding, true)?;
+                    // An authored revision may have removed the upgrade
+                    // policy with the route; the route goes without it rather
+                    // than naming one the document does not hold.
+                    let first = &mut route.chain.first;
+                    if first.upgrade_policy_id.as_ref().is_some_and(|id| {
+                        !document.upgrades.iter().any(|upgrade| &upgrade.id == id)
+                    }) {
+                        first.upgrade_policy_id = None;
+                    }
+                    operations.push(PolicyEditOperation::AddRoute { route });
+                }
+            }
+        }
+        for default in default_routes(protocol, binding)? {
+            if !has_default(&default.scope) {
+                operations.push(PolicyEditOperation::AddDefault { default });
+            }
+        }
+        protocols.push(protocol);
+    }
+    Ok(ProviderDefaults {
+        edit: super::PolicyEdit { operations },
+        protocols,
+    })
+}
+
 fn requested_reference(route_id: RouteId) -> anyhow::Result<RouteReference> {
     Ok(RouteReference {
         route_id,
@@ -605,6 +736,66 @@ mod tests {
             providers.push(Arc::new(AnthropicApi::new(provider.upstream.clone(), None)));
         }
         RouteRegistry::new(providers)
+    }
+
+    #[test]
+    fn enabling_a_provider_adds_a_route_an_authored_revision_removed() {
+        use crate::policy::PolicyEditOperation;
+        let config = load_config("");
+        let mut document = document(&config, &topology(&config)).unwrap();
+        document
+            .routes
+            .retain(|route| route.id.as_str() != "route-anthropic_sub-anthropic_messages");
+        // The operator's own unprefixed default is not a protocol default,
+        // and stays as it is.
+        let authored = DefaultRoute {
+            scope: unprefixed(FrontendProtocol::OpenaiChat).unwrap(),
+            target: requested_reference(
+                RouteId::new("route-openrouter-openrouter_chat_completions").unwrap(),
+            )
+            .unwrap(),
+        };
+        document.defaults.push(authored.clone());
+
+        let defaults = defaults_for_enabled_provider(&config, &document, "anthropic_sub").unwrap();
+        assert_eq!(
+            defaults.protocols,
+            [
+                FrontendProtocol::AnthropicMessages,
+                FrontendProtocol::OpenaiChat,
+                FrontendProtocol::OpenaiResponses,
+            ]
+        );
+        let added: Vec<&Route> = defaults
+            .edit
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                PolicyEditOperation::AddRoute { route } => Some(route),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(added.len(), 1, "one binding, one route");
+        assert_eq!(
+            added[0].id.as_str(),
+            "route-anthropic_sub-anthropic_messages"
+        );
+        assert!(added[0].chain.first.enabled);
+        let edited = defaults.edit.apply(&document).expect("the edit applies");
+        assert!(edited.defaults.contains(&authored));
+        assert_eq!(
+            edited
+                .defaults
+                .iter()
+                .filter(|default| default.scope == authored.scope)
+                .count(),
+            1
+        );
+
+        // Applied, nothing is left to add.
+        let again = defaults_for_enabled_provider(&config, &edited, "anthropic_sub").unwrap();
+        assert!(again.edit.operations.is_empty());
+        assert!(again.protocols.is_empty());
     }
 
     #[test]

@@ -302,7 +302,7 @@ where
 fn commit<T>(
     server: &Server,
     change: impl FnOnce(&mut Configuration) -> Result<T, (String, String)>,
-    write: impl FnOnce(&T) -> crate::store::Result<()>,
+    write: impl FnOnce(&T, &Config) -> Result<(), Box<Response>>,
 ) -> Response {
     let mut candidate = match server.store.load_configuration() {
         Ok(stored) => stored,
@@ -331,8 +331,8 @@ fn commit<T>(
     if let Some(response) = refused_store_replaced(server, "config-edit") {
         return response;
     }
-    if let Err(error) = write(&written) {
-        return store_error(error);
+    if let Err(response) = write(&written, &resolved) {
+        return *response;
     }
     server.replace_config(resolved);
     (
@@ -409,6 +409,7 @@ pub(crate) async fn provider(State(server): State<Server>, request: Request) -> 
         Err(error) => return refused("provider", &error.to_string()),
     };
 
+    let was_enabled = std::cell::Cell::new(false);
     commit(
         &server,
         |candidate| {
@@ -427,6 +428,7 @@ pub(crate) async fn provider(State(server): State<Server>, request: Request) -> 
                     provider: edit.provider.clone(),
                     ..ProviderConfigRow::default()
                 });
+            was_enabled.set(existing.enabled);
             // The credential stays exactly as it was: it moves only through
             // the credential operation.
             let row = ProviderConfigRow {
@@ -446,8 +448,59 @@ pub(crate) async fn provider(State(server): State<Server>, request: Request) -> 
                 .sort_by(|a, b| a.provider.cmp(&b.provider));
             Ok(row)
         },
-        |row| server.store.put_config_provider(row),
+        |row, resolved| {
+            // spec: DCONF#editing
+            // The revision is saved before the row is written. A save that
+            // fails (the live revision moved, say) then leaves the provider
+            // off and the routing as it was. The other order would leave it
+            // on with no default to reach it, which is the state this exists
+            // to end. A row write failing after the save leaves a default to a
+            // provider still off, which answers as nothing configured, as the
+            // protocol did before it had one.
+            if row.enabled && !was_enabled.get() {
+                server
+                    .default_routes_for_enabled_provider(resolved, &row.provider)
+                    .map_err(|error| Box::new(routing_refused(&row.provider, error)))?;
+            }
+            server
+                .store
+                .put_config_provider(row)
+                .map_err(|error| Box::new(store_error(error)))
+        },
     )
+}
+
+/// A provider not enabled because the routing revision its enabling saves
+/// could not be saved. Nothing was changed.
+fn routing_refused(provider: &str, error: crate::server::RoutingControlError) -> Response {
+    let (status, why) = match error {
+        crate::server::RoutingControlError::StaleRevision { .. } => (
+            StatusCode::CONFLICT,
+            format!(
+                "the routing revision changed while {provider} was being enabled, \
+                 so it was not; try again"
+            ),
+        ),
+        error => {
+            tracing::error!(%error, provider, "enabling a provider could not save its defaults");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "could not give {provider} a default route ({error}), so it was not enabled"
+                ),
+            )
+        }
+    };
+    (
+        status,
+        axum::Json(json!({
+            "toker": "config-edit",
+            "ok": false,
+            "setting": "provider",
+            "error": why,
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -523,7 +576,12 @@ pub(crate) async fn settings(State(server): State<Server>, request: Request) -> 
             candidate.settings = row;
             Ok(())
         },
-        |()| server.store.put_config_settings(&stored),
+        |(), _| {
+            server
+                .store
+                .put_config_settings(&stored)
+                .map_err(|error| Box::new(store_error(error)))
+        },
     )
 }
 
@@ -568,9 +626,12 @@ pub(crate) async fn notice(State(server): State<Server>, request: Request) -> Re
             }
             Ok(())
         },
-        |()| match &style {
-            Some(style) => server.store.put_config_notice(&profile, style),
-            None => server.store.delete_config_notice(&profile),
+        |(), _| {
+            match &style {
+                Some(style) => server.store.put_config_notice(&profile, style),
+                None => server.store.delete_config_notice(&profile),
+            }
+            .map_err(|error| Box::new(store_error(error)))
         },
     )
 }
@@ -629,7 +690,12 @@ pub(crate) async fn credential(State(server): State<Server>, request: Request) -
                 .sort_by(|a, b| a.provider.cmp(&b.provider));
             Ok(row)
         },
-        |row| server.store.put_config_provider(row),
+        |row, _| {
+            server
+                .store
+                .put_config_provider(row)
+                .map_err(|error| Box::new(store_error(error)))
+        },
     );
     // A new credential may be enrolled where the old one was not, so the
     // provider's refused asks are worth trying again

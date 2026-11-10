@@ -731,3 +731,123 @@ async fn an_edit_made_once_the_store_was_replaced_is_refused_and_not_applied() {
         "nor to the live state"
     );
 }
+
+fn active_revision(store: &Store) -> toker::store::PolicyRevision {
+    let id = store
+        .load_routing_policy_state()
+        .unwrap()
+        .active_revision_id
+        .expect("a revision is active");
+    store.load_policy_revision(id).unwrap().expect("it is kept")
+}
+
+async fn set_enabled(app: &axum::Router, provider: &str, enabled: bool) {
+    let response = app
+        .clone()
+        .oneshot(request(
+            "PUT",
+            "/_toker/config/provider",
+            Some("config-edit"),
+            Some(json!({ "provider": provider, "enabled": enabled })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        body(response).await
+    );
+}
+
+#[tokio::test]
+async fn enabling_a_provider_gives_each_protocol_without_a_default_one_to_it() {
+    // spec: DCONF#editing
+    use toker::policy::{FrontendProtocol, FrontendScope};
+    let (server, store) = server();
+    let app = server.router();
+    let before = active_revision(&store);
+    assert!(
+        before.document.document().defaults.is_empty(),
+        "a machine set up with no provider has no defaults"
+    );
+
+    set_enabled(&app, "codex_sub", true).await;
+
+    let after = active_revision(&store);
+    assert_ne!(
+        after.revision_id, before.revision_id,
+        "a revision was saved"
+    );
+    assert_eq!(
+        after.description.as_deref(),
+        Some(
+            "default for anthropic_messages → codex_sub, openai_chat → codex_sub, \
+             openai_responses → codex_sub, on enabling codex_sub"
+        )
+    );
+    let document = after.document.document();
+    for protocol in [
+        FrontendProtocol::AnthropicMessages,
+        FrontendProtocol::OpenaiChat,
+        FrontendProtocol::OpenaiResponses,
+    ] {
+        let default = document
+            .defaults
+            .iter()
+            .find(|default| default.scope == FrontendScope::Protocol { protocol })
+            .unwrap_or_else(|| panic!("{protocol:?} has a default"));
+        assert_eq!(
+            default.target.route_id.as_str(),
+            "route-codex_sub-codex_responses"
+        );
+        assert!(
+            document.defaults.iter().any(|default| matches!(
+                &default.scope,
+                FrontendScope::Profile { profile, protocol: scoped }
+                    if profile.as_str() == "unprefixed" && *scoped == protocol
+            )),
+            "{protocol:?} has an unprefixed default"
+        );
+    }
+    let route = document
+        .routes
+        .iter()
+        .find(|route| route.id.as_str() == "route-codex_sub-codex_responses")
+        .expect("the codex route");
+    assert!(route.chain.first.enabled, "the route reaches codex");
+}
+
+#[tokio::test]
+async fn enabling_a_provider_whose_protocols_have_defaults_saves_no_revision() {
+    let (server, store) = server();
+    let app = server.router();
+    set_enabled(&app, "codex_sub", true).await;
+    let with_codex = active_revision(&store);
+
+    // OpenRouter serves the same three protocols, each now with a default.
+    set_enabled(&app, "openrouter", true).await;
+    assert_eq!(active_revision(&store).revision_id, with_codex.revision_id);
+}
+
+#[tokio::test]
+async fn enabling_a_provider_again_leaves_the_defaults_alone() {
+    let (server, store) = server();
+    let app = server.router();
+    set_enabled(&app, "codex_sub", true).await;
+    let enabled = active_revision(&store);
+
+    // Already on: not a transition.
+    set_enabled(&app, "codex_sub", true).await;
+    assert_eq!(active_revision(&store).revision_id, enabled.revision_id);
+
+    // Off and on again: disabling removes nothing, so there is nothing to add.
+    set_enabled(&app, "codex_sub", false).await;
+    set_enabled(&app, "codex_sub", true).await;
+    let again = active_revision(&store);
+    assert_eq!(again.revision_id, enabled.revision_id);
+    assert_eq!(
+        again.document.document().defaults,
+        enabled.document.document().defaults
+    );
+}
