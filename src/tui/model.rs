@@ -601,8 +601,11 @@ pub(crate) fn aggregate_in_flight(
             buckets[bucket_of(began(None), now_ms, window_mins)].requests += 1;
         }
         // A request outcome with no group is its own request: a
-        // measurement, a failure, or a gate stopping it.
+        // measurement, a failure, or a gate stopping it. Like a group's, it
+        // marks the sessionless row only as a measurement, since that row
+        // is the unattributed traffic and not a session that failed.
         if row.attempt_group_id.is_none()
+            && (named.is_some() || measurement)
             && matches!(
                 row.kind,
                 None | Some(
@@ -3486,5 +3489,21 @@ mod tests {
         own.req_messages = Some(5);
         let snap = agg_live(&[served], &[child, own]);
         assert_eq!(session(&snap, "ses-p").req_messages, Some(5));
+    }
+
+    #[test]
+    fn a_sessionless_failure_does_not_mark_the_unattributed_row() {
+        let mut served = display_bare(mins_ago(2));
+        served.model = Some("m".to_owned());
+        let failed = display_kind_row(mins_ago(1), RowKind::Error);
+        let grouped_failure = grouped(
+            Some(RowKind::Error),
+            "77777777777777777777777777777777",
+            Some(0),
+            1,
+        );
+        let snap = agg(&[served, failed, grouped_failure], 3);
+        assert!(!session(&snap, NO_SESSION).failed);
+        assert_eq!(snap.failed_requests, 1, "still counted as a failure");
     }
 }
