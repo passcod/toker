@@ -30,7 +30,7 @@ Add one rewrite per Claude tier, each sending its requests to the codex route wi
 2. On the models tab, read the codex binding's catalogue offers and pick the model id for each tier.
    The id is sent as typed and is not checked against the catalogue, so copy it exactly.
 3. On the rewrites tab, press `n` to add a rewrite, and fill in:
-   - **id**: something like `claude-opus-to-codex`
+   - **id**: anything unique, such as `claude-opus-to-codex`; it is not shown again
    - **scope**: protocol `anthropic_messages` (or profile `claude` with protocol `anthropic_messages`, to affect only Claude Code)
    - **priority**: unique within the scope; the generated rules use `-10000` and `0` to `4`, so start at `10`
    - **matches**: glob `claude-opus-*`
@@ -75,4 +75,5 @@ For mapping Claude tiers onto another provider, the selector is the direct fit.
 - No way to duplicate a record, so each tier's rewrite is entered from the blank template.
 - Reference fields such as **route** complete only by prefix, start prefilled with another record's id, and never list the choices: clear back to `route-`, type the start of the id, then tab.
 - A route reference's arguments start empty, a new one is named `name-1`, and the form never offers the route's declared parameters, so `requested_model` has to be known and typed.
+- The rewrite form asks for an id that is shown nowhere afterwards, against the dashboard spec's rule that a rewrite needs no name of its own.
 - Codex has no generated classifier, and its listing has no release dates, so "newest codex model" needs a hand-written classifier regex first.
