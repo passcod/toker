@@ -85,7 +85,7 @@ The README's routing paragraph describes the draft, validate and activate flow, 
 
 ### Config gate check
 
-- [ ] `server/control/config.rs` `commit`: refuse a `cold_min_tokens` larger than every context window the enabled bindings resolve (`catalog::windows::resolve_context_window`), naming the largest; accept it where none resolves (GCOLD).
+- [x] `server/control/config.rs` `commit`: refuse a `cold_min_tokens` larger than every context window the enabled bindings resolve (`catalog::windows::resolve_context_window`), naming the largest; accept it where none resolves (GCOLD).
 
 ### Header (every page)
 

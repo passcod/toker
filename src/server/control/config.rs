@@ -100,6 +100,11 @@ pub(crate) async fn snapshot(State(server): State<Server>, request: Request) -> 
         })
         .collect();
 
+    let largest_window = match largest_window(&server) {
+        Ok(largest) => largest,
+        Err(error) => return store_error(error),
+    };
+
     let providers: Vec<_> = KNOWN_PROVIDERS
         .iter()
         .map(|name| {
@@ -131,6 +136,11 @@ pub(crate) async fn snapshot(State(server): State<Server>, request: Request) -> 
             "safeguards": safeguards,
             "settings": settings_body(&stored.settings),
             "notices": stored.notices,
+            // What a minimum for the cold gate is checked against: the
+            // largest window the enabled providers' models resolve, absent
+            // where none does, so a form can refuse as it is typed what a
+            // save would (spec: GCOLD#only-a-request-that-could-be-the-re-read).
+            "largest_context_window": largest_window,
             // Shown but not editable: settled before the store is opened
             // (spec: DCONF#before-the-store).
             "db_path": config.db_path.display().to_string(),
@@ -265,10 +275,20 @@ fn commit<T>(
         Ok(stored) => stored,
         Err(error) => return store_error(error),
     };
+    let minimum_before = candidate.settings.cold_min_tokens;
     let written = match change(&mut candidate) {
         Ok(written) => written,
         Err((setting, why)) => return refused(&setting, &why),
     };
+    // Only a minimum this edit sets is checked: one already stored is not
+    // the reason an unrelated edit, such as turning a provider off, should
+    // be refused.
+    if candidate.settings.cold_min_tokens != minimum_before
+        && let Some(minimum) = candidate.settings.cold_min_tokens
+        && let Err(response) = check_cold_minimum(server, minimum)
+    {
+        return *response;
+    }
     // Resolve before writing: a value toker cannot use is refused with the
     // stored one untouched (spec: DCTRL#the-operations).
     let resolved = match Config::resolve(&candidate) {
@@ -284,6 +304,59 @@ fn commit<T>(
         axum::Json(json!({ "toker": "config-edit", "ok": true })),
     )
         .into_response()
+}
+
+/// The largest context window any model the enabled bindings offer resolves
+/// to, as RMODEL specifies a window is resolved: the hand-verified
+/// catalogue, the provider's fetched listing, a stored declaration.
+fn largest_window(server: &Server) -> crate::store::Result<Option<u64>> {
+    let catalogs = server
+        .catalogs
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    // The inventory holds the offers of configured bindings only, so a
+    // provider that is off contributes nothing.
+    let inventory = crate::catalog::offers::inventory(&server.registry, &catalogs);
+    let declared: std::collections::HashMap<_, _> = server
+        .store
+        .load_models()?
+        .into_iter()
+        .filter_map(|entry| Some((entry.model_id, entry.context_window_json?)))
+        .collect();
+    Ok(inventory
+        .iter()
+        .filter_map(|offer| {
+            let declared = crate::catalog::model_identity(&offer.backend_model_id)
+                .and_then(|identity| declared.get(&identity));
+            crate::catalog::resolve_context_window(
+                &offer.backend_model_id,
+                None,
+                offer.context_window,
+                declared,
+                None,
+            )
+            .tokens()
+        })
+        .max())
+}
+
+/// Refuse a cold-gate minimum no request could reach, since the gate would
+/// be switched off without saying so; accept any where no window resolves.
+// spec: GCOLD#only-a-request-that-could-be-the-re-read
+fn check_cold_minimum(server: &Server, minimum: u64) -> Result<(), Box<Response>> {
+    let largest = largest_window(server).map_err(|error| Box::new(store_error(error)))?;
+    match largest {
+        Some(largest) if minimum > largest => Err(Box::new(refused(
+            "cold_min_tokens",
+            &format!(
+                "{minimum} tokens is larger than every context window the enabled \
+                 providers' models have; the largest is {largest} tokens, so the gate \
+                 could never fire. Set it to {largest} or less"
+            ),
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// `PUT /_toker/config/provider` — one provider's row.
