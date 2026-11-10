@@ -564,7 +564,13 @@ pub(super) fn not_replayable_words(code: &str) -> &'static str {
         "compaction_evidence_not_recorded" => {
             "a compaction's evidence that the lane was cold was not recorded"
         }
-        _ => "its facts were not recorded",
+        "lane_not_recorded" => {
+            "it was routed before the lane's state was recorded beside the facts"
+        }
+        // A reason this build has no words for: say that the resolver would
+        // be short of something, not which, since naming the wrong absence
+        // sends the reader to the wrong era of the ledger.
+        _ => "the resolver would have to be given a fact it was not",
     }
 }
 

@@ -434,3 +434,34 @@ fn a_busy_queue_is_said_and_leaves_the_page_usable() {
     press(&mut state, KeyCode::Esc);
     assert!(!state.capturing());
 }
+
+/// Every reason the service can give has words of its own. A reason without
+/// them once fell through to "its facts were not recorded", naming an absence
+/// that was not the one that had happened.
+#[test]
+fn every_not_replayable_reason_has_words_of_its_own() {
+    use std::collections::BTreeSet;
+
+    use crate::policy::facts::NotReplayable;
+
+    let reasons = [
+        NotReplayable::FactsNotRecorded,
+        NotReplayable::CompactionEvidenceNotRecorded,
+        NotReplayable::LaneNotRecorded,
+    ];
+    // Exhaustive, so a reason added without words fails to compile here.
+    for reason in reasons {
+        match reason {
+            NotReplayable::FactsNotRecorded
+            | NotReplayable::CompactionEvidenceNotRecorded
+            | NotReplayable::LaneNotRecorded => {}
+        }
+    }
+    let fallback = super::trace::not_replayable_words("no_such_reason");
+    let mut seen = BTreeSet::new();
+    for reason in reasons {
+        let words = super::trace::not_replayable_words(reason.code());
+        assert_ne!(words, fallback, "{} falls through", reason.code());
+        assert!(seen.insert(words), "{} shares its words", reason.code());
+    }
+}
