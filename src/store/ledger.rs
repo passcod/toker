@@ -2681,7 +2681,7 @@ fn read_row(row: &rusqlite::Row<'_>) -> Result<RequestRow> {
         policy_routing,
         safeguards: read_safeguards(row)?,
         lineage: read_lineage(row)?,
-        started_ms: None,
+        started_ms: row.get("started_ms")?,
     })
 }
 

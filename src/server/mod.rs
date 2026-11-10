@@ -1845,11 +1845,6 @@ impl Server {
         };
         let address = listener.local_addr()?;
         tracing::info!("toker listening on http://{address}");
-        // No request outlives the process handling it, so a record left by
-        // a crash describes nothing.
-        if let Err(error) = self.store.clear_in_flight() {
-            tracing::error!(%error, "clearing in-flight records failed");
-        }
         self.spawn_state_prune();
         self.spawn_awake_timer();
         self.spawn_catalog_refresh();
@@ -1878,6 +1873,11 @@ impl Server {
     /// The background tasks [`Server::serve`] spawns are not stopped here:
     /// they end with the runtime, when the process exits.
     pub async fn serve_listener(self, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
+        // No request outlives the process handling it, so a record left by
+        // a crash describes nothing. Nothing is accepted until it is gone.
+        if let Err(error) = self.store.clear_in_flight() {
+            tracing::error!(%error, "clearing in-flight records failed");
+        }
         let shutdown = self.shutdown.clone();
         let serving = axum::serve(listener, self.router())
             .with_graceful_shutdown(async move { shutdown.notified().await });
@@ -5500,5 +5500,72 @@ api_key = "ak-literal-test"
                 .is_some(),
             "a learned model reaches the snapshot the resolver reads"
         );
+    }
+
+    #[tokio::test]
+    async fn a_fallback_moves_the_in_flight_record_to_the_next_attempt() {
+        use crate::policy::BindingId;
+        use crate::store::{AttemptGroupId, AttemptIndex, AttemptProvenance, AttemptReason};
+
+        let dir =
+            std::env::temp_dir().join(format!("toker-in-flight-fallback-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = server(&dir);
+        let guard = server.begin_in_flight(true, Some("claude"));
+        let first = AttemptProvenance {
+            attempt_group_id: AttemptGroupId::fresh(),
+            attempt_index: AttemptIndex::zero(),
+            reason: AttemptReason::Initial,
+        };
+        let sub = BindingId::new("anthropic_sub.anthropic_messages").unwrap();
+        server.note_attempt_sent(
+            Some(&guard),
+            Some(&first),
+            "anthropic_sub",
+            &sub,
+            Some("opus"),
+        );
+        guard.streaming();
+        let now = server.store.in_flight_rows().unwrap().remove(0);
+        assert_eq!(now.stage, crate::store::InFlightStage::Streaming);
+
+        // The first attempt failed before commitment and the next is sent:
+        // the record takes it, and is waiting again.
+        let second = AttemptProvenance {
+            attempt_group_id: first.attempt_group_id.clone(),
+            attempt_index: first.attempt_index.next().unwrap(),
+            reason: AttemptReason::Overload,
+        };
+        let api = BindingId::new("anthropic_api.anthropic_messages").unwrap();
+        server.note_attempt_sent(
+            Some(&guard),
+            Some(&second),
+            "anthropic_api",
+            &api,
+            Some("opus-5"),
+        );
+        let moved = server.store.in_flight_rows().unwrap().remove(0);
+        assert_eq!(moved.stage, crate::store::InFlightStage::Waiting);
+        assert_eq!(moved.attempt_index.map(AttemptIndex::get), Some(1));
+        assert_eq!(
+            moved.attempt_group_id.as_ref(),
+            Some(&first.attempt_group_id)
+        );
+        assert_eq!(moved.provider.as_deref(), Some("anthropic_api"));
+        assert_eq!(
+            moved.binding_id.as_deref(),
+            Some("anthropic_api.anthropic_messages")
+        );
+        assert_eq!(moved.effective_model.as_deref(), Some("opus-5"));
+
+        // A clone of the guard, as a cancelled attempt's row carries, keeps
+        // the record until the last of them drops.
+        let held = guard.clone();
+        drop(guard);
+        assert_eq!(server.store.in_flight_rows().unwrap().len(), 1);
+        drop(held);
+        assert!(server.store.in_flight_rows().unwrap().is_empty());
+        assert_eq!(server.in_flight.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

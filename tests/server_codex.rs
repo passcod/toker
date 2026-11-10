@@ -1766,6 +1766,11 @@ async fn chat_to_subscription_obeys_the_request_global_quota_gate() {
     assert_eq!(row.route.as_deref(), Some("openai_chat:anthropic_sub"));
     assert_eq!(row.attempt, None);
     assert_eq!(row.policy_routing, None);
+    assert_eq!(
+        row.requested_model.as_deref(),
+        Some("anthropic_sub/claude-sonnet-5")
+    );
+    assert_eq!(row.effective_model.as_deref(), Some("claude-sonnet-5"));
 }
 
 #[tokio::test]

@@ -4625,6 +4625,44 @@ mod tests {
     }
 
     #[test]
+    fn the_in_flight_migration_keeps_every_row_and_leaves_started_ms_absent() {
+        let dir = test_dir("in-flight-upgrade");
+        let db = dir.join("toker.db");
+        let last = schema::MIGRATIONS.len();
+        std::fs::create_dir_all(&dir).expect("create the db parent dir");
+        {
+            let conn = Connection::open(&db).expect("open raw db");
+            for script in &schema::MIGRATIONS[..last - 1] {
+                conn.execute_batch(script).expect("apply a migration");
+            }
+            conn.pragma_update(None, "user_version", last as i64 - 1)
+                .expect("stamp the version before");
+            for ts in [1_000, 2_000, 3_000] {
+                conn.execute(
+                    "INSERT INTO requests (ts_ms, session_id, duration_ms) VALUES (?1, 'ses-old', 500)",
+                    [ts],
+                )
+                .expect("insert a row from before");
+            }
+        }
+        let store = Store::open(&db).expect("the database migrates");
+        assert_eq!(user_version(&store), last as i64);
+        let rows = store.requests_since(0, 10).expect("rows");
+        assert_eq!(rows.len(), 3, "no row was lost");
+        assert!(
+            rows.iter().all(|row| row.started_ms.is_none()),
+            "earlier rows say nothing of when they began: absence, not zero"
+        );
+        assert!(store.in_flight_rows().expect("rows").is_empty());
+        // A row written now carries it.
+        let mut row = bare_row(4_000);
+        row.started_ms = Some(3_500);
+        store.record_request(&row).expect("record");
+        let newest = store.requests_since(4_000, 10).expect("rows");
+        assert_eq!(newest[0].started_ms, Some(3_500));
+    }
+
+    #[test]
     fn migration_v2_upgrades_a_v1_database_in_place() {
         let dir = test_dir("v1-upgrade");
         let db = dir.join("toker.db");
