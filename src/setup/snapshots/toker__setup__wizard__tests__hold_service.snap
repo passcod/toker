@@ -4,6 +4,11 @@ expression: unit
 ---
 [Unit]
 Description=toker hold service (holds the idle-sleep lock for its span)
+# Only while the schedule is on and a provider that anchors its windows
+# is enabled: toker keeps the marker, so the dashboard switches this
+# without elevation. On the service, not the timer, whose condition is
+# read once when it starts.
+ConditionPathExists=/home/user/.local/share/toker/pings-enabled
 
 [Service]
 Type=oneshot

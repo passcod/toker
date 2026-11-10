@@ -630,8 +630,9 @@ ExecStart=/bin/true
 /// machine is suspended fires on resume, and the hold then keeps the
 /// machine up those 15 minutes so the ping (11 m after the slot) can
 /// fire; `Persistent=false` keeps a missed slot from re-running hours
-/// late — the ping's own lateness guard refuses those anyway.
-pub fn hold_user_units(slots: &[String], exe: &Path) -> (String, String) {
+/// late — the ping's own lateness guard refuses those anyway. The service
+/// runs only while the marker in `state_dir` is there (spec: GPING#scope).
+pub fn hold_user_units(slots: &[String], exe: &Path, state_dir: &Path) -> (String, String) {
     let mut on_calendar = String::new();
     for slot in slots {
         on_calendar.push_str(&format!("OnCalendar=Mon..Fri {slot}\n"));
@@ -659,6 +660,11 @@ WantedBy=timers.target
     let service = format!(
         r#"[Unit]
 Description=toker hold service (holds the idle-sleep lock for its span)
+# Only while the schedule is on and a provider that anchors its windows
+# is enabled: toker keeps the marker, so the dashboard switches this
+# without elevation. On the service, not the timer, whose condition is
+# read once when it starts.
+ConditionPathExists={marker}
 
 [Service]
 Type=oneshot
@@ -670,6 +676,7 @@ TimeoutStartSec=0
 ExecStart="{exe}" hold --for={HOLD_UNIT_FOR}
 "#,
         exe = exe.display(),
+        marker = timers::ping_marker(state_dir).display(),
     );
     (timer, service)
 }
@@ -735,8 +742,10 @@ pub struct PingUnits {
 /// service running the ping verb **for that slot**. Per-slot because
 /// the `--slot` argument must match its timer's clock time: a shared
 /// service cannot know which slot fired. The slots must already be
-/// validated `hh:mm` (the wizard validates before calling).
-pub fn ping_user_units(slots: &[String], exe: &Path) -> Vec<PingUnits> {
+/// validated `hh:mm` (the wizard validates before calling). Each service
+/// runs only while the marker in `state_dir` is there (spec: GPING#scope).
+pub fn ping_user_units(slots: &[String], exe: &Path, state_dir: &Path) -> Vec<PingUnits> {
+    let marker = timers::ping_marker(state_dir);
     slots
         .iter()
         .filter_map(|slot| {
@@ -773,6 +782,9 @@ WantedBy=timers.target
             let service = format!(
                 r#"[Unit]
 Description=toker ping service (opens the {slot} quota window)
+# As for the hold: only while toker keeps the marker, and on the service
+# rather than the timer.
+ConditionPathExists={marker}
 
 [Service]
 Type=oneshot
@@ -788,6 +800,7 @@ TimeoutStartSec=3m
 ExecStart="{exe}" ping-window --slot={slot}
 "#,
                 exe = exe.display(),
+                marker = marker.display(),
             );
             Some(PingUnits {
                 slot: slot.clone(),
@@ -2484,12 +2497,12 @@ impl<'a> Wizard<'a> {
         report.timer_slots = slots.to_vec();
 
         // The user units: one hold pair, plus one ping pair per slot.
-        let (hold_timer, hold_service) = hold_user_units(slots, &exe);
+        let (hold_timer, hold_service) = hold_user_units(slots, &exe, &self.paths.state_dir);
         let mut units = vec![
             (HOLD_TIMER_UNIT.to_owned(), hold_timer),
             (HOLD_SERVICE_UNIT.to_owned(), hold_service),
         ];
-        let pings = ping_user_units(slots, &exe);
+        let pings = ping_user_units(slots, &exe, &self.paths.state_dir);
         for pair in &pings {
             units.push((pair.timer_name.clone(), pair.timer.clone()));
             units.push((pair.service_name.clone(), pair.service.clone()));
@@ -3938,7 +3951,8 @@ default_backend_anthropic = "codex_sub"
 
         // The hold pair: the slots verbatim, Persistent=false, and the
         // verb with the pinned 15 m span.
-        let (hold_timer, hold_service) = hold_user_units(&slots, exe);
+        let state_dir = Path::new("/home/user/.local/share/toker");
+        let (hold_timer, hold_service) = hold_user_units(&slots, exe, state_dir);
         unit_snapshot("hold_timer", &hold_timer);
         unit_snapshot("hold_service", &hold_service);
 
@@ -3956,7 +3970,7 @@ default_backend_anthropic = "codex_sub"
         // 23:55 slot wraps to 00:06, which a daily OnCalendar reads as
         // the next day, exactly 11 m later — and the service carrying
         // ITS OWN slot. Per-slot unit names (no colon in unit names).
-        let pings = ping_user_units(&slots, exe);
+        let pings = ping_user_units(&slots, exe, state_dir);
         assert_eq!(pings.len(), 2, "one timer+service pair per slot");
         assert_eq!(pings[0].timer_name, "toker-ping-0900.timer");
         assert_eq!(pings[0].service_name, "toker-ping-0900.service");
@@ -5310,8 +5324,8 @@ default_backend_anthropic = "codex_sub"
 
         let exe = std::env::current_exe().expect("this test binary's path");
         let slots = ["09:00".to_owned(), "12:30".to_owned()];
-        let pings = ping_user_units(&slots, &exe);
-        let (hold_timer, hold_service) = hold_user_units(&slots, &exe);
+        let pings = ping_user_units(&slots, &exe, &rig.paths().state_dir);
+        let (hold_timer, hold_service) = hold_user_units(&slots, &exe, &rig.paths().state_dir);
 
         // The units installed, in order, byte-for-byte the generators'
         // output — including the staged wake system timer.

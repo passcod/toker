@@ -4,6 +4,9 @@ expression: unit
 ---
 [Unit]
 Description=toker ping service (opens the 09:00 quota window)
+# As for the hold: only while toker keeps the marker, and on the service
+# rather than the timer.
+ConditionPathExists=/home/user/.local/share/toker/pings-enabled
 
 [Service]
 Type=oneshot
