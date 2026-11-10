@@ -44,6 +44,7 @@ Everything else is held in the store as typed rows:
 - the notice style for each frontend profile, and the default for a profile with none
 - the session and ping header names
 - whether the idle-sleep lock is held
+- whether the [ping schedule](../gates/pinging.md#scope) is on
 - the extra transcript roots the dashboard searches for session labels
 
 Toker MUST hold a row for every provider it knows, whether or not that provider is enabled.

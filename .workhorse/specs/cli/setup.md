@@ -41,7 +41,7 @@ Where a configuration file exists, setup MUST report what it read from that file
 The order in which setup writes the store and removes the file is specified by [RMIG](../routing/migration.md#migrating-the-file-and-the-store-together).
 
 Setup MUST ask only what the dashboard cannot later change.
-That is the listener port and the schedule slots, which reach the units rather than the store.
+That is the listener port, which reaches the socket unit rather than the store.
 
 > [!NOTE]
 > A setting the dashboard can change is a setting setup asking for is a second surface to keep agreeing with the first.
@@ -51,7 +51,7 @@ On a store with no provider configured, setup MUST enable the providers whose cr
 Setup MUST NOT ask for a credential, and MUST NOT read a keyring entry's value to find out whether it exists.
 A store that already configures a provider MUST keep its providers as they are.
 
-Setup MUST complete whether or not it found a provider: it writes the configuration, installs the units, offers the schedule slots and points the clients at the proxy all the same.
+Setup MUST complete whether or not it found a provider: it writes the configuration, installs the units and points the clients at the proxy all the same.
 
 > [!NOTE]
 > Everything else about providers is edited on the dashboard's providers page, which setup hands off to, so a machine set up once never needs setup again for a provider to be added.
@@ -67,11 +67,6 @@ Setup MUST install the units that reconcile a client's settings whenever that cl
 > [!NOTE]
 > The rows come from the policy, not from one provider.
 
-Setup MUST reach the system manager through `systemctl` itself, leaving authorisation to the platform, and MUST NOT invoke `sudo`.
-
-> [!NOTE]
-> Some machines authorise through polkit and have no working sudo.
-
 Setup MUST sandbox each installed unit to the directories it needs and no others, as [DCONF](../service/config.md#state) specifies.
 
 Setup MUST run the settings reconciliation once itself, through the unit the schedule will use.
@@ -79,9 +74,13 @@ Setup MUST run the settings reconciliation once itself, through the unit the sch
 > [!NOTE]
 > Setup then exercises the sandboxed path rather than a path only it takes.
 
-Setup MUST install the ping and hold units for the chosen slots whether or not a provider that anchors windows is enabled, conditioned on the marker [GPING](../gates/pinging.md#scope) specifies.
+Setup MUST install and enable the ping and hold timers without asking, conditioned on the marker [GPING](../gates/pinging.md#scope) specifies, whether or not the schedule is on.
+Setup MUST write the wake timer where the operator's units are kept without placing it in the system manager.
+The timers MUST carry the slots already installed, or a default schedule where none are.
 
-Setup MUST retire the units of any schedule slot the operator dropped.
+> [!NOTE]
+> Turning the schedule on and choosing its slots are made on the dashboard, which asks the platform for elevation where the wake timer needs the system manager.
+> Setup itself never reaches the system manager.
 
 ## Handing off
 

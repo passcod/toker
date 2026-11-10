@@ -17,11 +17,12 @@ Toker MUST NOT send a scheduled ping, nor hold the machine awake for one, while 
 > [!NOTE]
 > A provider that meters without anchoring, or that does not meter at all, gains nothing from a request sent at a chosen time.
 
-Toker MUST keep a marker file in the state directory present exactly while such a provider is enabled, and the scheduled ping and hold jobs MUST run only while it is present.
-The service MUST bring the marker in line when it starts and whenever a provider is turned on or off.
+Toker MUST keep a marker file in the state directory present exactly while the ping schedule is turned on and such a provider is enabled, and the scheduled ping and hold jobs MUST run only while it is present.
+The ping schedule MUST be off until the operator turns it on.
+The service MUST bring the marker in line when it starts, whenever a provider is turned on or off, and whenever the schedule is.
 
 > [!NOTE]
-> The jobs are installed once and switched by the marker, so turning a provider on or off from the dashboard starts or stops pinging without asking the platform for elevation.
+> The jobs are installed once and switched by the marker, so turning the schedule or a provider on or off from the dashboard starts or stops pinging without asking the platform for elevation.
 > The condition is on the job rather than its timer: a timer's condition is read only when the timer starts, so one skipped at boot would stay off after the marker appeared.
 
 Every requirement below is about such a provider's windows.
