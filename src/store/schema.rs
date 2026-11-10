@@ -1390,6 +1390,31 @@ pub(super) const MIGRATIONS: &[&str] = &[
         SELECT RAISE(ABORT, 'invalid request resolver lane facts');
     END;
     "#,
+    // A request in flight, readable before any of its rows exists. It is
+    // state beside the ledger, not ledger: written when handling begins,
+    // moved at each stage change, and deleted once the last row is written.
+    // `requests.started_ms` is when handling began, for placing a request in
+    // the minute it was sent rather than the one its row landed in; rows
+    // from before it stay NULL.
+    r#"
+    CREATE TABLE in_flight (
+        id INTEGER PRIMARY KEY,
+        started_ms INTEGER NOT NULL,
+        attempt_group_id TEXT,
+        session_id TEXT,
+        parent_session_id TEXT,
+        frontend TEXT,
+        requested_model TEXT,
+        req_messages INTEGER,
+        stage TEXT NOT NULL CHECK (stage IN ('held', 'waiting', 'streaming')),
+        attempt_index INTEGER,
+        provider TEXT,
+        binding_id TEXT,
+        effective_model TEXT
+    );
+
+    ALTER TABLE requests ADD COLUMN started_ms INTEGER;
+    "#,
 ];
 
 fn validate_v10_history(conn: &Connection) -> Result<()> {

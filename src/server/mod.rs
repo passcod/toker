@@ -761,6 +761,18 @@ impl Server {
         }
     }
 
+    /// Write one ledger row. A row that carries its duration also says when
+    /// its request began handling, which is where it was written less how
+    /// long it took, so a long stream is placed where it was sent and not
+    /// where it finished.
+    pub(crate) fn record_row(&self, row: &crate::store::RequestRow) -> crate::store::Result<()> {
+        let mut row = row.clone();
+        if row.started_ms.is_none() {
+            row.started_ms = row.duration_ms.map(|duration| row.ts_ms - duration);
+        }
+        self.store.record_request(&row)
+    }
+
     pub(crate) fn note_binding_sent(
         &self,
         binding_id: &crate::policy::BindingId,

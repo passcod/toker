@@ -285,7 +285,7 @@ fn frontend_protocol_of(ctx: &AnthropicRecordCtx) -> &'static str {
 /// (spec: STORE#not-recorded-is-not-zero) — it is logged as the visible breakage it is.
 fn insert(ctx: &AnthropicRecordCtx, row: RequestRow) {
     let row = with_frontend(row, ctx.frontend.as_deref());
-    if let Err(error) = ctx.server.store.record_request(&row) {
+    if let Err(error) = ctx.server.record_row(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
 }
@@ -574,6 +574,7 @@ fn measurement_row(
         attempt: ctx.attempt.clone(),
         policy_routing: ctx.policy_routing.clone(),
         lineage: ctx.lineage.clone(),
+        started_ms: None,
     }
 }
 
@@ -703,6 +704,7 @@ fn error_row(
         attempt: ctx.attempt.clone(),
         policy_routing: ctx.policy_routing.clone(),
         lineage: ctx.lineage.clone(),
+        started_ms: None,
     }
 }
 
@@ -746,7 +748,7 @@ pub(crate) fn record_anthropic_released(
     row.frontend = Some(frontend_protocol.to_owned());
     row.route = Some(format!("{frontend_protocol}:{backend_id}"));
     let row = with_frontend(row, frontend);
-    if let Err(error) = server.store.record_request(&row) {
+    if let Err(error) = server.record_row(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
     tracing::info!(
@@ -896,9 +898,10 @@ pub(crate) fn record_quota_blocked(record: QuotaBlockedRecord<'_>) {
         attempt: None,
         policy_routing: None,
         lineage: None,
+        started_ms: None,
     };
     let row = with_frontend(row, frontend);
-    if let Err(error) = server.store.record_request(&row) {
+    if let Err(error) = server.record_row(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
     tracing::info!(
@@ -1034,9 +1037,10 @@ fn write_cold_row(record: ColdRecord<'_>, kind: RowKind, verb: &str) {
         attempt: None,
         policy_routing: None,
         lineage: None,
+        started_ms: None,
     };
     let row = with_frontend(row, frontend);
-    if let Err(error) = server.store.record_request(&row) {
+    if let Err(error) = server.record_row(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
     tracing::info!(
@@ -1197,9 +1201,10 @@ pub(crate) fn record_anthropic_cold_quiet(record: ColdRecord<'_>) {
         attempt: None,
         policy_routing: None,
         lineage: None,
+        started_ms: None,
     };
     let row = with_frontend(row, frontend);
-    if let Err(error) = server.store.record_request(&row) {
+    if let Err(error) = server.record_row(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
     tracing::info!(
@@ -1390,6 +1395,7 @@ pub(crate) fn record_responses_measurement(
         attempt: ctx.attempt.clone(),
         policy_routing: ctx.policy_routing.clone(),
         lineage: ctx.lineage.clone(),
+        started_ms: None,
     };
     insert(ctx, row);
 
@@ -1544,6 +1550,7 @@ pub(crate) fn record_codex_error(
         attempt: ctx.attempt.clone(),
         policy_routing: ctx.policy_routing.clone(),
         lineage: ctx.lineage.clone(),
+        started_ms: None,
     };
     insert(ctx, row);
     tracing::info!(

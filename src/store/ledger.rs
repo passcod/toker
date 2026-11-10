@@ -1182,6 +1182,10 @@ pub struct RequestRow {
     /// What the request's ask for server safeguards came to, content-free.
     pub safeguards: SafeguardsRow,
     pub lineage: Option<SessionLineage>,
+    /// Epoch milliseconds at which the server began handling the request,
+    /// as against `ts_ms`, when the row was written. `None` on rows from
+    /// before it was recorded.
+    pub started_ms: Option<i64>,
 }
 
 struct FlatPolicyRouting<'a> {
@@ -1450,7 +1454,7 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
             facts_class, lookup_kind, lookup_scope,
             facts_lane, facts_lane_route_fingerprint, facts_lane_candidate_id,
             facts_lane_binding_id, facts_lane_effective_model,
-            facts_lane_forced_from, facts_lane_forced_to
+            facts_lane_forced_from, facts_lane_forced_to, started_ms
         ) VALUES (
             :ts_ms, :duration_ms, :kind, :frontend, :provider, :route, :session_id, :ping,
             :credential_digest, :account_number,
@@ -1477,7 +1481,7 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
             :facts_class, :lookup_kind, :lookup_scope,
             :facts_lane, :facts_lane_route_fingerprint, :facts_lane_candidate_id,
             :facts_lane_binding_id, :facts_lane_effective_model,
-            :facts_lane_forced_from, :facts_lane_forced_to
+            :facts_lane_forced_from, :facts_lane_forced_to, :started_ms
         )",
     )?;
     stmt.execute(rusqlite::named_params! {
@@ -1583,6 +1587,7 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
         ":facts_lane_effective_model": lane_pin.map(|pin| pin.effective_model.as_str()),
         ":facts_lane_forced_from": lane_state.and_then(|lane| lane.forced_from.as_deref()),
         ":facts_lane_forced_to": lane_state.and_then(|lane| lane.forced_to.as_deref()),
+        ":started_ms": row.started_ms,
     })?;
     Ok(())
 }
@@ -1882,6 +1887,15 @@ pub struct DisplayRow {
     pub compact_generations: Option<i64>,
     /// Force-newest rewrite target — the `↑` marker's evidence.
     pub forced_to: Option<String>,
+    /// When the server began handling the request, absent on rows from
+    /// before it was recorded.
+    pub started_ms: Option<i64>,
+    /// The model the request asked for.
+    pub requested_model: Option<String>,
+    /// The model the request was routed to.
+    pub effective_model: Option<String>,
+    /// HTTP status of an error row.
+    pub status: Option<i64>,
 }
 
 /// The display tick's window read ([`DisplayRow`]s): every row with
@@ -1916,6 +1930,7 @@ pub(super) fn display_rows_since(
                    input, cache_read, cache_write_5m, cache_write_1h, output,
                    reasoning,
                    cost_usd, cost_kind, req_messages, compact_generations, forced_to,
+                   started_ms, requested_model, effective_model, status,
                    json_extract(extra, '$.serving_provider') AS serving_provider
             FROM requests
             WHERE ts_ms >= ?1
@@ -1970,6 +1985,10 @@ fn read_display_row(row: &rusqlite::Row<'_>) -> Result<DisplayRow> {
         req_messages: row.get("req_messages")?,
         compact_generations: row.get("compact_generations")?,
         forced_to: row.get("forced_to")?,
+        started_ms: row.get("started_ms")?,
+        requested_model: row.get("requested_model")?,
+        effective_model: row.get("effective_model")?,
+        status: row.get("status")?,
     })
 }
 
@@ -2339,15 +2358,26 @@ pub(super) fn latest_display_session_row(
     )
 }
 
-/// The newest row's timestamp, of any kind; `None` on an empty ledger.
-/// `MAX` over the indexed `ts_ms` is answered from the index's last
-/// entry, so this stays cheap however large the ledger grows — the TUI
+/// When the newest request began being handled, in flight or recorded;
+/// `None` when there is neither. A row from before `started_ms` was
+/// recorded falls back to when it was written. Each half is answered from
+/// an index, so this stays cheap however large the ledger grows — the TUI
 /// asks it on every display read.
-pub(super) fn latest_ts_ms(conn: &Connection) -> Result<Option<i64>> {
-    let ts = conn.query_row("SELECT MAX(ts_ms) FROM requests", [], |row| {
+///
+/// `started_ms` has no index, so the recorded half reads the newest rows by
+/// `ts_ms`: a row is written after its request began, so an older row can
+/// only lead on `started_ms` by outlasting the whole of that tail.
+pub(super) fn latest_started_ms(conn: &Connection) -> Result<Option<i64>> {
+    let recorded = conn.query_row(
+        "SELECT MAX(COALESCE(started_ms, ts_ms)) FROM
+            (SELECT ts_ms, started_ms FROM requests ORDER BY ts_ms DESC LIMIT 64)",
+        [],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    let in_flight = conn.query_row("SELECT MAX(started_ms) FROM in_flight", [], |row| {
         row.get::<_, Option<i64>>(0)
     })?;
-    Ok(ts)
+    Ok(recorded.max(in_flight))
 }
 
 /// One `per_provider`/`per_model` group of a session's billed cost: the
@@ -2654,6 +2684,7 @@ fn read_row(row: &rusqlite::Row<'_>) -> Result<RequestRow> {
         policy_routing,
         safeguards: read_safeguards(row)?,
         lineage: read_lineage(row)?,
+        started_ms: None,
     })
 }
 
@@ -2951,7 +2982,7 @@ fn read_recorded_lane(row: &rusqlite::Row<'_>) -> Result<crate::policy::facts::R
     })))
 }
 
-fn parse_optional_id<T>(column: &'static str, value: Option<String>) -> Result<Option<T>>
+pub(super) fn parse_optional_id<T>(column: &'static str, value: Option<String>) -> Result<Option<T>>
 where
     T: FromStr,
     T::Err: fmt::Display,

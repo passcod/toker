@@ -844,7 +844,7 @@ fn read_window(
     // The header's freshness: the newest row of ANY kind in the whole
     // ledger, not the window's — an empty window must still say how
     // long ago the proxy last wrote anything.
-    let latest = store.latest_ts_ms()?;
+    let latest = store.latest_started_ms()?;
     labels.start_refresh();
     let mut session_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for row in &rows {
@@ -1286,6 +1286,7 @@ pub(crate) mod testrows {
             attempt: None,
             policy_routing: None,
             lineage: None,
+            started_ms: None,
         }
     }
 
@@ -1397,6 +1398,10 @@ pub(crate) mod testrows {
             req_messages: None,
             compact_generations: None,
             forced_to: None,
+            started_ms: None,
+            requested_model: None,
+            effective_model: None,
+            status: None,
         }
     }
 
@@ -1468,6 +1473,10 @@ pub(crate) mod testrows {
                 req_messages: row.req_messages,
                 compact_generations: row.compact_generations,
                 forced_to: row.forced_to.clone(),
+                started_ms: None,
+                requested_model: None,
+                effective_model: None,
+                status: None,
             })
             .collect()
     }
