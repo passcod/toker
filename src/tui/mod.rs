@@ -520,6 +520,18 @@ pub fn run(
                         .contains(crossterm::event::KeyModifiers::CONTROL) =>
                 {
                     config.key(key);
+                    // A provider's detail can ask for one of its routes.
+                    if let Some(route) = config.take_goto() {
+                        page = go_to(
+                            Page::Routing,
+                            &mut ui,
+                            &mut routing,
+                            &mut config,
+                            &mut accounts,
+                            &store,
+                        );
+                        routing.open_route(&route);
+                    }
                 }
                 // The history tab's `c` is a plain key: Ctrl+C is still the
                 // quit below.
@@ -656,7 +668,7 @@ fn go_to(
     match target {
         Page::Dashboard => {}
         Page::Routing => routing.refresh(),
-        Page::Config => config.refresh(),
+        Page::Config => config.arrive(),
         Page::Accounts => accounts.refresh(store),
     }
     target

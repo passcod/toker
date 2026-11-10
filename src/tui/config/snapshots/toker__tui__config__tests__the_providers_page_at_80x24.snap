@@ -1,0 +1,24 @@
+---
+source: src/tui/config/tests.rs
+expression: "frame(&loaded_with_routing(), 80, 24, false)"
+---
+ ?   dashboard   routing   config   accounts   1 providers 5 · 2  2 providers on
+┌PROVIDERS─────────────────────────────────────────────────────────────────────┐
+│ provider       state  credential         used by                             │
+│ anthropic_api  off    none               3 rewrites · 1 route                │
+│ anthropic_sub  on     none               4 rewrites · 2 defaults · 1 route   │
+│ codex_sub      off    codex's own login  3 rewrites · 1 route                │
+│ openai_api     off    none               1 rewrite · 1 route                 │
+│ openrouter     on     keyring            10 rewrites · 4 defaults · 5 routes │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌PROVIDER──────────────────────────────────────────────────────────────────────┐
+│ anthropic_sub                                                                │
+│ state       on, not configured                                               │
+│ credential  none · env TOKER_ANTHROPIC_SUB_TOKEN is unset                    │
+│ endpoint    built-in                                                         │
+│ bindings    anthropic_sub.anthropic_messages · subscription · safeguards su… │
+│ rewrites    4  anthropic_messages 2 · openai_chat 1 · openai_responses 1     │
+│ defaults    2  anthropic_messages · unprefixed/anthropic_messages            │
+│ routes      1  claude-sub                                                    │
+│ [e] enter key   [space] turn off   [u] endpoint   [enter] open route         │
+└──────────────────────────────────────────────────────────────────────────────┘
