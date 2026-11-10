@@ -869,7 +869,10 @@ async fn forward(ready: ReadyAttempt, _server: Server, upstream: reqwest::Respon
                 ctx,
                 status.as_u16(),
                 "response_protocol",
-                "upstream Responses response used the wrong streaming mode",
+                &format!(
+                    "upstream Responses response used the wrong streaming mode ({})",
+                    super::proxy::content_type_detail(&headers)
+                ),
                 None,
                 frontend_wire.protocol(),
             );

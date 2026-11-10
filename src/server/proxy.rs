@@ -1233,6 +1233,28 @@ pub(crate) fn answers_stream_request(headers: &HeaderMap) -> bool {
     headers.get(header::CONTENT_TYPE).is_none() || is_event_stream(headers)
 }
 
+/// The most of a content type an error detail quotes: enough for any media
+/// type with its parameters, while the upstream picks the value.
+const CONTENT_TYPE_DETAIL_MAX: usize = 80;
+
+/// The content type a response named, for the recorded detail of a success
+/// refused for not being the stream asked for, so the row says what came
+/// instead. A header value is not content, so the ledger may hold it
+/// (spec: SEC#no-prompt-or-completion-content-is-recorded).
+pub(crate) fn content_type_detail(headers: &HeaderMap) -> String {
+    let Some(value) = headers.get(header::CONTENT_TYPE) else {
+        return "no content-type".to_owned();
+    };
+    let Ok(text) = value.to_str() else {
+        return "content-type not text".to_owned();
+    };
+    let mut quoted: String = text.chars().take(CONTENT_TYPE_DETAIL_MAX).collect();
+    if quoted.len() < text.len() {
+        quoted.push('…');
+    }
+    format!("content-type {quoted}")
+}
+
 /// A partial buffer of a response body: `rest` is `Some` when the cap
 /// overflowed and the response (positioned after `bytes`) remains, so the
 /// caller can forward the remainder verbatim.
@@ -1434,10 +1456,34 @@ pub(crate) fn plain_status(status: StatusCode, message: &'static str) -> Respons
 #[cfg(test)]
 mod tests {
     use super::{
-        ErrorWire, OVERAGE_PERIOD_MONTHLY_UTILIZATION, OVERAGE_UTILIZATION, buffer_up_to,
-        buffered_body, response_headers, transport_failure,
+        CONTENT_TYPE_DETAIL_MAX, ErrorWire, OVERAGE_PERIOD_MONTHLY_UTILIZATION,
+        OVERAGE_UTILIZATION, buffer_up_to, buffered_body, content_type_detail, response_headers,
+        transport_failure,
     };
     use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+
+    #[test]
+    fn a_content_type_detail_quotes_the_value_within_its_bound() {
+        assert_eq!(
+            content_type_detail(&headers(&[("content-type", "application/json")])),
+            "content-type application/json"
+        );
+        assert_eq!(content_type_detail(&HeaderMap::new()), "no content-type");
+        let long = format!("application/{}", "x".repeat(200));
+        let mut map = HeaderMap::new();
+        map.insert(header::CONTENT_TYPE, HeaderValue::from_str(&long).unwrap());
+        let detail = content_type_detail(&map);
+        assert_eq!(
+            detail,
+            format!("content-type {}…", &long[..CONTENT_TYPE_DETAIL_MAX])
+        );
+        let mut map = HeaderMap::new();
+        map.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_bytes(b"text/\xffhtml").unwrap(),
+        );
+        assert_eq!(content_type_detail(&map), "content-type not text");
+    }
 
     fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
         pairs

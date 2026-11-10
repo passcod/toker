@@ -372,7 +372,19 @@ async fn forward(
         );
     }
     if !answers_stream_request(&headers) {
-        record_terminal_failure(record.as_ref(), status, "response_protocol");
+        if let Some(ctx) = record.as_ref() {
+            record_codex_error(
+                ctx,
+                status.as_u16(),
+                "response_protocol",
+                &format!(
+                    "OpenRouter Responses did not stream ({})",
+                    super::proxy::content_type_detail(&headers)
+                ),
+                None,
+                "openai_responses",
+            );
+        }
         return upstream_failure(ErrorWire::Openai, "OpenRouter Responses did not stream");
     }
     if wants_stream {
