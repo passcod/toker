@@ -1712,7 +1712,7 @@ impl Server {
         }
     }
 
-    /// A request is now in flight. It is recorded in the store from here, so
+    /// A request is now in flight (spec: SATT#while-a-request-is-in-flight). It is recorded in the store from here, so
     /// the dashboard shows it before any of its rows exists. A `counted`
     /// request also holds the sleep lock: a lane's `updated_ms` moves only
     /// when a response finishes, and one long turn can outlast a 5-minute

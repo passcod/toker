@@ -622,7 +622,8 @@ pub(crate) fn aggregate_in_flight(
             );
         }
 
-        // Every row naming a session gives it a row, whatever its kind: a
+        // Every row naming a session gives it a row, whatever its kind
+        // (spec: UTUI#sessions): a
         // session only a gate has stopped is the one most in need of a
         // release. Rows naming none give a row only as measurements, as
         // they always have.
@@ -748,7 +749,7 @@ pub(crate) fn aggregate_in_flight(
         }
     }
 
-    // Requests in flight, oldest first. Each is a request of its session
+    // Requests in flight, oldest first (spec: UTUI#requests-in-flight). Each is a request of its session
     // from when the server began handling it, unless rows of its group
     // already counted it; and each is its session's latest activity.
     for request in &in_flight {
@@ -3152,5 +3153,335 @@ mod tests {
         assert_eq!(snap.tokens.input_total(), 0);
         assert_eq!(snap.tokens.cold, 1);
         assert_eq!(snap.tokens.hit_rate(), HitRate::NothingReusable);
+    }
+
+    // ── requests in flight, and sessions that only a gate or a failure touched ──
+
+    use crate::store::{AttemptGroupId, InFlightRequest, InFlightStage};
+
+    fn group(name: char) -> AttemptGroupId {
+        AttemptGroupId::new(name.to_string().repeat(32)).unwrap()
+    }
+
+    /// A request in flight for `session`, begun `secs` seconds before `NOW`.
+    fn live(session: &str, secs: i64, stage: InFlightStage) -> InFlightRequest {
+        InFlightRequest {
+            id: 1,
+            started_ms: NOW - secs * 1_000,
+            attempt_group_id: None,
+            session_id: Some(session.to_owned()),
+            lineage: None,
+            profile: None,
+            requested_model: Some("opus".to_owned()),
+            req_messages: Some(7),
+            stage,
+            attempt_index: None,
+            provider: None,
+            binding_id: None,
+            effective_model: None,
+        }
+    }
+
+    fn agg_live(rows: &[DisplayRow], in_flight: &[InFlightRequest]) -> Snapshot {
+        super::aggregate_in_flight(
+            rows,
+            in_flight,
+            None,
+            &no_sections(),
+            &no_labels(),
+            &no_catalogs(),
+            None,
+            WINDOW,
+            NOW,
+            rows.len() as i64,
+        )
+    }
+
+    fn named(mut row: DisplayRow, session: &str) -> DisplayRow {
+        row.session_id = Some(session.to_owned());
+        row
+    }
+
+    fn session<'a>(snap: &'a Snapshot, name: &str) -> &'a super::SessionAgg {
+        snap.sessions
+            .iter()
+            .find(|session| session.session == name)
+            .unwrap_or_else(|| panic!("no session {name}: {:?}", snap.sessions))
+    }
+
+    #[test]
+    fn a_request_in_flight_alone_gives_its_session_a_row() {
+        let request = live("ses-new", 4, InFlightStage::Waiting);
+        let snap = agg_live(&[], &[request]);
+        let row = session(&snap, "ses-new");
+        assert_eq!(row.requests, 1, "an in-flight request is a request");
+        assert_eq!(row.in_flight.len(), 1);
+        assert_eq!(row.latest_ts_ms, NOW - 4_000);
+        assert_eq!(row.req_messages, Some(7));
+        assert_eq!(snap.window_requests, 1);
+        assert!(!snap.window_empty, "a window holding only a request");
+        assert_eq!(snap.rate.buckets.last().unwrap().requests, 1);
+    }
+
+    #[test]
+    fn the_longest_running_request_leads_and_the_rest_are_counted() {
+        // Records arrive oldest first from the store, and the model keeps
+        // that order, so the first is the longest-running.
+        let snap = agg_live(
+            &[],
+            &[
+                live("ses-a", 40, InFlightStage::Streaming),
+                live("ses-a", 5, InFlightStage::Held),
+                live("ses-b", 1, InFlightStage::Held),
+            ],
+        );
+        let row = session(&snap, "ses-a");
+        assert_eq!(row.in_flight[0].stage, InFlightStage::Streaming);
+        assert_eq!(row.in_flight.len(), 2);
+        assert_eq!(row.requests, 2);
+        assert_eq!(session(&snap, "ses-b").in_flight.len(), 1);
+    }
+
+    #[test]
+    fn an_unidentified_record_makes_no_row() {
+        let mut request = live("x", 1, InFlightStage::Held);
+        request.session_id = None;
+        request.requested_model = None;
+        let snap = agg_live(&[], &[request]);
+        assert!(snap.sessions.is_empty());
+        assert_eq!(snap.window_requests, 0);
+    }
+
+    #[test]
+    fn a_session_only_a_gate_stopped_has_a_row_to_release() {
+        let mut gate = named(display_kind_row(mins_ago(2), RowKind::Blocked), "ses-gate");
+        gate.effective_model = Some("claude-opus-5".to_owned());
+        gate.provider = Some("anthropic_sub".to_owned());
+        let snap = agg(&[gate], 1);
+        let row = session(&snap, "ses-gate");
+        assert!(row.stopped);
+        assert_eq!(row.requests, 0, "a gate row is no request of its own");
+        assert_eq!(row.model.as_deref(), Some("claude-opus-5"));
+        assert!(row.model_unserved, "routed to, never served");
+        assert_eq!(row.provider.as_deref(), Some("anthropic_sub"));
+        assert_eq!(row.latest_ts_ms, mins_ago(2));
+    }
+
+    #[test]
+    fn a_session_whose_only_request_failed_has_a_row_marked_failed() {
+        let mut failed = named(
+            grouped(
+                Some(RowKind::Error),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                Some(0),
+                3,
+            ),
+            "ses-fail",
+        );
+        failed.effective_model = Some("claude-sonnet-5".to_owned());
+        let snap = agg(&[failed], 1);
+        let row = session(&snap, "ses-fail");
+        assert!(row.failed);
+        assert_eq!(row.requests, 1);
+        assert!(row.model_unserved);
+        assert_eq!(snap.failed_requests, 1);
+    }
+
+    #[test]
+    fn a_served_model_beats_a_routed_one() {
+        let mut gate = named(display_kind_row(mins_ago(5), RowKind::Blocked), "ses-s");
+        gate.effective_model = Some("routed".to_owned());
+        let mut served = named(display_bare(mins_ago(1)), "ses-s");
+        served.model = Some("served".to_owned());
+        served.effective_model = Some("routed".to_owned());
+        let snap = agg(&[gate, served], 2);
+        let row = session(&snap, "ses-s");
+        assert_eq!(row.model.as_deref(), Some("served"));
+        assert!(!row.model_unserved);
+    }
+
+    #[test]
+    fn a_request_in_flight_names_the_routed_model_of_a_session_with_none_served() {
+        let mut request = live("ses-r", 3, InFlightStage::Waiting);
+        request.effective_model = Some("opus-5".to_owned());
+        request.provider = Some("anthropic_sub".to_owned());
+        let snap = agg_live(&[], &[request]);
+        let row = session(&snap, "ses-r");
+        assert_eq!(row.model.as_deref(), Some("opus-5"));
+        assert!(row.model_unserved);
+    }
+
+    #[test]
+    fn the_failure_mark_follows_the_newest_final_outcome() {
+        let first_failed = named(
+            grouped(
+                Some(RowKind::Error),
+                "cccccccccccccccccccccccccccccccc",
+                Some(0),
+                6,
+            ),
+            "ses-m",
+        );
+        let then_served = named(
+            grouped(None, "dddddddddddddddddddddddddddddddd", Some(0), 4),
+            "ses-m",
+        );
+        let then_failed = named(
+            grouped(
+                Some(RowKind::Error),
+                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                Some(0),
+                2,
+            ),
+            "ses-m",
+        );
+        let marked = |rows: &[DisplayRow]| session(&agg(rows, 3), "ses-m").failed;
+        assert!(marked(&[first_failed.clone()]), "a failure sets it");
+        assert!(
+            !marked(&[first_failed.clone(), then_served.clone()]),
+            "a later success clears it"
+        );
+        assert!(
+            marked(&[first_failed, then_served, then_failed]),
+            "and a later failure sets it again"
+        );
+    }
+
+    #[test]
+    fn a_failure_a_fallback_recovered_does_not_mark_the_session() {
+        let rows = [
+            named(
+                grouped(
+                    Some(RowKind::Error),
+                    "ffffffffffffffffffffffffffffffff",
+                    Some(0),
+                    3,
+                ),
+                "ses-fb",
+            ),
+            named(
+                grouped(None, "ffffffffffffffffffffffffffffffff", Some(1), 2),
+                "ses-fb",
+            ),
+        ];
+        let snap = agg(&rows, 2);
+        let row = session(&snap, "ses-fb");
+        assert!(!row.failed);
+        assert_eq!(row.requests, 1, "two attempts, one request");
+    }
+
+    #[test]
+    fn a_group_in_flight_neither_sets_nor_clears_the_failure_mark() {
+        let group_id = group('a');
+        let mut failed_attempt = named(
+            grouped(Some(RowKind::Error), group_id.as_str(), Some(0), 3),
+            "ses-live",
+        );
+        failed_attempt.started_ms = Some(mins_ago(3) - 1_000);
+        let mut request = live("ses-live", 100, InFlightStage::Waiting);
+        request.attempt_group_id = Some(group_id.clone());
+        // The group's failed attempt row is written, and the fallback is
+        // still going: the client has seen no failure.
+        let snap = agg_live(&[failed_attempt.clone()], &[request.clone()]);
+        let row = session(&snap, "ses-live");
+        assert!(!row.failed);
+        assert_eq!(snap.failed_requests, 0);
+        assert_eq!(
+            row.requests, 1,
+            "the group counts once, not once more as live"
+        );
+        assert_eq!(snap.window_requests, 1);
+
+        // An earlier failure stays set while a later request is in flight.
+        let earlier = named(
+            grouped(
+                Some(RowKind::Error),
+                "99999999999999999999999999999999",
+                Some(0),
+                20,
+            ),
+            "ses-live",
+        );
+        let snap = agg_live(&[earlier], &[live("ses-live", 5, InFlightStage::Held)]);
+        assert!(session(&snap, "ses-live").failed);
+    }
+
+    #[test]
+    fn a_request_in_flight_is_placed_in_the_minute_it_began() {
+        let group_id = group('b');
+        // Its first row only lands as the response ends, minutes on.
+        let mut row = named(grouped(None, group_id.as_str(), Some(0), 1), "ses-long");
+        row.started_ms = Some(mins_ago(9));
+        let snap = agg(&[row.clone()], 1);
+        let buckets = &snap.rate.buckets;
+        assert_eq!(buckets[buckets.len() - 1 - 9].requests, 1, "by started_ms");
+        assert_eq!(buckets[buckets.len() - 2].requests, 0);
+
+        // The same request still in flight: counted once, by its record.
+        let mut request = live("ses-long", 9 * 60, InFlightStage::Streaming);
+        request.attempt_group_id = Some(group_id);
+        let snap = agg_live(&[row], &[request]);
+        let total: usize = snap.rate.buckets.iter().map(|bucket| bucket.requests).sum();
+        assert_eq!(total, 1);
+        assert_eq!(snap.window_requests, 1);
+    }
+
+    #[test]
+    fn rows_without_started_ms_are_placed_by_when_they_were_written() {
+        let row = named(grouped(None, group('c').as_str(), Some(0), 4), "ses-old");
+        let snap = agg(&[row], 1);
+        let buckets = &snap.rate.buckets;
+        assert_eq!(buckets[buckets.len() - 1 - 4].requests, 1);
+    }
+
+    #[test]
+    fn a_request_that_began_before_the_window_lands_in_its_first_minute() {
+        let mut row = named(grouped(None, group('d').as_str(), Some(0), 1), "ses-pre");
+        row.started_ms = Some(mins_ago(WINDOW as i64 + 40));
+        let snap = agg(&[row], 1);
+        assert_eq!(snap.rate.buckets[0].requests, 1);
+    }
+
+    #[test]
+    fn a_window_with_nothing_in_flight_aggregates_as_it_did() {
+        let mut served = named(display_bare(mins_ago(2)), "ses-q");
+        served.model = Some("m".to_owned());
+        served.input = Some(10);
+        served.cache_read = Some(0);
+        let rows = [served];
+        assert_eq!(agg(&rows, 1), agg_live(&rows, &[]));
+        let quiet = agg_live(&rows, &[]);
+        let row = session(&quiet, "ses-q");
+        assert!(row.in_flight.is_empty());
+        assert!(!row.failed);
+        assert!(!row.model_unserved);
+    }
+
+    #[test]
+    fn only_the_sessions_own_conversation_moves_its_message_count() {
+        let mut served = named(display_bare(mins_ago(2)), "ses-p");
+        served.model = Some("m".to_owned());
+        served.req_messages = Some(3);
+        let mut child = live("ses-c", 2, InFlightStage::Held);
+        child.lineage = SessionLineage::codex_guardian("guardian:ses-p");
+        child.req_messages = Some(99);
+        let snap = agg_live(&[served.clone()], &[child.clone()]);
+        let row = session(&snap, "ses-p");
+        assert_eq!(
+            row.req_messages,
+            Some(3),
+            "a child's turn is not the conversation"
+        );
+        assert_eq!(
+            row.in_flight.len(),
+            1,
+            "but it is in flight under its parent"
+        );
+        assert_eq!(row.child_roles.len(), 1);
+
+        let mut own = live("ses-p", 1, InFlightStage::Held);
+        own.req_messages = Some(5);
+        let snap = agg_live(&[served], &[child, own]);
+        assert_eq!(session(&snap, "ses-p").req_messages, Some(5));
     }
 }

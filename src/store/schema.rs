@@ -1393,6 +1393,7 @@ pub(super) const MIGRATIONS: &[&str] = &[
     // A request in flight, readable before any of its rows exists. It is
     // state beside the ledger, not ledger: written when handling begins,
     // moved at each stage change, and deleted once the last row is written.
+    // (spec: SATT#while-a-request-is-in-flight, SLEDGR#fields-that-need-care).
     // `requests.started_ms` is when handling began, for placing a request in
     // the minute it was sent rather than the one its row landed in; rows
     // from before it stay NULL.

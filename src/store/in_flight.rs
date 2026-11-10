@@ -1,4 +1,5 @@
-//! Requests in flight: state beside the ledger, not ledger.
+//! Requests in flight: state beside the ledger, not ledger
+//! (spec: SATT#while-a-request-is-in-flight).
 //!
 //! A row is written when the server begins handling a request, moved at each
 //! stage change, and deleted once the request's last ledger row has been

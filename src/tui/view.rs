@@ -5106,4 +5106,211 @@ mod tests {
                 .expect("draw");
         }
     }
+
+    // ── requests in flight, and sessions only a gate or a failure touched ──
+
+    /// Six sessions: two requests in flight in one, a first turn with
+    /// nothing served in another, a stream under way in a third, one that
+    /// only a gate stopped, one that only failed, and one gone quiet.
+    fn in_flight_snapshot() -> model::Snapshot {
+        use crate::store::{AttemptGroupId, AttemptIndex, InFlightRequest, InFlightStage, RowKind};
+
+        let served = |ts: i64, session: &str, model: &str, messages: i64| {
+            let mut row = display_bare(ts);
+            row.session_id = Some(session.into());
+            row.model = Some(model.into());
+            row.provider = Some("anthropic_sub".into());
+            row.input = Some(1_500);
+            row.cache_read = Some(449_393);
+            row.cache_write_1h = Some(20_000);
+            row.cache_write_5m = Some(0);
+            row.output = Some(768);
+            row.req_messages = Some(messages);
+            row
+        };
+        let live =
+            |session: &str, secs: i64, stage: InFlightStage, model: Option<&str>| InFlightRequest {
+                id: 1,
+                started_ms: NOW - secs * 1_000,
+                attempt_group_id: None,
+                session_id: Some(session.into()),
+                lineage: None,
+                profile: None,
+                requested_model: Some("opus".into()),
+                req_messages: Some(4),
+                stage,
+                attempt_index: model.map(|_| AttemptIndex::zero()),
+                provider: model.map(|_| "anthropic_sub".into()),
+                binding_id: None,
+                effective_model: model.map(str::to_owned),
+            };
+        let mut rows = vec![
+            served(NOW - 5 * MIN, "ses-free", "claude-sonnet-5", 60),
+            served(NOW - 2 * MIN, "ses-hot", "claude-opus-5", 79),
+            served(NOW - 10 * MIN, "ses-crow", "claude-haiku-4-5", 12),
+        ];
+        let mut gate = display_kind_row(NOW - 2 * MIN, RowKind::Blocked);
+        gate.session_id = Some("ses-gate".into());
+        gate.effective_model = Some("claude-opus-5".into());
+        gate.provider = Some("anthropic_sub".into());
+        rows.push(gate);
+        let mut failed = display_kind_row(NOW - 4 * MIN, RowKind::Error);
+        failed.session_id = Some("ses-fail".into());
+        failed.attempt_group_id = Some(AttemptGroupId::new("a".repeat(32)).unwrap());
+        failed.attempt_index = Some(AttemptIndex::zero());
+        failed.effective_model = Some("claude-sonnet-5".into());
+        failed.provider = Some("anthropic_sub".into());
+        rows.push(failed);
+        let in_flight = [
+            live(
+                "ses-hot",
+                60,
+                InFlightStage::Streaming,
+                Some("claude-opus-5"),
+            ),
+            live(
+                "ses-free",
+                22,
+                InFlightStage::Streaming,
+                Some("claude-sonnet-5"),
+            ),
+            live("ses-new", 14, InFlightStage::Waiting, Some("claude-opus-5")),
+            live("ses-free", 3, InFlightStage::Held, None),
+        ];
+        let mut snap = model::aggregate_in_flight(
+            &rows,
+            &in_flight,
+            None,
+            &Released::new(),
+            &no_labels(),
+            &FetchedCatalogs::default(),
+            None,
+            30,
+            NOW,
+            523,
+        );
+        // The newest request began three seconds ago, in flight.
+        snap.latest_started_ms = Some(NOW - 3_000);
+        snap
+    }
+
+    #[test]
+    fn the_idle_cell_shows_how_far_a_request_has_got() {
+        use crate::store::InFlightStage;
+        assert_eq!(
+            super::in_flight_cell(InFlightStage::Held, 3_000, 0),
+            "held 3s"
+        );
+        assert_eq!(
+            super::in_flight_cell(InFlightStage::Waiting, 14_000, 0),
+            "sent 14s"
+        );
+        assert_eq!(
+            super::in_flight_cell(InFlightStage::Streaming, 22_000, 1),
+            "recv 22s +1"
+        );
+        assert_eq!(
+            super::in_flight_cell(InFlightStage::Streaming, 61_000, 0),
+            "recv 1m"
+        );
+        assert_eq!(super::in_flight_age(-5), "0s", "a skewed clock reads zero");
+    }
+
+    #[test]
+    fn requests_in_flight_show_on_their_rows_at_every_width() {
+        let snap = in_flight_snapshot();
+        for (width, height) in [(80, 30), (100, 30), (120, 40)] {
+            let text = rendered(&snap, width, height);
+            frame_snapshot(&format!("sessions_in_flight_{width}x{height}"), &text);
+            for expected in ["recv 22s", "sent 14s", "recv 1m"] {
+                assert!(text.contains(expected), "{expected:?} at {width}:\n{text}");
+            }
+            for session in ["ses-free", "ses-new", "ses-hot", "ses-gate", "ses-fail"] {
+                assert!(text.contains(session), "{session} at {width}:\n{text}");
+            }
+        }
+        let wide = rendered(&snap, 120, 40);
+        // The longest-running of ses-free's two leads, with the other counted.
+        assert!(wide.contains("recv 22s +1"), "{wide}");
+        // Nothing served yet: the routed model, marked, and the marks that
+        // say why each of the other two has a row.
+        assert!(wide.contains("~opus-5"), "{wide}");
+        assert!(wide.contains("~sonnet-5 ✗"), "{wide}");
+        assert!(wide.contains("~opus-5 !"), "{wide}");
+    }
+
+    #[test]
+    fn a_quiet_dashboard_shows_none_of_the_in_flight_marks() {
+        let text = rendered(&full_snapshot(), 120, 40);
+        for absent in ["held ", "sent ", "recv ", "~", "✗", " +1"] {
+            assert!(!text.contains(absent), "{absent:?} in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn an_unserved_model_dims_with_its_ceiling() {
+        let snap = in_flight_snapshot();
+        let new = snap
+            .sessions
+            .iter()
+            .find(|session| session.session == "ses-new")
+            .expect("ses-new");
+        let ctx = super::ctx_cell(new.ctx, new.model_unserved);
+        assert!(ctx.style.add_modifier.contains(Modifier::DIM), "{ctx:?}");
+        let model = super::model_cell(new);
+        assert!(model.spans[0].content.starts_with('~'), "{model:?}");
+        assert!(model.spans[0].style.add_modifier.contains(Modifier::DIM));
+        let served = snap
+            .sessions
+            .iter()
+            .find(|session| session.session == "ses-hot")
+            .expect("ses-hot");
+        assert!(!super::model_cell(served).spans[0].content.starts_with('~'));
+        assert!(
+            !super::ctx_cell(served.ctx, served.model_unserved)
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+    }
+
+    #[test]
+    fn the_failure_mark_is_red_and_the_gate_mark_stays_bold() {
+        let snap = in_flight_snapshot();
+        let find = |name: &str| {
+            snap.sessions
+                .iter()
+                .find(|session| session.session == name)
+                .expect("session")
+        };
+        let failed = super::model_cell(find("ses-fail"));
+        let mark = failed.spans.last().expect("mark");
+        assert_eq!(mark.content, " ✗");
+        assert_eq!(mark.style.fg, Some(Color::Red));
+        let gated = super::model_cell(find("ses-gate"));
+        let mark = gated.spans.last().expect("mark");
+        assert_eq!(mark.content, " !");
+        assert!(mark.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn the_legend_teaches_the_in_flight_marks() {
+        let ui = super::Ui {
+            legend: true,
+            ..plain()
+        };
+        let text: String = buffer_with(&in_flight_snapshot(), 140, 60, &ui)
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        for expected in [
+            "failed: this session's newest finished request ended in failure",
+            "routed to this model, none served yet",
+            "in flight: not yet sent, awaiting a reply, or streaming",
+            "N more requests in flight in that session",
+        ] {
+            assert!(text.contains(expected), "{expected:?} in:\n{text}");
+        }
+    }
 }
