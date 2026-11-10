@@ -291,8 +291,38 @@ fn route_changes(before: &Route, after: &Route, out: &mut Vec<Change>) {
     }
 }
 
-/// Added, removed and changed records of one kind, by identifier.
-#[allow(clippy::too_many_arguments)]
+/// Added, removed and changed records of one kind, matched by `key_of`.
+///
+/// Records are walked in `after`'s order, reporting each as added or passing
+/// it with its old self to `changed`, then the ones only in `before` as
+/// removed. What each is called is the caller's to say, so a kind with its own
+/// wording or its own notion of changed does not need a loop of its own.
+fn matched<T>(
+    before: &[T],
+    after: &[T],
+    key_of: impl Fn(&T) -> String,
+    added: impl Fn(&T) -> Change,
+    changed: impl Fn(&T, &T, &mut Vec<Change>),
+    removed: impl Fn(&T) -> Change,
+    out: &mut Vec<Change>,
+) {
+    for record in after {
+        let key = key_of(record);
+        match before.iter().find(|old| key_of(old) == key) {
+            None => out.push(added(record)),
+            Some(old) => changed(old, record, out),
+        }
+    }
+    for old in before {
+        let key = key_of(old);
+        if !after.iter().any(|record| key_of(record) == key) {
+            out.push(removed(old));
+        }
+    }
+}
+
+/// Records of one kind, by identifier, that are described by a summary and
+/// one line of text and changed where any field differs.
 fn records<T: Serialize>(
     kind: &'static str,
     before: &[T],
@@ -300,45 +330,44 @@ fn records<T: Serialize>(
     id_of: impl Fn(&T) -> String,
     summary_of: impl Fn(&T) -> String,
     text_of: impl Fn(&T) -> String,
-    ignore: &[&str],
     out: &mut Vec<Change>,
 ) {
-    for record in after {
-        let id = id_of(record);
-        match before.iter().find(|old| id_of(old) == id) {
-            None => out.push(change(
+    matched(
+        before,
+        after,
+        &id_of,
+        |record| {
+            change(
                 "added",
                 kind,
-                Some(id),
+                Some(id_of(record)),
                 format!("add {}", summary_of(record)),
                 text_of(record),
-            )),
-            Some(old) => {
-                let fields = differing(old, record, ignore);
-                if !fields.is_empty() {
-                    out.push(change(
-                        "changed",
-                        kind,
-                        Some(id),
-                        format!("change {}", summary_of(record)),
-                        format!("{}: {}", text_of(record), fields.join(", ")),
-                    ));
-                }
+            )
+        },
+        |old, record, out| {
+            let fields = differing(old, record, &[]);
+            if !fields.is_empty() {
+                out.push(change(
+                    "changed",
+                    kind,
+                    Some(id_of(record)),
+                    format!("change {}", summary_of(record)),
+                    format!("{}: {}", text_of(record), fields.join(", ")),
+                ));
             }
-        }
-    }
-    for old in before {
-        let id = id_of(old);
-        if !after.iter().any(|record| id_of(record) == id) {
-            out.push(change(
+        },
+        |old| {
+            change(
                 "removed",
                 kind,
-                Some(id),
+                Some(id_of(old)),
                 format!("remove {}", summary_of(old)),
                 text_of(old),
-            ));
-        }
-    }
+            )
+        },
+        out,
+    );
 }
 
 /// Every record that differs between `before` and `after`, in the order a
@@ -353,7 +382,6 @@ pub(super) fn changes(before: &PolicyDocument, after: &PolicyDocument) -> Vec<Ch
         |p| p.id.to_string(),
         |p| format!("presentation {}", p.slug),
         |p| format!("presentation {}  {}", scope_label(&p.scope), p.slug),
-        &[],
         &mut out,
     );
 
@@ -369,59 +397,62 @@ pub(super) fn changes(before: &PolicyDocument, after: &PolicyDocument) -> Vec<Ch
         |rule: &RewriteRule| format!("rewrite {} → {}", matcher_text(rule), route_of(rule));
     // The position a rewrite holds is not part of its record: moving one
     // renumbers its neighbours, and that is reported as the move.
-    for rule in &after.rewrites {
-        let text = |rule: &RewriteRule| {
-            let mut text = format!(
-                "rewrite {} {}  {} → {}",
-                scope_label(&rule.scope),
-                position(&now, rule),
-                matcher_text(rule),
-                route_of(rule)
-            );
-            if let Some(sends) = sends_text(&rule.target) {
-                text.push_str(&format!("  {sends}"));
-            }
-            text
-        };
-        match before.rewrites.iter().find(|old| old.id == rule.id) {
-            None => out.push(change(
+    let text = |rule: &RewriteRule, order: &BTreeMap<String, Vec<&RewriteRule>>| {
+        format!(
+            "rewrite {} {}  {} → {}",
+            scope_label(&rule.scope),
+            position(order, rule),
+            matcher_text(rule),
+            route_of(rule)
+        )
+    };
+    // What a rewrite that is present now says, with what it sends. One that
+    // is gone is described as it stood, with no more than where it sat.
+    let text_now = |rule: &RewriteRule| {
+        let mut line = text(rule, &now);
+        if let Some(sends) = sends_text(&rule.target) {
+            line.push_str(&format!("  {sends}"));
+        }
+        line
+    };
+    matched(
+        &before.rewrites,
+        &after.rewrites,
+        |rule| rule.id.to_string(),
+        |rule| {
+            let text = text_now(rule);
+            change(
                 "added",
                 "rewrite",
                 Some(rule.id.to_string()),
                 format!("add {}", rewrite_summary(rule)),
-                text(rule),
-            )),
-            Some(old) => {
-                let fields = differing(old, rule, &["priority"]);
-                if !fields.is_empty() {
-                    out.push(change(
-                        "changed",
-                        "rewrite",
-                        Some(rule.id.to_string()),
-                        format!("change {}", rewrite_summary(rule)),
-                        format!("{}: {}", text(rule), fields.join(", ")),
-                    ));
-                }
+                text,
+            )
+        },
+        |old, rule, out| {
+            let fields = differing(old, rule, &["priority"]);
+            if !fields.is_empty() {
+                let text = text_now(rule);
+                out.push(change(
+                    "changed",
+                    "rewrite",
+                    Some(rule.id.to_string()),
+                    format!("change {}", rewrite_summary(rule)),
+                    format!("{text}: {}", fields.join(", ")),
+                ));
             }
-        }
-    }
-    for old in &before.rewrites {
-        if !after.rewrites.iter().any(|rule| rule.id == old.id) {
-            out.push(change(
+        },
+        |old| {
+            change(
                 "removed",
                 "rewrite",
                 Some(old.id.to_string()),
                 format!("remove {}", rewrite_summary(old)),
-                format!(
-                    "rewrite {} {}  {} → {}",
-                    scope_label(&old.scope),
-                    position(&was, old),
-                    matcher_text(old),
-                    route_of(old)
-                ),
-            ));
-        }
-    }
+                text(old, &was),
+            )
+        },
+        &mut out,
+    );
     for (scope, rules) in &now {
         let ids = |rules: &[&RewriteRule]| -> Vec<String> {
             rules.iter().map(|rule| rule.id.to_string()).collect()
@@ -454,77 +485,76 @@ pub(super) fn changes(before: &PolicyDocument, after: &PolicyDocument) -> Vec<Ch
         }
     }
 
-    for default in &after.defaults {
-        let label = scope_label(&default.scope);
-        let text = |route: &RouteReference| format!("default {label}  → {}", route.route_id);
-        match before
-            .defaults
-            .iter()
-            .find(|old| old.scope == default.scope)
-        {
-            None => out.push(change(
+    matched(
+        &before.defaults,
+        &after.defaults,
+        |default| scope_label(&default.scope),
+        |default| {
+            let label = scope_label(&default.scope);
+            change(
                 "added",
                 "default",
                 Some(label.clone()),
                 format!("add the default for {label} → {}", default.target.route_id),
-                text(&default.target),
-            )),
-            Some(old) if old.target != default.target => out.push(change(
-                "changed",
-                "default",
-                Some(label.clone()),
-                format!(
-                    "send the default for {label} to {}",
-                    default.target.route_id
-                ),
-                format!(
-                    "default {label}  {} → {}",
-                    old.target.route_id, default.target.route_id
-                ),
-            )),
-            Some(_) => {}
-        }
-    }
-    for old in &before.defaults {
-        if !after
-            .defaults
-            .iter()
-            .any(|default| default.scope == old.scope)
-        {
+                format!("default {label}  → {}", default.target.route_id),
+            )
+        },
+        |old, default, out| {
+            if old.target != default.target {
+                let label = scope_label(&default.scope);
+                out.push(change(
+                    "changed",
+                    "default",
+                    Some(label.clone()),
+                    format!(
+                        "send the default for {label} to {}",
+                        default.target.route_id
+                    ),
+                    format!(
+                        "default {label}  {} → {}",
+                        old.target.route_id, default.target.route_id
+                    ),
+                ));
+            }
+        },
+        |old| {
             let label = scope_label(&old.scope);
-            out.push(change(
+            change(
                 "removed",
                 "default",
                 Some(label.clone()),
                 format!("remove the default for {label}"),
                 format!("default {label}  → {}", old.target.route_id),
-            ));
-        }
-    }
+            )
+        },
+        &mut out,
+    );
 
-    for route in &after.routes {
-        match before.routes.iter().find(|old| old.id == route.id) {
-            None => out.push(change(
+    matched(
+        &before.routes,
+        &after.routes,
+        |route| route.id.to_string(),
+        |route| {
+            change(
                 "added",
                 "route",
                 Some(route.id.to_string()),
                 format!("add route {}", route.id),
                 describe_route(route),
-            )),
-            Some(old) => route_changes(old, route, &mut out),
-        }
-    }
-    for old in &before.routes {
-        if !after.routes.iter().any(|route| route.id == old.id) {
-            out.push(change(
+            )
+        },
+        route_changes,
+        |old| {
+            change(
                 "removed",
                 "route",
                 Some(old.id.to_string()),
                 format!("remove route {}", old.id),
                 describe_route(old),
-            ));
-        }
-    }
+            )
+        },
+        &mut out,
+    );
 
     records(
         "family",
@@ -533,7 +563,6 @@ pub(super) fn changes(before: &PolicyDocument, after: &PolicyDocument) -> Vec<Ch
         |c| c.id.to_string(),
         |c| format!("family {}", c.id),
         |c| format!("family {}  on {}", c.id, c.binding_id),
-        &[],
         &mut out,
     );
     records(
@@ -543,7 +572,6 @@ pub(super) fn changes(before: &PolicyDocument, after: &PolicyDocument) -> Vec<Ch
         |u| u.id.to_string(),
         |u| format!("upgrade {}", u.id),
         |u| format!("upgrade {}  on family {}", u.id, u.classifier_id),
-        &[],
         &mut out,
     );
 
@@ -753,6 +781,50 @@ mod tests {
         let found = changes(&document(base()), &document(after));
         assert_eq!(found[0].change, "changed");
         assert!(found[0].text.ends_with(": target"), "{}", found[0].text);
+    }
+
+    #[test]
+    fn a_default_is_added_redirected_and_removed_by_its_scope() {
+        let default = |to: &str| {
+            json!({
+                "scope": {"kind": "protocol", "protocol": "anthropic_messages"},
+                "target": {"route_id": to, "parameters": {}},
+            })
+        };
+        let mut with_alpha = base();
+        with_alpha["defaults"] = json!([default("alpha")]);
+        let mut with_beta = base();
+        with_beta["defaults"] = json!([default("beta")]);
+        let texts = |before: &Value, after: &Value| -> Vec<(String, String, String)> {
+            changes(&document(before.clone()), &document(after.clone()))
+                .into_iter()
+                .map(|change| (change.change.to_owned(), change.summary, change.text))
+                .collect()
+        };
+        assert_eq!(
+            texts(&base(), &with_alpha),
+            [(
+                "added".to_owned(),
+                "add the default for anthropic_messages → alpha".to_owned(),
+                "default anthropic_messages  → alpha".to_owned()
+            )]
+        );
+        assert_eq!(
+            texts(&with_alpha, &with_beta),
+            [(
+                "changed".to_owned(),
+                "send the default for anthropic_messages to beta".to_owned(),
+                "default anthropic_messages  alpha → beta".to_owned()
+            )]
+        );
+        assert_eq!(
+            texts(&with_beta, &base()),
+            [(
+                "removed".to_owned(),
+                "remove the default for anthropic_messages".to_owned(),
+                "default anthropic_messages  → beta".to_owned()
+            )]
+        );
     }
 
     #[test]
