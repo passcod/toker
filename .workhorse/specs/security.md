@@ -84,6 +84,11 @@ Toker MUST NOT emit cross-origin resource sharing headers and MUST NOT serve a p
 
 A control path added later MUST take the same checks.
 
+## Toker never runs with elevation
+
+Toker MUST NOT run with elevation.
+The one change needing the system manager, placing the machine's wake, MUST be made by a shell script holding only the commands for it, as [GPING](gates/pinging.md#where-the-schedule-is-kept) specifies.
+
 ## Accounting cannot stop a session
 
 Observing and recording a request MUST NOT be able to fail it, as [SATT](store/attempts.md) and [GQUOTA](gates/quota.md#firing) specify.

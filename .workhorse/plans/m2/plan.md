@@ -14,8 +14,10 @@ Specs: GPING#the-schedule, UTUI#schedule, USETUP#installing-units.
   A ping carried past midnight shifts each of its slot's days forward by one, generalising the Friday-to-Saturday case the code handles now.
 - The user units are written by the TUI process, since the service's sandbox excludes the units directory.
   After writing: `systemctl --user daemon-reload`, then `enable --now` the new timers and `disable --now` plus remove those of removed slots.
-- Placing the wake: writing a file into the system unit directory is beyond what polkit-authorised `systemctl` can do, so the elevated step is one `pkexec` invocation that writes `toker-wake.timer` and `toker-wake.service` into `/etc/systemd/system`, reloads the system manager and enables the timer (or disables and removes both).
-  One prompt per change. Never `sudo`.
+- Placing the wake: polkit-authorised `systemctl` cannot write a unit file into the system unit directory, so the elevated step is one `pkexec /bin/sh -c '<script>'`, never `sudo` and never the toker binary (GPING#where-the-schedule-is-kept).
+  The script writes `toker-wake.timer` and `toker-wake.service` into `/etc/systemd/system` from quoted heredocs carrying their full contents, then `systemctl daemon-reload` and `enable --now toker-wake.timer`; the removal script is `disable --now`, `rm` of both, `daemon-reload`.
+  The contents go in the script rather than through a temp file, so the command pkexec shows for authorisation is everything that runs as root, and nothing it reads can change between the prompt and the copy.
+  Generate the heredoc delimiter so no unit line can match it, and `set -eu` so a failed write stops before the reload.
   The units are copied rather than linked from home, so a home not mounted at boot cannot break them.
 - The elevated step runs with the TUI suspended: leave the alternate screen and raw mode, run it, then restore and redraw.
   pkexec uses the desktop's agent where one is registered, and otherwise prompts on the terminal.

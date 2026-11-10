@@ -65,6 +65,12 @@ The installed timer units MUST be the record of the slots, their days, and wheth
 Waking the machine needs the system manager, so placing the wake, changing its slots or days, and removing it MUST ask the platform for elevation.
 Turning the schedule on or off, and editing its slots while the machine is not woken, MUST NOT.
 
+The elevated step MUST be a shell script holding only the commands that write or remove the wake's units and have the system manager pick up the change, with the units' contents written out in it.
+Toker itself MUST NOT run with elevation.
+
+> [!NOTE]
+> The platform shows the command it is asked to authorise, so a script carrying the units in full shows exactly what will be written as root, where elevating Toker would ask for trust in the whole binary.
+
 ## Where a boundary falls
 
 A five-hour window's reset falls at the fire time of the request that opened it, floored to a ten-minute grid, plus five hours.
