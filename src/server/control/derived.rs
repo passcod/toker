@@ -18,9 +18,9 @@ use crate::catalog::offers::{OfferInventory, PolicyPublication, render_policy};
 use crate::policy::shadow::Shape;
 use crate::policy::{
     AvailabilitySnapshot, BindingAvailability, BindingId, CatalogueAvailability, CircuitSnapshot,
-    CompiledCandidateModel, CompiledClassifier, CompiledPolicy, CompiledPresentation, CostClass,
-    EdgeSetting, Evidence, FrontendProtocol, FrontendScope, LearningView, MatcherSpec,
-    PolicyDocument, Reach, RouteId, route_reach, upgrade_standing,
+    CompiledClassifier, CompiledPolicy, CompiledPresentation, CostClass, EdgeSetting, Evidence,
+    FrontendProtocol, FrontendScope, LearningView, MatcherSpec, PolicyDocument, Reach, RouteId,
+    route_reach,
 };
 use crate::routing::{Capabilities, CapabilityEvidence};
 use crate::server::RoutingLaneImpacts;
@@ -30,6 +30,9 @@ mod models;
 mod providers;
 mod routes;
 mod rules;
+
+#[cfg(test)]
+mod facts_tests;
 
 /// The adapters a policy publishes through, by the frontend each serves.
 const CLAUDE_ADAPTER: &str = "claude_settings";
@@ -198,7 +201,7 @@ fn policy_body<L: LearningView>(
         "rewrites": rules.rewrites,
         "defaults": rules.defaults,
         "upgrades": upgrades.body(),
-        "compaction": models::compaction(&ctx, &upgrades),
+        "compaction": models::compaction(&ctx),
         "providers": providers::providers_body(&ctx, &rules),
         "first_refused_tab": first_refused_tab,
     })
@@ -505,7 +508,10 @@ fn scope_label(scope: &FrontendScope) -> String {
 /// Whether the slug is listed to its frontend, and if not why. The listing
 /// is whatever `render_policy` would publish, so this cannot disagree with
 /// `/v1/models`.
-fn presentations_body<L: LearningView>(policy: &CompiledPolicy, inputs: &Inputs<'_, L>) -> Value {
+fn presentations_body<L: LearningView>(
+    policy: &CompiledPolicy,
+    inputs: &Inputs<'_, L>,
+) -> Vec<Value> {
     let active = inputs.active;
     let mut rows = Vec::new();
     for (scope, slug, presentation) in policy.all_presentations() {
@@ -540,7 +546,7 @@ fn presentations_body<L: LearningView>(policy: &CompiledPolicy, inputs: &Inputs<
             )),
         }));
     }
-    Value::Array(rows)
+    rows
 }
 
 fn desired_state(

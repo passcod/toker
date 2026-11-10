@@ -863,7 +863,8 @@ impl Server {
         let lane_impacts = self.routing_lane_impacts_locked(&state, now)?;
         let publications = self.store.load_publications()?;
         let active_policy = compile_stored_policy(&revision, &self.registry, &inventory).ok();
-        let pinned = self.pinned_lanes_by_route(now)?;
+        let (pinned, revision_lanes) = self.pinned_lanes(now)?;
+        let hit_counts = self.store.routing_hit_counts(now)?;
         let learning = crate::policy::LearningView::snapshot(self.binding_learning.as_ref());
         let circuits = self
             .policy_runtime
@@ -876,8 +877,10 @@ impl Server {
             pinned: &pinned,
             publications: &publications,
             active: active_policy.as_ref(),
+            document: Some(revision.document.document()),
+            hits: &hit_counts,
+            revision_lanes: &revision_lanes,
         });
-        let hit_counts = self.store.routing_hit_counts(now)?;
         Ok(RoutingControlSnapshot {
             active_revision: revision,
             state,
@@ -926,30 +929,43 @@ impl Server {
         Ok(impacts)
     }
 
-    /// Pinned lanes grouped by the route they are pinned to, by cache
-    /// temperature as activation consent reads it.
-    fn pinned_lanes_by_route(
+    /// Pinned lanes grouped by the route they are pinned to and, separately,
+    /// by the revision, each by cache temperature as activation consent reads
+    /// it.
+    #[allow(clippy::type_complexity)]
+    fn pinned_lanes(
         &self,
         now: i64,
     ) -> Result<
-        std::collections::BTreeMap<crate::policy::RouteId, RoutingLaneImpacts>,
+        (
+            std::collections::BTreeMap<crate::policy::RouteId, RoutingLaneImpacts>,
+            std::collections::BTreeMap<i64, RoutingLaneImpacts>,
+        ),
         crate::store::Error,
     > {
         let mut by_route: std::collections::BTreeMap<crate::policy::RouteId, RoutingLaneImpacts> =
+            std::collections::BTreeMap::new();
+        let mut by_revision: std::collections::BTreeMap<i64, RoutingLaneImpacts> =
             std::collections::BTreeMap::new();
         for lane in self.store.load_lanes()? {
             let Some(pin) = lane.pin.as_ref() else {
                 continue;
             };
-            let impacts = by_route.entry(pin.policy_route_id.clone()).or_default();
-            impacts.total += 1;
-            match cache_temperature(&lane, self.registry.binding(&pin.binding_id), None, now) {
-                crate::policy::CacheTemperature::Warm => impacts.warm += 1,
-                crate::policy::CacheTemperature::Cold => impacts.cold += 1,
-                crate::policy::CacheTemperature::Unknown => impacts.unknown += 1,
+            let temperature =
+                cache_temperature(&lane, self.registry.binding(&pin.binding_id), None, now);
+            for impacts in [
+                by_route.entry(pin.policy_route_id.clone()).or_default(),
+                by_revision.entry(pin.policy_revision_id).or_default(),
+            ] {
+                impacts.total += 1;
+                match temperature {
+                    crate::policy::CacheTemperature::Warm => impacts.warm += 1,
+                    crate::policy::CacheTemperature::Cold => impacts.cold += 1,
+                    crate::policy::CacheTemperature::Unknown => impacts.unknown += 1,
+                }
             }
         }
-        Ok(by_route)
+        Ok((by_route, by_revision))
     }
 
     pub(crate) fn routing_revisions(&self) -> Result<Vec<PolicyRevision>, crate::store::Error> {

@@ -75,13 +75,13 @@ The README's routing paragraph describes the draft, validate and activate flow, 
 
 ### Facts the page reads
 
-- [ ] `server/control/derived.rs`: each rewrite's, default's and presentation's reach, as one of the five outcomes UTUI lists, by walking its route against the snapshot's availability, naming the edge or setting that stopped it.
-- [ ] Hit counts for the last 24 hours, from the store query, with floor and not-recorded states.
-- [ ] Shadowing: for each rule, the earlier presentations, profile rules and same-scope rules that catch all or part of what it matches (prefix and exact by comparison, glob and regex against the offers they would catch).
-- [ ] Per route: what refers to it, the lanes it holds and its reach; per revision: lanes pinned to it.
-- [ ] Per upgrade policy: the evidence bar and the move it would make now; compaction's target and bindings.
-- [ ] Per provider: the presentations, rewrites, defaults and routes reaching it through any offer or candidate, fallbacks included.
-- [ ] `policy/diagnostic.rs`: a sentence and a fix for each diagnostic code the editor can raise, for the form to show beside the field.
+- [x] `server/control/derived.rs`: each rewrite's, default's and presentation's reach, as one of the five outcomes UTUI lists, by walking its route against the snapshot's availability, naming the edge or setting that stopped it.
+- [x] Hit counts for the last 24 hours, from the store query, with floor and not-recorded states.
+- [x] Shadowing: for each rule, the earlier presentations, profile rules and same-scope rules that catch all or part of what it matches (prefix and exact by comparison, glob and regex against the offers they would catch).
+- [x] Per route: what refers to it, the lanes it holds and its reach; per revision: lanes pinned to it.
+- [x] Per upgrade policy: the evidence bar and the move it would make now; compaction's target and bindings.
+- [x] Per provider: the presentations, rewrites, defaults and routes reaching it through any offer or candidate, fallbacks included.
+- [x] `policy/diagnostic.rs`: a sentence and a fix for each diagnostic code the editor can raise, for the form to show beside the field.
 
 ### Config gate check
 

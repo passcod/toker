@@ -57,17 +57,14 @@ pub(super) fn upgrades<L: LearningView>(ctx: &Context<'_>, inputs: &Inputs<'_, L
                     "moves": moves,
                     "held_back": held_back,
                 });
-                by_route
-                    .entry(route.id().clone())
-                    .or_default()
-                    .push(json!({
-                        "policy_id": upgrade.id,
-                        "candidate_id": candidate.id(),
-                        "enabled": upgrade.enabled && candidate.enabled(),
-                        "bar": usage["bar"],
-                        "moves": usage["moves"],
-                        "held_back": usage["held_back"],
-                    }));
+                by_route.entry(route.id().clone()).or_default().push(json!({
+                    "policy_id": upgrade.id,
+                    "candidate_id": candidate.id(),
+                    "enabled": upgrade.enabled && candidate.enabled(),
+                    "bar": usage["bar"],
+                    "moves": usage["moves"],
+                    "held_back": usage["held_back"],
+                }));
                 used_by.push(usage);
             }
         }
@@ -107,9 +104,10 @@ fn bar_for<L: LearningView>(
     if upgrade.minimum_learning == MinimumLearning::Scaled {
         let active_days = inputs.learning.active_days(binding).ok();
         bar["active_days"] = json!(active_days);
-        bar["needs_days"] = json!(active_days.map(|active| {
-            crate::policy::learning::requirement(active).floor() as u64 + 1
-        }));
+        bar["needs_days"] = json!(
+            active_days
+                .map(|active| { crate::policy::learning::requirement(active).floor() as u64 + 1 })
+        );
     }
     if let MinimumLearning::DistinctDays { days } = upgrade.minimum_learning {
         bar["needs_days"] = json!(days);
@@ -213,7 +211,7 @@ fn moves<L: LearningView>(
 
 /// Where cold compactions go: a route of their own, or a cheaper model on
 /// whichever of some bindings the request reached (spec: RCOMP).
-pub(super) fn compaction(ctx: &Context<'_>, _upgrades: &Upgrades) -> Value {
+pub(super) fn compaction(ctx: &Context<'_>) -> Value {
     let Some(compaction) = &ctx.document.compaction else {
         return Value::Null;
     };

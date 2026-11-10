@@ -58,6 +58,15 @@ fn provider_body(ctx: &Context<'_>, rules: &Rules, provider: &str) -> Value {
             .filter(|(_, binding)| ctx.provider_of(binding) == provider)
             .map(|(referrer, _)| referrer),
     );
+    // In the order the tables are read: by scope as they are drawn, then by
+    // place in it.
+    let scope_rank = |referrer: &Referrer| {
+        rules
+            .scopes
+            .iter()
+            .position(|scope| scope["scope"] == json!(referrer.scope))
+    };
+    referrers.sort_by_key(|referrer| (scope_rank(referrer), referrer.position));
     let mut seen: BTreeSet<(&'static str, String)> = BTreeSet::new();
     referrers.retain(|referrer| {
         let key = referrer
@@ -67,7 +76,11 @@ fn provider_body(ctx: &Context<'_>, rules: &Rules, provider: &str) -> Value {
         seen.insert((referrer.kind, key))
     });
 
-    let of_kind = |kind: &str| referrers.iter().filter(move |referrer| referrer.kind == kind);
+    let of_kind = |kind: &'static str| {
+        referrers
+            .iter()
+            .filter(move |referrer| referrer.kind == kind)
+    };
     let mut by_protocol: BTreeMap<&str, usize> = BTreeMap::new();
     for rewrite in of_kind("rewrite") {
         *by_protocol

@@ -7,12 +7,10 @@ use serde_json::{Value, json};
 
 use super::models::Upgrades;
 use super::rules::{Referrer, Rules};
-use super::{
-    Context, Inputs, cost_name, lanes_body, matcher_body, reach_body, rejection_name,
-};
+use super::{Context, Inputs, cost_name, lanes_body, matcher_body, reach_body, rejection_name};
 use crate::policy::{
-    BindingId, CapabilityFlags, CompactionTarget, CompiledCandidateModel,
-    CompiledRoute, LearningView, upgrade_standing,
+    BindingId, CapabilityFlags, CompactionTarget, CompiledCandidateModel, CompiledRoute,
+    LearningView, upgrade_standing,
 };
 
 pub(super) fn route_body<L: LearningView>(
@@ -85,6 +83,8 @@ pub(super) fn route_body<L: LearningView>(
                         crate::policy::CostClass::Billed | crate::policy::CostClass::Unknown
                     ),
                 "billed_boundary": edge.billed_boundary,
+                "ambiguous_transport": edge.ambiguous_transport,
+                "post_send": edge.post_send,
                 "cache_transition": edge.cache_transition,
                 "preflight": edge.preflight,
             })
@@ -188,7 +188,8 @@ fn handled_by(ctx: &Context<'_>, route: &CompiledRoute, upgrades: &Upgrades) -> 
         .iter()
         .filter_map(|candidate| {
             let names = capability_names(candidate.required_capabilities);
-            (!names.is_empty()).then(|| json!({"candidate_id": candidate.id, "capabilities": names}))
+            (!names.is_empty())
+                .then(|| json!({"candidate_id": candidate.id, "capabilities": names}))
         })
         .collect();
 

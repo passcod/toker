@@ -1164,6 +1164,40 @@ async fn the_snapshot_carries_derived_content_for_the_active_revision() {
         assert_eq!(route["pinned_lanes"]["warm"], 0);
     }
     assert!(active["classifiers"].is_array());
+    // The facts the tables and details read are worked out on the service.
+    for key in [
+        "scopes",
+        "presentation_records",
+        "rewrites",
+        "defaults",
+        "upgrades",
+        "providers",
+        "first_refused_tab",
+    ] {
+        assert!(active.get(key).is_some(), "{key}");
+    }
+    let rewrites = active["rewrites"].as_array().unwrap();
+    assert!(
+        !rewrites.is_empty(),
+        "revision one writes a rewrite per prefix"
+    );
+    for rewrite in rewrites {
+        for key in [
+            "scope_label",
+            "position",
+            "matcher",
+            "reach",
+            "hits",
+            "shadowed_by",
+        ] {
+            assert!(rewrite.get(key).is_some(), "{key}: {rewrite}");
+        }
+        assert!(rewrite["reach"]["outcome"].is_string(), "{rewrite}");
+        // Nothing has been served, so every count is a known zero.
+        assert_eq!(rewrite["hits"], json!({"count": 0, "state": "exact"}));
+    }
+    // A fresh store has no lanes on any revision.
+    assert!(derived["revisions"].as_array().unwrap().is_empty());
     // A fresh revision one authors no presentations; the rows carry their
     // state when it has them.
     for presentation in active["presentations"].as_array().unwrap() {
@@ -1212,6 +1246,11 @@ async fn the_snapshot_carries_derived_content_for_the_active_revision() {
         .map(|key| pinned[key].as_u64().unwrap())
         .sum();
     assert_eq!(counted, 1, "{pinned}");
+    // And under the revision it is pinned to.
+    let revisions = derived["revisions"].as_array().unwrap();
+    assert_eq!(revisions.len(), 1, "{revisions:?}");
+    assert_eq!(revisions[0]["revision_id"], 1);
+    assert_eq!(revisions[0]["total"], 1);
 }
 
 #[tokio::test]
@@ -1293,6 +1332,8 @@ async fn a_saved_billed_edge_and_virtual_presentation_derive_both() {
     assert_eq!(presentation["adapter"], "dynamic_responses_models");
     assert_eq!(presentation["desired"], "left_out");
     assert_eq!(presentation["reason"], "no_codex_record");
-    assert_eq!(presentation["applied"], Value::Null);
+    // The Responses list is rendered from the active revision on every
+    // request, so it already holds exactly what the revision lists: not this.
+    assert_eq!(presentation["applied"], false);
     assert!(snapshot.get("draft").is_none());
 }

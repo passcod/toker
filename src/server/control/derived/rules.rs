@@ -11,11 +11,14 @@ use serde_json::{Value, json};
 use super::{Context, hits_body, matcher_body, reach_body, scope_fields};
 use crate::policy::shadow::{Basis, Catches, Earlier, Shape, compare};
 use crate::policy::{
-    ArgumentBinding, BindingId, CompiledRewrite, FrontendProtocol, FrontendScope, MatcherSpec,
-    NoRoute, PolicyDocument, PresentationId, PresentationRoute, PresentationSource, ProfileId,
-    REQUESTED_MODEL_PARAMETER, Reach, RewriteId, RewriteRule, RouteId, RouteReference,
+    AdapterMetadata, ArgumentBinding, BindingId, CompiledRewrite, FrontendProtocol, FrontendScope,
+    MatcherSpec, NoRoute, PolicyDocument, PresentationId, PresentationRoute, PresentationSource,
+    ProfileId, REQUESTED_MODEL_PARAMETER, Reach, RewriteId, RewriteRule, RouteId, RouteReference,
     offer_reach,
 };
+
+/// Models named in a presentation's `lists`, the rest being counted.
+const LISTED_MODELS: usize = 5;
 
 /// What sends a request to a route or an offer: one record of the tables.
 #[derive(Debug, Clone)]
@@ -64,6 +67,9 @@ struct Published {
     /// An offer named outright: its generated candidate and binding, and the
     /// model, one per slug.
     offers: Vec<(crate::policy::CandidateId, BindingId, String)>,
+    /// The same offers' models, each with the place a selector gave it, so
+    /// that the first is the newest the presentation lists.
+    ranked: Vec<(usize, String)>,
 }
 
 /// Scopes in the order the tables are drawn: for each protocol in turn, each
@@ -102,9 +108,7 @@ fn scope_order(document: &PolicyDocument) -> Vec<FrontendScope> {
 
 fn protocol_of(scope: &FrontendScope) -> FrontendProtocol {
     match scope {
-        FrontendScope::Profile { protocol, .. } | FrontendScope::Protocol { protocol } => {
-            *protocol
-        }
+        FrontendScope::Profile { protocol, .. } | FrontendScope::Protocol { protocol } => *protocol,
     }
 }
 
@@ -121,6 +125,7 @@ pub(super) fn build(ctx: &Context<'_>, slug_rows: &[Value]) -> Rules {
                 slugs: BTreeSet::new(),
                 routes: BTreeSet::new(),
                 offers: Vec::new(),
+                ranked: Vec::new(),
             });
         entry.slugs.insert(slug.to_owned());
         match presentation.route() {
@@ -132,9 +137,12 @@ pub(super) fn build(ctx: &Context<'_>, slug_rows: &[Value]) -> Rules {
                 binding_id,
                 model_id,
                 ..
-            } => entry
-                .offers
-                .push((candidate_id.clone(), binding_id.clone(), model_id.clone())),
+            } => {
+                entry
+                    .offers
+                    .push((candidate_id.clone(), binding_id.clone(), model_id.clone()));
+                entry.ranked.push((presentation.rank(), model_id.clone()));
+            }
         }
     }
 
@@ -192,8 +200,11 @@ pub(super) fn build(ctx: &Context<'_>, slug_rows: &[Value]) -> Rules {
                         .or_default()
                         .push(referrer.clone());
                 }
-                let bindings: BTreeSet<&BindingId> =
-                    published.offers.iter().map(|(_, binding, _)| binding).collect();
+                let bindings: BTreeSet<&BindingId> = published
+                    .offers
+                    .iter()
+                    .map(|(_, binding, _)| binding)
+                    .collect();
                 for binding in bindings {
                     rules.to_offer.push((referrer.clone(), binding.clone()));
                 }
@@ -463,11 +474,9 @@ fn rewrite_shadows(
                 let Some(rule) = rewrite_rules.get(earlier.id()) else {
                     continue;
                 };
-                if let Some((catches, basis)) = compare(
-                    &Earlier::Matcher(&rule.model_matcher),
-                    spec,
-                    &ctx.names,
-                ) {
+                if let Some((catches, basis)) =
+                    compare(&Earlier::Matcher(&rule.model_matcher), spec, &ctx.names)
+                {
                     found.push(shadow_entry(
                         "profile_rule",
                         Some(earlier.id().as_str()),
@@ -578,10 +587,27 @@ fn presentation_record(
         }
     };
 
-    let slugs: Vec<&String> = published.map_or_else(Vec::new, |published| {
-        published.slugs.iter().collect()
-    });
+    let slugs: Vec<&String> =
+        published.map_or_else(Vec::new, |published| published.slugs.iter().collect());
     record["slugs"] = json!(slugs);
+    record["behaves_as"] = match &presentation.metadata {
+        Some(AdapterMetadata::Claude { behaves_as }) => json!(behaves_as),
+        _ => Value::Null,
+    };
+    // What it lists, newest first as its selector ordered them. A virtual
+    // presentation lists one name and no models.
+    record["lists"] = match published {
+        Some(published) if !published.ranked.is_empty() => {
+            let mut models = published.ranked.clone();
+            models.sort();
+            json!({
+                "count": models.len(),
+                "newest": models[0].1,
+                "models": models.iter().map(|(_, model)| model).take(LISTED_MODELS).collect::<Vec<_>>(),
+            })
+        }
+        _ => Value::Null,
+    };
     // Whether what it publishes is listed, from the per-name rows the
     // publication state is read from.
     let rows: Vec<&Value> = slug_rows
@@ -599,10 +625,9 @@ fn presentation_record(
     } else {
         json!("partly")
     };
-    record["route_ids"] = json!(published.map_or_else(Vec::new, |published| published
-        .routes
-        .iter()
-        .collect::<Vec<_>>()));
+    record["route_ids"] = json!(published.map_or_else(Vec::new, |published| {
+        published.routes.iter().collect::<Vec<_>>()
+    }));
     record["bindings"] = json!(
         published
             .map(|published| published
@@ -667,7 +692,11 @@ fn presentation_shadows(
         {
             continue;
         }
-        let shared: Vec<String> = published.slugs.intersection(&other.slugs).cloned().collect();
+        let shared: Vec<String> = published
+            .slugs
+            .intersection(&other.slugs)
+            .cloned()
+            .collect();
         if shared.is_empty() {
             continue;
         }
