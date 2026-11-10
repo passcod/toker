@@ -424,3 +424,76 @@ fn the_keys_do_nothing_while_a_move_is_on_its_way() {
     assert!(key(&mut state, 'a').is_none());
     assert!(key(&mut state, 'm').is_none());
 }
+
+/// One page of history as the daemon sends it: `ids` newest first, and
+/// whether there are older revisions behind it.
+fn page(ids: &[i64], next_before: Option<i64>) -> Value {
+    json!({
+        "toker": "routing-revisions",
+        "ok": true,
+        "revisions": ids.iter().map(|id| json!({
+            "revision_id": id,
+            "created_ms": 1_762_000_000_000_i64,
+            "activated_ms": 1_762_000_000_000_i64,
+            "description": null,
+            "source": "save",
+            "parent_revision_id": id - 1,
+            "summary": format!("rev {id}"),
+            "changes": [],
+        })).collect::<Vec<_>>(),
+        "has_more": next_before.is_some(),
+        "next_before": next_before,
+    })
+}
+
+/// A reply to a page asked for with `before`, which adds to the history
+/// already read rather than replacing it.
+fn older(state: &mut State, before: i64, body: Value) {
+    let mut command = Command::snapshot("routing-snapshot");
+    command.name = "revisions";
+    command.query = Some(format!("limit=50&before={before}"));
+    state.receive(Reply::Command(command, Ok(Response { status: 200, body })));
+}
+
+/// The daemon pages `routing-revisions`, so the newest page is not the whole
+/// history: the tab says there is more and reads it when the operator
+/// reaches the oldest revision it holds.
+#[test]
+fn a_capped_history_says_so_and_reads_the_page_behind_it() {
+    let mut state = State::default();
+    reply(&mut state, "snapshot", 200, testing::snapshot(World::SAVED));
+    reply(&mut state, "revisions", 200, page(&[10, 9, 8], Some(8)));
+    state.set_tab(Tab::History);
+
+    assert!(
+        state.more_revisions(),
+        "the daemon said there are older ones"
+    );
+    let text = frame(&state, 120, 40);
+    assert!(text.contains("older revisions below"), "{text}");
+
+    // Nothing is read until the operator reaches the oldest one held.
+    assert_eq!(state.wants_older_revisions(), None);
+    state.move_selection(2);
+    assert_eq!(state.wants_older_revisions(), Some(8));
+    assert_eq!(
+        state.wants_older_revisions(),
+        None,
+        "and the same page is not asked for twice"
+    );
+
+    older(&mut state, 8, page(&[7, 6], None));
+    let read: Vec<i64> = state
+        .revisions()
+        .iter()
+        .map(|revision| revision["revision_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        read,
+        [10, 9, 8, 7, 6],
+        "the older page was added, not swapped"
+    );
+    assert!(!state.more_revisions());
+    let text = frame(&state, 120, 40);
+    assert!(!text.contains("older revisions below"), "{text}");
+}

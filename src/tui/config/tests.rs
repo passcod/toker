@@ -75,6 +75,7 @@ fn answered(state: &mut State, status: u16, body: Value) -> Option<Command> {
             path: "settings",
             control: "config-edit",
             body: None,
+            query: None,
         },
         Ok(Response { status, body }),
     ))
@@ -934,6 +935,7 @@ fn clear_reply(status: u16) -> Reply {
             path: "/safeguards/mark/clear",
             control: "safeguards-mark-clear",
             body: None,
+            query: None,
         },
         Ok(Response {
             status,

@@ -456,7 +456,13 @@ fn history_tab(frame: &mut Frame, body: Rect, snapshot: &Value, state: &State, d
         return;
     }
     let selected = state.selected_in(Tab::History);
-    let table = history::table(snapshot, revisions, live, content_width(body));
+    let table = history::table(
+        snapshot,
+        revisions,
+        live,
+        state.more_revisions(),
+        content_width(body),
+    );
     let mut detail = history::detail(
         snapshot,
         &revisions[selected.min(revisions.len() - 1)],

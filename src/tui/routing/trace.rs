@@ -74,6 +74,7 @@ impl Trace {
                 "against": against,
                 "request": request,
             })),
+            query: None,
         }
     }
 
@@ -689,6 +690,7 @@ impl Picking {
             path: "preview",
             control: "routing-preview",
             body: Some(json!({ "mode": "recent_requests", "limit": 50 })),
+            query: None,
         }
     }
 

@@ -1405,5 +1405,7 @@ pub(super) fn revisions(world: World) -> Value {
                 },
             })
         }).collect::<Vec<_>>(),
+        "has_more": false,
+        "next_before": 1,
     })
 }

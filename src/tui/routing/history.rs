@@ -67,6 +67,7 @@ pub(super) fn table(
     snapshot: &Value,
     revisions: &[Value],
     live: Option<i64>,
+    more: bool,
     width: usize,
 ) -> Table {
     const REV: usize = 9;
@@ -107,6 +108,15 @@ pub(super) fn table(
             BodyLine::of(line, entry)
         })
         .collect();
+    // A list that silently stops is worse than one that says where it stops:
+    // the older revisions are read when the selection reaches the last row.
+    let mut body: Vec<BodyLine> = body;
+    if more {
+        body.push(BodyLine::plain(Line::from(span(
+            "  older revisions below".to_owned(),
+            dim(),
+        ))));
+    }
     Table { header, body }
 }
 

@@ -31,14 +31,26 @@ use model::State;
 use reconcile::Reconciler;
 pub use reconcile::SettingsSync;
 
+/// How many revisions a page of the history reads. The daemon clamps its
+/// own limit; asking for one keeps the page's idea of a page and the
+/// daemon's the same.
+pub(super) const REVISIONS_PAGE: u32 = 50;
+
 /// The revision history read: independent data the page loads eagerly.
-fn revisions() -> Command {
+/// `before` asks for the page older than that revision; without it, the
+/// newest page.
+pub(super) fn revisions(before: Option<i64>) -> Command {
+    let mut query = format!("limit={REVISIONS_PAGE}");
+    if let Some(before) = before {
+        query.push_str(&format!("&before={before}"));
+    }
     Command {
         name: "revisions",
         method: reqwest::Method::GET,
         path: "revisions",
         control: "routing-revisions",
         body: None,
+        query: Some(query),
     }
 }
 
@@ -87,7 +99,7 @@ impl Page {
         page.refresh();
         // Revisions are independent data: load them eagerly, but never make an
         // unavailable new endpoint stop the established read-only snapshot.
-        page.send(revisions());
+        page.send(revisions(None));
         page
     }
 
@@ -106,7 +118,7 @@ impl Page {
                 // The reply carries the activation; the derived facts and the
                 // history behind it are read again.
                 self.refresh();
-                self.send(revisions());
+                self.send(revisions(None));
                 if let Some(note) = self.reconciler.start() {
                     self.state.set_settings_note(note);
                 }
@@ -163,6 +175,9 @@ impl Page {
     fn check(&mut self) {
         if let Some(command) = self.state.next_check() {
             self.send(command);
+        }
+        if let Some(before) = self.state.wants_older_revisions() {
+            self.send(revisions(Some(before)));
         }
         if self.state.take_refresh_wanted() {
             self.refresh();

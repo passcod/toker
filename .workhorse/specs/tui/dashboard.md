@@ -262,6 +262,7 @@ Where a client's settings are not applied for the live revision, it MUST say whe
 ### History
 
 The history tab MUST list the revisions newest first, each with a summary of what it changed from its predecessor and the lanes pinned to it.
+The history is read a page at a time, so the tab MUST say when it holds fewer revisions than there are, and MUST read the page behind it rather than stopping there.
 
 A revision's detail MUST list each record it added, changed or removed, in words.
 

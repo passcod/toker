@@ -819,6 +819,7 @@ impl State {
             path: "/safeguards/mark/clear",
             control: "safeguards-mark-clear",
             body: Some(json!({ "binding_id": binding_id })),
+            query: None,
         }
     }
 
@@ -1039,6 +1040,7 @@ impl State {
             path,
             control,
             body: Some(body),
+            query: None,
         }
     }
 }

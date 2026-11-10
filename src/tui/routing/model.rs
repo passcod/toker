@@ -203,6 +203,11 @@ pub(super) struct State {
     /// A move of the running lanes that has asked once and waits for the
     /// second confirmation.
     armed: Option<Armed>,
+    /// The revision to read the next page of history before, where the
+    /// daemon said there are older ones than those read.
+    older_revisions: Option<i64>,
+    /// The `before` of the page on its way, so one is not asked for twice.
+    revisions_asked: Option<i64>,
 }
 
 impl Default for State {
@@ -228,6 +233,8 @@ impl Default for State {
             refresh_wanted: false,
             trace: None,
             tracing_under: None,
+            older_revisions: None,
+            revisions_asked: None,
             armed: None,
         }
     }
@@ -827,11 +834,31 @@ impl State {
             return;
         }
         if command.name == "revisions" && response.status / 100 == 2 {
-            self.revisions = array(&response.body, "revisions").to_vec();
+            // A page asked for with `before` is older history added to what
+            // is read; the newest page replaces it.
+            if command
+                .query
+                .as_deref()
+                .is_none_or(|query| !query.split('&').any(|pair| pair.starts_with("before=")))
+            {
+                self.revisions.clear();
+            }
+            self.revisions
+                .extend(array(&response.body, "revisions").iter().cloned());
             // Newest first, whatever order they were sent in.
             self.revisions.sort_by_key(|revision| {
                 std::cmp::Reverse(revision.get("revision_id").and_then(Value::as_i64))
             });
+            self.revisions
+                .dedup_by_key(|revision| revision.get("revision_id").and_then(Value::as_i64));
+            // Where the daemon says there are older ones, the page reads them
+            // when the operator reaches the oldest it has: a history that
+            // silently stopped at the newest page hid the revision a lane
+            // was pinned to.
+            self.older_revisions = (response.body.get("has_more") == Some(&Value::Bool(true)))
+                .then(|| response.body.get("next_before").and_then(Value::as_i64))
+                .flatten();
+            self.revisions_asked = None;
             self.error = None;
             self.clamp_selection();
             return;
@@ -983,6 +1010,26 @@ impl State {
     /// The next check to ask the daemon for, if the open edit needs one: its
     /// operations against the live revision, and once those are accepted,
     /// how recent requests would route under them. One of each at a time.
+    /// The revision an older page of history should be read before, where
+    /// there is one and the operator has reached the oldest revision read.
+    /// `None` once it has been asked for, until the answer lands.
+    pub(super) fn wants_older_revisions(&mut self) -> Option<i64> {
+        let before = self.older_revisions?;
+        if self.revisions_asked.is_some()
+            || self.tab != Tab::History
+            || self.selected_in(Tab::History) + 1 < self.revisions.len()
+        {
+            return None;
+        }
+        self.revisions_asked = Some(before);
+        Some(before)
+    }
+
+    /// Whether the history read stops short of the oldest revision there is.
+    pub(super) fn more_revisions(&self) -> bool {
+        self.older_revisions.is_some()
+    }
+
     pub(super) fn next_check(&mut self) -> Option<Command> {
         if self.in_flight {
             return None;
@@ -1914,6 +1961,7 @@ fn command(
         path,
         control,
         body: Some(body),
+        query: None,
     }
 }
 
