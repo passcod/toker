@@ -7,19 +7,17 @@
 
 use ratatui::{
     Frame,
-    layout::{Alignment, Rect},
+    layout::{Alignment, Position, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Clear, Padding, Paragraph},
 };
 use unicode_width::UnicodeWidthStr;
 
-/// The `?` chip's width: a key between two spaces.
-const CHIP_WIDTH: u16 = 3;
+use super::Page;
 
-/// Below this width the header needs every cell, so the `⇄` chip goes and
-/// `Tab` is the way across.
-const SWITCH_MIN_WIDTH: u16 = 80;
+/// The `?` button's width: a key between two spaces.
+const CHIP_WIDTH: u16 = 3;
 
 /// How the panels are framed. Boxed panels cost two rows each (the
 /// borders); a short terminal drops them for a `TITLE ───` rule that
@@ -89,136 +87,244 @@ pub(super) fn panel(frame: &mut Frame, area: Rect, title: &str, chrome: Chrome) 
     }
 }
 
-/// Where the header's chips landed, and the rest of the row for the
+/// Where the header's buttons landed, and the rest of the row for the
 /// page's own tabs or status.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Header {
-    /// The `?` chip, which opens the page's overlay.
+    /// The `?` button, which opens the page's overlay.
     pub(crate) keys: Rect,
-    /// The `⇄` chip, which goes to the next page. Zero-wide when the
-    /// header is too narrow to spare it.
-    pub(crate) switch: Rect,
+    /// One button per page, indexed as [`Page::ALL`]. A click on one goes
+    /// to that page. A button the header was too narrow to reach is
+    /// zero-wide, so nothing is under it to click.
+    pub(crate) pages: [Rect; Page::ALL.len()],
+    /// The page being drawn, whose button reads as current.
+    pub(crate) current: Page,
     /// What is left of the row.
     pub(crate) rest: Rect,
 }
 
-/// Lay out the header row: `?` at the far left, `⇄` in the one-cell
-/// gutter after it, and the rest after that.
-pub(super) fn header(area: Rect) -> Header {
-    let height = area.height.min(1);
-    let keys_width = area.width.min(CHIP_WIDTH);
-    let keys = Rect::new(area.x, area.y, keys_width, height);
-    let switch_width = u16::from(area.width >= SWITCH_MIN_WIDTH);
-    let switch = Rect::new(area.x + keys_width, area.y, switch_width, height);
-    let rest_x = area.x + keys_width + u16::from(area.width > keys_width);
-    let rest = Rect::new(
-        rest_x,
-        area.y,
-        area.width.saturating_sub(rest_x - area.x),
-        area.height,
-    );
-    Header { keys, switch, rest }
+impl Header {
+    /// The page whose button is under `at`.
+    pub(crate) fn page_at(&self, at: Position) -> Option<Page> {
+        let index = self.pages.iter().position(|button| button.contains(at))?;
+        Some(Page::ALL[index])
+    }
 }
 
-/// Draw the chips. Drawn last on a page, so a panel that had to share the
-/// header's row cannot paint over the way out to the overlay.
+/// Lay out the header row: `?`, then a button for each page, each a cell
+/// apart, and the rest after them. The buttons never shorten; a header
+/// too narrow for all of them clips at its edge, the `?` surviving longest
+/// because it is the way out to the overlay at any size.
+pub(super) fn header(area: Rect, current: Page) -> Header {
+    let height = area.height.min(1);
+    let keys = Rect::new(area.x, area.y, area.width.min(CHIP_WIDTH), height);
+    let mut pages = [Rect::default(); Page::ALL.len()];
+    // One cell of gutter before every button, and after the last.
+    let mut x = keys.right();
+    for (button, page) in pages.iter_mut().zip(Page::ALL) {
+        x = x.saturating_add(1).min(area.right());
+        let width = (page.label().width() as u16 + 2).min(area.right() - x);
+        *button = Rect::new(x, area.y, width, height);
+        x += width;
+    }
+    let rest_x = x.saturating_add(1).min(area.right());
+    let rest = Rect::new(rest_x, area.y, area.right() - rest_x, area.height);
+    Header {
+        keys,
+        pages,
+        current,
+        rest,
+    }
+}
+
+/// Draw the buttons, the current page's in bold blue and the rest dark
+/// grey. Drawn last on a page, so a panel that had to share the header's
+/// row cannot paint over the way out to the overlay.
 pub(super) fn chips(frame: &mut Frame, header: &Header) {
+    let grey = Style::new()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::REVERSED);
     let label = if header.keys.width >= CHIP_WIDTH {
         " ? "
     } else {
         "?"
     };
-    frame.render_widget(
-        Paragraph::new(label).style(
+    frame.render_widget(Paragraph::new(label).style(grey), header.keys);
+    for (button, page) in header.pages.iter().zip(Page::ALL) {
+        if button.width == 0 {
+            continue;
+        }
+        let style = if page == header.current {
             Style::new()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::REVERSED),
-        ),
-        header.keys,
-    );
-    if header.switch.width > 0 {
+                .fg(Color::Blue)
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            grey
+        };
         frame.render_widget(
-            Paragraph::new("⇄").style(
-                Style::new()
-                    .fg(Color::Blue)
-                    .add_modifier(Modifier::REVERSED),
-            ),
-            header.switch,
+            Paragraph::new(format!(" {} ", page.label())).style(style),
+            *button,
         );
     }
 }
 
-/// The tab strip's gap between tabs.
-const TAB_GAP: &str = "  ";
-
-/// The tab strip's lines, from widest to narrowest: every label in full,
-/// then the other tabs down to their number, then the current label
-/// clipped to what is left.
-fn tab_spans(labels: &[&str], current: usize, width: usize) -> Vec<(Span<'static>, Option<usize>)> {
-    let tab = |index: usize, full: bool| -> String {
-        if full {
-            format!("{} {}", index + 1, labels[index])
-        } else {
-            format!("{}", index + 1)
-        }
-    };
-    let build = |others_full: bool, current_text: String| {
-        let mut spans: Vec<(Span<'static>, Option<usize>)> = vec![(Span::raw(" "), None)];
-        for index in 0..labels.len() {
-            if index > 0 {
-                spans.push((Span::raw(TAB_GAP), None));
-            }
-            let span = if index == current {
-                Span::styled(current_text.clone(), Style::new().bold().reversed())
-            } else {
-                Span::styled(tab(index, others_full), Style::new().dim())
-            };
-            spans.push((span, Some(index)));
-        }
-        spans
-    };
-    let fits = |spans: &[(Span, Option<usize>)]| {
-        spans.iter().map(|(span, _)| span.width()).sum::<usize>() <= width
-    };
-    let full = build(true, tab(current, true));
-    if fits(&full) {
-        return full;
-    }
-    let collapsed = build(false, tab(current, true));
-    if fits(&collapsed) {
-        return collapsed;
-    }
-    let others: usize = build(false, String::new())
-        .iter()
-        .map(|(span, _)| span.width())
-        .sum();
-    build(
-        false,
-        clip_ellipsis(&tab(current, true), width.saturating_sub(others)),
-    )
+/// One tab of a page's strip. The strip numbers them itself, from one.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Tab<'a> {
+    pub(super) label: &'a str,
+    /// How many records the tab holds, where it is a list of them.
+    pub(super) count: Option<usize>,
+    /// What stands between the previous tab and this one. Unused on the
+    /// first.
+    pub(super) joiner: &'a str,
 }
 
-/// The narrowest the tab strip goes before its current label clips: every
-/// other tab down to its number.
-pub(super) fn tabs_min_width(labels: &[&str], current: usize) -> u16 {
-    tab_spans(labels, current, 0)
+impl<'a> Tab<'a> {
+    pub(super) const fn new(label: &'a str) -> Self {
+        Tab {
+            label,
+            count: None,
+            joiner: "  ",
+        }
+    }
+
+    pub(super) const fn count(self, count: usize) -> Self {
+        Tab {
+            count: Some(count),
+            ..self
+        }
+    }
+
+    /// Set the text between the previous tab and this one: ` → ` for a
+    /// tab a request passes through after it, ` · ` for one that sits
+    /// apart.
+    #[allow(dead_code)] // the routing page joins its lookup tabs with arrows
+    pub(super) const fn after(self, joiner: &'a str) -> Self {
+        Tab { joiner, ..self }
+    }
+}
+
+/// How much of the tabs other than the current one the strip shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Others {
+    /// Label and count.
+    Counted,
+    /// Label alone.
+    Named,
+    /// Number alone.
+    Numbered,
+}
+
+type Spans = Vec<(Span<'static>, Option<usize>)>;
+
+/// The strip showing tabs `lo..=hi`, with a `‹` or `›` where tabs lie
+/// beyond them.
+fn strip(tabs: &[Tab], current: usize, lo: usize, hi: usize, others: Others) -> Spans {
+    let dim = Style::new().dim();
+    let mut spans: Spans = vec![(Span::raw(" "), None)];
+    if lo > 0 {
+        spans.push((Span::styled("‹ ", dim), None));
+    }
+    for (index, tab) in tabs.iter().enumerate().take(hi + 1).skip(lo) {
+        if index > lo {
+            spans.push((Span::styled(tab.joiner.to_owned(), dim), None));
+        }
+        let counted = |text: String| match tab.count {
+            Some(count) => format!("{text} {count}"),
+            None => text,
+        };
+        let named = format!("{} {}", index + 1, tab.label);
+        let span = if index == current {
+            Span::styled(counted(named), Style::new().bold().reversed())
+        } else {
+            let text = match others {
+                Others::Counted => counted(named),
+                Others::Named => named,
+                Others::Numbered => format!("{}", index + 1),
+            };
+            Span::styled(text, dim)
+        };
+        spans.push((span, Some(index)));
+    }
+    if hi + 1 < tabs.len() {
+        spans.push((Span::styled(" ›", dim), None));
+    }
+    spans
+}
+
+fn spans_width(spans: &Spans) -> usize {
+    spans.iter().map(|(span, _)| span.width()).sum()
+}
+
+/// The tab strip's spans, from widest to narrowest: every tab in full;
+/// the other tabs without their counts; a window of tabs around the
+/// current one, as many as fit and at least two, marked where tabs are
+/// hidden; every tab as its number but the current; and the current tab
+/// alone, clipped to what is left. The current tab keeps its count
+/// throughout.
+fn tab_spans(tabs: &[Tab], current: usize, width: usize) -> Spans {
+    let last = tabs.len().saturating_sub(1);
+    for others in [Others::Counted, Others::Named] {
+        let spans = strip(tabs, current, 0, last, others);
+        if spans_width(&spans) <= width {
+            return spans;
+        }
+    }
+    let (mut lo, mut hi) = (current, current);
+    loop {
+        let mut grew = false;
+        for left in [true, false] {
+            let (next_lo, next_hi) = match left {
+                true if lo > 0 => (lo - 1, hi),
+                false if hi < last => (lo, hi + 1),
+                _ => continue,
+            };
+            if spans_width(&strip(tabs, current, next_lo, next_hi, Others::Named)) <= width {
+                (lo, hi) = (next_lo, next_hi);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    if lo < hi {
+        return strip(tabs, current, lo, hi, Others::Named);
+    }
+    let numbers = strip(tabs, current, 0, last, Others::Numbered);
+    if spans_width(&numbers) <= width {
+        return numbers;
+    }
+    let mut alone = strip(tabs, current, current, current, Others::Named);
+    let fixed: usize = alone
         .iter()
         .filter(|(_, tab)| *tab != Some(current))
         .map(|(span, _)| span.width())
-        .sum::<usize>()
-        .saturating_add(format!("{} {}", current + 1, labels[current]).width()) as u16
+        .sum();
+    if let Some((span, _)) = alone.iter_mut().find(|(_, tab)| *tab == Some(current)) {
+        span.content = clip_ellipsis(&span.content, width.saturating_sub(fixed)).into();
+    }
+    alone
+}
+
+/// The narrowest the tab strip goes before its current label clips: the
+/// current tab alone, with the markers for what is hidden.
+pub(super) fn tabs_min_width(tabs: &[Tab], current: usize) -> u16 {
+    let spans = strip(tabs, current, current, current, Others::Named);
+    u16::try_from(spans_width(&spans)).unwrap_or(u16::MAX)
 }
 
 /// Draw the tab strip into `area` and return each tab's rectangle, for
-/// the mouse.
-pub(super) fn tabs(frame: &mut Frame, area: Rect, labels: &[&str], current: usize) -> Vec<Rect> {
-    let spans = tab_spans(labels, current, usize::from(area.width));
-    let mut hits = Vec::new();
+/// the mouse, indexed like `tabs`. A tab scrolled out of the strip gets
+/// an empty one, which nothing is inside of.
+pub(super) fn tabs(frame: &mut Frame, area: Rect, tabs: &[Tab], current: usize) -> Vec<Rect> {
+    let spans = tab_spans(tabs, current, usize::from(area.width));
+    let mut hits = vec![Rect::default(); tabs.len()];
     let mut x = area.x;
     for (span, tab) in &spans {
         let width = span.width() as u16;
-        if tab.is_some() {
-            hits.push(Rect::new(x, area.y, width, area.height.min(1)).intersection(area));
+        if let Some(index) = tab {
+            hits[*index] = Rect::new(x, area.y, width, area.height.min(1)).intersection(area);
         }
         x = x.saturating_add(width);
     }
@@ -260,12 +366,15 @@ pub(super) fn status(frame: &mut Frame, area: Rect, tabs_min: u16, text: &str) -
 /// Lay out a page other than the dashboard: the header row, then the
 /// page's message under it for as many rows as it takes, then the body.
 /// The chips are left to [`chips`], drawn once the body is down.
-pub(super) fn page(frame: &mut Frame, message: Option<&str>) -> (Header, Rect) {
+pub(super) fn page(frame: &mut Frame, current: Page, message: Option<&str>) -> (Header, Rect) {
     let area = frame.area();
-    let header = header(Rect {
-        height: area.height.min(1),
-        ..area
-    });
+    let header = header(
+        Rect {
+            height: area.height.min(1),
+            ..area
+        },
+        current,
+    );
     let below = area.height - header.keys.height;
     let lines = message_lines(message, area.width.saturating_sub(2));
     // The body keeps a row: a message never takes the whole page.
@@ -688,19 +797,100 @@ mod tests {
         assert_eq!(selection_window(10, 4, 2).shown, 0..3);
     }
 
+    fn strip_text(tabs: &[Tab], current: usize, width: usize) -> String {
+        tab_spans(tabs, current, width)
+            .into_iter()
+            .map(|(span, _)| span.content.into_owned())
+            .collect()
+    }
+
+    /// The routing page's strip, as the design draws it.
+    fn lookup_tabs() -> [Tab<'static>; 6] {
+        [
+            Tab::new("presentations").count(15),
+            Tab::new("rewrites").count(14).after(" → "),
+            Tab::new("defaults").count(4).after(" → "),
+            Tab::new("routes").count(7).after(" → "),
+            Tab::new("models").count(11).after(" · "),
+            Tab::new("history").count(9).after(" · "),
+        ]
+    }
+
     #[test]
-    fn the_tab_strip_collapses_the_other_tabs_before_clipping_the_current_one() {
-        let labels = ["presentations", "routes", "rewrites"];
-        let text = |width| {
-            tab_spans(&labels, 1, width)
-                .into_iter()
-                .map(|(span, _)| span.content.into_owned())
-                .collect::<String>()
-        };
-        assert_eq!(text(80), " 1 presentations  2 routes  3 rewrites");
-        assert_eq!(text(20), " 1  2 routes  3");
-        assert_eq!(text(12), " 1  2 ro…  3");
-        assert_eq!(tabs_min_width(&labels, 1), " 1  2 routes  3".width() as u16);
+    fn the_tab_strip_drops_counts_then_scrolls_then_numbers_then_stands_alone() {
+        let tabs = lookup_tabs();
+        assert_eq!(
+            strip_text(&tabs, 1, 120),
+            " 1 presentations 15 → 2 rewrites 14 → 3 defaults 4 → 4 routes 7 · 5 models 11 · 6 history 9"
+        );
+        assert_eq!(
+            strip_text(&tabs, 1, 90),
+            " 1 presentations → 2 rewrites 14 → 3 defaults → 4 routes · 5 models · 6 history"
+        );
+        // A window of neighbours around the current tab, marked where
+        // tabs are hidden.
+        assert_eq!(
+            strip_text(&tabs, 1, 60),
+            " 1 presentations → 2 rewrites 14 → 3 defaults → 4 routes ›"
+        );
+        assert_eq!(
+            strip_text(&tabs, 3, 41),
+            " ‹ 3 defaults → 4 routes 7 · 5 models ›"
+        );
+        // A window of two would not fit, but every tab's number does.
+        let wide = [
+            Tab::new("presentations"),
+            Tab::new("x"),
+            Tab::new("presentations"),
+        ];
+        assert_eq!(strip_text(&wide, 1, 10), " 1  2 x  3");
+        // Neither fits: the current tab alone.
+        assert_eq!(strip_text(&wide, 1, 9), " ‹ 2 x ›");
+        assert_eq!(strip_text(&tabs, 1, 21), " ‹ 2 rewrites 14 ›");
+        assert_eq!(strip_text(&tabs, 0, 21), " 1 presentations 15 ›");
+        assert_eq!(tabs_min_width(&tabs, 1), 18);
+        assert_eq!(strip_text(&tabs, 1, 12), " ‹ 2 rewr… ›");
+    }
+
+    #[test]
+    fn a_scrolled_tab_has_no_click_target() {
+        let tabs = lookup_tabs();
+        let backend = ratatui::backend::TestBackend::new(30, 1);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let mut hits = Vec::new();
+        terminal
+            .draw(|frame| hits = super::tabs(frame, frame.area(), &tabs, 1))
+            .expect("draw");
+        assert_eq!(hits.len(), 6);
+        assert_eq!(hits[1].width, "2 rewrites 14".width() as u16);
+        assert!(hits[0].is_empty() && hits[2].is_empty());
+    }
+
+    #[test]
+    fn the_buttons_never_shorten_and_clip_only_at_the_edge() {
+        let header = |width| header(Rect::new(0, 0, width, 24), Page::Config);
+        let wide = header(100);
+        assert_eq!(wide.keys, Rect::new(0, 0, 3, 1));
+        assert_eq!(
+            wide.pages,
+            [
+                Rect::new(4, 0, 11, 1),
+                Rect::new(16, 0, 9, 1),
+                Rect::new(26, 0, 8, 1),
+                Rect::new(35, 0, 10, 1),
+            ]
+        );
+        assert_eq!(wide.rest, Rect::new(46, 0, 54, 24));
+        assert_eq!(wide.page_at(Position::new(20, 0)), Some(Page::Routing));
+        assert_eq!(wide.page_at(Position::new(15, 0)), None, "the gap");
+        // The narrowest the design draws: the strip has nothing left.
+        assert_eq!(header(46).rest.width, 0);
+        // Narrower than the buttons, the later ones clip and then go.
+        let tiny = header(20);
+        assert_eq!(tiny.pages[1], Rect::new(16, 0, 4, 1));
+        assert_eq!(tiny.pages[2].width, 0);
+        assert_eq!(tiny.page_at(Position::new(22, 0)), None);
+        assert_eq!(header(2).keys.width, 2);
     }
 
     #[test]

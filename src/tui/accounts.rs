@@ -198,7 +198,7 @@ impl Page {
     pub(super) fn render(&self, frame: &mut Frame, now_ms: i64, overlay: bool) -> chrome::Header {
         // A failed read or write says so over the last list read, which
         // stays standing: an empty page would read as "no accounts".
-        let (header, body) = chrome::page(frame, self.error.as_deref());
+        let (header, body) = chrome::page(frame, super::Page::Accounts, self.error.as_deref());
         let width = usize::from(body.width.saturating_sub(2));
         let entries: Vec<Vec<Line<'static>>> = if self.entries.is_empty() {
             vec![vec![Line::styled(
@@ -359,12 +359,11 @@ const NOUN: Noun = Noun {
 };
 
 /// The page's keys, in its `?` overlay.
-const KEYS: [(&str, &str); 6] = [
+const KEYS: [(&str, &str); 5] = [
     ("↑/↓ j/k", "select"),
     ("n", "name the selected account"),
     ("r", "refresh"),
     ("esc", "back to the dashboard"),
-    ("tab or ⇄", "next page"),
     ("q", "quit"),
 ];
 

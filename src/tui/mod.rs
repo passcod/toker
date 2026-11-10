@@ -127,12 +127,35 @@ const ROW_CAP: u64 = 10_000;
 /// The TUI's top-level page. Page-owned state remains alive while the other
 /// page is visible, so moving between the dashboard and routing never drops a
 /// fetched snapshot or a selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum Page {
+    #[default]
     Dashboard,
     Routing,
     Config,
     Accounts,
+}
+
+impl Page {
+    /// Every page, in the order `Tab` cycles them and the header lists
+    /// their buttons.
+    const ALL: [Page; 4] = [Page::Dashboard, Page::Routing, Page::Config, Page::Accounts];
+
+    /// The page's name, as its header button reads.
+    const fn label(self) -> &'static str {
+        match self {
+            Page::Dashboard => "dashboard",
+            Page::Routing => "routing",
+            Page::Config => "config",
+            Page::Accounts => "accounts",
+        }
+    }
+
+    /// The page `Tab` goes to from here.
+    fn next(self) -> Page {
+        let at = Page::ALL.iter().position(|page| *page == self).unwrap_or(0);
+        Page::ALL[(at + 1) % Page::ALL.len()]
+    }
 }
 
 /// `toker tui --window-mins <m>`: open the ledger and run the dashboard
@@ -320,15 +343,21 @@ pub fn run(
                 toggle_legend(&mut ui);
                 continue;
             }
-            if left && !modal && header.switch.contains(at) {
-                page = next_page(
-                    page,
-                    &mut ui,
-                    &mut routing,
-                    &mut config,
-                    &mut accounts,
-                    &store,
-                );
+            if left
+                && !modal
+                && let Some(target) = header.page_at(at)
+            {
+                // A click on the current page's own button does nothing.
+                if target != page {
+                    page = go_to(
+                        target,
+                        &mut ui,
+                        &mut routing,
+                        &mut config,
+                        &mut accounts,
+                        &store,
+                    );
+                }
                 continue;
             }
             if page == Page::Accounts {
@@ -440,8 +469,8 @@ pub fn run(
             }
             match key.code {
                 crossterm::event::KeyCode::Tab => {
-                    page = next_page(
-                        page,
+                    page = go_to(
+                        page.next(),
                         &mut ui,
                         &mut routing,
                         &mut config,
@@ -590,10 +619,11 @@ pub fn run(
     Ok(())
 }
 
-/// The page after `page`, the way `Tab` and the `⇄` chip both go: the
-/// overlay closes, and the page arrived at re-reads what it shows.
-fn next_page(
-    page: Page,
+/// Go to `target`, the way `Tab` and a click on a page's header button
+/// both do: the overlay closes, the dashboard's session detail with it,
+/// and the page arrived at re-reads what it shows.
+fn go_to(
+    target: Page,
     ui: &mut view::Ui,
     routing: &mut routing::Page,
     config: &mut config::Page,
@@ -601,22 +631,14 @@ fn next_page(
     store: &Store,
 ) -> Page {
     ui.legend = false;
-    match page {
-        Page::Dashboard => {
-            ui.detail = None;
-            routing.refresh();
-            Page::Routing
-        }
-        Page::Routing => {
-            config.refresh();
-            Page::Config
-        }
-        Page::Config => {
-            accounts.refresh(store);
-            Page::Accounts
-        }
-        Page::Accounts => Page::Dashboard,
+    ui.detail = None;
+    match target {
+        Page::Dashboard => {}
+        Page::Routing => routing.refresh(),
+        Page::Config => config.refresh(),
+        Page::Accounts => accounts.refresh(store),
     }
+    target
 }
 
 /// Open or close the legend, always dismissing the mutually exclusive

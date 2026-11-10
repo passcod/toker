@@ -24,7 +24,7 @@ pub(super) struct Drawn {
 const TABS: [&str; 2] = ["providers", "settings"];
 
 /// The page's keys, in its `?` overlay.
-const KEYS: [(&str, &str); 9] = [
+const KEYS: [(&str, &str); 8] = [
     ("↑/↓ j/k", "select"),
     ("←/→ h/l 1 2", "switch view"),
     ("space", "toggle"),
@@ -32,19 +32,27 @@ const KEYS: [(&str, &str); 9] = [
     ("c", "clear a provider's server safeguards rejection marks"),
     ("r", "refresh"),
     ("esc", "back to the dashboard"),
-    ("tab or ⇄", "next page"),
     ("q", "quit"),
 ];
 
 pub(super) fn render(frame: &mut Frame, state: &State, overlay: bool) -> Drawn {
     // A refused value is reported on the page, under the header, for as
     // many rows as it takes (spec: UTUI#the-configuration-pages).
-    let (header, body) = chrome::page(frame, state.error());
+    let (header, body) = chrome::page(frame, crate::tui::Page::Config, state.error());
     let current = match state.view() {
         View::Providers => 0,
         View::Settings => 1,
     };
-    let tabs = chrome::tabs(frame, header.rest, &TABS, current);
+    // Providers are a list of records, so the tab says how many.
+    let providers = state.snapshot().map(|snapshot| snapshot.providers.len());
+    let strip = [
+        match providers {
+            Some(count) => chrome::Tab::new(TABS[0]).count(count),
+            None => chrome::Tab::new(TABS[0]),
+        },
+        chrome::Tab::new(TABS[1]),
+    ];
+    let tabs = chrome::tabs(frame, header.rest, &strip, current);
 
     let rows = if !state.reachable() {
         // The service is the only writer, so a form the operator can

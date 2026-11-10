@@ -47,8 +47,8 @@ const NOUN: Noun = Noun {
 pub(super) fn render(frame: &mut Frame, state: &State, overlay: bool) -> Drawn {
     // A refusal or a failed read is said over the page, which stays
     // usable read-only on the snapshot it last loaded.
-    let (header, body) = chrome::page(frame, state.error());
-    let labels = View::ALL.map(View::tab);
+    let (header, body) = chrome::page(frame, crate::tui::Page::Routing, state.error());
+    let labels = View::ALL.map(|view| chrome::Tab::new(view.tab()));
     let current = View::ALL
         .iter()
         .position(|view| *view == state.view())
@@ -179,7 +179,7 @@ fn status_text(state: &State) -> String {
 }
 
 /// The page's keys, in its `?` overlay.
-const KEYS: [(&str, &str); 15] = [
+const KEYS: [(&str, &str); 14] = [
     ("↑/↓ j/k", "select a record"),
     ("←/→ h/l 1–4", "switch view"),
     ("pgup/pgdn", "scroll the detail"),
@@ -196,7 +196,6 @@ const KEYS: [(&str, &str); 15] = [
     ("click", "select a record, or focus a form field"),
     ("wheel", "scroll what is under the pointer"),
     ("esc", "back to the dashboard"),
-    ("tab or ⇄", "next page"),
     ("q", "quit"),
 ];
 
@@ -747,18 +746,19 @@ mod tests {
         assert!(narrow.entries.height <= 32 / 3, "{text}");
     }
 
-    /// The other tabs collapse to their number before the current label
-    /// clips, and every tab stays clickable.
+    /// The tabs scroll around the current one before the strip clips,
+    /// and every tab stays indexed for the mouse.
     #[test]
-    fn a_narrow_header_collapses_the_other_tabs() {
+    fn a_narrow_header_scrolls_the_tabs() {
         let state = page_in(super::View::Routes);
         let (text, drawn) = drawn_at(&state, 90, 32);
         let header = text.lines().next().unwrap_or_default();
         assert!(
-            header.contains("1  2 routes, candidates & defaults  3  4"),
+            header.contains("‹ 2 routes, candidates & defaults ›"),
             "{header}"
         );
         assert_eq!(drawn.tabs.len(), 4);
+        assert!(drawn.tabs[0].is_empty(), "scrolled out of the strip");
     }
 
     /// Too short for the detail boxed, both panes give up their borders

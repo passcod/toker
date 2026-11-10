@@ -298,8 +298,8 @@ pub(crate) struct Scroll {
 /// for hit-testing the wheel, and how far it can scroll.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Drawn {
-    /// The header's chips: `?` toggles the legend, `⇄` goes to the next
-    /// page.
+    /// The header's buttons: `?` toggles the legend, and each page's goes
+    /// to that page.
     pub header: chrome::Header,
     pub sessions: DrawnList,
     pub context: DrawnList,
@@ -373,7 +373,7 @@ pub(crate) fn render(
         height: layout.header.height.max(frame.area().height.min(1)),
         ..layout.header
     };
-    let header = chrome::header(action_header);
+    let header = chrome::header(action_header, super::Page::Dashboard);
     render_header(frame, header.rest, snap, clock);
     let (sessions_offset, sessions_rows) = render_sessions(
         frame,
@@ -517,12 +517,11 @@ const LEGEND: [(&str, &str); 21] = [
 
 /// The dashboard's keys, under its marks in the same overlay: with no
 /// footer on any page, the overlay is where a page teaches what it takes.
-const KEYS: [(&str, &str); 6] = [
+const KEYS: [(&str, &str); 5] = [
     ("click", "open a session's detail"),
     ("wheel", "scroll the list under the pointer"),
     ("←/→ h/l", "scroll the accounts in rate & quota"),
     ("r", "refresh now"),
-    ("tab or ⇄", "next page"),
     ("q", "quit"),
 ];
 
@@ -3303,16 +3302,26 @@ mod tests {
                     .contains(ratatui::layout::Position::new(x, 0))
             );
         }
+        let text = |range: std::ops::Range<u16>| {
+            range.map(|x| buffer[(x, 0)].symbol()).collect::<String>()
+        };
         assert_eq!(
-            drawn.header.switch,
-            ratatui::layout::Rect::new(3, 0, 1, 1),
-            "the routing chip fills the gutter"
+            drawn.header.pages[0],
+            ratatui::layout::Rect::new(4, 0, 11, 1)
         );
-        assert_eq!(buffer[(3, 0)].symbol(), "⇄");
+        assert_eq!(text(4..15), " dashboard ");
+        assert_eq!(text(16..25), " routing ");
+        assert_eq!(text(26..34), " config ");
+        assert_eq!(text(35..45), " accounts ");
+        let (current, other) = (&buffer[(5, 0)], &buffer[(17, 0)]);
+        assert_eq!(current.fg, Color::Blue);
+        assert!(current.modifier.contains(Modifier::BOLD));
+        assert_eq!(other.fg, Color::DarkGray);
+        assert!(!other.modifier.contains(Modifier::BOLD));
         assert_eq!(
-            buffer[(4, 0)].symbol(),
+            buffer[(46, 0)].symbol(),
             "l",
-            "the status follows the gutter"
+            "the status follows the buttons"
         );
     }
 
@@ -5029,14 +5038,5 @@ mod tests {
                 })
                 .expect("draw");
         }
-    }
-
-    #[test]
-    fn the_switch_chip_sits_in_the_legend_gutter_from_80_columns() {
-        let header = |width| chrome::header(ratatui::layout::Rect::new(0, 0, width, 24));
-        assert_eq!(header(100).switch, ratatui::layout::Rect::new(3, 0, 1, 1));
-        assert_eq!(header(100).rest.x, 4, "the status starts after the gutter");
-        assert_eq!(header(80).switch.width, 1);
-        assert_eq!(header(79).switch.width, 0);
     }
 }
