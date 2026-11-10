@@ -7,8 +7,8 @@
 //! [store] as the SQLite ledger, [server] as the listener, [tui] as the
 //! dashboard, [setup] as the wizard's library half (the tested
 //! modules the interactive `toker setup` composes), [timers] as the
-//! wake/hold/ping subsystem (the hidden verbs the wizard-installed
-//! systemd units invoke), and [release] as the quota gate's grant and
+//! wake/hold/ping subsystem (the hidden verbs the installed systemd units
+//! invoke), [schedule] as those units and the slots they carry, and [release] as the quota gate's grant and
 //! revoke writes, shared by the markers and the TUI. The binary
 //! (src/main.rs) is the CLI surface over these modules.
 //!
@@ -33,6 +33,7 @@ pub mod proto;
 pub mod providers;
 pub mod release;
 pub mod routing;
+pub mod schedule;
 pub mod secrets;
 pub mod server;
 pub mod setup;

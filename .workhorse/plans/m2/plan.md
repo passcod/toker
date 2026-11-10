@@ -6,7 +6,7 @@ Specs: GPING#the-schedule, UTUI#schedule, USETUP#installing-units.
 ## Technical notes
 
 - The units are the record (GPING#where-the-schedule-is-kept).
-  Slots and days are read back from the per-slot ping timers' `OnCalendar=` lines rather than only their filenames, which `installed_ping_slots` reads today.
+  Slots and days are read back from the hold timer's `OnCalendar=` lines, one per slot with its days; the ping verb takes the days as `--days`, defaulting to weekdays for units written before slots carried them.
   Whether the machine is woken is read from the system manager (`systemctl is-enabled toker-wake.timer`), which needs no elevation.
 - The position is the pair (stored `ping_schedule`, wake placed): off is (false, not placed), while awake is (true, not placed), wake then ping is (true, placed).
   (false, placed) is not offered. If found, it reads as wake then ping with the switch off, and the page offers to stop waking.
@@ -27,8 +27,8 @@ Specs: GPING#the-schedule, UTUI#schedule, USETUP#installing-units.
 
 ## Steps
 
-- [ ] Parse days from installed units; slot list with days as the read model
-- [ ] Days in unit generation, including the past-midnight shift
+- [x] Parse days from installed units; slot list with days as the read model
+- [x] Days in unit generation, including the past-midnight shift
 - [ ] Slot rules: at least one day, unique times, the five-hour overlap refusal, no turning on with no slots
 - [ ] Schedule tab: position row, slots table with last runs, add/edit/remove slot forms, the orphan-wake flag
 - [ ] The elevated wake step via pkexec, with the TUI suspended around it

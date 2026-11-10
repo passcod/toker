@@ -390,12 +390,19 @@ pub fn hold(for_arg: String) -> anyhow::Result<()> {
     )
 }
 
-/// `ping-window --slot=hh:mm` (the ping timers' verb): open a fresh
+/// `ping-window --slot=hh:mm --days=…` (the ping timers' verb): open a fresh
 /// quota window with one tiny client request, then confirm the ping
 /// row landed on the ledger. The lateness guard refuses a slot more
 /// than 10 minutes past its fire time, with the reason and a non-zero
 /// exit.
-pub fn ping_window(slot: String) -> anyhow::Result<()> {
+pub fn ping_window(slot: String, days: String) -> anyhow::Result<()> {
+    let Some(time) = crate::timers::parse_slot(&slot) else {
+        anyhow::bail!("--slot must be hh:mm — got {slot:?}");
+    };
+    let days =
+        crate::timers::Days::parse(&days).map_err(|error| anyhow::anyhow!("--days: {error}"))?;
+    anyhow::ensure!(!days.is_empty(), "--days names no day");
+    let slot = crate::schedule::ScheduledSlot { time, days };
     let config = Config::load()?;
     // The predecessor's CTP_PING_CLAUDE and CTP_PING_MODEL, renamed: a
     // claude that is not on the unit's PATH, or a model to try.
@@ -416,7 +423,7 @@ pub fn ping_window(slot: String) -> anyhow::Result<()> {
     crate::timers::ping_window(
         &mut out,
         &ping,
-        &slot,
+        slot,
         now,
         &jiff::tz::TimeZone::system(),
         &crate::timers::ProcessCommandRunner,

@@ -77,6 +77,6 @@ systemctl --user start toker-picker.service — ok
     patched: opencode ([ROOT]/.config/opencode/opencode.json)
     patched: shell rc ([ROOT]/.bashrc)
   ledger    : not imported
-  timers    : slots 07:20, 12:20 — NOT fully up — finish by hand: systemctl --user daemon-reload && systemctl --user enable --now toker-hold.timer && systemctl --user enable --now toker-ping-0720.timer && systemctl --user enable --now toker-ping-1220.timer
+  timers    : slots 07:20 Mon..Fri, 12:20 Mon..Fri — NOT fully up — finish by hand: systemctl --user daemon-reload && systemctl --user enable --now toker-hold.timer && systemctl --user enable --now toker-ping-0720.timer && systemctl --user enable --now toker-ping-1220.timer
   picker    : Claude /model rows synced; toker-picker.timer refreshes them daily
 re-run `toker setup` any time to change anything.

@@ -7,10 +7,10 @@
 //!   suspend only** (a powered-off machine stays off — that is
 //!   rtcwake's job, not this one's). Root-level because the user
 //!   manager lacks `CAP_WAKE_ALARM`; it is the only root-level piece
-//!   toker has ([`crate::setup::wizard::wake_system_unit`] generates
-//!   it and the `/bin/true` service it starts; setup only writes them,
-//!   and the dashboard places them in the system manager, which needs
-//!   elevation, when the ping schedule is turned on).
+//!   toker has ([`crate::schedule::wake_system_unit`] generates it and
+//!   the `/bin/true` service it starts; setup only writes them, and the
+//!   dashboard places them in the system manager, which needs elevation,
+//!   when the ping schedule is turned on).
 //! - **hold** — USER timers at the same slots running `toker hold
 //!   --for=15m`: a timer that elapses while the machine is suspended
 //!   fires on resume, and the hold then keeps the machine up those 15
@@ -21,7 +21,7 @@
 //!   PID-watching child makes a verb that dies for any reason release
 //!   with it.
 //! - **ping** — USER timers ~11 minutes after each slot running `toker
-//!   ping-window --slot=hh:mm`: opens a fresh 5-hour quota window by
+//!   ping-window --slot=hh:mm --days=…`: opens a fresh 5-hour quota window by
 //!   sending **one tiny request as a client** — `claude -p` with
 //!   `ANTHROPIC_BASE_URL` pointed at toker and
 //!   `ANTHROPIC_CUSTOM_HEADERS` carrying the configured ping header
@@ -224,6 +224,108 @@ fn two_digits(text: &str) -> Option<u8> {
     Some((bytes[0] - b'0') * 10 + (bytes[1] - b'0'))
 }
 
+/// The days of the week a slot runs on, Monday first. A slot's days are
+/// the days its own clock time falls on; its ping, a few minutes later,
+/// may land on the next (spec: GPING#the-schedule).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Days(u8);
+
+/// The day names `OnCalendar=` takes, Monday first.
+const DAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+impl Days {
+    /// Monday to Friday: what every slot ran on before slots carried days,
+    /// and what a unit installed then still means.
+    pub const WEEKDAYS: Days = Days(0b001_1111);
+
+    /// No day at all, which no slot may have.
+    pub const NONE: Days = Days(0);
+
+    /// Whether no day is set.
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Whether the day `index` (0 = Monday) is set.
+    pub fn has(self, index: usize) -> bool {
+        index < 7 && self.0 & (1 << index) != 0
+    }
+
+    /// Whether `weekday` is set.
+    pub fn contains(self, weekday: jiff::civil::Weekday) -> bool {
+        self.has(weekday.to_monday_zero_offset() as usize)
+    }
+
+    /// The day after each set day: Sunday's is Monday.
+    pub fn next_day(self) -> Days {
+        Days(((self.0 << 1) | (self.0 >> 6)) & 0b111_1111)
+    }
+
+    /// The set days' indices, Monday first.
+    pub fn indices(self) -> impl Iterator<Item = usize> {
+        (0..7).filter(move |index| self.has(*index))
+    }
+
+    /// The `OnCalendar=` spelling, which is also how the dashboard shows
+    /// and takes the days: a run of three or more as a range
+    /// (`Mon..Fri`), the rest by name (`Sat,Sun`).
+    pub fn calendar(self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        let mut at = 0;
+        while at < 7 {
+            if !self.has(at) {
+                at += 1;
+                continue;
+            }
+            let start = at;
+            while at + 1 < 7 && self.has(at + 1) {
+                at += 1;
+            }
+            if at - start >= 2 {
+                parts.push(format!("{}..{}", DAY_NAMES[start], DAY_NAMES[at]));
+            } else {
+                parts.extend((start..=at).map(|day| DAY_NAMES[day].to_owned()));
+            }
+            at += 1;
+        }
+        parts.join(",")
+    }
+
+    /// Parse days as the dashboard takes them and `OnCalendar=` writes them:
+    /// names (`Mon`, any case), ranges (`Mon..Fri`, or `Mon-Fri`), separated
+    /// by commas or spaces. A range runs forward within one week, so
+    /// `Fri..Mon` is refused rather than read as wrapping. `Err` names what
+    /// was not a day.
+    pub fn parse(text: &str) -> std::result::Result<Days, String> {
+        let day = |name: &str| {
+            DAY_NAMES
+                .iter()
+                .position(|known| known.eq_ignore_ascii_case(name))
+                .ok_or_else(|| format!("{name:?} is not a day: use Mon, Tue … Sun"))
+        };
+        let mut bits = 0u8;
+        for token in text.split(|c: char| c == ',' || c.is_whitespace()) {
+            if token.is_empty() {
+                continue;
+            }
+            let range = token.split_once("..").or_else(|| token.split_once('-'));
+            match range {
+                Some((from, to)) => {
+                    let (from, to) = (day(from)?, day(to)?);
+                    if from > to {
+                        return Err(format!("{token} runs backwards: write it Monday first"));
+                    }
+                    for index in from..=to {
+                        bits |= 1 << index;
+                    }
+                }
+                None => bits |= 1 << day(token)?,
+            }
+        }
+        Ok(Days(bits))
+    }
+}
+
 /// Parse the hold span, in minutes: a positive finite number with an
 /// optional single trailing `m` — `15m` (what the unit passes),
 /// `15`, `0.5`, `0.5m`. Strictly: no whitespace, no other suffix, and
@@ -234,31 +336,10 @@ pub fn parse_hold_minutes(text: &str) -> Option<f64> {
     minutes.is_finite().then_some(minutes).filter(|m| *m > 0.0)
 }
 
-/// Parse a free-form slot list: tokens separated by commas and/or
-/// whitespace, each a strict `hh:mm`; duplicates collapse (first wins,
-/// input order kept); an empty answer is no slots. `Err` carries the
-/// first offending token, so the caller can name it.
-pub fn parse_slot_list(text: &str) -> std::result::Result<Vec<String>, String> {
-    let mut slots: Vec<String> = Vec::new();
-    for token in text.split(|c: char| c == ',' || c.is_whitespace()) {
-        let token = token.trim();
-        if token.is_empty() {
-            continue;
-        }
-        if parse_slot(token).is_none() {
-            return Err(token.to_owned());
-        }
-        if !slots.iter().any(|slot| slot == token) {
-            slots.push(token.to_owned());
-        }
-    }
-    Ok(slots)
-}
-
-/// The slot's clock time plus `minutes`, wrapping past midnight (the
-/// timers are weekday `OnCalendar` values, so a wrapped time fires
-/// the NEXT day — a Friday 23:55 slot's ping fires Saturday 00:06,
-/// which is why its timer's mask runs Tue..Sat).
+/// The slot's clock time plus `minutes`, wrapping past midnight (a
+/// wrapped time fires the NEXT day — a Friday 23:55 slot's ping fires
+/// Saturday 00:06, which is why its timer runs on the day after each of
+/// the slot's days).
 pub fn slot_plus_minutes(slot: &Slot, minutes: i64) -> Slot {
     let total = (slot.hour as i64 * 60 + slot.minute as i64 + minutes).rem_euclid(24 * 60);
     Slot {
@@ -267,21 +348,22 @@ pub fn slot_plus_minutes(slot: &Slot, minutes: i64) -> Slot {
     }
 }
 
-/// The most recent WEEKDAY (Mon–Fri) occurrence of the slot's
-/// wall-clock time at-or-before `now`, in `tz` — the schedule is
-/// weekday-only, matching the work pattern it serves. A weekend day
-/// has no occurrence of its own: Saturday and Sunday resolve to
-/// Friday's slot, and the lateness guard then refuses a weekend run
-/// as long past (weekends have no ping, by design). Before the slot's
-/// first occurrence of the local day, the resolution steps to the
-/// previous weekday — an early run for today's slot reads as very
-/// late for Friday's, which the guard refuses.
+/// The most recent occurrence of the slot's wall-clock time on one of its
+/// `days`, at-or-before `now`, in `tz`. A day the slot does not run on has
+/// no occurrence of its own: a Saturday under a weekday slot resolves to
+/// Friday's, and the lateness guard then refuses the run as long past.
+/// Before the slot's first occurrence of the local day, the resolution
+/// steps to the previous day it runs on — an early run for today's slot
+/// reads as very late for that one, which the guard refuses. `None` for
+/// no days at all.
 ///
 /// A slot inside a DST gap or fold resolves by jiff's compatible
-/// strategy (the gap folds forward); a weekday clock slot has no
-/// meaningful finer answer.
-pub fn last_occurrence_ms(now_ms: i64, slot: &Slot, tz: &TimeZone) -> Option<i64> {
-    use jiff::civil::Weekday;
+/// strategy (the gap folds forward); a clock slot has no meaningful
+/// finer answer.
+pub fn last_occurrence_ms(now_ms: i64, slot: &Slot, days: Days, tz: &TimeZone) -> Option<i64> {
+    if days.is_empty() {
+        return None;
+    }
     let now = jiff::Timestamp::from_millisecond(now_ms).ok()?;
     let zoned = now.to_zoned(tz.clone());
     let time = jiff::civil::Time::constant(slot.hour as i8, slot.minute as i8, 0, 0);
@@ -294,19 +376,16 @@ pub fn last_occurrence_ms(now_ms: i64, slot: &Slot, tz: &TimeZone) -> Option<i64
                 .as_millisecond(),
         )
     };
-    // Start at today; step back until the weekday whose slot has
-    // occurred. Weekends never resolve to themselves — the timers do
-    // not fire Sat/Sun, so a weekend keeps walking to Friday.
+    // Start at today; step back until a day whose slot has occurred and
+    // that the slot runs on. A week back always finds one.
     let mut date = zoned.date();
     if at(date)? > now_ms {
         date = date.yesterday().ok()?;
     }
-    loop {
-        match date.weekday() {
-            Weekday::Saturday | Weekday::Sunday => date = date.yesterday().ok()?,
-            _ => return at(date),
-        }
+    while !days.contains(date.weekday()) {
+        date = date.yesterday().ok()?;
     }
+    at(date)
 }
 
 /// When a slot's ping is scheduled to fire: the occurrence plus
@@ -552,7 +631,7 @@ impl Drop for ScratchDir {
     }
 }
 
-/// `toker ping-window --slot=hh:mm`: resolve the slot, refuse if more
+/// `toker ping-window --slot=hh:mm --days=…`: resolve the slot on its days, refuse if more
 /// than [`LATENESS_LIMIT_MINUTES`] past its fire time (non-zero exit,
 /// the reason said), skip if the ledger shows a window already open
 /// (recorded, clean exit), then send one tiny request as a client — `claude
@@ -569,16 +648,14 @@ impl Drop for ScratchDir {
 pub fn ping_window(
     out: &mut dyn Write,
     config: &PingConfig<'_>,
-    slot_text: &str,
+    scheduled: crate::schedule::ScheduledSlot,
     now_ms: i64,
     tz: &TimeZone,
     runner: &dyn CommandRunner,
     sleep: &mut dyn FnMut(Duration),
 ) -> Result<()> {
-    let Some(slot) = parse_slot(slot_text) else {
-        bail!("--slot must be hh:mm — got {slot_text:?}");
-    };
-    let Some(occurrence) = last_occurrence_ms(now_ms, &slot, tz) else {
+    let slot = scheduled.time;
+    let Some(occurrence) = last_occurrence_ms(now_ms, &slot, scheduled.days, tz) else {
         bail!("the slot could not be resolved on this clock");
     };
     let fire = scheduled_fire_ms(occurrence);
@@ -888,10 +965,10 @@ fn say(out: &mut dyn Write, line: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANCHOR_STEP_MS, CommandRunner, HOLD_UNIT_FOR, LATENESS_LIMIT_MINUTES, PING_DELAY_MINUTES,
-        WAKE_ARM_NOTE, WINDOW_MS, hold_lock, last_occurrence_ms, parse_hold_minutes, parse_slot,
-        parse_slot_list, ping_marker, scheduled_fire_ms, slot_plus_minutes, sync_ping_marker,
-        window_boundary_ms,
+        ANCHOR_STEP_MS, CommandRunner, Days, HOLD_UNIT_FOR, LATENESS_LIMIT_MINUTES,
+        PING_DELAY_MINUTES, WAKE_ARM_NOTE, WINDOW_MS, hold_lock, last_occurrence_ms,
+        parse_hold_minutes, parse_slot, ping_marker, scheduled_fire_ms, slot_plus_minutes,
+        sync_ping_marker, window_boundary_ms,
     };
     use crate::config::{AnthropicSubConfig, Config};
     use crate::middleware::awake::{InhibitCommand, InhibitLock, LockSpawner};
@@ -981,6 +1058,14 @@ mod tests {
             .as_millisecond()
     }
 
+    /// A slot at `time` on weekdays, as every unit before days meant.
+    fn weekday_slot(time: &str) -> crate::schedule::ScheduledSlot {
+        crate::schedule::ScheduledSlot {
+            time: parse_slot(time).expect("slot"),
+            days: Days::WEEKDAYS,
+        }
+    }
+
     // ── the parsers ───────────────────────────────────────────────
 
     #[test]
@@ -1002,6 +1087,36 @@ mod tests {
     }
 
     #[test]
+    fn days_parse_by_name_and_range_and_spell_as_systemd_does() {
+        let days = |text: &str| Days::parse(text).expect(text);
+        assert_eq!(days("Mon..Fri"), Days::WEEKDAYS);
+        assert_eq!(days("mon-fri"), Days::WEEKDAYS);
+        assert_eq!(days("Mon Tue, Wed,Thu  fri"), Days::WEEKDAYS);
+        assert_eq!(Days::WEEKDAYS.calendar(), "Mon..Fri");
+        // Runs of three or more are ranges; shorter runs are named.
+        assert_eq!(days("Sat Sun").calendar(), "Sat,Sun");
+        assert_eq!(days("Mon,Wed,Fri").calendar(), "Mon,Wed,Fri");
+        assert_eq!(days("Mon..Wed Fri..Sun").calendar(), "Mon..Wed,Fri..Sun");
+        assert_eq!(days("Mon..Sun").calendar(), "Mon..Sun");
+        // Every spelling reads back as itself.
+        for text in ["Mon..Fri", "Sat,Sun", "Mon,Wed,Fri", "Tue", "Mon..Sun"] {
+            assert_eq!(days(text).calendar(), text);
+        }
+        assert!(days("").is_empty());
+        assert!(Days::parse("Fri..Mon").unwrap_err().contains("backwards"));
+        assert!(Days::parse("Funday").unwrap_err().contains("not a day"));
+        assert!(Days::parse("Mon..").is_err());
+    }
+
+    #[test]
+    fn the_day_after_wraps_sunday_to_monday() {
+        let days = |text: &str| Days::parse(text).expect(text);
+        assert_eq!(Days::WEEKDAYS.next_day(), days("Tue..Sat"));
+        assert_eq!(days("Sat,Sun").next_day(), days("Sun,Mon"));
+        assert_eq!(days("Mon..Sun").next_day(), days("Mon..Sun"));
+    }
+
+    #[test]
     fn hold_minutes_parse_strictly() {
         assert_eq!(parse_hold_minutes("15m"), Some(15.0));
         assert_eq!(parse_hold_minutes("15"), Some(15.0));
@@ -1014,30 +1129,6 @@ mod tests {
         ] {
             assert_eq!(parse_hold_minutes(bad), None, "{bad:?} is not a span");
         }
-    }
-
-    #[test]
-    fn slot_lists_split_dedupe_and_reject() {
-        assert_eq!(
-            parse_slot_list("09:00, 12:30").expect("comma and space"),
-            vec!["09:00".to_owned(), "12:30".to_owned()]
-        );
-        assert_eq!(
-            parse_slot_list("09:00 12:30\t18:45").expect("any whitespace"),
-            vec!["09:00", "12:30", "18:45"]
-        );
-        // Duplicates collapse, first position wins.
-        assert_eq!(
-            parse_slot_list("12:30, 09:00, 12:30").expect("dedupe"),
-            vec!["12:30".to_owned(), "09:00".to_owned()]
-        );
-        // Empty — however padded — is no slots.
-        for empty in ["", "  ", " , "] {
-            assert_eq!(parse_slot_list(empty).expect("empty"), Vec::<String>::new());
-        }
-        // The first offending token is named, for the re-ask.
-        assert_eq!(parse_slot_list("09:00, 9:30").unwrap_err(), "9:30");
-        assert_eq!(parse_slot_list("09:00;12:30").unwrap_err(), "09:00;12:30");
     }
 
     #[test]
@@ -1066,25 +1157,25 @@ mod tests {
         let slot = parse_slot("09:00").expect("slot");
         // After today's slot: today's.
         assert_eq!(
-            last_occurrence_ms(utc_ms(9, 5), &slot, &utc()),
+            last_occurrence_ms(utc_ms(9, 5), &slot, Days::WEEKDAYS, &utc()),
             Some(utc_ms(9, 0))
         );
         // Exactly at the slot: today's (at-or-before).
         assert_eq!(
-            last_occurrence_ms(utc_ms(9, 0), &slot, &utc()),
+            last_occurrence_ms(utc_ms(9, 0), &slot, Days::WEEKDAYS, &utc()),
             Some(utc_ms(9, 0))
         );
         // Before today's slot: the previous WEEKDAY's — Sunday and
         // Saturday are skipped (the timers never fire then).
         assert_eq!(
-            last_occurrence_ms(utc_ms(8, 59), &slot, &utc()),
+            last_occurrence_ms(utc_ms(8, 59), &slot, Days::WEEKDAYS, &utc()),
             Some(utc_ms(9, 0) - 3 * 86_400_000),
             "Monday 08:59 resolves FRIDAY's 09:00"
         );
         // Midnight edge: the day's first minute.
         let midnight = parse_slot("00:00").expect("slot");
         assert_eq!(
-            last_occurrence_ms(utc_ms(0, 0), &midnight, &utc()),
+            last_occurrence_ms(utc_ms(0, 0), &midnight, Days::WEEKDAYS, &utc()),
             Some(utc_ms(0, 0))
         );
     }
@@ -1105,22 +1196,55 @@ mod tests {
                 .as_millisecond()
         };
         assert_eq!(
-            last_occurrence_ms(day(3, 10, 0), &slot, &utc()),
+            last_occurrence_ms(day(3, 10, 0), &slot, Days::WEEKDAYS, &utc()),
             Some(day(2, 9, 0))
         );
         assert_eq!(
-            last_occurrence_ms(day(4, 23, 0), &slot, &utc()),
+            last_occurrence_ms(day(4, 23, 0), &slot, Days::WEEKDAYS, &utc()),
             Some(day(2, 9, 0))
         );
         // Friday itself: its own slot, once past.
         assert_eq!(
-            last_occurrence_ms(day(2, 10, 0), &slot, &utc()),
+            last_occurrence_ms(day(2, 10, 0), &slot, Days::WEEKDAYS, &utc()),
             Some(day(2, 9, 0))
         );
         // Early Friday (before the slot): THURSDAY's.
         assert_eq!(
-            last_occurrence_ms(day(2, 8, 0), &slot, &utc()),
+            last_occurrence_ms(day(2, 8, 0), &slot, Days::WEEKDAYS, &utc()),
             Some(day(1, 9, 0))
+        );
+    }
+
+    #[test]
+    fn a_slot_resolves_only_on_its_own_days() {
+        // 2026-10-03 is a Saturday: a weekend slot resolves to it, and a
+        // Monday run before the slot walks back to Sunday's.
+        let slot = parse_slot("09:00").expect("slot");
+        let weekend = Days::parse("Sat,Sun").expect("days");
+        let day = |d: i8, h: i8, m: i8| {
+            jiff::civil::date(2026, 10, d)
+                .at(h, m, 0, 0)
+                .to_zoned(utc())
+                .expect("valid")
+                .timestamp()
+                .as_millisecond()
+        };
+        assert_eq!(
+            last_occurrence_ms(day(3, 9, 30), &slot, weekend, &utc()),
+            Some(day(3, 9, 0))
+        );
+        assert_eq!(
+            last_occurrence_ms(day(5, 8, 0), &slot, weekend, &utc()),
+            Some(day(4, 9, 0))
+        );
+        // A Wednesday is not a weekend day: Sunday's, three days back.
+        assert_eq!(
+            last_occurrence_ms(day(7, 9, 30), &slot, weekend, &utc()),
+            Some(day(4, 9, 0))
+        );
+        assert_eq!(
+            last_occurrence_ms(day(7, 9, 30), &slot, Days::NONE, &utc()),
+            None
         );
     }
 
@@ -1179,7 +1303,7 @@ mod tests {
         let slot = parse_slot("09:00").expect("slot");
         let now = auckland_ms(20, 30);
         assert_eq!(
-            last_occurrence_ms(now, &slot, &auckland),
+            last_occurrence_ms(now, &slot, Days::WEEKDAYS, &auckland),
             Some(auckland_ms(9, 0))
         );
         // The same instant in UTC resolves the same wall-clock slot to
@@ -1192,7 +1316,7 @@ mod tests {
             .timestamp()
             .as_millisecond();
         assert_eq!(
-            last_occurrence_ms(now_utc, &slot, &utc()),
+            last_occurrence_ms(now_utc, &slot, Days::WEEKDAYS, &utc()),
             Some(utc_ms(9, 0) - 3 * 86_400_000)
         );
     }
@@ -1632,7 +1756,7 @@ mod tests {
         super::ping_window(
             &mut out,
             &ping_config(&db, "x-my-ping"),
-            "09:00",
+            weekday_slot("09:00"),
             now,
             &utc(),
             &client,
@@ -1718,7 +1842,7 @@ mod tests {
         super::ping_window(
             &mut out,
             &ping_config(&db, "x-toker-ping"),
-            "09:00",
+            weekday_slot("09:00"),
             now,
             &utc(),
             &client,
@@ -1759,7 +1883,7 @@ mod tests {
         let error = super::ping_window(
             &mut out,
             &ping_config(&db, "x-toker-ping"),
-            "09:00",
+            weekday_slot("09:00"),
             now,
             &utc(),
             &client,
@@ -1792,7 +1916,7 @@ mod tests {
         super::ping_window(
             &mut out,
             &ping_config(&db, "x-toker-ping"),
-            "09:00",
+            weekday_slot("09:00"),
             now,
             &utc(),
             &client,
@@ -1823,7 +1947,7 @@ mod tests {
         let error = super::ping_window(
             &mut out,
             &ping_config(&db, "x-toker-ping"),
-            "09:00",
+            weekday_slot("09:00"),
             now,
             &utc(),
             &client,
@@ -1864,7 +1988,7 @@ mod tests {
             super::ping_window(
                 &mut out,
                 &ping_config(&db, "x-toker-ping"),
-                "09:00",
+                weekday_slot("09:00"),
                 now,
                 &utc(),
                 &client,
@@ -1879,7 +2003,7 @@ mod tests {
         let error = super::ping_window(
             &mut out,
             &ping_config(&db, "x-toker-ping"),
-            "09:00",
+            weekday_slot("09:00"),
             slot_fire + LATENESS_LIMIT_MINUTES * 60_000 + 1,
             &utc(),
             &ScriptedClient::new(0),
@@ -1900,7 +2024,7 @@ mod tests {
         let error = super::ping_window(
             &mut out,
             &ping_config(&dir.join("toker.db"), "x-toker-ping"),
-            "09:00",
+            weekday_slot("09:00"),
             now,
             &utc(),
             &ScriptedClient::new(0),
@@ -1928,7 +2052,7 @@ mod tests {
         let error = super::ping_window(
             &mut out,
             &ping_config(&db, "x-toker-ping"),
-            "09:00",
+            weekday_slot("09:00"),
             now,
             &utc(),
             &ScriptedClient::new(1),
@@ -1965,7 +2089,7 @@ mod tests {
         let error = super::ping_window(
             &mut out,
             &ping_config(&db, "x-toker-ping"),
-            "09:00",
+            weekday_slot("09:00"),
             now,
             &utc(),
             &client,
@@ -1999,7 +2123,7 @@ mod tests {
         super::ping_window(
             &mut out,
             &ping_config(&db, "x-toker-ping"),
-            "09:00",
+            weekday_slot("09:00"),
             now,
             &utc(),
             &ScriptedClient::new(0),
@@ -2050,7 +2174,7 @@ mod tests {
         super::ping_window(
             &mut Vec::new(),
             &config,
-            "09:00",
+            weekday_slot("09:00"),
             now,
             &utc(),
             &client,
@@ -2081,7 +2205,7 @@ mod tests {
         super::ping_window(
             &mut Vec::new(),
             &config,
-            "09:00",
+            weekday_slot("09:00"),
             now,
             &utc(),
             &client,
@@ -2140,7 +2264,7 @@ mod tests {
         super::ping_window(
             &mut out,
             &ping_config(&db, "x-toker-ping"),
-            "09:00",
+            weekday_slot("09:00"),
             now,
             &utc(),
             &client,
@@ -2189,7 +2313,7 @@ mod tests {
         super::ping_window(
             &mut out,
             &ping_config(&db, "x-toker-ping"),
-            "09:00",
+            weekday_slot("09:00"),
             now,
             &utc(),
             &client,
@@ -2225,7 +2349,7 @@ mod tests {
         super::ping_window(
             &mut out,
             &ping_config(&db, "x-toker-ping"),
-            "09:00",
+            weekday_slot("09:00"),
             now,
             &utc(),
             &client,
@@ -2241,28 +2365,5 @@ mod tests {
             .expect("pings");
         assert_eq!(pings[0].assumed, Some(false));
         assert_eq!(pings[0].verified, Some(true));
-    }
-
-    #[test]
-    fn a_bad_slot_argument_is_refused_before_anything_runs() {
-        let dir = test_dir("ping-bad-slot");
-        let mut out = Vec::new();
-        let mut sleep = no_sleep();
-        let client = ScriptedClient::new(0);
-        let error = super::ping_window(
-            &mut out,
-            &ping_config(&dir.join("toker.db"), "x-toker-ping"),
-            "9:30",
-            utc_ms(9, 12),
-            &utc(),
-            &client,
-            &mut sleep,
-        )
-        .expect_err("the slot argument is validated");
-        assert!(
-            format!("{error:#}").contains("--slot must be hh:mm"),
-            "{error:#}"
-        );
-        assert!(client.calls().is_empty());
     }
 }

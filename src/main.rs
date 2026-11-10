@@ -175,6 +175,11 @@ enum Command {
         /// The slot whose window this ping opens, `hh:mm`.
         #[arg(long = "slot", value_name = "HH:MM")]
         slot: String,
+        /// The days the slot runs on, as its unit's `OnCalendar=` spells
+        /// them. A unit written before slots carried days passes none, and
+        /// meant weekdays.
+        #[arg(long = "days", value_name = "DAYS", default_value = "Mon..Fri")]
+        days: String,
     },
 }
 
@@ -259,7 +264,7 @@ fn main() -> anyhow::Result<()> {
         } => cmds::watch_context_window(db, since, state, sessions),
         Command::WakeArm => cmds::wake_arm(),
         Command::Hold { for_ } => cmds::hold(for_),
-        Command::PingWindow { slot } => cmds::ping_window(slot),
+        Command::PingWindow { slot, days } => cmds::ping_window(slot, days),
     }
 }
 

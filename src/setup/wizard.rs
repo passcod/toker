@@ -62,6 +62,7 @@ use serde_json::Value;
 use crate::config::{ANTHROPIC_BACKENDS, Config, DEFAULT_PORT, OPENAI_CHAT_BACKENDS};
 use crate::import::{self, ImportOpts};
 use crate::routing::ProtocolId;
+use crate::schedule::{self, ScheduledSlot, UserManager, WAKE_SERVICE_UNIT, WAKE_TIMER_UNIT};
 use crate::secrets::{KEYRING_SERVICE, SecretStore};
 use crate::setup::atomic::atomic_write_bytes;
 use crate::setup::patchers::{self, Frontend};
@@ -69,7 +70,6 @@ use crate::setup::plugin;
 use crate::setup::verify::{self, ServiceReady};
 use crate::setup::{Step, plan};
 use crate::store::{PolicyRevisionSource, Store};
-use crate::timers::{self, HOLD_UNIT_FOR, PING_DELAY_MINUTES};
 
 /// The enabled unit (the socket). The service is never enabled
 /// directly — the socket starts it on demand.
@@ -77,25 +77,6 @@ pub const SOCKET_UNIT: &str = "toker.socket";
 
 /// The socket-activated service unit.
 pub const SERVICE_UNIT: &str = "toker.service";
-
-/// The wake SYSTEM timer's name —
-/// the only root-level piece. Staged into the user units dir, the one
-/// place setup can write without root; it belongs in the system manager
-/// because `WakeSystem=true` needs `CAP_WAKE_ALARM`, which the user
-/// manager lacks, and setup leaves placing it there to the dashboard.
-pub const WAKE_TIMER_UNIT: &str = "toker-wake.timer";
-
-/// The service the wake timer starts — staged beside it.
-/// A timer with no unit to activate is refused by systemd, so without
-/// this the wake timer never armed at all: the first install shipped
-/// the timer alone.
-pub const WAKE_SERVICE_UNIT: &str = "toker-wake.service";
-
-/// The hold USER timer's name (same name, timer + service pair).
-pub const HOLD_TIMER_UNIT: &str = "toker-hold.timer";
-
-/// The hold USER service's name.
-pub const HOLD_SERVICE_UNIT: &str = "toker-hold.service";
 
 /// The picker USER timer: the daily `toker picker sync`, which keeps
 /// Claude Code's `/model` rows in step with the active routing policy and
@@ -105,41 +86,6 @@ pub const PICKER_TIMER_UNIT: &str = "toker-picker.timer";
 
 /// The picker USER service, which the timer starts and setup runs once.
 pub const PICKER_SERVICE_UNIT: &str = "toker-picker.service";
-
-/// The slots installed when no earlier run left any: the predecessor's
-/// schedule. A slot is the wake and hold, and its ping fires
-/// [`PING_DELAY_MINUTES`] later: 07:20's ping at 07:31 anchors its
-/// window on floor(07:31, 10 min) = 07:30, ending 12:30, and 12:20's
-/// at 12:31 anchors 12:30–17:30 (README: a window open for the
-/// morning, re-opened after lunch).
-pub const DEFAULT_SLOTS: &str = "07:20, 12:20";
-
-/// The slots of the per-slot ping timers an earlier run left in the units
-/// dir, `hh:mm`, sorted. Unreadable is none installed: the dir is created
-/// by the first install, so a fresh machine has none.
-fn installed_ping_slots(units_dir: &Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(units_dir) else {
-        return Vec::new();
-    };
-    let mut slots: Vec<String> = entries
-        .flatten()
-        .filter_map(|entry| {
-            // toker-ping-HHMM.timer, the stem's colon munged away (see
-            // ping_unit_stem).
-            let name = entry.file_name();
-            let hhmm = name
-                .to_str()?
-                .strip_prefix("toker-ping-")?
-                .strip_suffix(".timer")?
-                .to_owned();
-            (hhmm.len() == 4 && hhmm.is_char_boundary(2))
-                .then(|| format!("{}:{}", &hhmm[..2], &hhmm[2..]))
-                .filter(|slot| timers::parse_slot(slot).is_some())
-        })
-        .collect();
-    slots.sort();
-    slots
-}
 
 /// How long [`Step::VerifyService`] waits for the listener to answer
 /// both usage paths: a cold socket-activated start (SQLite open,
@@ -195,23 +141,14 @@ impl Prompt for InquirePrompt {
     }
 }
 
-/// The wizard's systemd seam: every effect on the machine's units.
-/// A non-zero systemctl exit is `Ok(Output)` — the caller reads the
-/// status and stderr; `Err` is "the command could not run at all".
-pub trait SystemRunner {
-    /// Run `systemctl --user <args>` to completion.
-    fn systemctl_user(&self, args: &[&str]) -> Result<Output>;
-
+/// The wizard's systemd seam: every effect on the machine's units, the
+/// user manager's calls and unit writes among them.
+pub trait SystemRunner: UserManager {
     /// Ask the installed binary to replace the running service through
     /// its draining control endpoint. A setup re-run may have changed the
     /// config or unit while the old process still holds both in memory;
     /// `enable --now` does nothing to an already-active socket.
     fn graceful_restart(&self, exe: &Path) -> Result<ExitStatus>;
-
-    /// Install a unit file into the user units dir, returning the path
-    /// written. Declarative: the same contents install cleanly over an
-    /// earlier install of the same unit.
-    fn install_unit(&self, name: &str, contents: &str) -> Result<PathBuf>;
 }
 
 /// The real runner: `systemctl --user` via std::process, unit files
@@ -228,22 +165,13 @@ impl ProcessRunner {
     }
 }
 
-impl SystemRunner for ProcessRunner {
+impl UserManager for ProcessRunner {
     fn systemctl_user(&self, args: &[&str]) -> Result<Output> {
         std::process::Command::new("systemctl")
             .arg("--user")
             .args(args)
             .output()
             .with_context(|| format!("running systemctl --user {}", args.join(" ")))
-    }
-
-    fn graceful_restart(&self, exe: &Path) -> Result<ExitStatus> {
-        // Keep stdio attached: `toker restart` may wait for a quiet moment,
-        // and its progress (including the Ctrl-C promise) must stay visible.
-        std::process::Command::new(exe)
-            .arg("restart")
-            .status()
-            .with_context(|| format!("running {} restart", exe.display()))
     }
 
     fn install_unit(&self, name: &str, contents: &str) -> Result<PathBuf> {
@@ -257,6 +185,27 @@ impl SystemRunner for ProcessRunner {
             Ok(())
         })?;
         Ok(path)
+    }
+
+    fn remove_unit(&self, name: &str) -> Result<()> {
+        let path = self.units_dir.join(name);
+        match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(error).with_context(|| format!("removing {}", path.display()))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl SystemRunner for ProcessRunner {
+    fn graceful_restart(&self, exe: &Path) -> Result<ExitStatus> {
+        // Keep stdio attached: `toker restart` may wait for a quiet moment,
+        // and its progress (including the Ctrl-C promise) must stay visible.
+        std::process::Command::new(exe)
+            .arg("restart")
+            .status()
+            .with_context(|| format!("running {} restart", exe.display()))
     }
 }
 
@@ -498,119 +447,6 @@ pub fn extra_writable(paths: &Paths) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `toker-wake.timer` — the SYSTEM unit: one `OnCalendar=` per user-chosen slot
-/// plus
-/// `WakeSystem=true`, which wakes the machine **from suspend only**
-/// (a powered-off machine stays off). Root-level on purpose: the user
-/// manager lacks `CAP_WAKE_ALARM`, so this is the only unit toker
-/// installs into the system manager. `toker wake-arm` is the
-/// documented no-op pointing here. The schedule is **weekday-only**
-/// (Mon–Fri): the pattern this serves is a work machine that wakes on
-/// work days.
-pub fn wake_system_unit(slots: &[String]) -> String {
-    let mut on_calendar = String::new();
-    for slot in slots {
-        on_calendar.push_str(&format!("OnCalendar=Mon..Fri {slot}\n"));
-    }
-    format!(
-        r#"[Unit]
-Description=toker wake timer (wakes the machine at the chosen slots)
-
-[Timer]
-# The only root-level piece toker installs: WakeSystem=true needs
-# CAP_WAKE_ALARM, which the user manager lacks, so this unit belongs to
-# the system manager. Wakes from suspend only — a machine that is
-# powered off stays off.
-WakeSystem=true
-{on_calendar}# A missed wake is not worth honouring late: the ping would refuse its
-# slot anyway, and a wake at an arbitrary hour is what this avoids. To
-# the second, because the default accuracy lets systemd fire up to a
-# minute late, which eats into the hold's margin before the ping.
-Persistent=false
-AccuracySec=1s
-
-[Install]
-WantedBy=timers.target
-"#
-    )
-}
-
-/// `toker-wake.service` — what [`wake_system_unit`] activates (by the
-/// shared name; no `Unit=` needed). It does nothing: the timer's
-/// `WakeSystem=true` is the whole job, and staying awake for the ping
-/// is the hold USER unit's, so the root-owned half has nothing in it to
-/// audit and never needs the user's session bus. systemd still refuses
-/// to start a timer whose unit does not exist, so it must be there.
-pub fn wake_system_service() -> String {
-    r#"[Unit]
-Description=toker wake service (the wake timer's unit; does nothing itself)
-
-[Service]
-# The wake is the whole job and the timer's WakeSystem does it; holding
-# the machine up afterwards is the toker-hold user unit's.
-Type=oneshot
-ExecStart=/bin/true
-"#
-    .to_owned()
-}
-
-/// `toker-hold.timer` + `toker-hold.service` — the hold USER units
-/// : a timer at the wake slots running
-/// the hold verb for the pinned 15 m. A timer that elapses while the
-/// machine is suspended fires on resume, and the hold then keeps the
-/// machine up those 15 minutes so the ping (11 m after the slot) can
-/// fire; `Persistent=false` keeps a missed slot from re-running hours
-/// late — the ping's own lateness guard refuses those anyway. The service
-/// runs only while the marker in `state_dir` is there (spec: GPING#scope).
-pub fn hold_user_units(slots: &[String], exe: &Path, state_dir: &Path) -> (String, String) {
-    let mut on_calendar = String::new();
-    for slot in slots {
-        on_calendar.push_str(&format!("OnCalendar=Mon..Fri {slot}\n"));
-    }
-    let timer = format!(
-        r#"[Unit]
-Description=toker hold timer (holds the idle-sleep lock {HOLD_UNIT_FOR} after each wake slot)
-
-[Timer]
-# At the wake slots themselves: a timer that elapses while the machine
-# is suspended fires on resume, and the hold then keeps the machine up
-# for its span so the ping ({PING_DELAY_MINUTES} m after the slot) can fire.
-{on_calendar}
-# A hold re-run hours after a missed slot would hold the machine up for
-# nothing — the ping it protects never fires that late either.
-Persistent=false
-# To the second, beside the wake: systemd's default accuracy of a
-# minute could start the hold after the machine has dozed off again.
-AccuracySec=1s
-
-[Install]
-WantedBy=timers.target
-"#,
-    );
-    let service = format!(
-        r#"[Unit]
-Description=toker hold service (holds the idle-sleep lock for its span)
-# Only while the schedule is on and a provider that anchors its windows
-# is enabled: toker keeps the marker, so the dashboard switches this
-# without elevation. On the service, not the timer, whose condition is
-# read once when it starts.
-ConditionPathExists={marker}
-
-[Service]
-Type=oneshot
-# The verb takes the lock independently of the daemon's own — both
-# hold, both release on their own. The start timeout is off: a hold is
-# exactly as long as its --for, and must not be killed at the 90 s
-# default.
-TimeoutStartSec=0
-ExecStart="{exe}" hold --for={HOLD_UNIT_FOR}
-"#,
-        exe = exe.display(),
-        marker = timers::ping_marker(state_dir).display(),
-    );
-    (timer, service)
-}
-
 /// `toker-picker.timer` + `toker-picker.service`: a daily oneshot of
 /// `toker picker sync`. Sandboxed like the service, with two writable
 /// paths: claude's settings dir (the sync renames a temp file over
@@ -650,103 +486,6 @@ ReadWritePaths=-{state_dir}
         state_dir = state_dir.display(),
     );
     (timer, service)
-}
-
-/// One slot's ping pair — [`ping_user_units`] returns one per slot.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PingUnits {
-    /// The slot this pair serves, `hh:mm`.
-    pub slot: String,
-    /// The timer unit's name.
-    pub timer_name: String,
-    /// The timer unit's contents.
-    pub timer: String,
-    /// The service unit's name.
-    pub service_name: String,
-    /// The service unit's contents.
-    pub service: String,
-}
-
-/// The ping USER units — **one
-/// timer+service pair per slot**, the timer at slot+11 m and the
-/// service running the ping verb **for that slot**. Per-slot because
-/// the `--slot` argument must match its timer's clock time: a shared
-/// service cannot know which slot fired. The slots must already be
-/// validated `hh:mm` (the wizard validates before calling). Each service
-/// runs only while the marker in `state_dir` is there (spec: GPING#scope).
-pub fn ping_user_units(slots: &[String], exe: &Path, state_dir: &Path) -> Vec<PingUnits> {
-    let marker = timers::ping_marker(state_dir);
-    slots
-        .iter()
-        .filter_map(|slot| {
-            let parsed = timers::parse_slot(slot)?;
-            let fire = timers::slot_plus_minutes(&parsed, PING_DELAY_MINUTES).hhmm();
-            // A wrapped fire time lands the day AFTER a weekday slot —
-            // Friday 23:55's ping fires Saturday 00:06 — so its mask
-            // covers the following days (Tue..Sat) rather than the
-            // slot's own (Mon..Fri).
-            let wrapped =
-                (parsed.hour as i64 * 60 + parsed.minute as i64 + PING_DELAY_MINUTES) >= 24 * 60;
-            let mask = if wrapped { "Tue..Sat" } else { "Mon..Fri" };
-            let stem = ping_unit_stem(slot);
-            let timer = format!(
-                r#"[Unit]
-Description=toker ping timer (opens the {slot} quota window, {PING_DELAY_MINUTES} m after the slot)
-
-[Timer]
-# {PING_DELAY_MINUTES} m after the slot: the machine has woken and settled, and
-# the hold still has 4 m left to run. Persistent=false deliberately —
-# a ping re-run hours late would open a mostly-spent window, and the
-# verb's lateness guard refuses those anyway.
-OnCalendar={mask} {fire}
-Persistent=false
-# The window anchors on the 10-minute grid, so the fire time is the
-# boundary: systemd's default accuracy of a minute could push a ping
-# across a grid line and move the boundary with it.
-AccuracySec=10s
-
-[Install]
-WantedBy=timers.target
-"#,
-            );
-            let service = format!(
-                r#"[Unit]
-Description=toker ping service (opens the {slot} quota window)
-# As for the hold: only while toker keeps the marker, and on the service
-# rather than the timer.
-ConditionPathExists={marker}
-
-[Service]
-Type=oneshot
-# claude -p as a CLIENT of toker: the request lands on the ledger with
-# ping: true — on-ledger, and never holding the sleep lock. User
-# services start with a minimal environment, so the common user-local
-# bin dirs ride along on PATH (TOKER_PING_CLAUDE names one that is
-# not). The verb kills claude at 120 s itself; the start timeout is only
-# a backstop above that and the readback, so a hung verb cannot
-# suppress the next slot's ping.
-Environment="PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
-TimeoutStartSec=3m
-ExecStart="{exe}" ping-window --slot={slot}
-"#,
-                exe = exe.display(),
-                marker = marker.display(),
-            );
-            Some(PingUnits {
-                slot: slot.clone(),
-                timer_name: format!("{stem}.timer"),
-                timer,
-                service_name: format!("{stem}.service"),
-                service,
-            })
-        })
-        .collect()
-}
-
-/// The per-slot ping unit stem: `toker-ping-0900` for the 09:00 slot
-/// (a unit name cannot carry the colon).
-pub fn ping_unit_stem(slot: &str) -> String {
-    format!("toker-ping-{}", slot.replace(':', ""))
 }
 
 // ── detection ───────────────────────────────────────────────────────────
@@ -1060,7 +799,7 @@ pub struct RunReport {
     /// The wake/hold/ping slots the timers carry: the ones an earlier run
     /// installed, else [`DEFAULT_SLOTS`]. Empty when the run did not reach
     /// the timers.
-    pub timer_slots: Vec<String>,
+    pub timer_slots: Vec<ScheduledSlot>,
     /// The timer units installed this run: the hold pair, the per-slot
     /// ping pairs, and the staged wake pair.
     pub timers_installed: Vec<String>,
@@ -2348,28 +2087,17 @@ impl<'a> Wizard<'a> {
     fn timers_step(&mut self, report: &mut RunReport) -> Result<()> {
         let exe = std::env::current_exe().context("resolving the running binary's own path")?;
         // The slots are chosen on the dashboard, so a re-run keeps whatever
-        // is installed rather than putting the default back.
-        let mut slots = installed_ping_slots(&self.paths.units_dir);
+        // is installed, days and all, rather than putting the default back.
+        let mut slots = schedule::read_installed(&self.paths.units_dir).slots;
         if slots.is_empty() {
-            slots = timers::parse_slot_list(DEFAULT_SLOTS).expect("the default slots parse");
+            slots = schedule::default_schedule();
         }
         report.timer_slots = slots.clone();
 
         // The user units: one hold pair, plus one ping pair per slot.
-        let (hold_timer, hold_service) = hold_user_units(&slots, &exe, &self.paths.state_dir);
-        let mut units = vec![
-            (HOLD_TIMER_UNIT.to_owned(), hold_timer),
-            (HOLD_SERVICE_UNIT.to_owned(), hold_service),
-        ];
-        let pings = ping_user_units(&slots, &exe, &self.paths.state_dir);
-        for pair in &pings {
-            units.push((pair.timer_name.clone(), pair.timer.clone()));
-            units.push((pair.service_name.clone(), pair.service.clone()));
-        }
+        let (units, timer_names) = schedule::user_units(&slots, &exe, &self.paths.state_dir);
         let mut ok = self.install_timer_units(&units, "installed", report)?;
 
-        let mut timer_names = vec![HOLD_TIMER_UNIT.to_owned()];
-        timer_names.extend(pings.iter().map(|pair| pair.timer_name.clone()));
         if ok {
             match self.runner.systemctl_user(&["daemon-reload"]) {
                 Ok(output) if output.status.success() => {
@@ -2415,8 +2143,14 @@ impl<'a> Wizard<'a> {
         // which needs elevation, and that is asked for on the dashboard when
         // the schedule is turned on. Independent of the user timers' fate.
         let wake = [
-            (WAKE_SERVICE_UNIT.to_owned(), wake_system_service()),
-            (WAKE_TIMER_UNIT.to_owned(), wake_system_unit(&slots)),
+            (
+                WAKE_SERVICE_UNIT.to_owned(),
+                schedule::wake_system_service(),
+            ),
+            (
+                WAKE_TIMER_UNIT.to_owned(),
+                schedule::wake_system_unit(&slots),
+            ),
         ];
         let staged = self.install_timer_units(&wake, "staged", report)?;
 
@@ -2536,18 +2270,22 @@ impl<'a> Wizard<'a> {
             None => "not imported".to_owned(),
         };
         self.say(&format!("  ledger    : {ledger}"))?;
+        let slots = report
+            .timer_slots
+            .iter()
+            .map(|slot| format!("{} {}", slot.time.hhmm(), slot.days.calendar()))
+            .collect::<Vec<_>>()
+            .join(", ");
         let timers = if report.timer_slots.is_empty() {
             "not reached".to_owned()
         } else if report.timers_ok {
             format!(
-                "slots {} — hold+ping user timers enabled, wake timer staged; \
-                 pings run once the ping schedule is turned on",
-                report.timer_slots.join(", ")
+                "slots {slots} — hold+ping user timers enabled, wake timer staged; \
+                 pings run once the ping schedule is turned on"
             )
         } else {
             format!(
-                "slots {} — NOT fully up — finish by hand: {}",
-                report.timer_slots.join(", "),
+                "slots {slots} — NOT fully up — finish by hand: {}",
                 report.timers_manual.join(" && ")
             )
         };
@@ -2842,9 +2580,14 @@ fn stderr_of(outcome: &Result<Output>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schedule::{
+        HOLD_SERVICE_UNIT, HOLD_TIMER_UNIT, hold_user_units, ping_unit_stem, ping_user_units,
+        wake_system_service, wake_system_unit,
+    };
     use crate::secrets::MemoryStore;
     use crate::setup::test_dir;
     use crate::store::Store;
+    use crate::timers;
     use axum::http::StatusCode;
     use axum::routing::post;
     use serde_json::{Value, json};
@@ -2980,7 +2723,7 @@ mod tests {
         }
     }
 
-    impl SystemRunner for FakeRunner {
+    impl UserManager for FakeRunner {
         fn systemctl_user(&self, args: &[&str]) -> Result<Output> {
             self.calls
                 .lock()
@@ -2993,11 +2736,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("no scripted systemctl outcome for {args:?}"))
         }
 
-        fn graceful_restart(&self, exe: &Path) -> Result<ExitStatus> {
-            self.restarts.lock().unwrap().push(exe.to_owned());
-            Ok(ok_empty()?.status)
-        }
-
         fn install_unit(&self, name: &str, contents: &str) -> Result<PathBuf> {
             let path = self.units_dir.join(name);
             std::fs::create_dir_all(&self.units_dir).expect("create the scratch units dir");
@@ -3007,6 +2745,18 @@ mod tests {
                 .unwrap()
                 .push((name.to_owned(), contents.to_owned()));
             Ok(path)
+        }
+
+        fn remove_unit(&self, name: &str) -> Result<()> {
+            let _ = std::fs::remove_file(self.units_dir.join(name));
+            Ok(())
+        }
+    }
+
+    impl SystemRunner for FakeRunner {
+        fn graceful_restart(&self, exe: &Path) -> Result<ExitStatus> {
+            self.restarts.lock().unwrap().push(exe.to_owned());
+            Ok(ok_empty()?.status)
         }
     }
 
@@ -3493,7 +3243,7 @@ default_backend_anthropic = "codex_sub"
     #[test]
     fn the_timer_unit_templates_are_pinned() {
         let exe = Path::new("/opt/toker/toker");
-        let slots = ["09:00".to_owned(), "23:55".to_owned()];
+        let slots = [slot("09:00 Mon..Fri"), slot("23:55 Mon..Fri")];
 
         // The wake SYSTEM unit: one OnCalendar= per slot, WakeSystem,
         // no catch-up, to the second, timers.target.
@@ -3541,11 +3291,11 @@ default_backend_anthropic = "codex_sub"
         assert_eq!(pings[1].timer_name, "toker-ping-2355.timer");
         assert!(pings[1].timer.contains("OnCalendar=Tue..Sat 00:06"));
         assert!(pings[1].timer.contains("opens the 23:55 quota window"));
-        assert!(pings[1].service.contains("--slot=23:55"));
+        assert!(pings[1].service.contains("--slot=23:55 --days=Mon..Fri"));
 
         // The stems munge the colon away.
-        assert_eq!(ping_unit_stem("09:00"), "toker-ping-0900");
-        assert_eq!(ping_unit_stem("23:55"), "toker-ping-2355");
+        assert_eq!(ping_unit_stem(&slots[0].time), "toker-ping-0900");
+        assert_eq!(ping_unit_stem(&slots[1].time), "toker-ping-2355");
     }
 
     #[tokio::test]
@@ -4848,7 +4598,7 @@ default_backend_anthropic = "codex_sub"
         let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
 
         let slots = default_slots();
-        assert_eq!(slots, ["07:20", "12:20"]);
+        assert_eq!(slots, [slot("07:20 Mon..Fri"), slot("12:20 Mon..Fri")]);
         assert_eq!(report.timer_slots, slots);
         assert!(report.timers_ok);
         assert!(report.timers_manual.is_empty());
@@ -4894,8 +4644,8 @@ default_backend_anthropic = "codex_sub"
         let out = rig.out();
         assert!(
             out.contains(
-                "timers    : slots 07:20, 12:20 — hold+ping user timers enabled, wake timer \
-                 staged; pings run once the ping schedule is turned on"
+                "timers    : slots 07:20 Mon..Fri, 12:20 Mon..Fri — hold+ping user timers \
+                 enabled, wake timer staged; pings run once the ping schedule is turned on"
             ),
             "{out}"
         );
@@ -4912,24 +4662,24 @@ default_backend_anthropic = "codex_sub"
             with_timers_and_picker(vec![inactive(), ok_empty(), ok_empty()]),
         )
         .with_keys(FRESH_KEYS);
-        seed_units(
-            &rig,
-            &[
-                HOLD_TIMER_UNIT,
-                HOLD_SERVICE_UNIT,
-                "toker-ping-0730.timer",
-                "toker-ping-0730.service",
-                "toker-ping-1300.timer",
-                "toker-ping-1300.service",
-            ],
+        // An earlier install's hold timer, which is the schedule's record:
+        // its slots and their days come back as they were.
+        let installed = [slot("07:30 Mon..Fri"), slot("13:00 Sat,Sun")];
+        let units_dir = rig.paths().units_dir;
+        std::fs::create_dir_all(&units_dir).expect("create the scratch units dir");
+        let (hold_timer, _) = hold_user_units(
+            &installed,
+            Path::new("/opt/toker/toker"),
+            &rig.paths().state_dir,
         );
+        std::fs::write(units_dir.join(HOLD_TIMER_UNIT), hold_timer).expect("seed the hold timer");
         seed_claude(&rig.root);
         seed_opencode(&rig.root);
         seed_rc(&rig.root);
 
         let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
 
-        let slots = ["07:30".to_owned(), "13:00".to_owned()];
+        let slots = installed;
         assert_eq!(report.timer_slots, slots);
         let calls = rig.runner.calls();
         assert_eq!(calls[3..calls.len() - 3], timer_calls(&slots));
@@ -5080,15 +4830,6 @@ default_backend_anthropic = "codex_sub"
         );
     }
 
-    /// Seed the scratch units dir with what an earlier run left there.
-    fn seed_units(rig: &Rig, names: &[&str]) {
-        let dir = rig.paths().units_dir;
-        std::fs::create_dir_all(&dir).expect("create the scratch units dir");
-        for name in names {
-            std::fs::write(dir.join(name), "[Unit]\n").expect("seed a unit");
-        }
-    }
-
     fn strings(calls: Vec<Vec<&str>>) -> Vec<Vec<String>> {
         calls
             .into_iter()
@@ -5106,13 +4847,17 @@ default_backend_anthropic = "codex_sub"
         ])
     }
 
-    /// The default slots, parsed.
-    fn default_slots() -> Vec<String> {
-        timers::parse_slot_list(DEFAULT_SLOTS).expect("the default slots parse")
+    /// The default slots.
+    fn default_slots() -> Vec<ScheduledSlot> {
+        schedule::default_schedule()
+    }
+
+    fn slot(text: &str) -> ScheduledSlot {
+        ScheduledSlot::parse(text).expect(text)
     }
 
     /// The timers step's user-manager calls at `slots`.
-    fn timer_calls(slots: &[String]) -> Vec<Vec<String>> {
+    fn timer_calls(slots: &[ScheduledSlot]) -> Vec<Vec<String>> {
         let mut calls = strings(vec![
             vec!["daemon-reload"],
             vec!["enable", "--now", HOLD_TIMER_UNIT],
@@ -5122,7 +4867,7 @@ default_backend_anthropic = "codex_sub"
                 strings(vec![vec![
                     "enable",
                     "--now",
-                    &format!("{}.timer", ping_unit_stem(slot)),
+                    &format!("{}.timer", ping_unit_stem(&slot.time)),
                 ]])
                 .remove(0),
             );
@@ -5133,7 +4878,7 @@ default_backend_anthropic = "codex_sub"
     /// The timers step's units at `slots`, as the rig's paths generate
     /// them: the hold pair, a ping pair per slot, then the staged wake
     /// pair.
-    fn timers_installed(rig: &Rig, exe: &Path, slots: &[String]) -> Vec<(String, String)> {
+    fn timers_installed(rig: &Rig, exe: &Path, slots: &[ScheduledSlot]) -> Vec<(String, String)> {
         let state_dir = rig.paths().state_dir;
         let (hold_timer, hold_service) = hold_user_units(slots, exe, &state_dir);
         let mut units = vec![
