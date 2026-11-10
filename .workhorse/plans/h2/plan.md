@@ -18,6 +18,9 @@ Several keys per provider is left for a card of its own.
 
 - [x] Setup asks only the port and the schedule slots. On a store with no provider, it enables codex_sub where the codex login is present and each provider whose keyring entry exists, checking presence without reading the value; it never prompts for a credential (USETUP#writing). The key prompt, its retry loop and the keyring re-ask go with it.
 - [x] Setup reaches the system manager with plain `systemctl`, so polkit authorises, and never runs `sudo`.
+- [x] Setup completes whether or not it found a provider.
+- [x] The unit always lets the service write the codex login directory, existing or not, so codex can be turned on later without setup.
+- [x] Enabling a provider gives each protocol it serves a default route where it has none (DCONF).
 
 ## Routing form
 
