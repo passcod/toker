@@ -270,6 +270,26 @@ pub fn parse_lane_temperature(value: &str) -> Option<Option<CacheTemperature>> {
 mod tests {
     use super::*;
 
+    /// The one spelling of a protocol: the control surface, the derived
+    /// facts, the revision diffs and the store's publication keys all read
+    /// it from here, and the store's rows hold it, so it round-trips.
+    #[test]
+    fn every_protocol_has_one_name_that_parses_back() {
+        for protocol in [
+            FrontendProtocol::AnthropicMessages,
+            FrontendProtocol::OpenaiChat,
+            FrontendProtocol::OpenaiResponses,
+        ] {
+            // Exhaustive, so a protocol added without a name fails here.
+            match protocol {
+                FrontendProtocol::AnthropicMessages
+                | FrontendProtocol::OpenaiChat
+                | FrontendProtocol::OpenaiResponses => {}
+            }
+            assert_eq!(parse_protocol(protocol_name(protocol)), Some(protocol));
+        }
+    }
+
     fn pinned() -> LaneFacts {
         LaneFacts {
             temperature: CacheTemperature::Warm,

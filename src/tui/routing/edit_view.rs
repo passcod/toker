@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthStr;
 use super::data::{array, text};
 use super::editing::{Editing, What};
 use super::form::{FormLine, Note};
+use super::words::record_noun;
 use crate::tui::chrome;
 use crate::tui::table::{BodyLine, Cells, span, wrap};
 use crate::tui::tone::{Tone, dim, toned};
@@ -32,8 +33,8 @@ fn heading(editing: &Editing) -> String {
             }
         }
         What::Remove { kind, record } => match record.get("id").and_then(Value::as_str) {
-            Some(id) => format!("remove {} {id}", noun(kind)),
-            None => format!("remove the {}", noun(kind)),
+            Some(id) => format!("remove {} {id}", record_noun(kind)),
+            None => format!("remove the {}", record_noun(kind)),
         },
         What::AddCandidate { route_id, .. } => format!("add a fallback to {route_id}"),
         What::EditCandidate { route, index } => {
@@ -45,18 +46,6 @@ fn heading(editing: &Editing) -> String {
         } => format!("remove {candidate_id} from {route_id}"),
         What::MoveCandidate { route_id, .. } => format!("move a candidate of {route_id}"),
         What::MoveRule { scope_label, .. } => format!("move a rewrite of {scope_label}"),
-    }
-}
-
-fn noun(kind: &str) -> &str {
-    match kind {
-        "rewrites" => "rewrite",
-        "routes" => "route",
-        "presentations" => "presentation",
-        "defaults" => "default",
-        "classifiers" => "classifier",
-        "upgrades" => "upgrade",
-        other => other,
     }
 }
 

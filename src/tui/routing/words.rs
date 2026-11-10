@@ -271,6 +271,22 @@ pub(in crate::tui) fn matcher_kind(matcher: &Value) -> &str {
 }
 
 /// A lane transition in words.
+/// What one record of a collection is called. The collections are the
+/// document's own names, in the plural; this is the singular the page writes
+/// in a title, a refusal or an error.
+pub(in crate::tui) fn record_noun(collection: &str) -> &'static str {
+    match collection {
+        "presentations" => "presentation",
+        "routes" => "route",
+        "defaults" => "default",
+        "rewrites" => "rewrite",
+        "classifiers" => "classifier",
+        "upgrades" => "upgrade",
+        "compaction" => "compaction policy",
+        _ => "record",
+    }
+}
+
 pub(in crate::tui) fn lane_words(code: &str) -> &'static str {
     match code {
         "preserve_pinned" => "stays pinned",
@@ -390,4 +406,30 @@ pub(in crate::tui) fn when(ms: i64) -> String {
     #[cfg(not(test))]
     let zone = jiff::tz::TimeZone::system();
     at.to_zoned(zone).strftime("%a %d %b %H:%M").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::record_noun;
+
+    /// One noun table for the page: the title of a removal, the refusal that
+    /// names another record, and the error when a new one has nowhere to
+    /// send all read from it, so they cannot call the same thing two things.
+    #[test]
+    fn every_collection_the_page_edits_has_a_noun() {
+        for collection in [
+            "presentations",
+            "routes",
+            "defaults",
+            "rewrites",
+            "classifiers",
+            "upgrades",
+            "compaction",
+        ] {
+            let noun = record_noun(collection);
+            assert_ne!(noun, "record", "{collection}");
+            assert!(!noun.ends_with('s'), "{collection}: {noun}");
+        }
+        assert_eq!(record_noun("whatever"), "record");
+    }
 }

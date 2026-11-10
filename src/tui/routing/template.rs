@@ -28,20 +28,6 @@ pub(super) fn kind_for(tab: Tab, focus: Panel) -> Option<&'static str> {
     }
 }
 
-/// What a kind of record is called, one of them.
-pub(super) fn singular(kind: &str) -> &'static str {
-    match kind {
-        "presentations" => "presentation",
-        "routes" => "route",
-        "defaults" => "default",
-        "rewrites" => "rewrite",
-        "classifiers" => "classifier (family)",
-        "upgrades" => "upgrade",
-        "compaction" => "compaction policy",
-        _ => "record",
-    }
-}
-
 /// The template for a new record of `kind`. A new default points at
 /// `route_id`, which is the first route of the live policy when it has one.
 pub(super) fn template(kind: &str, route_id: Option<&str>) -> Value {

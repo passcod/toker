@@ -10,6 +10,7 @@
 use serde_json::{Value, json};
 
 use super::form::{Finding, Form, Severity, default_edge};
+use super::words::record_noun;
 
 /// What is being edited, and so what its operations are.
 #[derive(Debug, Clone)]
@@ -427,19 +428,6 @@ pub(super) fn remove_edit(key: &str, value: &Value) -> Value {
         "classifiers" => json!({ "kind": "remove_classifier", "id": id }),
         "upgrades" => json!({ "kind": "remove_upgrade", "id": id }),
         _ => Value::Null,
-    }
-}
-
-/// What a collection's records are called one at a time.
-fn record_noun(collection: &str) -> &str {
-    match collection {
-        "rewrites" => "rewrite",
-        "routes" => "route",
-        "presentations" => "presentation",
-        "defaults" => "default",
-        "classifiers" => "classifier",
-        "upgrades" => "upgrade",
-        other => other,
     }
 }
 

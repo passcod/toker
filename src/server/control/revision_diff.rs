@@ -12,10 +12,11 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::Value;
 
+use super::derived::scope_label;
 use crate::policy::shadow::Shape;
 use crate::policy::{
-    ArgumentBinding, Candidate, FrontendScope, PolicyDocument, REQUESTED_MODEL_PARAMETER,
-    RewriteRule, Route, RouteReference,
+    ArgumentBinding, Candidate, PolicyDocument, REQUESTED_MODEL_PARAMETER, RewriteRule, Route,
+    RouteReference,
 };
 
 /// One record's change between two revisions.
@@ -48,19 +49,6 @@ fn change(
         id,
         summary,
         text,
-    }
-}
-
-fn scope_label(scope: &FrontendScope) -> String {
-    match scope {
-        FrontendScope::Profile { profile, protocol } => {
-            format!(
-                "{}/{}",
-                profile.as_str(),
-                super::routing::protocol_name(*protocol)
-            )
-        }
-        FrontendScope::Protocol { protocol } => super::routing::protocol_name(*protocol).to_owned(),
     }
 }
 

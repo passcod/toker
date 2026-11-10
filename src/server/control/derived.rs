@@ -269,7 +269,7 @@ pub(super) fn scope_fields(scope: &FrontendScope) -> Value {
     json!({
         "scope": scope,
         "scope_label": scope_label(scope),
-        "protocol": super::routing::protocol_name(protocol_of(scope)),
+        "protocol": crate::policy::facts::protocol_name(protocol_of(scope)),
         "profile": match scope {
             FrontendScope::Profile { profile, .. } => Some(profile.as_str()),
             FrontendScope::Protocol { .. } => None,
@@ -515,16 +515,21 @@ fn protocol_of(scope: &FrontendScope) -> FrontendProtocol {
     }
 }
 
-fn scope_label(scope: &FrontendScope) -> String {
+/// A frontend scope as every surface writes it: `profile/protocol`, or the
+/// protocol alone. The one spelling, so a revision's diff and the page's
+/// tables cannot name the same scope differently.
+pub(super) fn scope_label(scope: &FrontendScope) -> String {
     match scope {
         FrontendScope::Profile { profile, protocol } => {
             format!(
                 "{}/{}",
                 profile.as_str(),
-                super::routing::protocol_name(*protocol)
+                crate::policy::facts::protocol_name(*protocol)
             )
         }
-        FrontendScope::Protocol { protocol } => super::routing::protocol_name(*protocol).to_owned(),
+        FrontendScope::Protocol { protocol } => {
+            crate::policy::facts::protocol_name(*protocol).to_owned()
+        }
     }
 }
 

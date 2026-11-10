@@ -1368,48 +1368,37 @@ pub fn scope_rank(scope: ActivationScope) -> u8 {
     }
 }
 
-fn frontend_protocol_name(protocol: crate::policy::FrontendProtocol) -> &'static str {
-    match protocol {
-        crate::policy::FrontendProtocol::AnthropicMessages => "anthropic_messages",
-        crate::policy::FrontendProtocol::OpenaiChat => "openai_chat",
-        crate::policy::FrontendProtocol::OpenaiResponses => "openai_responses",
-    }
-}
-
+/// The stored key for a publication's scope. The protocol names are
+/// `policy::facts`' own, which rows already hold, so they are a stored
+/// encoding and not only a wire spelling.
 fn encode_publication_scope(scope: &crate::policy::FrontendScope) -> String {
     match scope {
         crate::policy::FrontendScope::Profile { profile, protocol } => {
             format!(
                 "profile:{}:{}",
                 profile.as_str(),
-                frontend_protocol_name(*protocol)
+                crate::policy::facts::protocol_name(*protocol)
             )
         }
         crate::policy::FrontendScope::Protocol { protocol } => {
-            format!("protocol:{}", frontend_protocol_name(*protocol))
+            format!(
+                "protocol:{}",
+                crate::policy::facts::protocol_name(*protocol)
+            )
         }
-    }
-}
-
-fn parse_frontend_protocol(value: &str) -> Option<crate::policy::FrontendProtocol> {
-    match value {
-        "anthropic_messages" => Some(crate::policy::FrontendProtocol::AnthropicMessages),
-        "openai_chat" => Some(crate::policy::FrontendProtocol::OpenaiChat),
-        "openai_responses" => Some(crate::policy::FrontendProtocol::OpenaiResponses),
-        _ => None,
     }
 }
 
 fn decode_publication_scope(value: &str) -> Result<crate::policy::FrontendScope> {
     if let Some(protocol) = value.strip_prefix("protocol:")
-        && let Some(protocol) = parse_frontend_protocol(protocol)
+        && let Some(protocol) = crate::policy::facts::parse_protocol(protocol)
     {
         return Ok(crate::policy::FrontendScope::Protocol { protocol });
     }
     if let Some(rest) = value.strip_prefix("profile:") {
         let mut parts = rest.split(':');
         if let (Some(profile), Some(protocol), None) = (parts.next(), parts.next(), parts.next())
-            && let Some(protocol) = parse_frontend_protocol(protocol)
+            && let Some(protocol) = crate::policy::facts::parse_protocol(protocol)
             && let Ok(profile) = crate::policy::ProfileId::new(profile.to_owned())
         {
             return Ok(crate::policy::FrontendScope::Profile { profile, protocol });

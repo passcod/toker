@@ -1428,7 +1428,7 @@ impl State {
         if routes.is_empty() && matches!(kind, "rewrites" | "defaults" | "compaction") {
             self.error = Some(format!(
                 "a {} needs a route to send to: add one in routes first (press 4)",
-                template::singular(kind)
+                super::words::record_noun(kind)
             ));
             return;
         }

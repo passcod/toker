@@ -825,12 +825,14 @@ fn replay_change_body(change: &ReplayChange) -> Value {
 }
 
 fn recent_request_body(request: &RecentRequest) -> Value {
+    // The one classification: `replayable` is the absence of a reason, not a
+    // second walk of the same facts that could disagree with it.
     let reason = NotReplayable::of(request.facts.as_ref());
     json!({
         "id": request.id,
         "ts_ms": request.ts_ms,
         "policy_revision_id": request.policy_revision_id,
-        "replayable": request.replayable(),
+        "replayable": reason.is_none(),
         "not_replayable_reason": reason.map(NotReplayable::code),
         "kind": request.kind,
         "requested_model": request.requested_model,
@@ -980,11 +982,11 @@ fn publication_body(publication: RoutingPublication) -> Value {
         FrontendScope::Profile { profile, protocol } => json!({
             "kind": "profile",
             "profile": profile.as_str(),
-            "protocol": protocol_name(*protocol),
+            "protocol": crate::policy::facts::protocol_name(*protocol),
         }),
         FrontendScope::Protocol { protocol } => json!({
             "kind": "protocol",
-            "protocol": protocol_name(*protocol),
+            "protocol": crate::policy::facts::protocol_name(*protocol),
         }),
     };
     json!({
@@ -999,14 +1001,6 @@ fn publication_body(publication: RoutingPublication) -> Value {
         "detail_code": publication.detail_code.map(|code| code.to_string()),
         "updated_ms": publication.updated_ms,
     })
-}
-
-pub(super) fn protocol_name(protocol: FrontendProtocol) -> &'static str {
-    match protocol {
-        FrontendProtocol::AnthropicMessages => "anthropic_messages",
-        FrontendProtocol::OpenaiChat => "openai_chat",
-        FrontendProtocol::OpenaiResponses => "openai_responses",
-    }
 }
 
 fn revision_source_name(source: crate::store::PolicyRevisionSource) -> &'static str {

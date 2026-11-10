@@ -84,7 +84,7 @@ fn provider_body(ctx: &Context<'_>, rules: &Rules, provider: &str) -> Value {
     let mut by_protocol: BTreeMap<&str, usize> = BTreeMap::new();
     for rewrite in of_kind("rewrite") {
         *by_protocol
-            .entry(super::super::routing::protocol_name(super::protocol_of(
+            .entry(crate::policy::facts::protocol_name(super::protocol_of(
                 &rewrite.scope,
             )))
             .or_default() += 1;
