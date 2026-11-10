@@ -881,7 +881,7 @@ impl Server {
         let availability = availability
             .at(now, crate::catalog::fetched::CACHE_TTL_MS)
             .with_safeguards_marks(&self.safeguards_marks());
-        let lane_impacts = self.routing_lane_impacts_locked(&state, now)?;
+        let lane_impacts = self.routing_lane_impacts_locked(now)?;
         let publications = self.store.load_publications()?;
         let active_policy = compile_stored_policy(&revision, &self.registry, &inventory).ok();
         let (pinned, revision_lanes, at_risk) = self.pinned_lanes(now)?;
@@ -917,7 +917,6 @@ impl Server {
 
     fn routing_lane_impacts_locked(
         &self,
-        _state: &RoutingPolicyState,
         now: i64,
     ) -> Result<RoutingLaneImpacts, crate::store::Error> {
         let mut impacts = RoutingLaneImpacts::default();

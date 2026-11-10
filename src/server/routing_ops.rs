@@ -320,7 +320,7 @@ impl Server {
     ) -> Result<RoutingActivation, RoutingControlError> {
         // Neither operation moves a lane it could lose a warm cache on.
         let scope = ActivationScope::NewAndColdLanes;
-        let impacts = self.routing_lane_impacts_locked(&basis.state, now_ms())?;
+        let impacts = self.routing_lane_impacts_locked(now_ms())?;
         require_cache_consent(&impacts, scope, false)?;
         let policy = compile_control_policy(document, &self.registry, &basis.inventory)?;
         let activation = self
