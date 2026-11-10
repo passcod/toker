@@ -18,6 +18,24 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::{MAX_CONTROL_BODY, control_token_ok, forbidden, json_content_type, store_error};
+
+/// A refusal for a write made once the store was replaced, named as the
+/// `store` setting so the configuration page says why.
+fn refused_store_replaced(server: &Server, operation: &str) -> Option<Response> {
+    let why = super::store_replaced(server)?;
+    Some(
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({
+                "toker": operation,
+                "ok": false,
+                "setting": "store",
+                "error": why,
+            })),
+        )
+            .into_response(),
+    )
+}
 use crate::config::{Config, is_frontend_name};
 use crate::routing::{CapabilityEvidence, DialectId};
 use crate::server::Server;
@@ -310,6 +328,9 @@ fn commit<T>(
         Ok(resolved) => resolved,
         Err(error) => return refused("configuration", &format!("{error:#}")),
     };
+    if let Some(response) = refused_store_replaced(server, "config-edit") {
+        return response;
+    }
     if let Err(error) = write(&written) {
         return store_error(error);
     }
@@ -454,6 +475,9 @@ pub(crate) async fn clear_safeguards_mark(
         Ok(clear) => clear,
         Err(_) => return refused("safeguards", "the request does not parse"),
     };
+    if let Some(response) = refused_store_replaced(&server, "safeguards-mark-clear") {
+        return response;
+    }
     let cleared = server.clear_safeguards_marks([&clear.binding_id]);
     (
         StatusCode::OK,

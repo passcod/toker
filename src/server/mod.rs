@@ -135,6 +135,15 @@ const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 /// of silence is a dead stream, not a slow one.
 pub const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How often the service checks, between control writes, that its store
+/// path still names the file it opened (spec: DLIFE#keeping-to-its-store).
+/// Requests recorded after the store is replaced go into the old file and
+/// are lost with it, so this bounds that loss to about one period of
+/// traffic. The check is a single stat, so the period need not be longer;
+/// it need not be shorter either, since a person replacing the state dir
+/// does not then expect a reply within seconds.
+const STORE_CHECK_PERIOD: Duration = Duration::from_secs(30);
+
 /// A plan resolved without a lane, as a new lane's is: that is the lane its
 /// row records.
 fn new_lane_plan(mut plan: crate::policy::AttemptPlan) -> crate::policy::AttemptPlan {
@@ -484,6 +493,9 @@ pub struct Server {
     /// at once and the process exits through its normal path, which
     /// cancels what was still running (dropping it, so destructors run).
     pub(crate) force: Arc<tokio::sync::Notify>,
+    /// Set once the store path is found to name another file than the one
+    /// this instance opened, so the drain starts and is logged once.
+    store_replaced: Arc<std::sync::atomic::AtomicBool>,
     /// The console quota events' per-backend latches (see
     /// [`quota_events`]).
     pub(crate) quota_events: Arc<quota_events::QuotaEvents>,
@@ -678,6 +690,7 @@ impl Server {
             started_ms: now_ms(),
             shutdown: Arc::default(),
             force: Arc::default(),
+            store_replaced: Arc::default(),
             quota_events: Arc::default(),
             routing_control: Arc::default(),
             policy_runtime,
@@ -1831,8 +1844,9 @@ impl Server {
 
     /// Listen and serve: a socket-activated listener (`LISTEN_FDS`, via
     /// [`listenfd`]) when systemd handed us one, else a direct loopback
-    /// bind for dev and tests. Returns once a `POST /_toker/shutdown`
-    /// has drained (see [`Server::serve_listener`]), and the process then
+    /// bind for dev and tests. Returns once a `POST /_toker/shutdown`, or
+    /// finding the store replaced ([`Server::check_store_file`]), has
+    /// drained (see [`Server::serve_listener`]), and the process then
     /// exits 0; under systemd, `Restart=always` starts the next instance.
     pub async fn serve(self) -> anyhow::Result<()> {
         let mut listenfd = listenfd::ListenFd::from_env();
@@ -1846,6 +1860,7 @@ impl Server {
         let address = listener.local_addr()?;
         tracing::info!("toker listening on http://{address}");
         self.spawn_state_prune();
+        self.spawn_store_watch();
         self.spawn_awake_timer();
         self.spawn_catalog_refresh();
         // A restart inside a live session takes the lock straight back.
@@ -1913,6 +1928,39 @@ impl Server {
         if force {
             self.force.notify_one();
         }
+    }
+
+    /// What replaced the store, once its path no longer names the file this
+    /// instance opened (spec: DLIFE#keeping-to-its-store). From then on every
+    /// write lands in a file nothing will open again, so the first time this
+    /// finds it the instance starts its drain and exits, for the supervisor
+    /// to start one on the file that is there.
+    pub(crate) fn check_store_file(&self) -> Option<crate::store::Replaced> {
+        let replaced = self.store.replaced()?;
+        if !self.store_replaced.swap(true, Ordering::SeqCst) {
+            tracing::error!(
+                db = %self.config().db_path.display(),
+                "the store {replaced}: it is no longer the file this instance opened, \
+                 so writes would be lost; stopping for the next instance to open the store there now"
+            );
+            self.begin_shutdown(false);
+        }
+        Some(replaced)
+    }
+
+    /// Check the store path on [`STORE_CHECK_PERIOD`] until it is found
+    /// replaced, which starts the drain.
+    fn spawn_store_watch(&self) {
+        let server = self.clone();
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(STORE_CHECK_PERIOD);
+            loop {
+                timer.tick().await;
+                if server.check_store_file().is_some() {
+                    break;
+                }
+            }
+        });
     }
 
     /// This instance's id, as `/_toker/status` reports it.

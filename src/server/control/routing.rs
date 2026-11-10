@@ -136,6 +136,9 @@ pub(crate) async fn save(State(server): State<Server>, request: Request) -> Resp
     if request.edit.operations.is_empty() || !description_fits(request.description.as_deref()) {
         return invalid_request("routing-save");
     }
+    if let Some(response) = refused_store_replaced(&server, "routing-save") {
+        return response;
+    }
     match server.save_routing_edit(
         request.expected_revision_id,
         &request.edit,
@@ -167,6 +170,9 @@ pub(crate) async fn widen(State(server): State<Server>, request: Request) -> Res
         Ok(request) => request,
         Err(response) => return *response,
     };
+    if let Some(response) = refused_store_replaced(&server, "routing-widen") {
+        return response;
+    }
     match server.widen_routing_activation(
         request.expected_revision_id,
         request.scope,
@@ -440,6 +446,9 @@ pub(crate) async fn reactivate(State(server): State<Server>, request: Request) -
     if !description_fits(request.description.as_deref()) {
         return invalid_request("routing-reactivate");
     }
+    if let Some(response) = refused_store_replaced(&server, "routing-reactivate") {
+        return response;
+    }
     match server.reactivate_routing_policy(
         request.expected_revision_id,
         request.revision_id,
@@ -544,6 +553,9 @@ pub(crate) async fn promote(State(server): State<Server>, request: Request) -> R
         Ok(request) => request,
         Err(response) => return *response,
     };
+    if let Some(response) = refused_store_replaced(&server, "routing-promote") {
+        return response;
+    }
     match server.promote_routing_learning(&request.binding_id, &request.model_id) {
         Ok(Some(learning)) => (
             StatusCode::OK,
@@ -631,6 +643,9 @@ pub(crate) async fn publication(State(server): State<Server>, request: Request) 
             );
         }
     };
+    if let Some(response) = refused_store_replaced(&server, "routing-publication") {
+        return response;
+    }
     match server.record_routing_publication(
         &key,
         request.expected_revision_id,
@@ -1032,6 +1047,17 @@ fn routing_internal_error(error: impl std::fmt::Display) -> Response {
         "routing_control_failure",
         None,
     )
+}
+
+/// A refusal for a write made once the store was replaced.
+fn refused_store_replaced(server: &Server, operation: &str) -> Option<Response> {
+    let detail = super::store_replaced(server)?;
+    Some(routing_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        operation,
+        "store_replaced",
+        Some(json!({ "detail": detail })),
+    ))
 }
 
 fn routing_error(

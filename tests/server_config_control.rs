@@ -684,3 +684,50 @@ async fn a_stranded_cold_minimum_is_said_on_the_snapshot_without_refusing_anythi
     assert_eq!(snapshot["largest_context_window"], Value::Null);
     assert_eq!(snapshot["cold_min_unreachable"], false);
 }
+
+#[tokio::test]
+async fn an_edit_made_once_the_store_was_replaced_is_refused_and_not_applied() {
+    // spec: DLIFE#keeping-to-its-store
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("toker.db");
+    let config = Config {
+        db_path: db.clone(),
+        ..config()
+    };
+    let store = Arc::new(Store::open(&db).unwrap());
+    let server = Server::with_seams(config, store.clone(), toker::server::Seams::isolated())
+        .expect("server");
+    let app = server.router();
+
+    let other = dir.path().join("other.db");
+    drop(Store::open(&other).unwrap());
+    std::fs::rename(&other, &db).expect("rename over");
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            "PUT",
+            "/_toker/config/provider",
+            Some("config-edit"),
+            Some(json!({ "provider": "openrouter", "enabled": true })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let reply = body(response).await;
+    assert_eq!(reply["setting"], "store");
+    assert!(
+        reply["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("store was replaced")),
+        "{reply}"
+    );
+    assert!(
+        store.load_configuration().unwrap().providers.is_empty(),
+        "nothing was written to the store the service opened"
+    );
+    assert!(
+        server.config().openrouter.is_none(),
+        "nor to the live state"
+    );
+}

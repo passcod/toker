@@ -435,6 +435,19 @@ fn forbidden() -> Response {
         .into_response()
 }
 
+/// Why a control write is refused once the store path no longer names the
+/// file this instance opened, or `None` while it still does
+/// (spec: DLIFE#keeping-to-its-store). Checked before each write a control
+/// operation makes; finding it replaced also starts the drain.
+fn store_replaced(server: &Server) -> Option<String> {
+    let replaced = server.check_store_file()?;
+    Some(format!(
+        "the store was replaced ({} {replaced}), so this change was not applied; \
+         the service is restarting onto the store there now",
+        server.config().db_path.display()
+    ))
+}
+
 fn store_error(error: crate::store::Error) -> Response {
     tracing::error!(%error, "control endpoint store read failed");
     (StatusCode::INTERNAL_SERVER_ERROR, "ledger read failed\n").into_response()

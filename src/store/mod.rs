@@ -120,6 +120,64 @@ pub fn default_db_path() -> Result<PathBuf> {
 /// connection (see the module docs for the concurrency choice).
 pub struct Store {
     conn: Mutex<Connection>,
+    /// The file [`Store::open`] opened, where it opened one.
+    file: Option<OpenedFile>,
+}
+
+/// A path and the file it named when the store was opened there.
+struct OpenedFile {
+    path: PathBuf,
+    id: FileId,
+}
+
+/// A file by device and inode: what a path names, which changes when the
+/// file is deleted or another is renamed over it, while a connection
+/// already open goes on reading and writing the one it opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    dev: u64,
+    ino: u64,
+}
+
+impl FileId {
+    fn of(path: &Path) -> std::io::Result<FileId> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(path)?;
+        Ok(FileId {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+}
+
+/// How a store path no longer names the file the store opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replaced {
+    /// Nothing is at the path.
+    Missing,
+    /// Another file is at the path.
+    OtherFile,
+}
+
+impl std::fmt::Display for Replaced {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Replaced::Missing => "is gone",
+            Replaced::OtherFile => "is now another file",
+        })
+    }
+}
+
+/// What a path names now against the file it named at open. A path that
+/// cannot be looked up for any reason but its absence says nothing about
+/// which file is there, so it is not taken for a replacement.
+fn compare_file(opened: FileId, now: std::io::Result<FileId>) -> Option<Replaced> {
+    match now {
+        Ok(now) if now == opened => None,
+        Ok(_) => Some(Replaced::OtherFile),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(Replaced::Missing),
+        Err(_) => None,
+    }
 }
 
 impl Store {
@@ -143,6 +201,17 @@ impl Store {
             close_state_dir(parent)?;
         }
         let mut conn = Connection::open(path)?;
+        // Taken straight after the open, so it names the file the connection
+        // holds (spec: DLIFE#keeping-to-its-store). An in-memory database has
+        // no file to lose.
+        let file = if path == Path::new(":memory:") {
+            None
+        } else {
+            Some(OpenedFile {
+                path: path.to_owned(),
+                id: FileId::of(path)?,
+            })
+        };
         conn.pragma_update(None, "foreign_keys", true)?;
         // Returns the effective mode ("wal", or "memory" on :memory:).
         conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
@@ -152,6 +221,7 @@ impl Store {
         schema::migrate(&mut conn)?;
         let store = Store {
             conn: Mutex::new(conn),
+            file,
         };
         if store.get_meta("created_at")?.is_none() {
             // Zero only if the system clock is before the epoch; good enough
@@ -210,7 +280,17 @@ impl Store {
         }
         Ok(Store {
             conn: Mutex::new(conn),
+            file: None,
         })
+    }
+
+    /// Whether the path this store was opened at names another file now, or
+    /// none (spec: DLIFE#keeping-to-its-store). Every write after that goes
+    /// into a file nothing will open again. Only a store [`Store::open`]
+    /// opened on a file is checked; any other reads as never replaced.
+    pub fn replaced(&self) -> Option<Replaced> {
+        let file = self.file.as_ref()?;
+        compare_file(file.id, FileId::of(&file.path))
     }
 
     /// The mutexed connection; every operation goes through this, so
@@ -1104,6 +1184,7 @@ mod tests {
         SessionCostGroup, SessionLineage, Store, StoredCandidateState, StoredRoutingTrace,
         StoredRoutingTraceEvent, StoredSkipReason, WidenResult, is_api_measurement,
     };
+    use super::{FileId, Replaced, compare_file};
     use crate::ir::Release;
     use crate::policy::{
         ActivationScope, BindingId, CURRENT_FORMAT_VERSION, CandidateEvidence, CandidateId,
@@ -4679,6 +4760,81 @@ mod tests {
         store.record_request(&row).expect("record");
         let newest = store.requests_since(4_000, 10).expect("rows");
         assert_eq!(newest[0].started_ms, Some(3_500));
+    }
+
+    #[test]
+    fn a_store_still_at_its_path_is_not_replaced() {
+        let dir = test_dir("file-same");
+        let db = dir.join("toker.db");
+        let store = Store::open(&db).expect("open");
+        store.set_meta("probe", "written").expect("write");
+        assert_eq!(store.replaced(), None);
+        // Reopening the same file is not a replacement either.
+        drop(Store::open(&db).expect("reopen"));
+        assert_eq!(store.replaced(), None);
+    }
+
+    #[test]
+    fn a_store_whose_file_is_renamed_over_is_replaced() {
+        let dir = test_dir("file-other");
+        let db = dir.join("toker.db");
+        let store = Store::open(&db).expect("open");
+        let other = dir.join("other.db");
+        drop(Store::open(&other).expect("open another"));
+        std::fs::rename(&other, &db).expect("rename over");
+        assert_eq!(store.replaced(), Some(Replaced::OtherFile));
+    }
+
+    #[test]
+    fn a_store_whose_directory_is_gone_is_replaced() {
+        let dir = test_dir("file-missing");
+        let db = dir.join("state").join("toker.db");
+        let store = Store::open(&db).expect("open");
+        std::fs::remove_dir_all(dir.join("state")).expect("remove the state dir");
+        assert_eq!(store.replaced(), Some(Replaced::Missing));
+        // The service's successor creates a new store there, and the one
+        // still open does not take it for its own.
+        drop(Store::open(&db).expect("create anew"));
+        assert_eq!(store.replaced(), Some(Replaced::OtherFile));
+    }
+
+    #[test]
+    fn a_store_without_a_file_of_its_own_is_never_replaced() {
+        assert_eq!(mem_store().replaced(), None);
+        let dir = test_dir("file-read-only");
+        let db = dir.join("toker.db");
+        drop(Store::open(&db).expect("create"));
+        let reader = Store::open_read_only(&db).expect("open read-only");
+        std::fs::remove_file(&db).expect("remove");
+        assert_eq!(reader.replaced(), None);
+    }
+
+    #[test]
+    fn a_path_that_cannot_be_looked_up_is_not_a_replacement() {
+        let opened = FileId { dev: 1, ino: 2 };
+        assert_eq!(compare_file(opened, Ok(opened)), None);
+        assert_eq!(
+            compare_file(opened, Ok(FileId { dev: 1, ino: 3 })),
+            Some(Replaced::OtherFile)
+        );
+        assert_eq!(
+            compare_file(opened, Ok(FileId { dev: 4, ino: 2 })),
+            Some(Replaced::OtherFile)
+        );
+        assert_eq!(
+            compare_file(
+                opened,
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            ),
+            Some(Replaced::Missing)
+        );
+        assert_eq!(
+            compare_file(
+                opened,
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            ),
+            None
+        );
     }
 
     #[test]
