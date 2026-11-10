@@ -6100,6 +6100,57 @@ mod tests {
         );
     }
 
+    /// A row from before the facts still names the presentation or rewrite
+    /// that matched, and a stored identifier that does not parse degrades
+    /// its own count rather than failing the whole read.
+    #[test]
+    fn hit_counts_take_the_older_rows_record_and_survive_one_that_does_not_parse() {
+        use crate::policy::RewriteId;
+        let store = mem_store();
+        let revision_id = revision(&store, "hits", None);
+        let now = 10 * 24 * 60 * 60 * 1000;
+        let rewrite = RewriteId::new("sonnet").unwrap();
+
+        // Before the facts were recorded: the rewrite it caught is counted,
+        // and the window still reads as a floor.
+        store
+            .record_request(&routed_row(
+                revision_id,
+                now - 1_000,
+                1,
+                RequestLookupProvenance::ProtocolRewrite(rewrite.clone()),
+                None,
+            ))
+            .unwrap();
+        store
+            .record_request(&routed_row(
+                revision_id,
+                now - 2_000,
+                2,
+                RequestLookupProvenance::ProtocolRewrite(rewrite.clone()),
+                Some(facts()),
+            ))
+            .unwrap();
+        let counts = store.routing_hit_counts(now).unwrap();
+        assert_eq!(counts.coverage, super::HitCoverage::Floor);
+        assert_eq!(counts.unrecorded_requests, 1);
+        assert_eq!(counts.rewrites.get(&rewrite), Some(&2));
+
+        // One row whose stored identifier does not parse is counted as
+        // unrouted; the rest of the page still answers.
+        store
+            .conn()
+            .unwrap()
+            .execute(
+                "UPDATE requests SET rewrite_id = 'not a valid id' WHERE ts_ms = ?1",
+                [now - 2_000],
+            )
+            .unwrap();
+        let counts = store.routing_hit_counts(now).unwrap();
+        assert_eq!(counts.rewrites.get(&rewrite), Some(&1));
+        assert_eq!(counts.unrouted, 1);
+    }
+
     #[test]
     fn hit_counts_are_exact_a_floor_or_not_recorded_by_what_the_window_holds() {
         use crate::policy::{FrontendScope, RewriteId};

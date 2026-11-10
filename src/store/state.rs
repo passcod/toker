@@ -2355,8 +2355,14 @@ pub struct HitCounts {
 }
 
 /// Count the 24 hours ending at `until_ms`. One indexed range scan of
-/// `requests` on `ts_ms`; the three rule kinds are counted from the rows
-/// that carry the facts marker only, never inferred for older rows.
+/// `requests` on `ts_ms`.
+///
+/// A row from before the facts were recorded carries its presentation or
+/// rewrite all the same, so those two counts take it; only what the lookup
+/// columns say, the default that matched and the scope it matched in, is
+/// never inferred for such a row. A row whose stored identifier does not
+/// parse is counted as unrouted rather than taking the whole page down with
+/// it, as a row whose kind does not parse already was.
 pub(super) fn hit_counts(conn: &Connection, until_ms: i64) -> Result<HitCounts> {
     let since_ms = until_ms - ROUTING_WINDOW_MS;
     let rows = rows_of(
@@ -2398,6 +2404,16 @@ pub(super) fn hit_counts(conn: &Connection, until_ms: i64) -> Result<HitCounts> 
     for (marker, kind, scope, presentation, rewrite, profile, protocol, hits) in rows {
         if marker.is_none() {
             counts.unrecorded_requests += hits;
+            // The row still names the presentation or rewrite that matched,
+            // so those counts take it; it says nothing about a default.
+            match (
+                presentation.and_then(|id| id.parse::<PresentationId>().ok()),
+                rewrite.and_then(|id| id.parse::<RewriteId>().ok()),
+            ) {
+                (Some(id), _) => *counts.presentations.entry(id).or_default() += hits,
+                (None, Some(id)) => *counts.rewrites.entry(id).or_default() += hits,
+                (None, None) => {}
+            }
             continue;
         }
         counts.recorded_requests += hits;
@@ -2411,13 +2427,16 @@ pub(super) fn hit_counts(conn: &Connection, until_ms: i64) -> Result<HitCounts> 
         match kind {
             super::ledger::LookupKind::Compaction => counts.compactions += hits,
             super::ledger::LookupKind::Presentation => {
-                let id: PresentationId =
-                    parse_id("requests.presentation_id", presentation.unwrap_or_default())?;
-                *counts.presentations.entry(id).or_default() += hits;
+                match presentation.and_then(|id| id.parse::<PresentationId>().ok()) {
+                    Some(id) => *counts.presentations.entry(id).or_default() += hits,
+                    None => counts.unrouted += hits,
+                }
             }
             super::ledger::LookupKind::Rewrite => {
-                let id: RewriteId = parse_id("requests.rewrite_id", rewrite.unwrap_or_default())?;
-                *counts.rewrites.entry(id).or_default() += hits;
+                match rewrite.and_then(|id| id.parse::<RewriteId>().ok()) {
+                    Some(id) => *counts.rewrites.entry(id).or_default() += hits,
+                    None => counts.unrouted += hits,
+                }
             }
             super::ledger::LookupKind::Default => {
                 let protocol = parse_required(
