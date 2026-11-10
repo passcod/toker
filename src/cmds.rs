@@ -1111,7 +1111,8 @@ pub async fn restart_run(
 
 /// `wake-arm`: a documented no-op — on Linux, wake is owned by the
 /// systemd system timer (`WakeSystem=true`), which `toker setup`
-/// installs and enables. The predecessor's one-shot `pmset schedule
+/// writes and the dashboard places in the system manager when the ping
+/// schedule is turned on. The predecessor's one-shot `pmset schedule
 /// wake` was macOS-only and has no counterpart here; the wizard never
 /// installs anything for this verb.
 pub fn wake_arm() -> anyhow::Result<()> {

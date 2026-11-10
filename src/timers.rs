@@ -8,8 +8,9 @@
 //!   rtcwake's job, not this one's). Root-level because the user
 //!   manager lacks `CAP_WAKE_ALARM`; it is the only root-level piece
 //!   toker has ([`crate::setup::wizard::wake_system_unit`] generates
-//!   it and the `/bin/true` service it starts, the wizard enables them
-//!   through the system manager).
+//!   it and the `/bin/true` service it starts; setup only writes them,
+//!   and the dashboard places them in the system manager, which needs
+//!   elevation, when the ping schedule is turned on).
 //! - **hold** — USER timers at the same slots running `toker hold
 //!   --for=15m`: a timer that elapses while the machine is suspended
 //!   fires on resume, and the hold then keeps the machine up those 15
@@ -105,9 +106,10 @@ pub const HOLD_WHY: &str = "wake hold timer";
 /// wake is owned by the system timer, and the wizard never installs
 /// anything for the verb itself.
 pub const WAKE_ARM_NOTE: &str = "nothing to arm: wake is owned by the systemd \
-     system timer toker-wake.timer (WakeSystem=true), installed and enabled by \
-     `toker setup`. This verb was the predecessor's macOS one-shot \
-     (pmset schedule wake); on Linux the timer replaces it.";
+     system timer toker-wake.timer (WakeSystem=true), written by `toker setup` \
+     and placed in the system manager when the ping schedule is turned on. \
+     This verb was the predecessor's macOS one-shot (pmset schedule wake); \
+     on Linux the timer replaces it.";
 
 /// How many times the readback checks the ledger for the ping row: the
 /// row lands when the response completes server-side, which can be a
@@ -232,10 +234,10 @@ pub fn parse_hold_minutes(text: &str) -> Option<f64> {
     minutes.is_finite().then_some(minutes).filter(|m| *m > 0.0)
 }
 
-/// Parse a free-form slot list for the wizard: tokens separated by
-/// commas and/or whitespace, each a strict `hh:mm`; duplicates collapse
-/// (first wins, input order kept); an empty answer is no slots.
-/// `Err` carries the first offending token, for the re-ask.
+/// Parse a free-form slot list: tokens separated by commas and/or
+/// whitespace, each a strict `hh:mm`; duplicates collapse (first wins,
+/// input order kept); an empty answer is no slots. `Err` carries the
+/// first offending token, so the caller can name it.
 pub fn parse_slot_list(text: &str) -> std::result::Result<Vec<String>, String> {
     let mut slots: Vec<String> = Vec::new();
     for token in text.split(|c: char| c == ',' || c.is_whitespace()) {
@@ -1029,7 +1031,7 @@ mod tests {
             parse_slot_list("12:30, 09:00, 12:30").expect("dedupe"),
             vec!["12:30".to_owned(), "09:00".to_owned()]
         );
-        // Empty — however padded — is no slots (the wizard's silent skip).
+        // Empty — however padded — is no slots.
         for empty in ["", "  ", " , "] {
             assert_eq!(parse_slot_list(empty).expect("empty"), Vec::<String>::new());
         }

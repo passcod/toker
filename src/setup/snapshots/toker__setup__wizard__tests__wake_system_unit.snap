@@ -8,8 +8,8 @@ Description=toker wake timer (wakes the machine at the chosen slots)
 [Timer]
 # The only root-level piece toker installs: WakeSystem=true needs
 # CAP_WAKE_ALARM, which the user manager lacks, so this unit belongs to
-# the system manager and `toker setup` enables it. Wakes
-# from suspend only — a machine that is powered off stays off.
+# the system manager. Wakes from suspend only — a machine that is
+# powered off stays off.
 WakeSystem=true
 OnCalendar=Mon..Fri 09:00
 OnCalendar=Mon..Fri 23:55

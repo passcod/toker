@@ -46,6 +46,18 @@ opencode plugin: installed to [ROOT]/.config/opencode/plugins/toker-cost
 
 optional toggles
   awake (idle-sleep lock while sessions are live): on
+installed toker-hold.timer ([ROOT]/.config/systemd/user/toker-hold.timer)
+installed toker-hold.service ([ROOT]/.config/systemd/user/toker-hold.service)
+installed toker-ping-0720.timer ([ROOT]/.config/systemd/user/toker-ping-0720.timer)
+installed toker-ping-0720.service ([ROOT]/.config/systemd/user/toker-ping-0720.service)
+installed toker-ping-1220.timer ([ROOT]/.config/systemd/user/toker-ping-1220.timer)
+installed toker-ping-1220.service ([ROOT]/.config/systemd/user/toker-ping-1220.service)
+systemctl --user daemon-reload — ok
+systemctl --user enable --now toker-hold.timer — ok
+systemctl --user enable --now toker-ping-0720.timer — ok
+systemctl --user enable --now toker-ping-1220.timer — ok
+staged toker-wake.service ([ROOT]/.config/systemd/user/toker-wake.service)
+staged toker-wake.timer ([ROOT]/.config/systemd/user/toker-wake.timer)
   predecessor history: none to import
 installed toker-picker.timer ([ROOT]/.config/systemd/user/toker-picker.timer)
 installed toker-picker.service ([ROOT]/.config/systemd/user/toker-picker.service)
@@ -63,6 +75,6 @@ systemctl --user start toker-picker.service — ok
     patched: opencode ([ROOT]/.config/opencode/opencode.json)
     patched: shell rc ([ROOT]/.bashrc)
   ledger    : not imported
-  timers    : none
+  timers    : slots 07:20, 12:20 — hold+ping user timers enabled, wake timer staged; pings run once the ping schedule is turned on
   picker    : Claude /model rows synced; toker-picker.timer refreshes them daily
 re-run `toker setup` any time to change anything.
