@@ -29,9 +29,9 @@ Specs: GPING#the-schedule, UTUI#schedule, USETUP#installing-units.
 
 - [x] Parse days from installed units; slot list with days as the read model
 - [x] Days in unit generation, including the past-midnight shift
-- [ ] Slot rules: at least one day, unique times, the five-hour overlap refusal, no turning on with no slots
-- [ ] Schedule tab: position row, slots table with last runs, add/edit/remove slot forms, the orphan-wake flag
-- [ ] The elevated wake step via pkexec, with the TUI suspended around it
+- [x] Slot rules: at least one day, unique times, the five-hour overlap refusal, no turning on with no slots
+- [x] Schedule tab: position row, slots table with last runs, add/edit/remove slot forms, the orphan-wake flag
+- [x] The elevated wake step via pkexec, with the TUI suspended around it
 - [x] Setup: stop staging the wake; remove a `toker-wake.timer` / `toker-wake.service` an earlier setup left in the user units dir; carry installed days
 - [x] Update the `wake-arm` note and the timers module doc, which say setup writes the wake
-- [ ] Snapshots for the schedule tab at 80x24 and 120x40, and the keys overlay
+- [x] Snapshots for the schedule tab at 80x24 and 120x40, and the keys overlay

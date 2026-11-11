@@ -14,6 +14,8 @@ use reqwest::Method;
 use serde_json::{Value, json};
 
 use super::check;
+use crate::schedule::{self, ScheduledSlot};
+use crate::store::PingAction;
 use crate::tui::control::{Command, Reply, Response};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -21,6 +23,84 @@ pub(super) enum View {
     #[default]
     Providers,
     Settings,
+    Schedule,
+}
+
+impl View {
+    /// The views in the order the tabs list them.
+    pub(super) const ALL: [View; 3] = [View::Providers, View::Settings, View::Schedule];
+
+    /// The view `step` tabs along from this one, wrapping round.
+    fn step(self, step: isize) -> View {
+        let at = View::ALL.iter().position(|view| *view == self).unwrap_or(0) as isize;
+        View::ALL[(at + step).rem_euclid(View::ALL.len() as isize) as usize]
+    }
+}
+
+/// The provider whose windows the ping schedule exists for: the one that
+/// anchors a window to its opening request (spec: GPING#scope).
+const ANCHORING: &str = "anthropic_sub";
+
+/// The schedule as the machine holds it, read beside the service's snapshot
+/// rather than from it: the units are its record
+/// (spec: GPING#where-the-schedule-is-kept).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct Machine {
+    /// The installed slots, sorted by time.
+    pub(super) slots: Vec<ScheduledSlot>,
+    /// Whether the system manager has the wake enabled; `None` where that
+    /// could not be asked, which reads as not woken.
+    pub(super) wake: Option<bool>,
+    /// Each slot's newest run for each account it pinged.
+    pub(super) runs: Vec<Run>,
+}
+
+/// One ping run as the schedule page shows it, its times already in the
+/// local clock.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Run {
+    /// The slot it served, `hh:mm`.
+    pub(super) slot: String,
+    /// When it ran, as shown.
+    pub(super) when: String,
+    /// The account it pinged, by address where one is known.
+    pub(super) account: Option<String>,
+    pub(super) did: Option<PingAction>,
+    /// Whether the boundary the ledger reported matched the predicted one.
+    pub(super) verified: Option<bool>,
+    pub(super) predicted: Option<String>,
+    pub(super) observed: Option<String>,
+}
+
+/// Where the schedule stands (spec: GPING#waking-the-machine).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Position {
+    Off,
+    Awake,
+    Wake,
+}
+
+impl Position {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Position::Off => "off",
+            Position::Awake => "while awake",
+            Position::Wake => "wake then ping",
+        }
+    }
+}
+
+/// What an edit on the schedule page asks of the machine, for the page to
+/// carry out: the page's state decides, and never acts.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum Op {
+    /// Rewrite the user timers at these slots.
+    Write(Vec<ScheduledSlot>),
+    /// Run this script with elevation, then the ops after it, only if it
+    /// succeeded.
+    Elevate { script: String, then: Vec<Op> },
+    /// A request to the service.
+    Send(Command),
 }
 
 /// One provider as the snapshot describes it. Credentials are presence
@@ -82,9 +162,9 @@ pub(super) struct Settings {
     pub(super) cold_min_tokens: Option<u64>,
     pub(super) cold_idle_min: Option<f64>,
     pub(super) awake: Option<bool>,
-    /// Not shown on any page yet, but carried back whole: the settings
-    /// edit replaces the row, so a page that dropped it would turn the
-    /// schedule off with every other settings change.
+    /// The schedule's switch, set from the schedule page and carried back
+    /// whole by every other settings edit: the edit replaces the row, so a
+    /// page that dropped it would turn the schedule off with each change.
     pub(super) ping_schedule: Option<bool>,
     pub(super) ping_header: Option<String>,
     pub(super) notice_default: Option<String>,
@@ -200,6 +280,10 @@ pub(super) enum Row {
     /// (spec: UTUI#settings).
     Port,
     Store,
+    /// The schedule's position (spec: UTUI#schedule).
+    Position,
+    /// A slot, by its place in [`Machine::slots`].
+    Slot(usize),
 }
 
 impl Row {
@@ -213,7 +297,7 @@ impl Row {
 
     /// Whether the row can be changed at all.
     pub(super) fn is_editable(self) -> bool {
-        !matches!(self, Row::Port | Row::Store)
+        !matches!(self, Row::Port | Row::Store | Row::Position | Row::Slot(_))
     }
 }
 
@@ -225,6 +309,8 @@ pub(super) enum Target {
     RefreshUrl(usize),
     ClientVersion(usize),
     Setting(Row),
+    /// A slot of the schedule: the one at this place, or a new one.
+    Slot(Option<usize>),
 }
 
 impl Target {
@@ -241,6 +327,7 @@ impl Target {
             Target::Setting(Row::PingHeader) => "name",
             Target::Setting(Row::TranscriptRoots) => "paths",
             Target::Setting(_) => "style",
+            Target::Slot(_) => "slot",
         }
     }
 }
@@ -257,6 +344,8 @@ pub(super) struct Editing {
     pub(super) refusal: Option<String>,
     /// A save is with the service, which has not answered yet.
     sent: bool,
+    /// For a slot, the schedule's other slots, which it is judged against.
+    others: Vec<ScheduledSlot>,
 }
 
 /// A value as the form's check reads it: what would be stored.
@@ -398,8 +487,29 @@ pub(super) fn judge(
                 || note(fallback),
             )
         }
-        Target::Setting(_) => Err("this is not edited as text".to_owned()),
+        Target::Setting(_) | Target::Slot(_) => Err("this is not edited as text".to_owned()),
     }
+}
+
+/// Judge `buffer` as a slot beside `others`: the schedule it makes, sorted,
+/// and what the slot will do; or why the schedule's rules refuse it
+/// (spec: GPING#the-schedule).
+pub(super) fn judge_slot(
+    buffer: &str,
+    others: &[ScheduledSlot],
+) -> Result<(Vec<ScheduledSlot>, String), String> {
+    let slot = ScheduledSlot::parse(buffer)?;
+    let mut slots = others.to_vec();
+    slots.push(slot);
+    if let Some(refusal) = schedule::refusal(&slots, slots.len() - 1) {
+        return Err(refusal);
+    }
+    let reading = format!(
+        "pings at {} on {}",
+        slot.fire().hhmm(),
+        slot.ping_days().calendar()
+    );
+    Ok((schedule::sorted(slots), reading))
 }
 
 fn text(
@@ -445,8 +555,14 @@ impl Editing {
 
     /// What the check makes of the buffer as it stands.
     pub(super) fn verdict(&self, snapshot: &Snapshot) -> Verdict {
-        match judge(self.target, &self.buffer, snapshot) {
-            Ok((_, reading)) => Verdict::Accepted(reading),
+        let judged = match self.target {
+            Target::Slot(_) => {
+                judge_slot(&self.buffer, &self.others).map(|(_, reading)| Some(reading))
+            }
+            target => judge(target, &self.buffer, snapshot).map(|(_, reading)| reading),
+        };
+        match judged {
+            Ok(reading) => Verdict::Accepted(reading),
             Err(refusal) => Verdict::Refused(refusal),
         }
     }
@@ -454,7 +570,7 @@ impl Editing {
     /// Whether the buffer can be saved as it stands: nothing is refused,
     /// here or by the service for this very value.
     pub(super) fn saveable(&self, snapshot: &Snapshot) -> bool {
-        self.refusal.is_none() && judge(self.target, &self.buffer, snapshot).is_ok()
+        self.refusal.is_none() && matches!(self.verdict(snapshot), Verdict::Accepted(_))
     }
 }
 
@@ -481,6 +597,11 @@ pub(super) struct State {
     opened: bool,
     /// A route the operator asked to be taken to, for the loop to act on.
     goto: Option<String>,
+    /// The schedule as the machine holds it; unknown until read.
+    machine: Option<Machine>,
+    /// What edits on the schedule page ask of the machine, for the page to
+    /// carry out.
+    ops: Vec<Op>,
 }
 
 impl State {
@@ -565,7 +686,77 @@ impl State {
                 .into_iter()
                 .flat_map(|(_, rows)| rows)
                 .collect(),
+            View::Schedule => std::iter::once(Row::Position)
+                .chain((0..self.slots().len()).map(Row::Slot))
+                .collect(),
         }
+    }
+
+    /// The schedule as the machine holds it, once read.
+    pub(super) fn machine(&self) -> Option<&Machine> {
+        self.machine.as_ref()
+    }
+
+    /// The installed slots; none until they have been read.
+    pub(super) fn slots(&self) -> &[ScheduledSlot] {
+        self.machine
+            .as_ref()
+            .map_or(&[], |machine| machine.slots.as_slice())
+    }
+
+    /// Adopt what the machine holds of the schedule, keeping the cursor on
+    /// a row that is still there.
+    pub(super) fn set_machine(&mut self, machine: Machine) {
+        self.machine = Some(machine);
+        let limit = self.rows().len();
+        if limit > 0 && self.selected >= limit {
+            self.selected = limit - 1;
+        }
+    }
+
+    /// What edits have asked of the machine since the last call.
+    pub(super) fn take_ops(&mut self) -> Vec<Op> {
+        std::mem::take(&mut self.ops)
+    }
+
+    /// Report something the page could not do, in the header.
+    pub(super) fn report(&mut self, error: String) {
+        self.error = Some(error);
+    }
+
+    /// Where the schedule stands: woken where the system manager has the
+    /// wake, whatever the switch says, since a wake fires whether or not
+    /// anything follows it.
+    pub(super) fn position(&self) -> Position {
+        let woken = self.machine.as_ref().and_then(|machine| machine.wake) == Some(true);
+        let on = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.settings.ping_schedule)
+            .unwrap_or(false);
+        match (woken, on) {
+            (true, _) => Position::Wake,
+            (false, true) => Position::Awake,
+            (false, false) => Position::Off,
+        }
+    }
+
+    /// Why nothing would be pinged in the position the schedule is in, where
+    /// that is so: the switch is off, or no enabled provider anchors a
+    /// window (spec: UTUI#schedule).
+    pub(super) fn idle(&self) -> Option<String> {
+        let snapshot = self.snapshot.as_ref()?;
+        if self.position() == Position::Off {
+            return None;
+        }
+        if snapshot.settings.ping_schedule != Some(true) {
+            return Some("the schedule is off".to_owned());
+        }
+        let anchoring = snapshot
+            .providers
+            .iter()
+            .any(|provider| provider.name == ANCHORING && provider.enabled);
+        (!anchoring).then(|| format!("{ANCHORING} is off"))
     }
 
     /// The settings, grouped as the page draws them.
@@ -728,12 +919,12 @@ impl State {
                 self.move_selection(1);
                 None
             }
-            // Two views, so either way is the other one.
-            KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l') => {
-                self.set_view(match self.view {
-                    View::Providers => View::Settings,
-                    View::Settings => View::Providers,
-                });
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.set_view(self.view.step(-1));
+                None
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.set_view(self.view.step(1));
                 None
             }
             KeyCode::Char('1') => {
@@ -744,6 +935,16 @@ impl State {
                 self.set_view(View::Settings);
                 None
             }
+            KeyCode::Char('3') => {
+                self.set_view(View::Schedule);
+                None
+            }
+            KeyCode::Char(' ') if self.view == View::Schedule => {
+                if self.row() == Some(Row::Position) {
+                    self.step_position();
+                }
+                None
+            }
             KeyCode::Char(' ') => self.toggle_selected(),
             KeyCode::Enter => match self.view {
                 View::Providers => {
@@ -751,7 +952,27 @@ impl State {
                     None
                 }
                 View::Settings => self.act(),
+                View::Schedule => {
+                    match self.row() {
+                        Some(Row::Position) => self.step_position(),
+                        Some(Row::Slot(at)) => self.open_slot(Some(at)),
+                        _ => {}
+                    }
+                    None
+                }
             },
+            KeyCode::Char('n') if self.view == View::Schedule => {
+                self.open_slot(None);
+                None
+            }
+            KeyCode::Char('d') if self.view == View::Schedule => {
+                self.remove_slot();
+                None
+            }
+            KeyCode::Char('x') if self.view == View::Schedule => {
+                self.stop_waking();
+                None
+            }
             KeyCode::Char('c') => self.clear_marks(),
             KeyCode::Char(key @ ('e' | 'u' | 'f' | 'v')) => {
                 self.begin(key);
@@ -900,6 +1121,10 @@ impl State {
                 Some(row) if row.is_editable() && !row.is_toggle() => Target::Setting(row),
                 _ => return,
             },
+            (View::Schedule, 'e') => match self.row() {
+                Some(Row::Slot(at)) => Target::Slot(Some(at)),
+                _ => return,
+            },
             _ => return,
         };
         self.open(target);
@@ -909,13 +1134,143 @@ impl State {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return;
         };
+        let others = match target {
+            Target::Slot(at) => self
+                .slots()
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| Some(*index) != at)
+                .map(|(_, slot)| *slot)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let buffer = match target {
+            Target::Slot(Some(at)) => self
+                .slots()
+                .get(at)
+                .map(|slot| format!("{} {}", slot.time.hhmm(), slot.days.calendar()))
+                .unwrap_or_default(),
+            _ => current_text(target, snapshot),
+        };
         self.editing = Some(Editing {
             target,
-            buffer: current_text(target, snapshot),
+            buffer,
             secret: matches!(target, Target::Credential(_)),
             refusal: None,
             sent: false,
+            others,
         });
+    }
+
+    // ── the schedule ─────────────────────────────────────────────────
+
+    /// Open a slot's form: the slot at `at`, or a new one. Only once the
+    /// installed slots are known, since a slot is judged against them.
+    fn open_slot(&mut self, at: Option<usize>) {
+        if !self.reachable() || self.machine.is_none() {
+            return;
+        }
+        self.open(Target::Slot(at));
+    }
+
+    /// The request that turns the schedule's switch to `on`, the rest of the
+    /// settings carried back whole.
+    fn switch(&mut self, on: bool) -> Option<Command> {
+        let mut settings = self.snapshot.as_ref()?.settings.clone();
+        settings.ping_schedule = Some(on);
+        Some(self.put("settings", "config-edit", settings_body(&settings)))
+    }
+
+    /// Move the schedule to its next position: off, while awake, wake then
+    /// ping, and back to off. Only moves into or out of waking ask for
+    /// elevation; the switch is the service's (spec: GPING#where-the-schedule-is-kept).
+    fn step_position(&mut self) {
+        if !self.reachable() || self.machine.is_none() {
+            return;
+        }
+        let slots = self.slots().to_vec();
+        match self.position() {
+            Position::Off => {
+                // spec: GPING#the-schedule
+                if slots.is_empty() {
+                    self.error =
+                        Some("add a slot first: the schedule cannot be on with none".to_owned());
+                    return;
+                }
+                if let Some(command) = self.switch(true) {
+                    self.ops.push(Op::Send(command));
+                }
+            }
+            Position::Awake => self.ops.push(Op::Elevate {
+                script: schedule::place_script(&slots),
+                then: Vec::new(),
+            }),
+            Position::Wake => self.unwake(),
+        }
+    }
+
+    /// Stop waking the machine where it wakes with nothing to ping
+    /// (spec: UTUI#schedule).
+    fn stop_waking(&mut self) {
+        if self.reachable() && self.position() == Position::Wake && self.idle().is_some() {
+            self.unwake();
+        }
+    }
+
+    /// Remove the wake, and turn the switch off once it is gone, so the
+    /// schedule never pings on with nothing to wake for it.
+    fn unwake(&mut self) {
+        let on = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.settings.ping_schedule)
+            == Some(true);
+        let then = if on {
+            self.switch(false).map(Op::Send).into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        self.ops.push(Op::Elevate {
+            script: schedule::remove_script(),
+            then,
+        });
+    }
+
+    /// Remove the selected slot. The last one stays while the schedule is
+    /// on, which it cannot be with none (spec: GPING#the-schedule).
+    fn remove_slot(&mut self) {
+        if !self.reachable() {
+            return;
+        }
+        let Some(Row::Slot(at)) = self.row() else {
+            return;
+        };
+        let mut slots = self.slots().to_vec();
+        if at >= slots.len() {
+            return;
+        }
+        slots.remove(at);
+        if slots.is_empty() && self.position() != Position::Off {
+            self.error =
+                Some("the schedule cannot be on with no slots: turn it off first".to_owned());
+            return;
+        }
+        self.change_slots(slots);
+    }
+
+    /// Ask for the schedule at `slots`. While the machine is woken the wake
+    /// changes first, behind elevation, and the user timers only once it
+    /// has, so a refusal leaves both as they were (spec: UTUI#schedule).
+    fn change_slots(&mut self, slots: Vec<ScheduledSlot>) {
+        self.error = None;
+        if self.position() == Position::Wake {
+            self.ops.push(Op::Elevate {
+                script: schedule::place_script(&slots),
+                then: vec![Op::Write(slots)],
+            });
+        } else {
+            self.ops.push(Op::Write(slots));
+        }
     }
 
     fn toggle(&mut self, row: Row) -> Option<Command> {
@@ -966,6 +1321,14 @@ impl State {
         let snapshot = self.snapshot.as_ref()?;
         let editing = self.editing.as_ref()?;
         if editing.sent || !editing.saveable(snapshot) {
+            return None;
+        }
+        // A slot is the machine's to change, not the service's, so the form
+        // closes on its way rather than waiting for a reply.
+        if let Target::Slot(_) = editing.target {
+            let (slots, _) = judge_slot(&editing.buffer, &editing.others).ok()?;
+            self.editing = None;
+            self.change_slots(slots);
             return None;
         }
         let (change, _) = judge(editing.target, &editing.buffer, snapshot).ok()?;
@@ -1101,7 +1464,7 @@ fn current_text(target: Target, snapshot: &Snapshot) -> String {
             .and_then(|profile| snapshot.notices.get(profile))
             .cloned()
             .unwrap_or_default(),
-        Target::Setting(_) => String::new(),
+        Target::Setting(_) | Target::Slot(_) => String::new(),
     }
 }
 

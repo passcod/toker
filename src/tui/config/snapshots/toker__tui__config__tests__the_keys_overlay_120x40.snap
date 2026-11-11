@@ -2,33 +2,37 @@
 source: src/tui/config/tests.rs
 expression: "frame(&loaded_with_routing(), 120, 40, true)"
 ---
- ?   dashboard   routing   config   accounts   1 providers 5 · 2 settings                                 2 providers on
+ ?   dashboard   routing   config   accounts   1 providers 5 · 2 settings · 3 schedule                    2 providers on
 ┌PROVIDERS─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ provider        state   credential          endpoint                 bindings   used by                              │
 │ anthropic_api   off     none                built-in                        1   3 rewrites · 1 route                 │
 │ anthropic_sub   on      none                built-in                        1   4 rewrites · 2 defaults · 1 route    │
 │ codex_sub       off     codex's own login   http://gateway.invalid          1   3 rewrites · 1 route                 │
 │ openai_api      off     none                built-in                        1   1 rewrite · 1 route                  │
-│ openrouter      on      keyring             built-in                        3   10 rewrites · 4 defaults · 5 routes  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌PROVIDER──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ a┌KEYS────────────────────────────────────────────────────────────────────────────────────────────────────────────┐  │
-│ s│ ON BOTH                                              ON SETTINGS                                               │  │
-│ c│ ↑/↓ j/k      select a row                            space               switch a gate or the lock             │  │
-│ e│ ←/→ h/l 1 2  switch between providers and settings   e                   edit the row in a form                │  │
-│ b│ r            refresh                                 enter               switch or edit, as the row takes      │  │
-│ r│ esc          back to the dashboard                                                                             │  │
-│ d│ tab          next page                               IN A FORM                                                 │  │
-│ r│ q            quit                                    enter ctrl+s        save, once nothing is refused         │  │
-│ [│                                                      esc                 cancel                                │  │
-└──│ ON PROVIDERS                                                                                                   │──┘
-   │ space        turn the provider on or off             MARKS                                                     │
-   │ e            enter its key, which is never shown     none                on, with no credential to answer with │
-   │ u            set its endpoint                        not configured      the same, said in words               │
-   │ f            codex: set the refresh url              marked unsupported  a refusal marked the binding          │
-   │ v            codex: pin a client version             built-in            unset: this is what it falls back to  │
-   │ p            codex: probe for the version, or not    follows lane TTL    unset: the lane's own cache tier      │
-   │ c            clear its safeguards rejection marks    175k  1M  1.5M      token counts, in full or shorthand    │
-   │ enter        open the first route that reaches it    empty entry         puts the setting back to unset        │
-   │                                                      -                   not read from the service             │
-   └? or esc close──────────────────────────────────────────────────────────────────────────────────────────────────┘
+│ ┌KEYS─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐  │
+└─│ ON EVERY TAB                                          ON SETTINGS                                               │──┘
+┌P│ ↑/↓ j/k        select a row                           space               switch a gate or the lock             │──┐
+│ │ ←/→ h/l 1 2 3  switch between the tabs                e                   edit the row in a form                │  │
+│ │ r              refresh                                enter               switch or edit, as the row takes      │  │
+│ │ esc            back to the dashboard                                                                            │  │
+│ │ tab            next page                              ON SCHEDULE                                               │  │
+│ │ q              quit                                   space               off, while awake, wake then ping      │  │
+│ │                                                       n                   add a slot, as 07:20 Mon..Fri         │  │
+│ │ ON PROVIDERS                                          e enter             edit the slot                         │  │
+│ │ space          turn the provider on or off            d                   remove the slot                       │  │
+│ │ e              enter its key, which is never shown    x                   stop waking with nothing to ping      │  │
+└─│ u              set its endpoint                                                                                 │──┘
+  │ f              codex: set the refresh url             IN A FORM                                                 │
+  │ v              codex: pin a client version            enter ctrl+s        save, once nothing is refused         │
+  │ p              codex: probe for the version, or not   esc                 cancel                                │
+  │ c              clear its safeguards rejection marks                                                             │
+  │ enter          open the first route that reaches it   MARKS                                                     │
+  │                                                       none                on, with no credential to answer with │
+  │                                                       not configured      the same, said in words               │
+  │                                                       marked unsupported  a refusal marked the binding          │
+  │                                                       built-in            unset: this is what it falls back to  │
+  │                                                       follows lane TTL    unset: the lane's own cache tier      │
+  │                                                       175k  1M  1.5M      token counts, in full or shorthand    │
+  │                                                       empty entry         puts the setting back to unset        │
+  │                                                       -                   not read from the service             │
+  └? or esc close───────────────────────────────────────────────────────────────────────────────────────────────────┘

@@ -1,0 +1,18 @@
+---
+source: src/tui/config/tests.rs
+expression: text
+---
+ ?   dashboard   routing   config   accounts   1 providers 5 · 2 settings · 3 schedule 3        editing · 2 providers on
+┌SCHEDULE──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│   setting   value                                                                                                    │
+│ ┌─ schedule  1 ───────────────────────────────────────────────────────────────────────────────────────────────────── │
+│ │ position  while awake                                                                                              │
+│ ┌─ slots  3 ──────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│ │ 07:20     Mon..Fri  ping 07:31   Tue 07:31  alex@example.org  sent  matched 12:30                                  │
+│ │                                  Tue 07:32  sam@example.net   skipped                                              │
+│ │ 09:40     Sat,Sun   ping 09:51   never run                                                                         │
+│ │ 12:20     Mon..Fri  ping 12:31   Mon 12:31  alex@example.org  sent  missed 17:30 → 17:40                           │
+│ │                                  Mon 12:31  sam@example.net   failed                                               │
+│ │     ┌ slot            15:00 Mon..Fri▏   within 5 h of 12:20's ping at 12:31, so one would always be skipped        │
+│ │     └ [ctrl+s] fix value to save   [esc] cancel                                                                    │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

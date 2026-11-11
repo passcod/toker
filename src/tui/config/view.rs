@@ -10,7 +10,7 @@ use ratatui::style::Stylize;
 use ratatui::text::Line;
 
 use super::model::{State, View};
-use super::{providers, settings};
+use super::{providers, schedule, settings};
 use crate::tui::chrome::{self, Chrome, RowHit, Section};
 use crate::tui::table;
 
@@ -22,13 +22,13 @@ pub(super) struct Drawn {
     pub(super) rows: Vec<RowHit>,
 }
 
-/// The tabs, in the order `1` and `2` name them.
-const TABS: [&str; 2] = ["providers", "settings"];
+/// The tabs, in the order `1` to `3` name them.
+const TABS: [&str; 3] = ["providers", "settings", "schedule"];
 
-/// Keys on both views.
+/// Keys on every view.
 pub(super) const EVERYWHERE: [(&str, &str); 6] = [
     ("↑/↓ j/k", "select a row"),
-    ("←/→ h/l 1 2", "switch between providers and settings"),
+    ("←/→ h/l 1 2 3", "switch between the tabs"),
     ("r", "refresh"),
     ("esc", "back to the dashboard"),
     ("tab", "next page"),
@@ -52,6 +52,14 @@ pub(super) const ON_SETTINGS: [(&str, &str); 3] = [
     ("enter", "switch or edit, as the row takes"),
 ];
 
+pub(super) const ON_SCHEDULE: [(&str, &str); 5] = [
+    ("space", "off, while awake, wake then ping"),
+    ("n", "add a slot, as 07:20 Mon..Fri"),
+    ("e enter", "edit the slot"),
+    ("d", "remove the slot"),
+    ("x", "stop waking with nothing to ping"),
+];
+
 pub(super) const IN_A_FORM: [(&str, &str); 2] = [
     ("enter ctrl+s", "save, once nothing is refused"),
     ("esc", "cancel"),
@@ -70,10 +78,10 @@ pub(super) const READINGS: [(&str, &str); 8] = [
 ];
 
 pub(super) fn render(frame: &mut Frame, state: &State, overlay: bool) -> Drawn {
-    let current = match state.view() {
-        View::Providers => 0,
-        View::Settings => 1,
-    };
+    let current = View::ALL
+        .iter()
+        .position(|view| *view == state.view())
+        .unwrap_or(0);
     // Providers are a list of records, so the tab says how many.
     let providers = state.snapshot().map(|snapshot| snapshot.providers.len());
     let strip = [
@@ -82,6 +90,13 @@ pub(super) fn render(frame: &mut Frame, state: &State, overlay: bool) -> Drawn {
             None => chrome::Tab::new(TABS[0]),
         },
         chrome::Tab::new(TABS[1]).after(" · "),
+        // The slots are a list of records, as the providers are, once read.
+        match state.machine() {
+            Some(machine) => chrome::Tab::new(TABS[2])
+                .count(machine.slots.len())
+                .after(" · "),
+            None => chrome::Tab::new(TABS[2]).after(" · "),
+        },
     ];
     let status = status(state);
     let chrome::Laid { header, tabs, body } = chrome::page(
@@ -114,6 +129,7 @@ pub(super) fn render(frame: &mut Frame, state: &State, overlay: bool) -> Drawn {
         match state.view() {
             View::Providers => providers::draw(frame, body, state, snapshot),
             View::Settings => settings::draw(frame, body, state, snapshot),
+            View::Schedule => schedule::draw(frame, body, state, snapshot),
         }
     } else {
         Vec::new()
@@ -135,7 +151,7 @@ pub(super) fn render(frame: &mut Frame, state: &State, overlay: bool) -> Drawn {
             &[
                 &[
                     Section {
-                        heading: Some("ON BOTH"),
+                        heading: Some("ON EVERY TAB"),
                         rows: &EVERYWHERE,
                     },
                     Section {
@@ -147,6 +163,10 @@ pub(super) fn render(frame: &mut Frame, state: &State, overlay: bool) -> Drawn {
                     Section {
                         heading: Some("ON SETTINGS"),
                         rows: &ON_SETTINGS,
+                    },
+                    Section {
+                        heading: Some("ON SCHEDULE"),
+                        rows: &ON_SCHEDULE,
                     },
                     Section {
                         heading: Some("IN A FORM"),
