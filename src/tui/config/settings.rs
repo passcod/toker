@@ -34,7 +34,7 @@ fn label(row: Row, snapshot: &Snapshot) -> String {
         Row::Notice(at) => snapshot.profiles().get(at).cloned().unwrap_or_default(),
         Row::Port => "listener port".to_owned(),
         Row::Store => "store".to_owned(),
-        Row::Provider(_) => String::new(),
+        Row::Provider(_) | Row::Position | Row::Slot(_) => String::new(),
     }
 }
 
@@ -130,7 +130,7 @@ fn value(row: Row, snapshot: &Snapshot) -> Vec<Span<'static>> {
         }
         Row::Port => set(snapshot.port.to_string()),
         Row::Store => set(snapshot.db_path.clone()),
-        Row::Provider(_) => Vec::new(),
+        Row::Provider(_) | Row::Position | Row::Slot(_) => Vec::new(),
     }
 }
 
@@ -145,7 +145,7 @@ fn settled_by(row: Row) -> Option<&'static str> {
 
 /// A group's head: its rail turning the corner, its name and how many rows
 /// it holds, and the rule running to the edge.
-fn head(name: &str, count: usize, width: usize) -> Line<'static> {
+pub(super) fn head(name: &str, count: usize, width: usize) -> Line<'static> {
     let lead = "┌─ ";
     let tail = format!("  {count} ");
     let used = lead.width() + name.width() + tail.width();

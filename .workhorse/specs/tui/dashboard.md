@@ -326,14 +326,14 @@ It MUST be able to [promote](../routing/models.md#promotion) a learned model.
 
 ## The configuration pages
 
-Configuration is edited on two pages, providers and settings.
+Configuration is edited on three pages: providers, settings and schedule.
 
-Both MUST write through the control operations [DCTRL](../service/control.md#the-operations) specifies, and an edit MUST take effect without a restart.
+Each MUST write what the store holds through the control operations [DCTRL](../service/control.md#the-operations) specifies, and an edit MUST take effect without a restart.
 
 A value MUST be edited in place, in the row that shows it, and checked as it changes.
 A refused value MUST be reported beside the field that holds it, and MUST leave the stored value as it was.
 
-Where the service is not answering, both pages MUST report that rather than offer values to edit.
+Where the service is not answering, each page MUST report that rather than offer values to edit.
 
 > [!NOTE]
 > The service is the only writer, so a form the operator can fill in while it is down is a form whose edits go nowhere.
@@ -372,6 +372,29 @@ A setting left unset MUST say what it falls back to.
 The page MUST warn beside the cold-gate minimum where the minimum in force is out of every resolvable window's reach, as [GCOLD](../gates/cold.md#only-a-request-that-could-be-the-re-read) specifies.
 
 The page MUST show where the store is and which port the listener answers on, and MUST NOT offer to edit either, those being settled before the store is opened as [DCONF](../service/config.md#before-the-store) specifies.
+
+### Schedule
+
+The schedule page MUST show and set the [ping schedule](../gates/pinging.md#the-schedule)'s position, and MUST show and edit its slots and each slot's days.
+
+Each slot MUST show its most recent run for each account it pinged: when it ran, whether it sent a ping, skipped or failed, and whether the boundary it predicted matched the one the ledger reported.
+
+A slot MUST be checked against the schedule's rules as it is edited, and a slot they refuse MUST NOT be saveable.
+
+An edit MUST install the timers a slot needs, remove those of a slot removed, and take effect without a restart.
+An edit made while the machine is woken MUST change the wake and the pings together, or leave both as they were.
+
+Where the machine is woken while nothing would be pinged, because the schedule is off or no enabled provider anchors a window, the page MUST say that the machine wakes with nothing to ping, and MUST offer to stop waking it.
+
+> [!NOTE]
+> Disabling the provider is a providers-page edit, and having it also ask for elevation would interrupt that edit with a prompt about something else.
+
+The dashboard MUST hand the terminal to the platform while it asks for elevation, and MUST take it back once the platform has answered.
+
+> [!NOTE]
+> The platform may ask for a password on the terminal itself, which a dashboard drawing over it would hide.
+
+Elevation refused or failed MUST leave the schedule as it was, and MUST be reported on the page.
 
 ## The accounts page
 

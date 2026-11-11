@@ -1,0 +1,16 @@
+---
+source: src/tui/config/tests.rs
+expression: "frame(&schedule_page(true, false, &weekdays_and_weekend()), 80, 24, false)"
+---
+ ?   dashboard   routing   config   accounts   ‹ 3 schedule 3     2 providers on
+┌SCHEDULE──────────────────────────────────────────────────────────────────────┐
+│   setting   value                                                            │
+│ ┌─ schedule  1 ───────────────────────────────────────────────────────────── │
+│ │ position  while awake                                                      │
+│ ┌─ slots  3 ──────────────────────────────────────────────────────────────── │
+│ │ 07:20     Mon..Fri  alex@example.org  sent  matched 12:30                  │
+│ │                     sam@example.net   skipped                              │
+│ │ 09:40     Sat,Sun   never run                                              │
+│ │ 12:20     Mon..Fri  alex@example.org  sent  missed 17:30 → 17:40           │
+│ │                     sam@example.net   failed                               │
+└──────────────────────────────────────────────────────────────────────────────┘

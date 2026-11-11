@@ -19,4 +19,4 @@ Type=oneshot
 # suppress the next slot's ping.
 Environment="PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
 TimeoutStartSec=3m
-ExecStart="/opt/toker/toker" ping-window --slot=09:00
+ExecStart="/opt/toker/toker" ping-window --slot=09:00 --days=Mon..Fri

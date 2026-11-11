@@ -2,7 +2,7 @@
 source: src/tui/config/tests.rs
 expression: "frame(&settings_page(), 80, 24, false)"
 ---
- ?   dashboard   routing   config   accounts   1 · 2 settings     2 providers on
+ ?   dashboard   routing   config   accounts   1 · 2 settings · 3 2 providers on
 SETTINGS ──────────────────────────────────────────────────────────────────────
     setting               value
   ┌─ gates  5 ────────────────────────────────────────────────────────────────

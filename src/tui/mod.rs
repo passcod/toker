@@ -216,7 +216,7 @@ pub fn run(
     let mut header = chrome::Header::default();
     let mut page = Page::Dashboard;
     let mut routing = routing::Page::new(port, settings);
-    let mut config = config::Page::new(port);
+    let mut config = config::Page::new(port, db_path, &store);
     let mut accounts = accounts::Page::new(&store);
     // The transcript roots, resolved once: session labels read only
     // these, read-only, one tail per session per display read.
@@ -473,6 +473,7 @@ pub fn run(
             // an endpoint cannot switch pages halfway through it.
             if page == Page::Config && config.editing() {
                 config.key(key);
+                elevate(&mut terminal, &mut config)?;
                 continue;
             }
             // The naming entry takes every key while it is open, `q`
@@ -510,7 +511,9 @@ pub fn run(
                 {
                     routing.refresh()
                 }
-                crossterm::event::KeyCode::Char('r') if page == Page::Config => config.refresh(),
+                crossterm::event::KeyCode::Char('r') if page == Page::Config => {
+                    config.refresh(&store)
+                }
                 crossterm::event::KeyCode::Char('r') if page == Page::Accounts => {
                     accounts.refresh(&store)
                 }
@@ -533,6 +536,7 @@ pub fn run(
                         .contains(crossterm::event::KeyModifiers::CONTROL) =>
                 {
                     config.key(key);
+                    elevate(&mut terminal, &mut config)?;
                     // A provider's detail can ask for one of its routes.
                     if let Some(route) = config.take_goto() {
                         page = go_to(
@@ -681,7 +685,7 @@ fn go_to(
     match target {
         Page::Dashboard => {}
         Page::Routing => routing.refresh(),
-        Page::Config => config.arrive(),
+        Page::Config => config.arrive(store),
         Page::Accounts => accounts.refresh(store),
     }
     target
@@ -1204,6 +1208,33 @@ fn clock(fmt: &locale::Fmt) -> String {
 /// Mouse reporting is not the panic hook's to undo, so on a panic it
 /// goes off here, as the guard unwinds; left on, the shell after would
 /// read every click and wheel notch as escape-sequence garbage.
+/// Run the step the configuration page is waiting to elevate, if any, with
+/// the terminal given up for the platform's prompt, which may ask for a
+/// password on it, and taken back once the platform has answered
+/// (spec: UTUI#schedule).
+fn elevate(
+    terminal: &mut ratatui::DefaultTerminal,
+    config: &mut config::Page,
+) -> anyhow::Result<()> {
+    let Some(script) = config.take_elevation() else {
+        return Ok(());
+    };
+    let mut stdout = std::io::stdout();
+    crossterm::execute!(stdout, WheelCapture(false))?;
+    ratatui::try_restore()?;
+    println!("toker: changing the machine's wake needs the system manager");
+    let outcome = crate::schedule::elevate(&script);
+    crossterm::terminal::enable_raw_mode()?;
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::EnterAlternateScreen,
+        WheelCapture(true)
+    )?;
+    terminal.clear()?;
+    config.elevated(outcome);
+    Ok(())
+}
+
 struct RestoreGuard;
 
 impl Drop for RestoreGuard {

@@ -75,11 +75,11 @@ Setup MUST run the settings reconciliation once itself, through the unit the sch
 > Setup then exercises the sandboxed path rather than a path only it takes.
 
 Setup MUST install and enable the ping and hold timers without asking, conditioned on the marker [GPING](../gates/pinging.md#scope) specifies, whether or not the schedule is on.
-Setup MUST write the wake timer where the operator's units are kept without placing it in the system manager.
-The timers MUST carry the slots already installed, or a default schedule where none are.
+The timers MUST carry the slots and days already installed, or a default schedule where none are.
+Setup MUST leave the machine's wake as it finds it.
 
 > [!NOTE]
-> Turning the schedule on and choosing its slots are made on the dashboard, which asks the platform for elevation where the wake timer needs the system manager.
+> The schedule's position, its slots and the wake are set on the dashboard's [schedule page](../tui/dashboard.md#schedule), which asks the platform for elevation where the wake needs the system manager.
 > Setup itself never reaches the system manager.
 
 ## Handing off

@@ -2,7 +2,7 @@
 source: src/tui/config/tests.rs
 expression: "frame(&state, 100, 24, false)"
 ---
- ?   dashboard   routing   config   accounts   1 providers 5 · 2 settings
+ ?   dashboard   routing   config   accounts   1 providers 5 · 2 settings · 3 schedule
  config-snapshot: the service is not answering
 ┌CONFIGURATION─────────────────────────────────────────────────────────────────────────────────────┐
 │ the service is not answering                                                                     │

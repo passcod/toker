@@ -2,7 +2,7 @@
 source: src/tui/config/tests.rs
 expression: "frame(&loaded_with_routing(), 80, 24, false)"
 ---
- ?   dashboard   routing   config   accounts   1 providers 5 · 2  2 providers on
+ ?   dashboard   routing   config   accounts   1 providers 5 ›    2 providers on
 ┌PROVIDERS─────────────────────────────────────────────────────────────────────┐
 │ provider       state  credential         used by                             │
 │ anthropic_api  off    none               3 rewrites · 1 route                │

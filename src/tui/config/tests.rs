@@ -5,7 +5,7 @@ use ratatui::{Terminal, backend::TestBackend};
 use reqwest::Method;
 use serde_json::{Value, json};
 
-use super::model::{Row, State, View};
+use super::model::{Machine, Op, Position, Row, Run, State, View};
 use super::testing::{loaded, loaded_with_routing, ok, snapshot_body};
 use super::view::render;
 use crate::tui::control::{Command, Reply, Response};
@@ -270,6 +270,7 @@ fn the_overlay_names_every_key_the_page_takes() {
             &super::view::EVERYWHERE[..],
             &super::view::ON_PROVIDERS,
             &super::view::ON_SETTINGS,
+            &super::view::ON_SCHEDULE,
             &super::view::IN_A_FORM,
         ]
         .concat()
@@ -281,7 +282,7 @@ fn the_overlay_names_every_key_the_page_takes() {
             assert!(named(&key.to_string()), "{key} is taken but not named");
         }
     }
-    for key in ['1', '2'] {
+    for key in ['1', '2', '3'] {
         assert!(super::owns_key(KeyCode::Char(key)));
         assert!(named(&key.to_string()));
     }
@@ -1142,4 +1143,302 @@ fn a_cold_minimum_no_window_can_reach_is_warned_about_beside_it() {
     // The same minimum where the daemon does not say it is out of reach.
     let text = settings(false);
     assert!(!text.contains("the gate never fires"), "{text}");
+}
+
+// --- the schedule --------------------------------------------------------------
+
+fn slot(text: &str) -> crate::schedule::ScheduledSlot {
+    crate::schedule::ScheduledSlot::parse(text).expect(text)
+}
+
+fn run(slot: &str, when: &str, account: &str, did: crate::store::PingAction) -> Run {
+    Run {
+        slot: slot.to_owned(),
+        when: when.to_owned(),
+        account: Some(account.to_owned()),
+        did: Some(did),
+        verified: None,
+        predicted: None,
+        observed: None,
+    }
+}
+
+/// The schedule page on a machine whose service says the switch is `on`,
+/// holding `slots`, woken where `wake` is set.
+fn schedule_page(on: bool, wake: bool, slots: &[&str]) -> State {
+    use crate::store::PingAction;
+    let mut body = snapshot_body();
+    body["settings"]["ping_schedule"] = json!(on);
+    let mut state = State::default();
+    assert!(
+        state
+            .receive(Reply::Command(
+                Command::snapshot("config-snapshot"),
+                ok(body)
+            ))
+            .is_none()
+    );
+    state.set_view(View::Schedule);
+    let mut matched = run("07:20", "Tue 07:31", "alex@example.org", PingAction::Ping);
+    matched.verified = Some(true);
+    matched.predicted = Some("12:30".to_owned());
+    matched.observed = Some("12:30".to_owned());
+    let mut missed = run("12:20", "Mon 12:31", "alex@example.org", PingAction::Ping);
+    missed.verified = Some(false);
+    missed.predicted = Some("17:30".to_owned());
+    missed.observed = Some("17:40".to_owned());
+    state.set_machine(Machine {
+        // Sorted, as the units are read back.
+        slots: crate::schedule::sorted(slots.iter().map(|text| slot(text)).collect()),
+        wake: Some(wake),
+        runs: vec![
+            matched,
+            run("07:20", "Tue 07:32", "sam@example.net", PingAction::Skip),
+            missed,
+            run("12:20", "Mon 12:31", "sam@example.net", PingAction::Failed),
+        ],
+    });
+    state
+}
+
+fn weekdays_and_weekend() -> Vec<&'static str> {
+    vec!["07:20 Mon..Fri", "12:20 Mon..Fri", "09:40 Sat,Sun"]
+}
+
+fn ops(state: &mut State) -> Vec<Op> {
+    state.take_ops()
+}
+
+/// The page at rest: the position, each slot with its days and ping time,
+/// and its newest run for each account (spec: UTUI#schedule).
+#[test]
+fn the_schedule_page_at_rest_120x40() {
+    let state = schedule_page(true, true, &weekdays_and_weekend());
+    assert_eq!(state.position(), Position::Wake);
+    insta::assert_snapshot!(frame(&state, 120, 40, false));
+}
+
+#[test]
+fn the_schedule_page_at_80x24() {
+    insta::assert_snapshot!(frame(
+        &schedule_page(true, false, &weekdays_and_weekend()),
+        80,
+        24,
+        false
+    ));
+}
+
+/// A wake left with nothing to ping is flagged, with the way to stop it
+/// (spec: UTUI#schedule).
+#[test]
+fn a_wake_with_nothing_to_ping_is_flagged() {
+    let state = schedule_page(false, true, &weekdays_and_weekend());
+    assert_eq!(state.position(), Position::Wake);
+    let text = frame(&state, 120, 40, false);
+    assert!(
+        text.contains("wakes with nothing to ping: the schedule is off")
+            && text.contains("x stops waking"),
+        "{text}"
+    );
+
+    // And where the provider that anchors a window is off.
+    let mut body = snapshot_body();
+    body["settings"]["ping_schedule"] = json!(true);
+    body["providers"][1]["enabled"] = json!(false);
+    let mut state = schedule_page(true, true, &weekdays_and_weekend());
+    state.receive(Reply::Command(
+        Command::snapshot("config-snapshot"),
+        ok(body),
+    ));
+    let text = frame(&state, 120, 40, false);
+    assert!(
+        text.contains("wakes with nothing to ping: anthropic_sub is off"),
+        "{text}"
+    );
+    // `x` removes the wake, and the switch goes off once it is gone.
+    on(&mut state, Row::Position);
+    press(&mut state, KeyCode::Char('x'));
+    match &ops(&mut state)[..] {
+        [Op::Elevate { script, then }] => {
+            assert_eq!(*script, crate::schedule::remove_script());
+            assert!(matches!(&then[..], [Op::Send(command)]
+                if command.body.as_ref().expect("a body")["ping_schedule"] == json!(false)));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// `x` does nothing where the wake leads to a ping.
+#[test]
+fn stopping_the_wake_is_offered_only_where_it_leads_nowhere() {
+    let mut state = schedule_page(true, true, &weekdays_and_weekend());
+    press(&mut state, KeyCode::Char('x'));
+    assert!(ops(&mut state).is_empty());
+    assert!(!frame(&state, 120, 40, false).contains("x stops waking"));
+}
+
+/// Space moves through the positions; only moves into or out of waking
+/// ask for elevation (spec: GPING#where-the-schedule-is-kept).
+#[test]
+fn the_position_steps_through_off_awake_and_wake() {
+    // Off to while awake: the switch, through the service.
+    let mut state = schedule_page(false, false, &weekdays_and_weekend());
+    assert_eq!(state.position(), Position::Off);
+    on(&mut state, Row::Position);
+    press(&mut state, KeyCode::Char(' '));
+    match &ops(&mut state)[..] {
+        [Op::Send(command)] => {
+            assert_eq!(command.path, "settings");
+            let body = command.body.as_ref().expect("a body");
+            assert_eq!(body["ping_schedule"], json!(true));
+            // The rest of the settings go back whole.
+            assert_eq!(body["ping_header"], json!("x-toker-ping"));
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // While awake to waking: the wake placed at the installed slots.
+    let mut state = schedule_page(true, false, &weekdays_and_weekend());
+    assert_eq!(state.position(), Position::Awake);
+    press(&mut state, KeyCode::Enter);
+    let slots: Vec<_> = state.slots().to_vec();
+    assert_eq!(
+        ops(&mut state),
+        [Op::Elevate {
+            script: crate::schedule::place_script(&slots),
+            then: Vec::new(),
+        }]
+    );
+
+    // Waking to off: the wake removed, then the switch turned off.
+    let mut state = schedule_page(true, true, &weekdays_and_weekend());
+    press(&mut state, KeyCode::Char(' '));
+    match &ops(&mut state)[..] {
+        [Op::Elevate { script, then }] => {
+            assert_eq!(*script, crate::schedule::remove_script());
+            assert_eq!(then.len(), 1);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The schedule cannot be on with no slots (spec: GPING#the-schedule).
+#[test]
+fn the_schedule_does_not_turn_on_with_no_slots() {
+    let mut state = schedule_page(false, false, &[]);
+    press(&mut state, KeyCode::Char(' '));
+    assert!(ops(&mut state).is_empty());
+    assert!(
+        state.error().expect("said").contains("add a slot first"),
+        "{:?}",
+        state.error()
+    );
+    let text = frame(&state, 100, 24, false);
+    assert!(text.contains("none: n adds one"), "{text}");
+
+    // Nor be left on by removing the last one.
+    let mut state = schedule_page(true, false, &["07:20 Mon..Fri"]);
+    on(&mut state, Row::Slot(0));
+    press(&mut state, KeyCode::Char('d'));
+    assert!(ops(&mut state).is_empty());
+    assert!(state.error().expect("said").contains("turn it off first"));
+}
+
+/// A slot is checked as it is typed, against the others, and a refused one
+/// cannot be saved (spec: UTUI#schedule).
+#[test]
+fn a_slot_is_checked_as_it_is_typed() {
+    let mut state = schedule_page(true, false, &weekdays_and_weekend());
+    press(&mut state, KeyCode::Char('n'));
+    type_in(&mut state, "15:00 Mon..Fri");
+    let text = frame(&state, 120, 40, false);
+    assert!(
+        text.contains("within 5 h of 12:20's ping at 12:31"),
+        "{text}"
+    );
+    assert!(text.contains("fix value to save"), "{text}");
+    assert!(ctrl_s(&mut state).is_none());
+    assert!(ops(&mut state).is_empty(), "nothing is written");
+    insta::assert_snapshot!(text);
+
+    // Moved clear of the others, it is accepted and says what it does.
+    for _ in 0.."15:00 Mon..Fri".len() {
+        press(&mut state, KeyCode::Backspace);
+    }
+    type_in(&mut state, "18:00 Mon..Fri");
+    let text = frame(&state, 120, 40, false);
+    assert!(text.contains("pings at 18:11 on Mon..Fri"), "{text}");
+    ctrl_s(&mut state);
+    assert!(state.editing().is_none(), "the form closes on its way");
+    match &ops(&mut state)[..] {
+        [Op::Write(slots)] => assert_eq!(
+            slots
+                .iter()
+                .map(|slot| slot.time.hhmm())
+                .collect::<Vec<_>>(),
+            ["07:20", "09:40", "12:20", "18:00"]
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// An edit opens on the slot as it stands, and is judged against the other
+/// slots only, so it may keep its own time.
+#[test]
+fn editing_a_slot_opens_on_it_and_judges_it_against_the_rest() {
+    let mut state = schedule_page(true, false, &weekdays_and_weekend());
+    on(&mut state, Row::Slot(0));
+    press(&mut state, KeyCode::Char('e'));
+    assert_eq!(state.editing().expect("open").buffer, "07:20 Mon..Fri");
+    press(&mut state, KeyCode::Enter);
+    assert!(
+        matches!(&ops(&mut state)[..], [Op::Write(slots)] if slots.len() == 3),
+        "saved as it was"
+    );
+}
+
+/// While the machine is woken, a slot edit changes the wake first, and the
+/// user timers only once that has gone through (spec: UTUI#schedule).
+#[test]
+fn a_slot_edit_while_woken_changes_the_wake_and_then_the_timers() {
+    let mut state = schedule_page(true, true, &weekdays_and_weekend());
+    // 07:20, 09:40, 12:20: the weekend slot goes.
+    on(&mut state, Row::Slot(1));
+    press(&mut state, KeyCode::Char('d'));
+    match &ops(&mut state)[..] {
+        [Op::Elevate { script, then }] => {
+            let kept = [slot("07:20 Mon..Fri"), slot("12:20 Mon..Fri")];
+            assert_eq!(*script, crate::schedule::place_script(&kept));
+            assert_eq!(then, &[Op::Write(kept.to_vec())]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The third tab is reached by number and by stepping either way.
+#[test]
+fn the_tabs_step_round_all_three_views() {
+    let mut state = loaded_with_routing();
+    press(&mut state, KeyCode::Char('3'));
+    assert_eq!(state.view(), View::Schedule);
+    press(&mut state, KeyCode::Right);
+    assert_eq!(state.view(), View::Providers);
+    press(&mut state, KeyCode::Left);
+    assert_eq!(state.view(), View::Schedule);
+    press(&mut state, KeyCode::Char('h'));
+    assert_eq!(state.view(), View::Settings);
+}
+
+/// With the service down the schedule tab offers nothing to edit, as the
+/// other tabs do (spec: UTUI#the-configuration-pages).
+#[test]
+fn the_schedule_tab_offers_nothing_while_the_service_is_down() {
+    let mut state = schedule_page(true, true, &weekdays_and_weekend());
+    state.command_refused("config-snapshot");
+    let text = frame(&state, 100, 24, false);
+    assert!(text.contains("the service is not answering"), "{text}");
+    press(&mut state, KeyCode::Char(' '));
+    press(&mut state, KeyCode::Char('n'));
+    assert!(ops(&mut state).is_empty());
+    assert!(state.editing().is_none());
 }
