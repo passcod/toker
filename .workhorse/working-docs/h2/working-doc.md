@@ -68,6 +68,30 @@ The winner is looked up again whenever the catalogue refreshes, so a new release
 
 For mapping Claude tiers onto another provider, the selector is the direct fit.
 
+## Recipe: send everything to OpenRouter
+
+### Symptom
+
+With OpenRouter enabled after another provider, the rewrites tab reads `disabled` for OpenRouter's prefix rewrites, and a default pointed at an OpenRouter route refuses.
+
+### Why
+
+The first revision builds a route per provider, with its candidate switched off where the provider was not configured then.
+Enabling a provider used to switch that candidate on only for a protocol it also gave a default, and a provider enabled after codex (which serves all three protocols) got no default, so its routes stayed off.
+Enabling a provider now switches its routes on whatever the defaults.
+On a machine that hit this before the fix, turn OpenRouter off and on again on the providers page, or open each `route-openrouter-…` route on the routes tab and switch its candidate on.
+
+`disabled` in a reach means the route's own candidate is switched off; a provider that is merely off reads `off`.
+
+### Fix
+
+1. On the defaults tab, point every protocol default, and each unprefixed profile default, at OpenRouter's route for that protocol: `route-openrouter-openrouter_messages`, `route-openrouter-openrouter_chat_completions` and `route-openrouter-openrouter_responses`.
+2. OpenRouter spells Claude models `anthropic/claude-opus-5.5`, while Claude Code sends `claude-opus-5-5`, and a default passes the requested name through unchanged.
+   Map each Claude tier with a rewrite to the messages route, setting `requested_model` to OpenRouter's id, as in the codex recipe above.
+3. The `anthropic-protocol-alias` rewrite sends any `anthropic/…` name to whichever provider was the Anthropic default when the first revision was made, stripping the prefix.
+   A client already naming OpenRouter's spelling is caught by it, so repoint it at the OpenRouter messages route sending the whole name, or delete it.
+4. Press `t` and trace each tier.
+
 ## Starting from scratch
 
 Stop the service before deleting the state dir: `systemctl --user stop toker.socket toker.service`.
@@ -81,4 +105,7 @@ A running service keeps the deleted store open and goes on writing to it, so rou
 - Reference fields such as **route** complete only by prefix, start prefilled with another record's id, and never list the choices: clear back to `route-`, type the start of the id, then tab.
 - A route reference's arguments start empty, a new one is named `name-1`, and the form never offers the route's declared parameters, so `requested_model` has to be known and typed.
 - The rewrite form asks for an id that is shown nowhere afterwards, against the dashboard spec's rule that a rewrite needs no name of its own.
+- A provider enabled after another took every default kept its generated route switched off, so its prefix and any default pointed at it read `disabled` (fixed).
+- The reach word `disabled` does not say why the candidate is off, and the route form is the only place to switch it on.
+- The `anthropic-protocol-alias` rewrite keeps pointing at the provider that was the Anthropic default when the first revision was made, whatever the defaults later become.
 - Codex has no generated classifier, and its listing has no release dates, so "newest codex model" needs a hand-written classifier regex first.
