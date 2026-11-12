@@ -91,6 +91,11 @@ A protocol that already has a default MUST keep it.
 > [!NOTE]
 > A machine set up before any provider was found then serves once one is turned on, without a trip to the routing page.
 
+The same operation MUST switch on the candidate of each route [generated](../routing/migration.md#the-first-revision) to that provider which the active revision holds switched off, whether or not it gives a default.
+
+> [!NOTE]
+> The first revision switches off the route to a provider that was not configured then, so a provider enabled after another took every default would otherwise keep a route that answers locally, for its own prefix and for any default later pointed at it.
+
 ### Configuration never refuses a start
 
 A stored setting the service cannot use MUST disable only what that setting describes, and MUST NOT prevent the service from starting.

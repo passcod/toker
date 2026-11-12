@@ -820,15 +820,47 @@ async fn enabling_a_provider_gives_each_protocol_without_a_default_one_to_it() {
 }
 
 #[tokio::test]
-async fn enabling_a_provider_whose_protocols_have_defaults_saves_no_revision() {
+async fn enabling_a_provider_whose_protocols_have_defaults_switches_its_routes_on() {
+    // spec: DCONF#editing
     let (server, store) = server();
     let app = server.router();
     set_enabled(&app, "codex_sub", true).await;
     let with_codex = active_revision(&store);
+    let openrouter_routes = |revision: &toker::store::PolicyRevision| {
+        revision
+            .document
+            .document()
+            .routes
+            .iter()
+            .filter(|route| route.id.as_str().starts_with("route-openrouter-"))
+            .map(|route| route.chain.first.enabled)
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        openrouter_routes(&with_codex).iter().all(|on| !on),
+        "the first revision has OpenRouter's routes off: it was not configured"
+    );
 
     // OpenRouter serves the same three protocols, each now with a default.
+    // Its routes still have to reach it, for its prefix and for a default
+    // the operator then points at one of them.
     set_enabled(&app, "openrouter", true).await;
-    assert_eq!(active_revision(&store).revision_id, with_codex.revision_id);
+    let after = active_revision(&store);
+    assert_ne!(after.revision_id, with_codex.revision_id);
+    assert_eq!(
+        after.description.as_deref(),
+        Some("routes to openrouter switched on, on enabling it")
+    );
+    let routes = openrouter_routes(&after);
+    assert!(
+        !routes.is_empty() && routes.iter().all(|on| *on),
+        "{routes:?}"
+    );
+    assert_eq!(
+        after.document.document().defaults,
+        with_codex.document.document().defaults,
+        "the defaults codex was given stay"
+    );
 }
 
 #[tokio::test]
