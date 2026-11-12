@@ -521,16 +521,18 @@ pub struct ProviderDefaults {
 }
 
 /// The edit that gives each protocol `provider` serves a default route to it,
-/// where `document` has no default for that protocol (spec: DCONF#editing).
-/// The edit is empty where every protocol it serves has one already.
+/// where `document` has no default for that protocol, and switches on the
+/// provider's generated routes (spec: DCONF#editing). The edit is empty where
+/// every protocol it serves has a default already and its routes are on.
 ///
 /// Only a protocol-scoped default counts as the protocol having one: that is
 /// what a request reaches when no profile names a default of its own. The
 /// route each default points at is the generated route to the provider's
-/// binding for that protocol, as revision one builds it. It is added where
-/// the document lacks it, and its candidate on that binding enabled where it
-/// is not: a revision generated before the provider was on has the route with
-/// the candidate off, and a default to it would serve nothing. An unprefixed
+/// binding for that protocol, as revision one builds it, and is added where
+/// the document lacks it. Its candidate on that binding is enabled wherever
+/// it is not, default added or not: a revision generated before the provider
+/// was on has the route with the candidate off, so the provider's prefix and
+/// any default pointed at it by hand would serve nothing. An unprefixed
 /// profile default already there is the operator's and stays.
 pub fn defaults_for_enabled_provider(
     config: &Config,
@@ -563,14 +565,16 @@ pub fn defaults_for_enabled_provider(
         else {
             continue;
         };
-        if has_default(&FrontendScope::Protocol { protocol }) {
+        let needs_default = !has_default(&FrontendScope::Protocol { protocol });
+        let route_id = backend_route_id(binding)?;
+        let route = document.routes.iter().find(|route| route.id == route_id);
+        if !needs_default && route.is_none() {
             continue;
         }
-        let route_id = backend_route_id(binding)?;
         // One binding can serve several protocols (codex's serves all
         // three), and its route is edited once.
         if routes_done.insert(route_id.clone()) {
-            match document.routes.iter().find(|route| route.id == route_id) {
+            match route {
                 Some(route) => {
                     let first = &route.chain.first;
                     if &first.binding_id == binding.id() && !first.enabled {
@@ -598,6 +602,9 @@ pub fn defaults_for_enabled_provider(
                     operations.push(PolicyEditOperation::AddRoute { route });
                 }
             }
+        }
+        if !needs_default {
+            continue;
         }
         for default in default_routes(protocol, binding)? {
             if !has_default(&default.scope) {
