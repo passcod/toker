@@ -54,7 +54,7 @@ Only the request bounds the prefix this send would re-read, so anything reading 
 ## Cache identity
 
 A cache identity is the binding, the exact model sent upstream and the account that served, together.
-Two cache identities recording no account MUST compare as the same account.
+Where either of two cache identities records no account, they MUST compare as the same account.
 
 A lane MUST have one cache identity at a time.
 
@@ -89,6 +89,13 @@ A pin served through a provider with no such accounts MUST record none.
 > [!NOTE]
 > The account sits outside the all-or-nothing rule because most providers Toker serves have no account identity at all, and requiring one would leave their lanes unable to pin.
 > A pin that records no account still carries a cache identity; it is just one the account cannot narrow.
+
+A pin that records no account MUST take the account of a later request that differs from it in nothing else.
+A request whose account is not known MUST keep a pin that records one.
+
+> [!NOTE]
+> A credential is often named only after its first request has pinned the lane, and a refreshed one is not named until after its first request, as [ACCT](accounts.md#an-account-not-yet-known) allows.
+> An account not known on one side is no evidence of a different one, so neither may read as the lane moving account, which would refuse the session's next request as a warm cache loss.
 
 A pin MUST be written only when a response is recorded as served.
 A failed attempt, a cancelled attempt and a failure before sending MUST NOT pin.
