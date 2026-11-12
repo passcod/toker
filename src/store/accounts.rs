@@ -434,3 +434,18 @@ pub(super) fn rows_for_digest(conn: &Connection, provider: &str, digest: &str) -
         |row| row.get(0),
     )?)
 }
+
+/// The account `digest` is bound to, if any source has named it.
+pub(super) fn account_for_digest(
+    conn: &Connection,
+    digest: &CredentialDigest,
+) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT account_number FROM credential_accounts WHERE digest = ?1",
+            [digest.as_str()],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten())
+}

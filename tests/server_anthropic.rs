@@ -655,6 +655,29 @@ async fn mock_batches(State(mock): State<MockState>, request: Request) -> Respon
 /// Any path the mock's own route table does not name: a distinctive
 /// status and body, metered, so a test can see the pass-through carried
 /// the upstream's answer back unchanged.
+/// The login's profile, for the one bearer the mock knows the owner of.
+async fn mock_profile(State(mock): State<MockState>, request: Request) -> Response {
+    let (_path, headers, _json, _stream) = read_and_capture(&mock, request).await;
+    if headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        != Some("Bearer outside-token")
+    {
+        return raw_response(
+            StatusCode::UNAUTHORIZED,
+            "application/json",
+            Bytes::from_static(br#"{"type":"error"}"#),
+        );
+    }
+    raw_response(
+        StatusCode::OK,
+        "application/json",
+        Bytes::from_static(
+            br#"{"account":{"uuid":"acc-outside","email":"outside@example.test"},"organization":{"uuid":"org-1"}}"#,
+        ),
+    )
+}
+
 async fn mock_unmatched(State(mock): State<MockState>, request: Request) -> Response {
     let (_path, _headers, _json, _stream) = read_and_capture(&mock, request).await;
     let mut response = raw_response(
@@ -699,6 +722,7 @@ async fn spawn_mock() -> (MockState, reqwest::Url) {
         .route("/v1/messages/batches/{id}", get(mock_batches))
         .route("/v1/messages/batches/{id}/results", get(mock_batches))
         .route("/v1/messages/batches/{id}/cancel", post(mock_batches))
+        .route("/api/oauth/profile", get(mock_profile))
         .fallback(mock_unmatched)
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -4818,4 +4842,127 @@ async fn the_mark_is_shown_in_the_config_snapshot_and_cleared_by_the_control_ope
     assert_eq!(captured.len(), before + 2);
     let probe: Value = serde_json::from_slice(&captured[before].body).expect("probe JSON");
     assert!(probe.get("safeguards").is_some());
+}
+
+/// A login no local source knows, such as the Claude CLI's own, is named by
+/// the upstream it is sent to, and its rows join that account
+/// (spec: ACCT#coming-to-know-an-account).
+#[tokio::test]
+async fn a_credential_nothing_local_names_is_named_by_the_upstream() {
+    let (mock, upstream) = spawn_mock().await;
+    let config = test_config(upstream, None, "anthropic_sub");
+    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
+    let server = Server::with_seams(
+        config,
+        store.clone(),
+        toker::server::Seams::isolated().with_upstream_accounts(),
+    )
+    .expect("build server");
+    let app = server.router();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("toker binds");
+    let addr = listener.local_addr().expect("toker addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("toker serves");
+    });
+    let profile_lookups = || {
+        mock.captured()
+            .iter()
+            .filter(|request| request.path == "/api/oauth/profile")
+            .count()
+    };
+
+    // A credential another source already named is never asked about.
+    let named_digest = toker::providers::credential_digest("named-token");
+    store
+        .observe_credential(
+            "anthropic_sub",
+            &named_digest,
+            jiff::Timestamp::now().as_millisecond(),
+            Some(&toker::store::AccountIdentity {
+                upstream_id: None,
+                email: Some("named@example.test".to_owned()),
+                named_by: toker::store::AccountNameSource::Local,
+            }),
+        )
+        .expect("observe the named credential");
+    let body = messages_body_no_stream("claude-opus-5");
+    // Its own session: a session is pinned to the account it was served on.
+    client()
+        .post(toker_url(addr, "/v1/messages"))
+        .header("x-claude-code-session-id", "ccses-named")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .header(header::AUTHORIZATION, "Bearer named-token")
+        .body(body.clone())
+        .send()
+        .await
+        .expect("named request")
+        .bytes()
+        .await
+        .expect("named response");
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, None, "the named credential was served");
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(profile_lookups(), 0, "a named credential is not looked up");
+
+    let digest = toker::providers::credential_digest("outside-token");
+    let headers = [("authorization", "Bearer outside-token")];
+    for _ in 0..2 {
+        post_messages(addr, "/v1/messages", &headers, &body)
+            .await
+            .bytes()
+            .await
+            .expect("outside response");
+    }
+    let mut account = None;
+    for _ in 0..200 {
+        account = store.account_for_digest(&digest).expect("read binding");
+        if account.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let account = account.expect("the upstream named the credential");
+    let accounts = store.load_accounts().expect("accounts");
+    let named = accounts
+        .iter()
+        .find(|known| known.number == account)
+        .expect("the account is held");
+    assert_eq!(named.upstream_id.as_deref(), Some("acc-outside"));
+    assert_eq!(named.email.as_deref(), Some("outside@example.test"));
+    assert_eq!(named.named_by, toker::store::AccountNameSource::Upstream);
+
+    let rows = wait_for_rows(&store, 3).await;
+    let outside: Vec<_> = rows
+        .iter()
+        .filter(|row| row.credential_digest.as_ref() == Some(&digest))
+        .collect();
+    assert_eq!(outside.len(), 2);
+    assert!(
+        outside
+            .iter()
+            .all(|row| row.account_number == Some(account)),
+        "every row on the credential is attributed, the first included"
+    );
+    assert_eq!(profile_lookups(), 1, "a digest is asked about once");
+
+    // A refreshed credential is not named until after its first request,
+    // which must not read as the session moving off the account its lane
+    // learned.
+    let headers = [("authorization", "Bearer refreshed-token")];
+    post_messages(addr, "/v1/messages", &headers, &body)
+        .await
+        .bytes()
+        .await
+        .expect("refreshed response");
+    let rows = wait_for_rows(&store, 4).await;
+    let refreshed = toker::providers::credential_digest("refreshed-token");
+    let row = rows
+        .iter()
+        .find(|row| row.credential_digest.as_ref() == Some(&refreshed))
+        .expect("the refreshed credential's row");
+    assert_eq!(row.kind, None, "served, not refused");
+    assert_eq!(row.account_number, None, "the mock names no such login");
 }

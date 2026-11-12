@@ -335,6 +335,9 @@ pub struct Seams {
     /// cache, which only the service wants: a test's inventory would then
     /// depend on whichever machine runs it.
     pub catalogs: Option<FetchedCatalogs>,
+    /// Whether a credential no local source names is looked up with its
+    /// upstream. Off in tests, whose mock upstreams count what they serve.
+    pub upstream_accounts: bool,
 }
 
 impl Seams {
@@ -344,6 +347,7 @@ impl Seams {
             spawner: Box::new(awake::ProcessSpawner),
             secrets: Arc::new(OsKeyring),
             catalogs: None,
+            upstream_accounts: true,
         }
     }
 
@@ -355,6 +359,7 @@ impl Seams {
             spawner: Box::new(awake::RefusingSpawner),
             secrets: Arc::new(secrets::MemoryStore::new()),
             catalogs: Some(FetchedCatalogs::default()),
+            upstream_accounts: false,
         }
     }
 
@@ -370,6 +375,11 @@ impl Seams {
 
     pub fn with_catalogs(mut self, catalogs: FetchedCatalogs) -> Seams {
         self.catalogs = Some(catalogs);
+        self
+    }
+
+    pub fn with_upstream_accounts(mut self) -> Seams {
+        self.upstream_accounts = true;
         self
     }
 }
@@ -455,6 +465,9 @@ pub struct Server {
     /// digest. Re-read when it cannot answer, because another program
     /// rewrites it on every token refresh. Token values do not survive it.
     pub(crate) local_accounts: Arc<crate::accounts::LocalAccounts>,
+    /// The digests the upstream has been asked to name, or `None` where
+    /// it is never asked ([`Seams::upstream_accounts`]).
+    pub(crate) upstream_accounts: Option<Arc<crate::accounts::UpstreamAccounts>>,
     /// The enabled provider bindings and implemented frontend-to-backend
     /// routes. Policy picks the binding; handlers turn it into a concrete
     /// model target here.
@@ -531,6 +544,7 @@ impl Server {
             spawner,
             secrets,
             catalogs: initial_catalogs,
+            upstream_accounts,
         } = seams;
         // The legacy routing fields are only input to establishing revision
         // one, which validates them itself.
@@ -677,6 +691,7 @@ impl Server {
             config: Arc::new(ConfigCell::new(config)),
             http,
             local_accounts: Arc::new(local_accounts),
+            upstream_accounts: upstream_accounts.then(Arc::default),
             registry,
             codex_turn,
             binding_learning,
@@ -772,6 +787,87 @@ impl Server {
                 None
             }
         }
+    }
+
+    /// Ask the upstream whose the credential in `outgoing` is, when no other
+    /// source names it (spec: ACCT#coming-to-know-an-account). Called as a
+    /// request goes upstream; it only ever spawns, so the request never
+    /// waits on it and nothing here can fail it
+    /// (spec: WCRED#which-account-a-credential-names).
+    ///
+    /// The answer is recorded against the digest, which attributes every
+    /// row already held against it, so the request this was called for is
+    /// labelled whichever finishes first. The bearer is moved into the one
+    /// GET and dropped with it.
+    pub(crate) fn ask_upstream_whose(
+        &self,
+        provider: &dyn Provider,
+        outgoing: &HeaderMap,
+        digest: &CredentialDigest,
+    ) {
+        let Some(asked) = self.upstream_accounts.clone() else {
+            return;
+        };
+        if provider.id() != crate::accounts::ACCOUNTED_PROVIDER {
+            return;
+        }
+        let Some(authorization) = outgoing.get(header::AUTHORIZATION) else {
+            return;
+        };
+        if !asked.claim(digest, now_ms()) {
+            return;
+        }
+        let mut authorization = authorization.clone();
+        authorization.set_sensitive(true);
+        let url = provider.endpoint(crate::accounts::PROFILE_PATH);
+        let provider = provider.id().to_owned();
+        let digest = digest.clone();
+        let server = self.clone();
+        tokio::spawn(async move {
+            // The local source comes first: it answers without a request,
+            // and the store already holds whatever any source has said.
+            let named = server.local_accounts.get(&digest, now_ms()).is_some()
+                || matches!(server.store.account_for_digest(&digest), Ok(Some(_)));
+            if named {
+                return;
+            }
+            let identity = match server
+                .http
+                .get(url)
+                .header(header::AUTHORIZATION, authorization)
+                .timeout(crate::accounts::PROFILE_TIMEOUT)
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => response
+                    .bytes()
+                    .await
+                    .ok()
+                    .and_then(|body| crate::accounts::profile_identity(&body)),
+                Ok(response) => {
+                    tracing::debug!(status = %response.status(), "upstream did not name a credential");
+                    None
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "asking the upstream to name a credential failed");
+                    None
+                }
+            };
+            let Some(identity) = identity else {
+                asked.unanswered(&digest, now_ms());
+                return;
+            };
+            // An answer that cannot be recorded, such as an id and an
+            // address naming two different accounts, would be the same
+            // answer if asked again, so it stays settled.
+            if let Err(error) =
+                server
+                    .store
+                    .observe_credential(&provider, &digest, now_ms(), Some(&identity))
+            {
+                tracing::warn!(%error, "recording the account the upstream named failed");
+            }
+        });
     }
 
     /// Write one ledger row. A row that carries its duration also says when

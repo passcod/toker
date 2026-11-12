@@ -686,6 +686,9 @@ pub(crate) async fn send_upstream_to(
     let url = provider.endpoint(path);
     let headers = outgoing_headers(provider, &parts.headers, session_header_names, frontend);
     let credential_digest = outgoing_credential_digest(&headers);
+    if let Some(digest) = &credential_digest {
+        server.ask_upstream_whose(provider, &headers, digest);
+    }
     let response = server
         .http
         .request(parts.method.clone(), url)
