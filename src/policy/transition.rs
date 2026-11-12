@@ -35,14 +35,30 @@ impl PinIdentity {
     /// The cache identity: the binding, the exact model sent upstream and the
     /// account that served, together (spec: SLANE#cache-identity). The account
     /// belongs here because a prompt cache is the account's, so the same
-    /// binding on the same model under another login reads none of it. Two
-    /// pins that name no account are the same cache: a provider whose
-    /// accounts Toker cannot tell apart has one cache to tell about.
+    /// binding on the same model under another login reads none of it. A pin
+    /// that names no account matches any: a provider whose accounts Toker
+    /// cannot tell apart has one cache to tell about, and a credential not
+    /// named yet is no evidence of another login.
     fn same_cache_as(&self, other: &Self) -> bool {
         self.binding_id == other.binding_id
             && self.effective_model == other.effective_model
-            && self.account_number == other.account_number
+            && same_account(self.account_number, other.account_number)
     }
+
+    /// The same pin but for an account one of the two does not know.
+    fn same_but_unknown_account(&self, other: &Self) -> bool {
+        let without_account = |pin: &Self| Self {
+            account_number: None,
+            ..pin.clone()
+        };
+        self.account_number.is_none() != other.account_number.is_none()
+            && without_account(self) == without_account(other)
+    }
+}
+
+/// Two accounts compare only where both are known (spec: SLANE#cache-identity).
+fn same_account(left: Option<i64>, right: Option<i64>) -> bool {
+    left.zip(right).is_none_or(|(left, right)| left == right)
 }
 
 impl From<&crate::store::LanePin> for PinIdentity {
@@ -127,6 +143,9 @@ pub enum TransitionSource {
     Fallback,
     ExplicitUserChange,
     Compaction,
+    /// The pin learns the account its credential was named after it was
+    /// written, and moves nowhere.
+    AccountNamed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +208,23 @@ pub fn decide_transition(
     if current == &prospective {
         return TransitionDecision::Keep {
             pin: Some(current.clone()),
+        };
+    }
+    // The lane is where it was, and only one side knows whose it is: a
+    // credential named after it pinned the lane, or a refreshed one not
+    // named yet. Neither is the lane moving account, which would refuse
+    // the session's next request (spec: SLANE#the-pin).
+    if current.same_but_unknown_account(&prospective) {
+        return match current.account_number {
+            Some(_) => TransitionDecision::Keep {
+                pin: Some(current.clone()),
+            },
+            None => TransitionDecision::Replace {
+                expected_generation: *generation,
+                expected_pin: current.clone(),
+                new_pin: prospective,
+                source: TransitionSource::AccountNamed,
+            },
         };
     }
     if prospective.policy_revision_id < current.policy_revision_id {
@@ -692,5 +728,61 @@ mod tests {
             ),
             TransitionDecision::Replace { .. }
         ));
+    }
+
+    fn on_account(account_number: Option<i64>) -> PinIdentity {
+        PinIdentity {
+            account_number,
+            ..pin(1, "anthropic_sub.anthropic_messages", "model")
+        }
+    }
+
+    const PRESERVE_PINNED: TransitionCause = TransitionCause::Upgrade {
+        lane: LaneTransitionPolicy::PreservePinned,
+    };
+
+    #[test]
+    fn a_pin_learns_the_account_its_credential_was_later_named() {
+        assert_eq!(
+            decide_transition(
+                &lane(Some(on_account(None)), CacheTemperature::Warm),
+                on_account(Some(2)),
+                PRESERVE_PINNED,
+            ),
+            TransitionDecision::Replace {
+                expected_generation: 4,
+                expected_pin: on_account(None),
+                new_pin: on_account(Some(2)),
+                source: TransitionSource::AccountNamed,
+            }
+        );
+    }
+
+    #[test]
+    fn a_credential_not_named_yet_keeps_the_pin_s_account() {
+        assert_eq!(
+            decide_transition(
+                &lane(Some(on_account(Some(2))), CacheTemperature::Warm),
+                on_account(None),
+                PRESERVE_PINNED,
+            ),
+            TransitionDecision::Keep {
+                pin: Some(on_account(Some(2)))
+            }
+        );
+    }
+
+    #[test]
+    fn a_known_other_account_is_still_a_move() {
+        assert_eq!(
+            decide_transition(
+                &lane(Some(on_account(Some(1))), CacheTemperature::Warm),
+                on_account(Some(2)),
+                PRESERVE_PINNED,
+            ),
+            TransitionDecision::Denied(TransitionDenied::LanePinned)
+        );
+        assert!(!on_account(Some(1)).same_cache_as(&on_account(Some(2))));
+        assert!(on_account(None).same_cache_as(&on_account(Some(2))));
     }
 }

@@ -352,6 +352,12 @@ impl Store {
         accounts::load_credentials(&*self.conn()?)
     }
 
+    /// The account a credential digest is bound to, if any source has
+    /// named it.
+    pub fn account_for_digest(&self, digest: &CredentialDigest) -> Result<Option<i64>> {
+        accounts::account_for_digest(&*self.conn()?, digest)
+    }
+
     /// How many of a provider's rows carry `digest` — the requests held
     /// against a credential no source has named yet.
     pub fn rows_for_digest(&self, provider: &str, digest: &str) -> Result<i64> {

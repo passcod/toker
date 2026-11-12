@@ -211,9 +211,126 @@ impl LocalAccounts {
     }
 }
 
+/// Where the subscription says whose an OAuth token is: the path the
+/// Claude CLI reads its own login's profile from.
+pub const PROFILE_PATH: &str = "/api/oauth/profile";
+
+/// How long a profile lookup may take. It runs beside the request it would
+/// label, so nothing waits on it, but a hung one would hold its claim.
+pub const PROFILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a lookup that got no answer waits before the same digest is
+/// asked about again. A credential keeps being sent until it is refreshed,
+/// so without this every request on it would ask once more.
+const ASK_AGAIN_AFTER_MS: i64 = 10 * 60 * 1000;
+
+#[derive(Debug, Deserialize)]
+struct Profile {
+    account: ProfileAccount,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProfileAccount {
+    uuid: String,
+    email: Option<String>,
+}
+
+/// The identity a profile response names, or `None` for a body that names
+/// no account.
+pub fn profile_identity(body: &[u8]) -> Option<AccountIdentity> {
+    let profile = serde_json::from_slice::<Profile>(body).ok()?;
+    let upstream_id = profile.account.uuid.trim().to_owned();
+    if upstream_id.is_empty() {
+        return None;
+    }
+    let email = profile
+        .account
+        .email
+        .map(|email| email.trim().to_owned())
+        .filter(|email| !email.is_empty());
+    Some(AccountIdentity {
+        upstream_id: Some(upstream_id),
+        email,
+        named_by: AccountNameSource::Upstream,
+    })
+}
+
+/// Which digests the upstream has been asked about.
+///
+/// A login outside the local multi-account file, such as the Claude CLI's
+/// own, sends a credential no local source can name, and a refresh gives it
+/// a new digest every few hours. Only the upstream can name those
+/// (spec: ACCT#coming-to-know-an-account), and it is asked once per digest:
+/// again only after a lookup that got no answer.
+#[derive(Debug, Default)]
+pub struct UpstreamAccounts {
+    asked: std::sync::Mutex<BTreeMap<CredentialDigest, Asked>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Asked {
+    /// In flight, or answered: either way, not to be asked again.
+    Settled,
+    /// Got no answer at this time.
+    Unanswered(i64),
+}
+
+impl UpstreamAccounts {
+    /// Claim the lookup for `digest`, unless one is in flight, has answered,
+    /// or got no answer within [`ASK_AGAIN_AFTER_MS`].
+    pub fn claim(&self, digest: &CredentialDigest, now_ms: i64) -> bool {
+        let mut asked = self.asked.lock().unwrap_or_else(|e| e.into_inner());
+        match asked.get(digest) {
+            Some(Asked::Settled) => false,
+            Some(Asked::Unanswered(at)) if now_ms.saturating_sub(*at) < ASK_AGAIN_AFTER_MS => false,
+            _ => {
+                asked.insert(digest.clone(), Asked::Settled);
+                true
+            }
+        }
+    }
+
+    /// Record that the lookup claimed for `digest` got no answer.
+    pub fn unanswered(&self, digest: &CredentialDigest, now_ms: i64) {
+        self.asked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(digest.clone(), Asked::Unanswered(now_ms));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_profile_names_its_account_by_id_and_address() {
+        let identity = profile_identity(
+            br#"{"account":{"uuid":"acc-1","email":"one@example.test","display_name":"One"},"organization":{"uuid":"org-1"}}"#,
+        )
+        .expect("a profile names an account");
+        assert_eq!(identity.upstream_id.as_deref(), Some("acc-1"));
+        assert_eq!(identity.email.as_deref(), Some("one@example.test"));
+        assert_eq!(identity.named_by, AccountNameSource::Upstream);
+        assert_eq!(profile_identity(br#"{"error":"unauthorized"}"#), None);
+        assert_eq!(profile_identity(br#"{"account":{"uuid":" "}}"#), None);
+    }
+
+    #[test]
+    fn a_digest_is_asked_about_once_and_again_only_after_no_answer() {
+        let asked = UpstreamAccounts::default();
+        let digest = credential_digest("token-one");
+        let now = 1_000_000;
+        assert!(asked.claim(&digest, now));
+        assert!(!asked.claim(&digest, now + 1), "in flight");
+        asked.unanswered(&digest, now + 10);
+        assert!(!asked.claim(&digest, now + 20), "too soon after no answer");
+        assert!(asked.claim(&digest, now + 10 + ASK_AGAIN_AFTER_MS));
+        assert!(
+            !asked.claim(&digest, now + 20 * ASK_AGAIN_AFTER_MS),
+            "answered, or in flight again"
+        );
+    }
 
     fn write_source(path: &Path, entries: &[(&str, &str)]) {
         let accounts: Vec<String> = entries
