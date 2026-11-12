@@ -282,9 +282,10 @@ impl Server {
     }
 
     /// Give each protocol `provider` serves a default route to it where the
-    /// active revision has none, saved as a revision the way a routing save
-    /// is (spec: DCONF#editing, spec: RREV#saving-an-edit). `None` where every
-    /// protocol it serves has a default already, and nothing is saved.
+    /// active revision has none, and switch its generated routes on, saved as
+    /// a revision the way a routing save is (spec: DCONF#editing, spec:
+    /// RREV#saving-an-edit). `None` where every protocol it serves has a
+    /// default already and its routes are on, and nothing is saved.
     pub(crate) fn default_routes_for_enabled_provider(
         &self,
         config: &crate::config::Config,
@@ -306,18 +307,24 @@ impl Server {
         let document = defaults
             .edit
             .apply_validated(&basis.active_revision.document)?;
-        let description = format!(
-            "default for {}, on enabling {provider}",
-            defaults
-                .protocols
-                .iter()
-                .map(|protocol| format!(
-                    "{} → {provider}",
-                    crate::policy::facts::protocol_name(*protocol)
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        // An edit with no default in it only switches the provider's routes
+        // on, the protocols it serves having defaults already.
+        let description = if defaults.protocols.is_empty() {
+            format!("routes to {provider} switched on, on enabling it")
+        } else {
+            format!(
+                "default for {}, on enabling {provider}",
+                defaults
+                    .protocols
+                    .iter()
+                    .map(|protocol| format!(
+                        "{} → {provider}",
+                        crate::policy::facts::protocol_name(*protocol)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         self.activate_document_locked(
             &basis,
             &document,
