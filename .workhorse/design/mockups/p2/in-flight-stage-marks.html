@@ -223,8 +223,9 @@ ses-new ⇡ 14s   ses-free <span class="b">⇣</span> 22s   ses-hot <span class=
 </p>
 
 <h2>Legend rows</h2>
-<pre class="frame swatch"><span class="b">‖ ⇡ ⇣</span>   in flight: not yet sent, awaiting a reply, or streaming; timed from arrival
-<span class="b">⇣</span> <span class="cyan b">⇣</span>   bold: one more request in flight beside it; cyan: two or more</pre>
+<pre class="frame swatch"><span class="b">‖ ⇡ ⇣ </span>   in flight: not yet sent, awaiting a reply, or streaming; timed from arrival
+<span class="b">bold ⇣</span>   one other request in flight beside it
+<span class="b">cyan ⇣</span>   two or more others in flight beside it</pre>
 <p class="note">
   These replace the <strong>held sent recv</strong> and <strong>+N</strong>
   rows in the dashboard's <strong>?</strong> overlay, and the matching rows
@@ -233,13 +234,6 @@ ses-new ⇡ 14s   ses-free <span class="b">⇣</span> 22s   ses-hot <span class=
   is read.
 </p>
 
-<h2>Worth a look</h2>
-<p class="note">
-  <strong>The exact count leaves the table.</strong> The dashboard spec asks
-  a row to show how many requests are in flight. Colour banding gives
-  one, two, or three or more, so the spec's wording changes with this, and
-  the detail popup carries the exact number.
-</p>
 
 </body>
 </html>

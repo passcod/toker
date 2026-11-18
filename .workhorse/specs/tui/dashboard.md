@@ -134,7 +134,12 @@ The request rate MUST count each request in the minute Toker began handling it, 
 A recorded request whose rows predate the [time it began](../store/ledger.md#fields-that-need-care) MUST be placed by its first row instead.
 
 While a session has a request in flight, its row MUST show that request's stage and how long it has been in flight, in place of how long the session has been idle.
-Where a session has more than one request in flight, its row MUST show the one in flight longest, and how many there are.
+Where a session has more than one request in flight, its row MUST show the one in flight longest, and MUST distinguish one other request in flight beside it from two or more.
+The idle column MUST be as wide while a session has a request in flight as while none does, so that requests starting and finishing do not move the table's columns.
+
+> [!NOTE]
+> A column that widens for a request in flight reflows the whole table several times a minute on a busy machine, shifting every column the operator is reading.
+> The exact count is in the session detail, which lists each request in flight.
 
 A request in flight on the session's own conversation, rather than on a child's, MUST update the row's message count.
 Figures only a response reports, such as the prompt and the output, MUST keep their values from the session's latest completed request.
