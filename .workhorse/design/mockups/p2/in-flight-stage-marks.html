@@ -1,0 +1,239 @@
+<!-- spec: tui/dashboard.md -->
+<!DOCTYPE html>
+<html lang="en-NZ">
+<head>
+<meta charset="utf-8">
+<title>Sessions idle column with one-cell in-flight marks</title>
+<style>
+  /* Ghostty's stock palette, the reference ground toker is developed
+     against. The TUI sets no RGB anywhere: it names the ANSI sixteen, so
+     these are the reference theme's answer, not values from the code. */
+  :root {
+    --bg: #282c34;  /* background      */  --fg: #ffffff;  /* foreground   */
+    --c0: #1d1f21;  /* black           */  --c8: #666666;  /* dark gray    */
+    --c1: #cc6666;  /* red             */  --c9: #d54e53;  /* bright red   */
+    --c2: #b5bd68;  /* green           */  --c10:#b9ca4a;  /* bright green */
+    --c3: #f0c674;  /* yellow          */  --c11:#e7c547;  /* bright yellow*/
+    --c4: #81a2be;  /* blue            */  --c12:#7aa6da;  /* bright blue  */
+    --c5: #b294bb;  /* magenta         */  --c13:#c397d8;  /* bright mag.  */
+    --c6: #8abeb7;  /* cyan            */  --c14:#70c0b1;  /* bright cyan  */
+    --c7: #c5c8c6;  /* white           */  --c15:#eaeaea;  /* bright white */
+  }
+
+  body {
+    background: #14161a;
+    color: var(--c7);
+    font-family: system-ui, sans-serif;
+    margin: 0;
+    padding: 2rem;
+  }
+
+  /* One terminal frame. The frame takes its width from its own longest
+     row, so every row must advance the same number of cells or the grid
+     tears and the panel borders stop lining up with the content.
+
+     Term, never plain Iosevka. The default Iosevka family leaves the
+     characters Unicode calls ambiguous or wide at their natural width,
+     so the glyphs the TUI actually emits here -- the proportion bar's
+     mark, the four arrows and the em dash -- each advance two cells
+     instead of one. That tore the dashboard's cache-read row out to 187
+     cells against its neighbours' 120. Iosevka Term and Iosevka Fixed
+     force every glyph to a single cell; the generic fallbacks below are
+     strictly monospaced and behave.
+
+     All three Iosevka families set post.isFixedPitch, so the font
+     declares itself monospace whichever one is picked, and counting
+     characters cannot tell them apart. Only measuring the rendered
+     advance does. */
+  .frame {
+    font-family: "Iosevka Term", "Iosevka Fixed", "DejaVu Sans Mono", monospace;
+    font-size: 15px;
+    line-height: 1.2;
+    background: var(--bg);
+    color: var(--fg);
+    padding: 0.6rem 1rem;
+    margin: 0 0 0.5rem;
+    white-space: pre;
+    overflow-x: auto;
+    width: max-content;
+    /* The terminal runs Iosevka with calt on, but every arrow and
+       comparison the TUI emits is a precomposed character rather than an
+       ASCII sequence, so there is nothing here for a ligature to join.
+       Off, because a browser ligature need not stay cell-aligned and the
+       grid matters more than a feature nothing triggers. */
+    font-variant-ligatures: none;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Foreground colours. Each sets --now as well, so .r can swap them. */
+  .black   { color: var(--c0); --now: var(--c0); }
+  .red     { color: var(--c1); --now: var(--c1); }
+  .green   { color: var(--c2); --now: var(--c2); }
+  .yellow  { color: var(--c3); --now: var(--c3); }
+  .blue    { color: var(--c4); --now: var(--c4); }
+  .cyan    { color: var(--c6); --now: var(--c6); }
+  .gray    { color: var(--c8); --now: var(--c8); }
+
+  /* Modifiers. Compose them: class="green b", class="cyan d". */
+
+  /* BOLD is the emphasis channel, since colour is not. It keeps its
+     colour: the reference terminal leaves bold-color unset, so bold does
+     not remap onto the bright palette. */
+  .b { font-weight: 700; }
+
+  /* DIM at exactly the terminal's faint-opacity, so it keeps the colour
+     underneath rather than flattening to grey. A dim green mark is still
+     a green mark. */
+  .d { opacity: 0.5; }
+
+  /* REVERSED swaps foreground and background. --now carries whatever
+     colour class came before; plain text falls back to the foreground. */
+  .r { color: var(--bg); background-color: var(--now, var(--fg)); }
+
+  /* The one explicit pair in the TUI: an armed burn control. */
+  .on-yellow { color: var(--c0); background-color: var(--c3); }
+
+  /* A key rather than a screen, so its rows are deliberately ragged.
+     Anything claiming to be a frame has rows of equal width. */
+  .swatch { width: auto; }
+
+  /* Annotation outside the frame. Never inside it: a terminal has no
+     room for a note, and a mockup that puts one there is not a frame. */
+  .note {
+    font-size: 0.85rem;
+    color: #8b8f96;
+    margin: 0 0 1.5rem;
+    max-width: 70ch;
+    line-height: 1.5;
+  }
+  .note strong { color: var(--c7); font-weight: 600; }
+  h1 { font-size: 1.1rem; font-weight: 600; color: var(--fg); margin: 0 0 0.25rem; }
+  h2 { font-size: 0.95rem; font-weight: 600; color: var(--c7); margin: 2rem 0 0.5rem; }
+</style>
+</head>
+<body>
+
+<h1>Idle column: in-flight stage as a one-cell mark</h1>
+<p class="note">
+  The SESSIONS panel at 120x40, cropped below the table. Sample rows are the
+  pinned <strong>sessions_in_flight_120x40</strong> snapshot. Watch the
+  <strong>ctx</strong> column: it is the left edge of everything that moves.
+</p>
+
+<h2>Today: nothing in flight</h2>
+<pre class="frame"><span class="gray r"> ? </span> <span class="blue b r"> dashboard </span> <span class="gray r"> routing </span> <span class="gray r"> config </span> <span class="gray r"> accounts </span> last 30m · 6 sessions · 2 idle · 8 requests     last req <span class="green">3s ago</span> · 12:34:56
+┌SESSIONS──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│session                                                        ctx model       reqs prompt now    peak msgs ↺ out idle│
+│ses-free                                                        <span class="green b">1M</span> sonnet-5       3    470,893 470,893    4 <span class="d">-</span> 768  now│
+│ses-new                                                         <span class="green b d">1M</span> <span class="d">~opus-5</span>        1          ?       ?    4 <span class="d">-</span>   ?  now│
+│ses-hot                                                         <span class="green b">1M</span> opus-5         2    470,893 470,893    4 <span class="d">-</span> 768  now│
+│ses-gate                                                        <span class="green b d">1M</span> <span class="d">~opus-5</span><span class="red b"> !</span>      0          ?       ?    - <span class="d">-</span>   ?   2m│
+│ses-fail                                                        <span class="green b d">1M</span> <span class="d">~sonnet-5</span><span class="red"> ✗</span>    1          ?       ?    - <span class="d">-</span>   ?   <span class="d">4m</span>│
+│ses-crow                                                      <span class="yellow">200k</span> haiku-4-5      1    470,893 470,893   12 <span class="d">-</span> 768  <span class="d">10m</span>│
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</pre>
+<h2>Today: four requests in flight</h2>
+<pre class="frame"><span class="gray r"> ? </span> <span class="blue b r"> dashboard </span> <span class="gray r"> routing </span> <span class="gray r"> config </span> <span class="gray r"> accounts </span> last 30m · 6 sessions · 2 idle · 8 requests     last req <span class="green">3s ago</span> · 12:34:56
+┌SESSIONS──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│session                                                 ctx model       reqs prompt now    peak msgs ↺ out        idle│
+│ses-free                                                 <span class="green b">1M</span> sonnet-5       3    470,893 470,893    4 <span class="d">-</span> 768 recv 22s +1│
+│ses-new                                                  <span class="green b d">1M</span> <span class="d">~opus-5</span>        1          ?       ?    4 <span class="d">-</span>   ?    sent 14s│
+│ses-hot                                                  <span class="green b">1M</span> opus-5         2    470,893 470,893    4 <span class="d">-</span> 768     recv 1m│
+│ses-gate                                                 <span class="green b d">1M</span> <span class="d">~opus-5</span><span class="red b"> !</span>      0          ?       ?    - <span class="d">-</span>   ?          2m│
+│ses-fail                                                 <span class="green b d">1M</span> <span class="d">~sonnet-5</span><span class="red"> ✗</span>    1          ?       ?    - <span class="d">-</span>   ?          <span class="d">4m</span>│
+│ses-crow                                               <span class="yellow">200k</span> haiku-4-5      1    470,893 470,893   12 <span class="d">-</span> 768         <span class="d">10m</span>│
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</pre>
+<p class="note">
+  <strong>recv 22s +1</strong> widens the idle column from 4 cells to 11, so
+  the label column gives up 7 and every column from ctx onwards jumps left.
+  It jumps back when the requests finish, several times a minute on a busy
+  machine.
+</p>
+
+<h2>Proposed: nothing in flight</h2>
+<pre class="frame"><span class="gray r"> ? </span> <span class="blue b r"> dashboard </span> <span class="gray r"> routing </span> <span class="gray r"> config </span> <span class="gray r"> accounts </span> last 30m · 6 sessions · 2 idle · 8 requests     last req <span class="green">3s ago</span> · 12:34:56
+┌SESSIONS──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│session                                                       ctx model       reqs prompt now    peak msgs ↺ out  idle│
+│ses-free                                                       <span class="green b">1M</span> sonnet-5       3    470,893 470,893    4 <span class="d">-</span> 768   now│
+│ses-new                                                        <span class="green b d">1M</span> <span class="d">~opus-5</span>        1          ?       ?    4 <span class="d">-</span>   ?   now│
+│ses-hot                                                        <span class="green b">1M</span> opus-5         2    470,893 470,893    4 <span class="d">-</span> 768   now│
+│ses-gate                                                       <span class="green b d">1M</span> <span class="d">~opus-5</span><span class="red b"> !</span>      0          ?       ?    - <span class="d">-</span>   ?    2m│
+│ses-fail                                                       <span class="green b d">1M</span> <span class="d">~sonnet-5</span><span class="red"> ✗</span>    1          ?       ?    - <span class="d">-</span>   ?    <span class="d">4m</span>│
+│ses-crow                                                     <span class="yellow">200k</span> haiku-4-5      1    470,893 470,893   12 <span class="d">-</span> 768   <span class="d">10m</span>│
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</pre>
+<h2>Proposed: one request per session in flight</h2>
+<pre class="frame"><span class="gray r"> ? </span> <span class="blue b r"> dashboard </span> <span class="gray r"> routing </span> <span class="gray r"> config </span> <span class="gray r"> accounts </span> last 30m · 6 sessions · 2 idle · 8 requests     last req <span class="green">3s ago</span> · 12:34:56
+┌SESSIONS──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│session                                                       ctx model       reqs prompt now    peak msgs ↺ out  idle│
+│ses-free                                                       <span class="green b">1M</span> sonnet-5       3    470,893 470,893    4 <span class="d">-</span> 768 ⇣ 22s│
+│ses-new                                                        <span class="green b d">1M</span> <span class="d">~opus-5</span>        1          ?       ?    4 <span class="d">-</span>   ? ⇡ 14s│
+│ses-hot                                                        <span class="green b">1M</span> opus-5         2    470,893 470,893    4 <span class="d">-</span> 768 ⇣  1m│
+│ses-gate                                                       <span class="green b d">1M</span> <span class="d">~opus-5</span><span class="red b"> !</span>      0          ?       ?    - <span class="d">-</span>   ?    2m│
+│ses-fail                                                       <span class="green b d">1M</span> <span class="d">~sonnet-5</span><span class="red"> ✗</span>    1          ?       ?    - <span class="d">-</span>   ?    <span class="d">4m</span>│
+│ses-crow                                                     <span class="yellow">200k</span> haiku-4-5      1    470,893 470,893   12 <span class="d">-</span> 768   <span class="d">10m</span>│
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</pre>
+<p class="note">
+  The idle column always carries a one-cell stage slot and a space, blank on
+  a quiet row. A request in flight fills the slot, and its age, padded to
+  three cells, replaces the idle age, so the table holds still and the marks
+  line up. <strong>‖</strong> held, <strong>⇡</strong> sent,
+  <strong>⇣</strong> receiving: dashed, so they stay apart from the
+  model column's <strong>↑</strong>. A lone request's mark is plain, since a
+  stage is not a judgement.
+</p>
+
+<h2>Proposed: parallel requests</h2>
+<pre class="frame"><span class="gray r"> ? </span> <span class="blue b r"> dashboard </span> <span class="gray r"> routing </span> <span class="gray r"> config </span> <span class="gray r"> accounts </span> last 30m · 6 sessions · 2 idle · 8 requests     last req <span class="green">3s ago</span> · 12:34:56
+┌SESSIONS──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│session                                                       ctx model       reqs prompt now    peak msgs ↺ out  idle│
+│ses-free                                                       <span class="green b">1M</span> sonnet-5       3    470,893 470,893    4 <span class="d">-</span> 768 <span class="yellow b">⇣</span> 22s│
+│ses-new                                                        <span class="green b d">1M</span> <span class="d">~opus-5</span>        1          ?       ?    4 <span class="d">-</span>   ? ⇡ 14s│
+│ses-hot                                                        <span class="green b">1M</span> opus-5         2    470,893 470,893    4 <span class="d">-</span> 768 <span class="red b">⇣</span>  1m│
+│ses-gate                                                       <span class="green b d">1M</span> <span class="d">~opus-5</span><span class="red b"> !</span>      0          ?       ?    - <span class="d">-</span>   ?    2m│
+│ses-fail                                                       <span class="green b d">1M</span> <span class="d">~sonnet-5</span><span class="red"> ✗</span>    1          ?       ?    - <span class="d">-</span>   ?    <span class="d">4m</span>│
+│ses-crow                                                     <span class="yellow">200k</span> haiku-4-5      1    470,893 470,893   12 <span class="d">-</span> 768   <span class="d">10m</span>│
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</pre>
+<p class="note">
+  The mark stands for the longest-running request, and its colour says how
+  many others run beside it: plain for none, yellow for one more
+  (<strong>ses-free</strong>), red for two or more (<strong>ses-hot</strong>).
+  It turns bold as well once there is more than one, so with
+  <strong>NO_COLOR</strong> "more than one" survives even though one more
+  and several more then look alike. The column is the same width as in the
+  quiet frame.
+</p>
+
+<h2>Legend rows</h2>
+<pre class="frame swatch"><span class="b">‖ ⇡ ⇣</span>   in flight: not yet sent, awaiting a reply, or streaming; timed from arrival
+<span class="b">yellow red</span>   on a stage mark: one more request in flight, or two or more</pre>
+<p class="note">
+  These replace the <strong>held sent recv</strong> and <strong>+N</strong>
+  rows in the dashboard's <strong>?</strong> overlay, and the matching rows
+  in the design language. The session detail popup keeps the words and its
+  per-request lines: nothing there reflows, and it is where the exact count
+  is read.
+</p>
+
+<h2>Worth a look</h2>
+<p class="note">
+  <strong>Red means exhausted, failed, or about to be</strong> everywhere
+  else in the TUI. Two or more parallel requests is none of those, so a red
+  mark here borrows an alarm it has not earned. Yellow for one more and
+  yellow plus bold for two or more would stay inside the colour rules.<br>
+  <strong>The exact count leaves the table.</strong> The dashboard spec asks
+  a row to show how many requests are in flight. Colour banding gives
+  one, two, or three or more, so the spec's wording changes with this, and
+  the detail popup carries the exact number.
+</p>
+
+</body>
+</html>
