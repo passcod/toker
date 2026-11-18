@@ -189,71 +189,22 @@
   stage is not a judgement.
 </p>
 
-<h2>Colourways for parallel requests</h2>
+<h2>Proposed: parallel requests</h2>
 <p class="note">
   The mark stands for the longest-running request, and its style says how
-  many others run beside it: <strong>ses-new</strong> has none,
-  <strong>ses-free</strong> one more, <strong>ses-hot</strong> two more.
-  Every colourway keeps the column the same width as the quiet frame. Under
-  each, the same three cells as <strong>NO_COLOR</strong> renders them, with
-  colour stripped and bold kept.
+  many others run beside it: plain for none (<strong>ses-new</strong>), bold
+  for one more (<strong>ses-free</strong>), cyan bold for two or more
+  (<strong>ses-hot</strong>). Cyan marks identity rather than judgement, so
+  it says "busy" without saying "worry". The column is the same width as in
+  the quiet frame. Under the frame, the same three cells as
+  <strong>NO_COLOR</strong> renders them: both parallel steps keep their
+  bold, so "more than one" survives even though one more and several more
+  then look alike.
 </p>
-<h2>A. Yellow, then red</h2>
-<pre class="frame"><span class="gray r"> ? </span> <span class="blue b r"> dashboard </span> <span class="gray r"> routing </span> <span class="gray r"> config </span> <span class="gray r"> accounts </span> last 30m · 6 sessions · 2 idle · 8 requests     last req <span class="green">3s ago</span> · 12:34:56
-┌SESSIONS──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│session                                                       ctx model       reqs prompt now    peak msgs ↺ out  idle│
-│ses-free                                                       <span class="green b">1M</span> sonnet-5       3    470,893 470,893    4 <span class="d">-</span> 768 <span class="yellow b">⇣</span> 22s│
-│ses-new                                                        <span class="green b d">1M</span> <span class="d">~opus-5</span>        1          ?       ?    4 <span class="d">-</span>   ? ⇡ 14s│
-│ses-hot                                                        <span class="green b">1M</span> opus-5         2    470,893 470,893    4 <span class="d">-</span> 768 <span class="red b">⇣</span>  1m│
-│ses-gate                                                       <span class="green b d">1M</span> <span class="d">~opus-5</span><span class="red b"> !</span>      0          ?       ?    - <span class="d">-</span>   ?    2m│
-│ses-fail                                                       <span class="green b d">1M</span> <span class="d">~sonnet-5</span><span class="red"> ✗</span>    1          ?       ?    - <span class="d">-</span>   ?    <span class="d">4m</span>│
-│ses-crow                                                     <span class="yellow">200k</span> haiku-4-5      1    470,893 470,893   12 <span class="d">-</span> 768   <span class="d">10m</span>│
-│                                                                                                                      │
-│                                                                                                                      │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</pre>
-<pre class="frame swatch">ses-new ⇡ 14s   ses-free <span class="yellow b">⇣</span> 22s   ses-hot <span class="red b">⇣</span>  1m   <span class="d">colour</span>
-ses-new ⇡ 14s   ses-free <span class="b">⇣</span> 22s   ses-hot <span class="b">⇣</span>  1m   <span class="d">NO_COLOR</span></pre>
-<p class="note">Most urgent-looking. Red elsewhere means exhausted, failed or about to be, which several parallel requests is not. Without colour, one more and two more look alike.</p>
-
-<h2>B. Yellow, then yellow bold</h2>
-<pre class="frame"><span class="gray r"> ? </span> <span class="blue b r"> dashboard </span> <span class="gray r"> routing </span> <span class="gray r"> config </span> <span class="gray r"> accounts </span> last 30m · 6 sessions · 2 idle · 8 requests     last req <span class="green">3s ago</span> · 12:34:56
-┌SESSIONS──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│session                                                       ctx model       reqs prompt now    peak msgs ↺ out  idle│
-│ses-free                                                       <span class="green b">1M</span> sonnet-5       3    470,893 470,893    4 <span class="d">-</span> 768 <span class="yellow">⇣</span> 22s│
-│ses-new                                                        <span class="green b d">1M</span> <span class="d">~opus-5</span>        1          ?       ?    4 <span class="d">-</span>   ? ⇡ 14s│
-│ses-hot                                                        <span class="green b">1M</span> opus-5         2    470,893 470,893    4 <span class="d">-</span> 768 <span class="yellow b">⇣</span>  1m│
-│ses-gate                                                       <span class="green b d">1M</span> <span class="d">~opus-5</span><span class="red b"> !</span>      0          ?       ?    - <span class="d">-</span>   ?    2m│
-│ses-fail                                                       <span class="green b d">1M</span> <span class="d">~sonnet-5</span><span class="red"> ✗</span>    1          ?       ?    - <span class="d">-</span>   ?    <span class="d">4m</span>│
-│ses-crow                                                     <span class="yellow">200k</span> haiku-4-5      1    470,893 470,893   12 <span class="d">-</span> 768   <span class="d">10m</span>│
-│                                                                                                                      │
-│                                                                                                                      │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</pre>
-<pre class="frame swatch">ses-new ⇡ 14s   ses-free <span class="yellow">⇣</span> 22s   ses-hot <span class="yellow b">⇣</span>  1m   <span class="d">colour</span>
-ses-new ⇡ 14s   ses-free <span>⇣</span> 22s   ses-hot <span class="b">⇣</span>  1m   <span class="d">NO_COLOR</span></pre>
-<p class="note">Stays inside the colour rules: yellow is worth noticing. The two steps differ only by weight, so they sit close together. Without colour, one more reads as no more at all, which breaks the rule that colour never carries a reading alone.</p>
-
-<h2>C. Bold, then yellow bold</h2>
 <pre class="frame"><span class="gray r"> ? </span> <span class="blue b r"> dashboard </span> <span class="gray r"> routing </span> <span class="gray r"> config </span> <span class="gray r"> accounts </span> last 30m · 6 sessions · 2 idle · 8 requests     last req <span class="green">3s ago</span> · 12:34:56
 ┌SESSIONS──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │session                                                       ctx model       reqs prompt now    peak msgs ↺ out  idle│
 │ses-free                                                       <span class="green b">1M</span> sonnet-5       3    470,893 470,893    4 <span class="d">-</span> 768 <span class="b">⇣</span> 22s│
-│ses-new                                                        <span class="green b d">1M</span> <span class="d">~opus-5</span>        1          ?       ?    4 <span class="d">-</span>   ? ⇡ 14s│
-│ses-hot                                                        <span class="green b">1M</span> opus-5         2    470,893 470,893    4 <span class="d">-</span> 768 <span class="yellow b">⇣</span>  1m│
-│ses-gate                                                       <span class="green b d">1M</span> <span class="d">~opus-5</span><span class="red b"> !</span>      0          ?       ?    - <span class="d">-</span>   ?    2m│
-│ses-fail                                                       <span class="green b d">1M</span> <span class="d">~sonnet-5</span><span class="red"> ✗</span>    1          ?       ?    - <span class="d">-</span>   ?    <span class="d">4m</span>│
-│ses-crow                                                     <span class="yellow">200k</span> haiku-4-5      1    470,893 470,893   12 <span class="d">-</span> 768   <span class="d">10m</span>│
-│                                                                                                                      │
-│                                                                                                                      │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</pre>
-<pre class="frame swatch">ses-new ⇡ 14s   ses-free <span class="b">⇣</span> 22s   ses-hot <span class="yellow b">⇣</span>  1m   <span class="d">colour</span>
-ses-new ⇡ 14s   ses-free <span class="b">⇣</span> 22s   ses-hot <span class="b">⇣</span>  1m   <span class="d">NO_COLOR</span></pre>
-<p class="note">Parallel work shows in weight first and only the busier step takes a colour. Without colour, both steps keep their bold, so it reads the same as A.</p>
-
-<h2>D. Cyan, then cyan bold</h2>
-<pre class="frame"><span class="gray r"> ? </span> <span class="blue b r"> dashboard </span> <span class="gray r"> routing </span> <span class="gray r"> config </span> <span class="gray r"> accounts </span> last 30m · 6 sessions · 2 idle · 8 requests     last req <span class="green">3s ago</span> · 12:34:56
-┌SESSIONS──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│session                                                       ctx model       reqs prompt now    peak msgs ↺ out  idle│
-│ses-free                                                       <span class="green b">1M</span> sonnet-5       3    470,893 470,893    4 <span class="d">-</span> 768 <span class="cyan">⇣</span> 22s│
 │ses-new                                                        <span class="green b d">1M</span> <span class="d">~opus-5</span>        1          ?       ?    4 <span class="d">-</span>   ? ⇡ 14s│
 │ses-hot                                                        <span class="green b">1M</span> opus-5         2    470,893 470,893    4 <span class="d">-</span> 768 <span class="cyan b">⇣</span>  1m│
 │ses-gate                                                       <span class="green b d">1M</span> <span class="d">~opus-5</span><span class="red b"> !</span>      0          ?       ?    - <span class="d">-</span>   ?    2m│
@@ -262,31 +213,18 @@ ses-new ⇡ 14s   ses-free <span class="b">⇣</span> 22s   ses-hot <span class=
 │                                                                                                                      │
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</pre>
-<pre class="frame swatch">ses-new ⇡ 14s   ses-free <span class="cyan">⇣</span> 22s   ses-hot <span class="cyan b">⇣</span>  1m   <span class="d">colour</span>
-ses-new ⇡ 14s   ses-free <span>⇣</span> 22s   ses-hot <span class="b">⇣</span>  1m   <span class="d">NO_COLOR</span></pre>
-<p class="note">Cyan means identity, never good or bad, so it says "busy" without saying "worry". It sits close to the cyan working directories in the label column. Without colour, it reads like B.</p>
-
-<h2>E. Bold only</h2>
-<pre class="frame"><span class="gray r"> ? </span> <span class="blue b r"> dashboard </span> <span class="gray r"> routing </span> <span class="gray r"> config </span> <span class="gray r"> accounts </span> last 30m · 6 sessions · 2 idle · 8 requests     last req <span class="green">3s ago</span> · 12:34:56
-┌SESSIONS──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│session                                                       ctx model       reqs prompt now    peak msgs ↺ out  idle│
-│ses-free                                                       <span class="green b">1M</span> sonnet-5       3    470,893 470,893    4 <span class="d">-</span> 768 <span class="b">⇣</span> 22s│
-│ses-new                                                        <span class="green b d">1M</span> <span class="d">~opus-5</span>        1          ?       ?    4 <span class="d">-</span>   ? ⇡ 14s│
-│ses-hot                                                        <span class="green b">1M</span> opus-5         2    470,893 470,893    4 <span class="d">-</span> 768 <span class="b">⇣</span>  1m│
-│ses-gate                                                       <span class="green b d">1M</span> <span class="d">~opus-5</span><span class="red b"> !</span>      0          ?       ?    - <span class="d">-</span>   ?    2m│
-│ses-fail                                                       <span class="green b d">1M</span> <span class="d">~sonnet-5</span><span class="red"> ✗</span>    1          ?       ?    - <span class="d">-</span>   ?    <span class="d">4m</span>│
-│ses-crow                                                     <span class="yellow">200k</span> haiku-4-5      1    470,893 470,893   12 <span class="d">-</span> 768   <span class="d">10m</span>│
-│                                                                                                                      │
-│                                                                                                                      │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</pre>
-<pre class="frame swatch">ses-new ⇡ 14s   ses-free <span class="b">⇣</span> 22s   ses-hot <span class="b">⇣</span>  1m   <span class="d">colour</span>
+<pre class="frame swatch">ses-new ⇡ 14s   ses-free <span class="b">⇣</span> 22s   ses-hot <span class="cyan b">⇣</span>  1m   <span class="d">colour</span>
 ses-new ⇡ 14s   ses-free <span class="b">⇣</span> 22s   ses-hot <span class="b">⇣</span>  1m   <span class="d">NO_COLOR</span></pre>
-<p class="note">The baseline: parallel or not, with no count at all. Reads the same with colour off.</p>
 
+<p class="note">
+  Considered and set aside: yellow then red (red means exhausted or failed
+  elsewhere), yellow then yellow bold and cyan then cyan bold (with colour
+  off, one more reads as none), and bold alone (no sense of how many).
+</p>
 
 <h2>Legend rows</h2>
 <pre class="frame swatch"><span class="b">‖ ⇡ ⇣</span>   in flight: not yet sent, awaiting a reply, or streaming; timed from arrival
-<span class="b">styled ⇣</span>   one more request in flight beside it, or two or more (per the colourway chosen)</pre>
+<span class="b">⇣</span> <span class="cyan b">⇣</span>   bold: one more request in flight beside it; cyan: two or more</pre>
 <p class="note">
   These replace the <strong>held sent recv</strong> and <strong>+N</strong>
   rows in the dashboard's <strong>?</strong> overlay, and the matching rows
