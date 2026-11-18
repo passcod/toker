@@ -4,9 +4,9 @@ expression: "rows.join(\"\\n\")"
 ---
  ?   dashboard   routing   config   accounts  last 30m · 4 sessions      last req no data · 12:34:56
 ┌SESSIONS──────────────────────────────────────────────────────────────────────────────────────────┐
-│session                                ctx model         reqs prompt now    peak msgs ↺   out idle│
-│ses-free                                1M sonnet-5 $       3      2,500   2,500    - -    60   1m│
-│ses-hot                                 1M opus-5 ↑         3    470,893 472,000   77 1 2,304   1m│
+│session                               ctx model         reqs prompt now    peak msgs ↺   out  idle│
+│ses-free                               1M sonnet-5 $       3      2,500   2,500    - -    60    1m│
+│ses-hot                                1M opus-5 ↑         3    470,893 472,000   77 1 2,304    1m│
 │… 2 more sessions                                                                                 │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌CONTEXT───────────────────────────────────────────────────────────────────────────────────────────┐

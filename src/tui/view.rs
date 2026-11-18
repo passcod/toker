@@ -471,7 +471,7 @@ pub(crate) fn render(
 }
 
 /// The legend's rows: a glyph or marker, and what it means.
-const LEGEND: [(&str, &str); 25] = [
+const LEGEND: [(&str, &str); 26] = [
     (
         "↑",
         "served on a newer model: bright on the latest turn, dim earlier",
@@ -520,10 +520,11 @@ const LEGEND: [(&str, &str); 25] = [
     ("ctx", "green: native 1M; yellow: another known ceiling"),
     ("idle", "dim once a session has been quiet 3m"),
     (
-        "held sent recv",
+        "‖ ⇡ ⇣",
         "in flight: not yet sent, awaiting a reply, or streaming; timed from arrival",
     ),
-    ("+N", "N more requests in flight in that session"),
+    ("bold ⇣", "one other request in flight beside it"),
+    ("cyan ⇣", "two or more others in flight beside it"),
 ];
 
 /// The dashboard's keys, under its marks in the same overlay: with no
@@ -1123,16 +1124,17 @@ fn session_cells(session: &SessionAgg, now_ms: i64, fmt: &Fmt) -> [Line<'static>
         },
         Col::Out => Line::raw(unknown_or_grouped(fmt, session.output_total)),
         // A request in flight takes the place of the idle age: how far it
-        // has got and how long it has been going, the longest first, and
-        // how many more there are.
+        // has got and how long it has been going, the longest first, with
+        // the others told by the mark's style. A quiet row keeps the mark's
+        // slot blank, so the column is as wide either way.
         Col::Idle => match session.in_flight.first() {
-            Some(request) => Line::raw(in_flight_cell(
+            Some(request) => in_flight_cell(
                 request.stage,
                 now_ms - request.started_ms,
                 session.in_flight.len() - 1,
-            )),
-            None if idle => Line::styled(last.clone(), Style::new().dim()),
-            None => Line::raw(last.clone()),
+            ),
+            None if idle => Line::styled(quiet_cell(&last), Style::new().dim()),
+            None => Line::raw(quiet_cell(&last)),
         },
     })
 }
@@ -1194,20 +1196,47 @@ fn session_cell(session: &SessionAgg, width: u16) -> Cell<'static> {
     Cell::new(short_id(&session.session))
 }
 
-/// The idle column's cell for a session with a request in flight: `held`,
-/// `sent` or `recv` for how far the longest-running one has got, its age,
-/// and `+N` for the others.
-fn in_flight_cell(stage: InFlightStage, age_ms: i64, more: usize) -> String {
-    let stage = match stage {
-        InFlightStage::Held => "held",
-        InFlightStage::Waiting => "sent",
-        InFlightStage::Streaming => "recv",
+/// The idle column's cell for a session with a request in flight: a
+/// one-cell mark for how far the longest-running one has got (`‖` held,
+/// `⇡` sent, `⇣` streaming), then its age padded to [`IDLE_AGE_W`] so the
+/// marks line up down the column.
+///
+/// The others in flight beside it are told by the mark's style rather than
+/// a `+N`: bold for one, cyan and bold for two or more. A count that
+/// widened the column reflowed the whole table each time a session's
+/// parallel requests came and went. Bold on both, so `NO_COLOR` keeps
+/// "more than one"; cyan because parallel work is a fact about the session,
+/// not a warning. The arrows are dashed to stay apart from the model
+/// column's `↑`, and `‖` stands in for U+23F8, which carries emoji
+/// presentation and so has no width terminals agree on.
+// spec: UTUI#requests-in-flight
+fn in_flight_cell(stage: InFlightStage, age_ms: i64, more: usize) -> Line<'static> {
+    let mark = match stage {
+        InFlightStage::Held => "‖",
+        InFlightStage::Waiting => "⇡",
+        InFlightStage::Streaming => "⇣",
     };
-    let mut cell = format!("{stage} {}", in_flight_age(age_ms));
-    if more > 0 {
-        cell.push_str(&format!(" +{more}"));
-    }
-    cell
+    let style = match more {
+        0 => Style::new(),
+        1 => Style::new().add_modifier(Modifier::BOLD),
+        _ => Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    };
+    Line::from(vec![
+        Span::styled(mark, style),
+        Span::raw(format!(" {:>IDLE_AGE_W$}", in_flight_age(age_ms))),
+    ])
+}
+
+/// The cells an age takes in the idle column, which every age short of a
+/// hundred hours fits.
+const IDLE_AGE_W: usize = 3;
+
+/// The idle column's cell for a quiet session: its age, behind the blank
+/// slot [`in_flight_cell`] puts its mark in, so a request starting or
+/// finishing does not change the column's width.
+// spec: UTUI#requests-in-flight
+fn quiet_cell(age: &str) -> String {
+    format!("  {age:>IDLE_AGE_W$}")
 }
 
 /// How long a request has been in flight: seconds up to a minute, where
@@ -5197,23 +5226,100 @@ mod tests {
     #[test]
     fn the_idle_cell_shows_how_far_a_request_has_got() {
         use crate::store::InFlightStage;
+        let text = |line: ratatui::text::Line<'_>| line.to_string();
         assert_eq!(
-            super::in_flight_cell(InFlightStage::Held, 3_000, 0),
-            "held 3s"
+            text(super::in_flight_cell(InFlightStage::Held, 3_000, 0)),
+            "‖  3s"
         );
         assert_eq!(
-            super::in_flight_cell(InFlightStage::Waiting, 14_000, 0),
-            "sent 14s"
+            text(super::in_flight_cell(InFlightStage::Waiting, 14_000, 0)),
+            "⇡ 14s"
         );
         assert_eq!(
-            super::in_flight_cell(InFlightStage::Streaming, 22_000, 1),
-            "recv 22s +1"
+            text(super::in_flight_cell(InFlightStage::Streaming, 22_000, 1)),
+            "⇣ 22s"
         );
         assert_eq!(
-            super::in_flight_cell(InFlightStage::Streaming, 61_000, 0),
-            "recv 1m"
+            text(super::in_flight_cell(InFlightStage::Streaming, 61_000, 0)),
+            "⇣  1m"
         );
+        // A quiet row is as wide, its mark's slot blank.
+        assert_eq!(super::quiet_cell("10m"), "  10m");
+        assert_eq!(super::quiet_cell("2m"), "   2m");
         assert_eq!(super::in_flight_age(-5), "0s", "a skewed clock reads zero");
+    }
+
+    #[test]
+    fn the_mark_tells_parallel_requests_by_style_alone() {
+        use crate::store::InFlightStage;
+        let mark =
+            |more| super::in_flight_cell(InFlightStage::Streaming, 22_000, more).spans[0].style;
+        assert_eq!(mark(0), Style::new(), "a lone request is plain");
+        assert_eq!(mark(1), Style::new().add_modifier(Modifier::BOLD));
+        let several = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+        assert_eq!(mark(2), several);
+        assert_eq!(mark(5), several);
+        // However many there are, the cell is no wider: no count is drawn.
+        for more in [0, 1, 2, 12] {
+            let cell = super::in_flight_cell(InFlightStage::Streaming, 22_000, more);
+            assert_eq!(cell.width(), 5, "{more} more");
+        }
+    }
+
+    #[test]
+    fn without_colour_parallel_requests_still_read_as_more_than_one() {
+        let snap = in_flight_snapshot();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                super::render(frame, &snap, "12:34:56", &utc(), &plain());
+                chrome::strip_colour(frame);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        // The stage mark on the row naming `session`.
+        let mark = |session: &str| {
+            (0..buffer.area.height)
+                .find_map(|y| {
+                    let row: String = (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect();
+                    if !row.contains(session) {
+                        return None;
+                    }
+                    (0..buffer.area.width)
+                        .map(|x| &buffer[(x, y)])
+                        .find(|cell| ["‖", "⇡", "⇣"].contains(&cell.symbol()))
+                })
+                .unwrap_or_else(|| panic!("{session}'s mark"))
+                .clone()
+        };
+        // ses-free has two in flight; ses-new and ses-hot one each.
+        assert!(mark("ses-free").modifier.contains(Modifier::BOLD));
+        assert!(!mark("ses-new").modifier.contains(Modifier::BOLD));
+        assert!(!mark("ses-hot").modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn requests_in_flight_do_not_move_the_columns() {
+        // The same sessions with nothing in flight and with four requests
+        // in flight, two of them in one session: every column starts in
+        // the same place, so the table does not reflow as they come and go.
+        let busy = in_flight_snapshot();
+        let mut quiet = busy.clone();
+        for session in &mut quiet.sessions {
+            session.in_flight.clear();
+        }
+        for (width, height) in [(80, 30), (100, 30), (120, 40)] {
+            let header = |snap| {
+                rendered(snap, width, height)
+                    .lines()
+                    .find(|line| line.contains("prompt now") || line.contains("ctx model"))
+                    .expect("the sessions header")
+                    .to_owned()
+            };
+            assert_eq!(header(&busy), header(&quiet), "at {width}x{height}");
+        }
     }
 
     #[test]
@@ -5222,7 +5328,7 @@ mod tests {
         for (width, height) in [(80, 30), (100, 30), (120, 40)] {
             let text = rendered(&snap, width, height);
             frame_snapshot(&format!("sessions_in_flight_{width}x{height}"), &text);
-            for expected in ["recv 22s", "sent 14s", "recv 1m"] {
+            for expected in ["⇣ 22s", "⇡ 14s", "⇣  1m"] {
                 assert!(text.contains(expected), "{expected:?} at {width}:\n{text}");
             }
             for session in ["ses-free", "ses-new", "ses-hot", "ses-gate", "ses-fail"] {
@@ -5230,8 +5336,13 @@ mod tests {
             }
         }
         let wide = rendered(&snap, 120, 40);
-        // The longest-running of ses-free's two leads, with the other counted.
-        assert!(wide.contains("recv 22s +1"), "{wide}");
+        // The longest-running of ses-free's two leads; the other shows only
+        // in its mark's style, which the frame does not pin.
+        let free = wide
+            .lines()
+            .find(|line| line.contains("ses-free"))
+            .expect("ses-free's row");
+        assert!(free.ends_with("⇣ 22s│"), "{free}");
         // Nothing served yet: the routed model, marked, and the marks that
         // say why each of the other two has a row.
         assert!(wide.contains("~opus-5"), "{wide}");
@@ -5242,7 +5353,7 @@ mod tests {
     #[test]
     fn a_quiet_dashboard_shows_none_of_the_in_flight_marks() {
         let text = rendered(&full_snapshot(), 120, 40);
-        for absent in ["held ", "sent ", "recv ", "~", "✗", " +1"] {
+        for absent in ["‖", "⇡", "⇣", "~", "✗"] {
             assert!(!text.contains(absent), "{absent:?} in:\n{text}");
         }
     }
@@ -5308,7 +5419,8 @@ mod tests {
             "failed: this session's newest finished request ended in failure",
             "routed to this model, none served yet",
             "in flight: not yet sent, awaiting a reply, or streaming",
-            "N more requests in flight in that session",
+            "one other request in flight beside it",
+            "two or more others in flight beside it",
         ] {
             assert!(text.contains(expected), "{expected:?} in:\n{text}");
         }
