@@ -4,10 +4,10 @@ expression: "rows.join(\"\\n\")"
 ---
  ?   dashboard   routing   config   accounts  last 30m · 4 sessions      last req no data · 12:34:56
 ┌SESSIONS──────────────────────────────────────────────────────────────────────────────────────────┐
-│session                                ctx model         reqs prompt now    peak msgs ↺   out idle│
+│session                               ctx model         reqs prompt now    peak msgs ↺   out  idle│
 │… 2 sessions above                                                                                │
-│ses-myst                                 ? gpt-5.6-terra    3      3,132   3,132    - -    40   2m│
-│ses-crow                              200k haiku-4-5        3    170,000 170,000    - -   100  10m│
+│ses-myst                                ? gpt-5.6-terra    3      3,132   3,132    - -    40    2m│
+│ses-crow                             200k haiku-4-5        3    170,000 170,000    - -   100   10m│
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌CONTEXT───────────────────────────────────────────────────────────────────────────────────────────┐
 │… 2 above                                                                                         │

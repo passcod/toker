@@ -63,7 +63,7 @@ A meter between 80% and 95%. A hit rate between 80% and 95%. Freshness between 3
 A meter over 95%, or one whose verdict is `spent` or `out ~T`. A hit rate under 80%. Freshness beyond five minutes, and `no data` on an empty ledger. Errors, failed requests and drift in the requests line, and the sparkline bucket holding an error. A context occupancy over 80% on a live session, with its `← compacts soon` marker. A session whose newest decision was a gate stopping it (`!`), and one whose newest finished request failed (`✗`). `overage IN USE`. A popup's error message.
 
 **Cyan — identity rather than judgement.**
-A session's working directory in its label, and the context occupancy bar at a share that is not yet a concern. Cyan never means good or bad; it distinguishes.
+A session's working directory in its label, the context occupancy bar at a share that is not yet a concern, and the stage mark of a session with two or more requests in flight beside its longest-running one. Cyan never means good or bad; it distinguishes.
 
 **Blue — one use only.** The current page's button in the header.
 
@@ -89,7 +89,7 @@ They are repeated here as description; the code is where they are changed.
 
 **`BOLD` is the emphasis channel**, since colour is not.
 It renders as a heavier weight and keeps its colour — the reference terminal does not map bold onto the bright palette.
-It marks the best case (a native 1M ceiling), the most urgent case (a stopped session's `!`), the current turn (a bright `↑` against the dim earlier ones), a sparkline bucket holding an error, a ruled panel's title, and a legend key.
+It marks the best case (a native 1M ceiling), the most urgent case (a stopped session's `!`), the current turn (a bright `↑` against the dim earlier ones), a sparkline bucket holding an error, the stage mark of a session running requests in parallel, a ruled panel's title, and a legend key.
 
 **`DIM` means absent, inactive or subordinate.**
 It renders at half the foreground's opacity, so it keeps the colour underneath rather than flattening to grey — which matters, because a dim green `↑` is still a green `↑`.
@@ -137,8 +137,9 @@ The contract is that agreement and not the length of the list: a screen that gai
 | `last req` | green under 30s, yellow under 5m, red beyond |
 | `ctx` | green: native 1M; yellow: another known ceiling |
 | `idle` | dim once a session has been quiet 3m |
-| `held` `sent` `recv` | in flight: not yet sent, awaiting a reply, or streaming; timed from arrival |
-| `+N` | N more requests in flight in that session |
+| `‖` `⇡` `⇣` | in flight: not yet sent, awaiting a reply, or streaming; timed from arrival |
+| `bold ⇣` | one other request in flight beside it |
+| `cyan ⇣` | two or more others in flight beside it |
 
 ### Structural glyphs
 
@@ -219,6 +220,13 @@ Only a terminal too short for any of that cuts whole rows from the top of the mi
 **The label column is the one that resists.**
 A session's name renders at twelve cells or more, below which the column shows the eight-character short id instead, because too narrow a name is noise.
 The table gives the label its leftover width and sheds a numeric column rather than let the label drop under twenty cells: a title is worth more than a peak or an output total.
+
+**The idle column holds still.**
+Every row reserves a cell for the stage mark and a space after it, blank on a quiet row, and a request in flight pads its age to three cells.
+So a request starting or finishing changes the cell's characters and never the column's width, and the marks line up down the column.
+The mark stands for the longest-running request: plain alone, bold with one more beside it, cyan and bold with two or more.
+Cyan rather than yellow or red, because parallel work is a fact about the session and not a warning; bold on both, so `NO_COLOR` keeps "more than one".
+The `⇡` and `⇣` are dashed to stay apart from the model column's `↑`, and `‖` stands for held because the pause symbol carries emoji presentation and terminals disagree on its width.
 
 ## Copy
 
